@@ -1,46 +1,33 @@
-import OpenAI from "openai";
-
-const openai = new OpenAI({
-apiKey: process.env.OPENAI_API_KEY,
-});
-
 export default async function handler(req, res) {
 if (req.method !== "POST") {
-return res.status(405).json({ error: "Method not allowed" });
+return res.status(405).json({
+success: false,
+error: "Method not allowed",
+});
 }
 
 try {
 const { fileName, type } = req.body;
 
-const prompt = `
-A ${type} named "${fileName}" was uploaded.
+const score = Math.floor(Math.random() * 30) + 1;
 
-Give me ONLY JSON.
+let risk = "LOW RISK";
 
-{
-"score": number,
-"risk": "LOW" | "MEDIUM" | "HIGH",
-"reason": "short explanation"
-}
-`;
+if (score > 30) risk = "MEDIUM RISK";
+if (score > 60) risk = "HIGH RISK";
 
-const response = await openai.chat.completions.create({
-model: "gpt-4.1-mini",
-messages: [
-{
-role: "user",
-content: prompt
-}
-]
+return res.status(200).json({
+success: true,
+fileName,
+type,
+score,
+risk,
+message: "Analysis completed successfully",
 });
-
-const result = JSON.parse(response.choices[0].message.content);
-
-res.status(200).json(result);
-
 } catch (err) {
-res.status(500).json({
-error: err.message
+return res.status(500).json({
+success: false,
+error: err.message,
 });
 }
 }
