@@ -1,0 +1,8 @@
+{
+ "name": "verifydoc-api",
+ "version": "1.0.0",
+ "type": "module",
+ "dependencies": {
+ "openai": "^5.12.2"
+ }
+}
