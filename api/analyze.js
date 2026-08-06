@@ -31,16 +31,54 @@ error: "No image received",
 }
 
 const prompt = `
-You are a professional forensic document analyst.
+You are a world-class AI forensic document examiner.
 
-Analyze this receipt or bank document.
+Analyze the uploaded document like a professional forensic laboratory.
 
-Return ONLY valid JSON:
+Check all of the following:
+
+1. OCR consistency
+2. Font family consistency
+3. Font size differences
+4. Character spacing
+5. Line spacing
+6. Text alignment
+7. Baseline shifts
+8. Image compression artifacts
+9. Clone stamp traces
+10. Copy-paste regions
+11. Photoshop editing artifacts
+12. AI-generated image traces
+13. Metadata consistency
+14. Logo authenticity
+15. Stamp authenticity
+16. Signature authenticity
+17. Date consistency
+18. Amount formatting
+19. Currency formatting
+20. IBAN formatting
+21. SWIFT/BIC formatting
+22. QR code consistency (if present)
+23. Barcode consistency (if present)
+24. Overall layout integrity
+25. Missing or suspicious elements
+
+Return ONLY valid JSON in exactly this format:
 
 {
-"score": number,
-"risk": "LOW RISK" | "MEDIUM RISK" | "HIGH RISK",
-"reason": "Short explanation"
+"score": 0,
+"risk": "LOW RISK",
+"reason": "Maximum 80 words.",
+"checks": {
+"ocr": true,
+"fonts": true,
+"layout": true,
+"metadata": true,
+"signature": true,
+"logo": true,
+"editing": false,
+"aiGenerated": false
+}
 }
 
 Rules:
@@ -48,9 +86,9 @@ Rules:
 - LOW = 0-30
 - MEDIUM = 31-60
 - HIGH = 61-100
-- Look for OCR inconsistencies, editing artifacts, font mismatch, spacing problems, duplicated areas, suspicious metadata indicators, compression anomalies and visual manipulation.
-`;
-
+- Return JSON only.
+- Never return markdown.
+- Never explain outside JSON.
 const response = await openai.responses.create({
 model: "gpt-5",
 input: [
