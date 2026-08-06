@@ -31,44 +31,48 @@ error: "No image received",
 }
 
 const prompt = `
-You are a world-class AI forensic document examiner.
+You are a professional document forensic analyst.
 
-Analyze the uploaded document like a professional forensic laboratory.
+Analyze this uploaded ${type || "document"} carefully.
 
-Check all of the following:
+Look for:
+- OCR consistency
+- Font consistency
+- Font size differences
+- Character spacing
+- Line spacing
+- Text alignment
+- Baseline shifts
+- Image compression artifacts
+- Copy-paste regions
+- Photoshop editing artifacts
+- AI-generated image traces
+- Metadata consistency
+- Logo authenticity
+- Stamp authenticity
+- Signature authenticity
+- Date consistency
+- Amount formatting
+- Currency formatting
+- IBAN formatting
+- SWIFT/BIC formatting
+- QR code consistency
+- Barcode consistency
+- Overall layout integrity
+- Missing or suspicious elements
 
-1. OCR consistency
-2. Font family consistency
-3. Font size differences
-4. Character spacing
-5. Line spacing
-6. Text alignment
-7. Baseline shifts
-8. Image compression artifacts
-9. Clone stamp traces
-10. Copy-paste regions
-11. Photoshop editing artifacts
-12. AI-generated image traces
-13. Metadata consistency
-14. Logo authenticity
-15. Stamp authenticity
-16. Signature authenticity
-17. Date consistency
-18. Amount formatting
-19. Currency formatting
-20. IBAN formatting
-21. SWIFT/BIC formatting
-22. QR code consistency (if present)
-23. Barcode consistency (if present)
-24. Overall layout integrity
-25. Missing or suspicious elements
+Give a score from 0 to 100.
 
-Return ONLY valid JSON in exactly this format:
+0-30 = LOW RISK
+31-60 = MEDIUM RISK
+61-100 = HIGH RISK
+
+Return ONLY valid JSON in this exact structure:
 
 {
 "score": 0,
 "risk": "LOW RISK",
-"reason": "Maximum 80 words.",
+"reason": "Short explanation.",
 "checks": {
 "ocr": true,
 "fonts": true,
@@ -81,16 +85,12 @@ Return ONLY valid JSON in exactly this format:
 }
 }
 
-Rules:
-- score must be between 0 and 100.
-- LOW = 0-30
-- MEDIUM = 31-60
-- HIGH = 61-100
-- Return JSON only.
-- Never return markdown.
-- Never explain outside JSON.
+Do not return Markdown.
+Do not put the JSON inside code fences.
+`;
+
 const response = await openai.responses.create({
-model: "gpt-5",
+model: "gpt-4.1-mini",
 input: [
 {
 role: "user",
@@ -114,19 +114,20 @@ const result = JSON.parse(text);
 
 return res.status(200).json({
 success: true,
-fileName,
-type,
+fileName: fileName || "document.jpg",
+type: type || "Document",
 score: result.score,
 risk: result.risk,
 reason: result.reason,
+checks: result.checks,
 });
 
 } catch (err) {
-console.error(err);
+console.error("ANALYZE ERROR:", err);
 
 return res.status(500).json({
 success: false,
-error: err.message,
+error: err.message || "Analysis failed",
 });
 }
 }
