@@ -1,297 +1,614 @@
 import OpenAI from "openai";
 
 const openai = new OpenAI({
-apiKey: process.env.OPENAI_API_KEY,
+ apiKey: process.env.OPENAI_API_KEY,
 });
+
+/*
+====================================================
+VERIFYDOC RISK ENGINE V2
+====================================================
+
+AI = Evidence Collector
+Risk Engine = Final Scoring System
+
+PASS = 0 risk
+REVIEW = low/moderate risk
+SUSPICIOUS = high risk
+UNKNOWN = no penalty
+
+The final score is calculated HERE,
+not by the AI.
+====================================================
+*/
+
+const CHECK_WEIGHTS = {
+ ocrConsistency: 7,
+ fontConsistency: 6,
+ fontSizeConsistency: 4,
+ characterSpacing: 4,
+ lineSpacing: 3,
+ textAlignment: 4,
+ baselineConsistency: 3,
+
+ compressionArtifacts: 4,
+ copyPasteRegions: 7,
+ editingTraces: 12,
+ photoshopArtifacts: 8,
+ aiGeneratedIndicators: 8,
+
+ logoConsistency: 3,
+ stampConsistency: 2,
+ signatureConsistency: 3,
+
+ dateConsistency: 5,
+ amountConsistency: 8,
+ currencyFormatting: 3,
+
+ ibanFormatting: 5,
+ swiftFormatting: 3,
+ qrBarcodeConsistency: 3,
+
+ layoutIntegrity: 5,
+ suspiciousElements: 10,
+ documentTypeConsistency: 3,
+
+ imageQuality: 2,
+};
+
+const STATUS_RISK = {
+ pass: 0,
+ review: 0.35,
+ suspicious: 1,
+ unknown: 0,
+};
+
+function clamp(value, min = 0, max = 100) {
+ return Math.max(min, Math.min(max, value));
+}
+
+function calculateRisk(checks) {
+ let totalWeight = 0;
+ let weightedRisk = 0;
+
+ const details = {};
+
+ for (const [name, weight] of Object.entries(CHECK_WEIGHTS)) {
+ const check = checks?.[name];
+
+ if (!check) continue;
+
+ const status = String(check.status || "unknown").toLowerCase();
+
+ if (status === "unknown") {
+ details[name] = {
+ status: "unknown",
+ contribution: 0,
+ };
+ continue;
+ }
+
+ const riskFactor = STATUS_RISK[status] ?? 0;
+
+ totalWeight += weight;
+ weightedRisk += weight * riskFactor;
+
+ details[name] = {
+ status,
+ contribution: Number((weight * riskFactor).toFixed(2)),
+ };
+ }
+
+ if (totalWeight === 0) {
+ return {
+ score: 0,
+ details,
+ };
+ }
+
+ const score = clamp(
+ Math.round((weightedRisk / totalWeight) * 100)
+ );
+
+ return {
+ score,
+ details,
+ };
+}
+
+function getRiskLabel(score) {
+ if (score <= 20) return "LOW RISK";
+ if (score <= 45) return "MODERATE RISK";
+ if (score <= 70) return "HIGH RISK";
+ return "VERY HIGH RISK";
+}
+
+function calculateConfidence(checks) {
+ const values = Object.values(checks || {});
+
+ const available = values.filter(
+ (item) =>
+ item &&
+ String(item.status).toLowerCase() !== "unknown"
+ );
+
+ if (available.length === 0) return 0;
+
+ const average =
+ available.reduce(
+ (sum, item) => sum + Number(item.confidence || 0),
+ 0
+ ) / available.length;
+
+ return clamp(Math.round(average));
+}
+
+function calculateCategories(checks) {
+ const groups = {
+ visualRisk: [
+ "compressionArtifacts",
+ "logoConsistency",
+ "stampConsistency",
+ "signatureConsistency",
+ "imageQuality",
+ ],
+
+ textRisk: [
+ "ocrConsistency",
+ "fontConsistency",
+ "fontSizeConsistency",
+ "characterSpacing",
+ "lineSpacing",
+ "textAlignment",
+ "baselineConsistency",
+ ],
+
+ layoutRisk: [
+ "layoutIntegrity",
+ "copyPasteRegions",
+ "suspiciousElements",
+ "documentTypeConsistency",
+ ],
+
+ financialDataRisk: [
+ "dateConsistency",
+ "amountConsistency",
+ "currencyFormatting",
+ "ibanFormatting",
+ "swiftFormatting",
+ "qrBarcodeConsistency",
+ ],
+
+ editingRisk: [
+ "editingTraces",
+ "photoshopArtifacts",
+ "aiGeneratedIndicators",
+ ],
+ };
+
+ const output = {};
+
+ for (const [category, names] of Object.entries(groups)) {
+ let totalWeight = 0;
+ let weightedRisk = 0;
+
+ for (const name of names) {
+ const check = checks?.[name];
+
+ if (!check) continue;
+
+ const status = String(
+ check.status || "unknown"
+ ).toLowerCase();
+
+ if (status === "unknown") continue;
+
+ const weight = CHECK_WEIGHTS[name] || 1;
+ const risk = STATUS_RISK[status] ?? 0;
+
+ totalWeight += weight;
+ weightedRisk += weight * risk;
+ }
+
+ output[category] =
+ totalWeight === 0
+ ? 0
+ : clamp(
+ Math.round(
+ (weightedRisk / totalWeight) * 100
+ )
+ );
+ }
+
+ return output;
+}
 
 export default async function handler(req, res) {
-res.setHeader("Access-Control-Allow-Origin", "*");
-res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+ res.setHeader(
+ "Access-Control-Allow-Origin",
+ "*"
+ );
 
-if (req.method === "OPTIONS") {
-return res.status(200).end();
-}
+ res.setHeader(
+ "Access-Control-Allow-Methods",
+ "POST, OPTIONS"
+ );
 
-if (req.method !== "POST") {
-return res.status(405).json({
-success: false,
-error: "Method not allowed",
-});
-}
+ res.setHeader(
+ "Access-Control-Allow-Headers",
+ "Content-Type"
+ );
 
-try {
-const { image, fileName, type } = req.body || {};
+ if (req.method === "OPTIONS") {
+ return res.status(200).end();
+ }
 
-if (!image) {
-return res.status(400).json({
-success: false,
-error: "No image received",
-});
-}
+ if (req.method !== "POST") {
+ return res.status(405).json({
+ success: false,
+ error: "Method not allowed",
+ });
+ }
 
-const prompt = `
-You are VerifyDoc, an AI-assisted document forensic screening system.
+ try {
+ const {
+ image,
+ fileName,
+ type,
+ } = req.body || {};
 
-Analyze the uploaded document image carefully.
+ if (!image) {
+ return res.status(400).json({
+ success: false,
+ error: "No image received",
+ });
+ }
 
-IMPORTANT:
-- Never claim a document is definitely authentic or definitely fake.
-- Do not invent evidence.
-- If something cannot be reliably determined from the image, return "unknown".
-- Separate visible evidence from assumptions.
-- A clean-looking document does NOT prove authenticity.
-- Metadata cannot be verified from a screenshot/photo unless metadata is actually available.
-- The result is a forensic screening assessment, not a legal determination.
+ const documentType =
+ type || "Document";
 
-Analyze:
+ const prompt = `
+You are VerifyDoc's forensic evidence collector.
 
-1. OCR/text consistency
-2. Font consistency
-3. Font size consistency
-4. Character spacing
-5. Line spacing
-6. Text alignment
-7. Baseline consistency
-8. Image compression artifacts
-9. Copy/paste regions
-10. Clone/editing traces
-11. Photoshop-like manipulation artifacts
-12. AI-generated image indicators
-13. Logo/branding consistency
-14. Stamp consistency
-15. Signature consistency
-16. Date consistency
-17. Amount consistency
-18. Currency formatting
-19. IBAN formatting if visible
-20. SWIFT/BIC formatting if visible
-21. QR/barcode consistency if visible
-22. Overall layout consistency
-23. Missing or suspicious elements
-24. Document type consistency
-25. Image quality limitations
+Your job is NOT to decide the final risk score.
 
-For every check return:
-- status: "pass", "review", "suspicious", or "unknown"
-- score: 0-100 where 0 means no detected risk and 100 means very strong suspicious evidence
-- evidence: concise explanation based ONLY on visible evidence
+Your job is to inspect the uploaded ${documentType}
+and return structured evidence.
 
-Calculate category scores:
+IMPORTANT RULES:
 
-visualRisk
-textRisk
-layoutRisk
-financialDataRisk
-editingRisk
+1. Never invent evidence.
+2. Never assume a document is authentic.
+3. Never assume a document is fake.
+4. Only report things visible or reasonably inferable
+ from the supplied image.
+5. If something cannot be determined, use "unknown".
+6. Metadata must be "unknown" unless metadata is
+ actually available.
+7. A suspicious finding does not automatically prove fraud.
+8. Poor image quality should reduce confidence rather
+ than create false suspicious findings.
 
-Then calculate overallRisk from 0-100.
+Check:
 
-Risk labels:
-0-20 = LOW RISK
-21-45 = MODERATE RISK
-46-70 = HIGH RISK
-71-100 = VERY HIGH RISK
+- OCR consistency
+- Font consistency
+- Font size consistency
+- Character spacing
+- Line spacing
+- Text alignment
+- Baseline consistency
+- Compression artifacts
+- Copy/paste regions
+- Editing traces
+- Photoshop-like artifacts
+- AI-generated indicators
+- Logo consistency
+- Stamp consistency
+- Signature consistency
+- Date consistency
+- Amount consistency
+- Currency formatting
+- IBAN formatting
+- SWIFT/BIC formatting
+- QR/barcode consistency
+- Layout integrity
+- Suspicious elements
+- Document type consistency
+- Image quality
 
-Also provide confidence from 0-100.
+For EVERY check return:
 
-Return ONLY valid JSON.
+status:
+"pass"
+"review"
+"suspicious"
+"unknown"
 
-Required JSON structure:
+confidence:
+0-100
+
+evidence:
+short explanation based on visible evidence.
+
+Return ONLY JSON.
+
+Use exactly this structure:
 
 {
-"overallRisk": 0,
-"riskLabel": "LOW RISK",
-"confidence": 0,
+ "checks": {
+ "ocrConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
 
-"summary": "",
+ "fontConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
 
-"categories": {
-"visualRisk": 0,
-"textRisk": 0,
-"layoutRisk": 0,
-"financialDataRisk": 0,
-"editingRisk": 0
-},
+ "fontSizeConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
 
-"checks": {
-"ocrConsistency": {
-"status": "pass",
-"score": 0,
-"evidence": ""
-},
-"fontConsistency": {
-"status": "pass",
-"score": 0,
-"evidence": ""
-},
-"fontSizeConsistency": {
-"status": "pass",
-"score": 0,
-"evidence": ""
-},
-"characterSpacing": {
-"status": "pass",
-"score": 0,
-"evidence": ""
-},
-"lineSpacing": {
-"status": "pass",
-"score": 0,
-"evidence": ""
-},
-"textAlignment": {
-"status": "pass",
-"score": 0,
-"evidence": ""
-},
-"baselineConsistency": {
-"status": "pass",
-"score": 0,
-"evidence": ""
-},
-"compressionArtifacts": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"copyPasteRegions": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"editingTraces": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"photoshopArtifacts": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"aiGeneratedIndicators": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"logoConsistency": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"stampConsistency": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"signatureConsistency": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"dateConsistency": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"amountConsistency": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"currencyFormatting": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"ibanFormatting": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"swiftFormatting": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"qrBarcodeConsistency": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"layoutIntegrity": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"suspiciousElements": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"documentTypeConsistency": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-},
-"imageQuality": {
-"status": "unknown",
-"score": 0,
-"evidence": ""
-}
-},
+ "characterSpacing": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
 
-"limitations": []
+ "lineSpacing": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "textAlignment": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "baselineConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "compressionArtifacts": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "copyPasteRegions": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "editingTraces": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "photoshopArtifacts": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "aiGeneratedIndicators": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "logoConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "stampConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "signatureConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "dateConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "amountConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "currencyFormatting": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "ibanFormatting": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "swiftFormatting": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "qrBarcodeConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "layoutIntegrity": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "suspiciousElements": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "documentTypeConsistency": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ },
+
+ "imageQuality": {
+ "status": "",
+ "confidence": 0,
+ "evidence": ""
+ }
+ },
+
+ "summary": "",
+ "limitations": []
 }
 `;
 
-const response = await openai.responses.create({
-model: "gpt-5",
-input: [
-{
-role: "user",
-content: [
-{
-type: "input_text",
-text: prompt,
-},
-{
-type: "input_image",
-image_url: `data:image/jpeg;base64,${image}`,
-},
-],
-},
-],
-});
+ const response =
+ await openai.responses.create({
+ model: "gpt-5",
 
-const text = response.output_text;
+ input: [
+ {
+ role: "user",
+ content: [
+ {
+ type: "input_text",
+ text: prompt,
+ },
+ {
+ type: "input_image",
+ image_url:
+ `data:image/jpeg;base64,${image}`,
+ },
+ ],
+ },
+ ],
+ });
 
-let result;
+ let aiResult;
 
-try {
-result = JSON.parse(text);
-} catch (parseError) {
-console.error("JSON parse error:", text);
+ try {
+ aiResult = JSON.parse(
+ response.output_text
+ );
+ } catch (error) {
+ console.error(
+ "AI JSON ERROR:",
+ response.output_text
+ );
 
-return res.status(500).json({
-success: false,
-error: "AI returned invalid JSON",
-});
-}
+ return res.status(500).json({
+ success: false,
+ error: "AI returned invalid JSON",
+ });
+ }
 
-return res.status(200).json({
-success: true,
-fileName: fileName || "document.jpg",
-type: type || "Document",
-...result,
-});
-} catch (err) {
-console.error("VerifyDoc API error:", err);
+ /*
+ ================================================
+ HERE THE REAL VERIFYDOC ENGINE STARTS
+ ================================================
+ */
 
-return res.status(500).json({
-success: false,
-error: err.message || "Analysis failed",
-});
-}
+ const checks =
+ aiResult.checks || {};
+
+ const riskResult =
+ calculateRisk(checks);
+
+ const overallRisk =
+ riskResult.score;
+
+ const riskLabel =
+ getRiskLabel(overallRisk);
+
+ const confidence =
+ calculateConfidence(checks);
+
+ const categories =
+ calculateCategories(checks);
+
+ /*
+ ================================================
+ FINAL RESPONSE
+ ================================================
+ */
+
+ return res.status(200).json({
+ success: true,
+
+ fileName:
+ fileName || "document.jpg",
+
+ type: documentType,
+
+ overallRisk,
+
+ riskLabel,
+
+ confidence,
+
+ summary:
+ aiResult.summary ||
+ "No summary available.",
+
+ categories,
+
+ checks,
+
+ limitations:
+ aiResult.limitations || [],
+
+ engine: {
+ name: "VerifyDoc Risk Engine",
+ version: "2.0",
+ scoring: "server-side weighted analysis",
+ },
+
+ scoringDetails:
+ riskResult.details,
+ });
+
+ } catch (error) {
+ console.error(
+ "VERIFYDOC API ERROR:",
+ error
+ );
+
+ return res.status(500).json({
+ success: false,
+ error:
+ error.message ||
+ "Analysis failed",
+ });
+ }
 }
