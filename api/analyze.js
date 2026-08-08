@@ -1,684 +1,937 @@
 import OpenAI from "openai";
 
-/*
-|--------------------------------------------------------------------------
-| VERIFYDOC API - IMAGE ANALYSIS ENDPOINT
-|--------------------------------------------------------------------------
-| Vercel Serverless Function
-| Endpoint:
-| POST /api/analyze
-|
-| Supported image inputs:
-| 1. { image: "data:image/jpeg;base64,..." }
-| 2. { image: "https://example.com/image.jpg" }
-| 3. { imageUrl: "https://example.com/image.jpg" }
-| 4. { imageBase64: "...." }
-|--------------------------------------------------------------------------
-*/
+const openai = new OpenAI({
+ apiKey: process.env.OPENAI_API_KEY,
+});
 
 export const config = {
-api: {
-bodyParser: {
-sizeLimit: "20mb",
-},
-},
+ api: {
+ bodyParser: {
+ sizeLimit: "20mb",
+ },
+ },
 };
 
-/*
-|--------------------------------------------------------------------------
-| Helpers
-|--------------------------------------------------------------------------
-*/
+const ENGINE = {
+ name: "VerifyDoc Risk Engine",
+ version: "2.0",
+ scoring: "server-side weighted analysis",
+};
+
+const MAX_IMAGE_SIZE = 20 * 1024 * 1024;
+
+const ALLOWED_TYPES = [
+ "image/jpeg",
+ "image/jpg",
+ "image/png",
+ "image/webp",
+];
+
+/* -------------------------------------------------------
+ BASIC HELPERS
+------------------------------------------------------- */
 
 function send(res, status, data) {
-return res.status(status).json(data);
+ return res.status(status).json(data);
 }
 
-function isObject(value) {
-return (
-value !== null &&
-typeof value === "object" &&
-!Array.isArray(value)
-);
+function clean(value) {
+ if (value === null || value === undefined) return "";
+ return String(value).trim();
 }
 
-function cleanString(value) {
-if (typeof value !== "string") {
-return "";
+function number(value, fallback = 0) {
+ const n = Number(value);
+ return Number.isFinite(n) ? n : fallback;
 }
 
-return value.trim();
+function clamp(value, min = 0, max = 100) {
+ return Math.min(max, Math.max(min, number(value)));
 }
 
-/*
-|--------------------------------------------------------------------------
-| Get image from request
-|--------------------------------------------------------------------------
-*/
+function array(value) {
+ if (Array.isArray(value)) return value;
+ if (value === undefined || value === null) return [];
+ return [value];
+}
+
+/* -------------------------------------------------------
+ CORS
+------------------------------------------------------- */
+
+function setCors(res) {
+ res.setHeader("Access-Control-Allow-Origin", "*");
+ res.setHeader(
+ "Access-Control-Allow-Methods",
+ "POST, OPTIONS"
+ );
+ res.setHeader(
+ "Access-Control-Allow-Headers",
+ "Content-Type, Authorization"
+ );
+ res.setHeader("Cache-Control", "no-store");
+}
+
+/* -------------------------------------------------------
+ IMAGE EXTRACTION
+------------------------------------------------------- */
 
 function getImageFromBody(body) {
-if (!body) {
-return null;
+ if (!body || typeof body !== "object") {
+ return null;
+ }
+
+ if (body.image) return body.image;
+ if (body.imageUrl) return body.imageUrl;
+ if (body.file) return body.file;
+ if (body.document) return body.document;
+
+ return null;
 }
 
-/*
-|--------------------------------------------------------------------------
-| JSON body
-|--------------------------------------------------------------------------
-*/
-
-if (isObject(body)) {
-// Most common
-if (body.image) {
-return body.image;
-}
-
-// Alternative
-if (body.imageUrl) {
-return body.imageUrl;
-}
-
-// Alternative
-if (body.imageBase64) {
-const base64 = cleanString(body.imageBase64);
-
-if (!base64) {
-return null;
-}
-
-// Already a data URL
-if (base64.startsWith("data:image/")) {
-return base64;
-}
-
-return `data:image/jpeg;base64,${base64}`;
-}
-
-// Other possible names
-if (body.file) {
-return body.file;
-}
-
-if (body.document) {
-return body.document;
-}
-
-if (body.documentImage) {
-return body.documentImage;
-}
-}
-
-/*
-|--------------------------------------------------------------------------
-| If body itself is a string
-|--------------------------------------------------------------------------
-*/
-
-if (typeof body === "string") {
-const value = body.trim();
-
-if (!value) {
-return null;
-}
-
-if (
-value.startsWith("http://") ||
-value.startsWith("https://") ||
-value.startsWith("data:image/")
-) {
-return value;
-}
-
-return `data:image/jpeg;base64,${value}`;
-}
-
-return null;
-}
-
-/*
-|--------------------------------------------------------------------------
-| Validate image
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ IMAGE VALIDATION
+------------------------------------------------------- */
 
 function validateImage(image) {
-if (!image) {
-return {
-valid: false,
-error: "No image received",
-};
+ if (!image) {
+ return {
+ ok: false,
+ error: "No image received",
+ };
+ }
+
+ if (typeof image !== "string") {
+ return {
+ ok: false,
+ error: "Image must be a string",
+ };
+ }
+
+ /* DATA URL */
+
+ if (image.startsWith("data:")) {
+ const match = image.match(
+ /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/s
+ );
+
+ if (!match) {
+ return {
+ ok: false,
+ error: "Invalid image data",
+ };
+ }
+
+ const mime = match[1].toLowerCase();
+ const base64 = match[2].replace(/\s/g, "");
+
+ if (!ALLOWED_TYPES.includes(mime)) {
+ return {
+ ok: false,
+ error: `Unsupported image type: ${mime}`,
+ };
+ }
+
+ const estimatedSize =
+ Math.floor((base64.length * 3) / 4);
+
+ if (estimatedSize > MAX_IMAGE_SIZE) {
+ return {
+ ok: false,
+ error: "Image is larger than 20 MB",
+ };
+ }
+
+ return {
+ ok: true,
+ value: image,
+ type: mime,
+ };
+ }
+
+ /* PUBLIC URL */
+
+ try {
+ const url = new URL(image);
+
+ if (
+ url.protocol !== "http:" &&
+ url.protocol !== "https:"
+ ) {
+ return {
+ ok: false,
+ error: "Invalid image URL",
+ };
+ }
+
+ return {
+ ok: true,
+ value: image,
+ type: "url",
+ };
+ } catch {
+ return {
+ ok: false,
+ error: "Invalid image URL",
+ };
+ }
 }
 
-if (typeof image !== "string") {
-return {
-valid: false,
-error: "Image must be a string",
-};
+/* -------------------------------------------------------
+ JSON CLEANING
+------------------------------------------------------- */
+
+function cleanAIResponse(text) {
+ let output = clean(text);
+
+ output = output
+ .replace(/^```json/i, "")
+ .replace(/^```/i, "")
+ .replace(/```$/i, "")
+ .trim();
+
+ const start = output.indexOf("{");
+ const end = output.lastIndexOf("}");
+
+ if (start !== -1 && end !== -1) {
+ output = output.substring(start, end + 1);
+ }
+
+ return output;
 }
 
-const value = image.trim();
+function parseAIResponse(text) {
+ const cleaned = cleanAIResponse(text);
 
-if (!value) {
-return {
-valid: false,
-error: "Image is empty",
-};
+ if (!cleaned) {
+ throw new Error("Empty AI response");
+ }
+
+ try {
+ return JSON.parse(cleaned);
+ } catch {
+ throw new Error("AI returned invalid JSON");
+ }
 }
 
-/*
-|--------------------------------------------------------------------------
-| Data URL
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ DOCUMENT NORMALIZATION
+------------------------------------------------------- */
 
-if (value.startsWith("data:image/")) {
-return {
-valid: true,
-image: value,
-};
+function normalizeDocument(document) {
+ const d =
+ document && typeof document === "object"
+ ? document
+ : {};
+
+ return {
+ type: clean(d.type) || "bank_receipt",
+
+ bankName: clean(d.bankName),
+
+ accountHolder: clean(d.accountHolder),
+
+ senderName: clean(d.senderName),
+
+ receiverName: clean(d.receiverName),
+
+ senderIban: clean(d.senderIban),
+
+ receiverIban: clean(d.receiverIban),
+
+ amount: clean(d.amount),
+
+ currency: clean(d.currency),
+
+ transactionDate: clean(d.transactionDate),
+
+ transactionTime: clean(d.transactionTime),
+
+ reference: clean(d.reference),
+
+ transactionId: clean(d.transactionId),
+
+ statusText: clean(d.statusText),
+
+ extractedText: clean(d.extractedText).slice(
+ 0,
+ 12000
+ ),
+ };
 }
 
-/*
-|--------------------------------------------------------------------------
-| Remote image URL
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ CATEGORIES
+------------------------------------------------------- */
 
-if (
-value.startsWith("https://") ||
-value.startsWith("http://")
-) {
-return {
-valid: true,
-image: value,
-};
+function normalizeCategories(categories) {
+ return array(categories).map((category, index) => {
+ if (typeof category === "string") {
+ return {
+ id: `category_${index + 1}`,
+ name: category,
+ score: 0,
+ status: "unknown",
+ details: "",
+ };
+ }
+
+ const c =
+ category && typeof category === "object"
+ ? category
+ : {};
+
+ return {
+ id:
+ clean(c.id) ||
+ `category_${index + 1}`,
+
+ name:
+ clean(c.name) ||
+ "Unnamed category",
+
+ score: clamp(c.score),
+
+ status:
+ clean(c.status).toLowerCase() ||
+ "unknown",
+
+ details: clean(c.details),
+ };
+ });
 }
 
-/*
-|--------------------------------------------------------------------------
-| Raw base64
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ CHECKS
+------------------------------------------------------- */
 
-const looksLikeBase64 =
-/^[A-Za-z0-9+/=\s]+$/.test(value) &&
-value.length > 100;
+function normalizeChecks(checks) {
+ return array(checks).map((check, index) => {
+ if (typeof check === "string") {
+ return {
+ id: `check_${index + 1}`,
+ name: check,
+ status: "unknown",
+ severity: "medium",
+ score: 0,
+ details: "",
+ evidence: "",
+ };
+ }
 
-if (looksLikeBase64) {
-return {
-valid: true,
-image: `data:image/jpeg;base64,${value.replace(/\s/g, "")}`,
-};
+ const c =
+ check && typeof check === "object"
+ ? check
+ : {};
+
+ return {
+ id:
+ clean(c.id) ||
+ `check_${index + 1}`,
+
+ name:
+ clean(c.name) ||
+ "Unnamed check",
+
+ status:
+ clean(c.status).toLowerCase() ||
+ "unknown",
+
+ severity:
+ clean(c.severity).toLowerCase() ||
+ "medium",
+
+ score: clamp(c.score),
+
+ details: clean(c.details),
+
+ evidence: clean(c.evidence),
+ };
+ });
 }
 
-return {
-valid: false,
-error: "Unsupported image format",
-};
+/* -------------------------------------------------------
+ LIMITATIONS
+------------------------------------------------------- */
+
+function normalizeLimitations(value) {
+ return array(value)
+ .map((item) => {
+ if (typeof item === "string") {
+ return item.trim();
+ }
+
+ if (item && typeof item === "object") {
+ return {
+ type: clean(item.type),
+ message: clean(item.message),
+ severity: clean(item.severity),
+ };
+ }
+
+ return "";
+ })
+ .filter(Boolean);
 }
 
-/*
-|--------------------------------------------------------------------------
-| Extract JSON from AI response
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ AI RISK
+------------------------------------------------------- */
 
-function extractJson(text) {
-if (!text || typeof text !== "string") {
-return null;
+function getAIRisk(result) {
+ const risk =
+ result &&
+ typeof result.riskResult === "object"
+ ? result.riskResult
+ : {};
+
+ return {
+ score: clamp(risk.score),
+
+ level:
+ clean(risk.level).toLowerCase() ||
+ "low",
+
+ reasons: array(risk.reasons)
+ .map(clean)
+ .filter(Boolean),
+
+ details:
+ risk.details &&
+ typeof risk.details === "object"
+ ? risk.details
+ : {},
+ };
 }
 
-let cleaned = text.trim();
+/* -------------------------------------------------------
+ SERVER SIDE RISK ENGINE
+------------------------------------------------------- */
 
-/*
-|--------------------------------------------------------------------------
-| Remove markdown code fences
-|--------------------------------------------------------------------------
-*/
+function calculateRisk({
+ aiRisk,
+ checks,
+ categories,
+ limitations,
+}) {
+ let score = clamp(aiRisk.score);
 
-cleaned = cleaned
-.replace(/^```json\s*/i, "")
-.replace(/^```\s*/i, "")
-.replace(/\s*```$/i, "")
-.trim();
+ let failed = 0;
+ let warnings = 0;
+ let critical = 0;
 
-/*
-|--------------------------------------------------------------------------
-| Try direct JSON
-|--------------------------------------------------------------------------
-*/
+ for (const check of checks) {
+ const status = clean(check.status).toLowerCase();
+ const severity = clean(check.severity).toLowerCase();
 
-try {
-return JSON.parse(cleaned);
-} catch (_) {
-// Continue
+ if (
+ status === "fail" ||
+ status === "failed" ||
+ status === "mismatch" ||
+ status === "suspicious"
+ ) {
+ failed++;
+
+ score += 4;
+
+ if (
+ severity === "high" ||
+ severity === "critical"
+ ) {
+ critical++;
+ score += 8;
+ }
+ }
+
+ if (
+ status === "warning" ||
+ status === "unknown" ||
+ status === "inconclusive"
+ ) {
+ warnings++;
+ score += 1;
+ }
+ }
+
+ score += limitations.length * 2;
+
+ if (categories.length) {
+ const scores = categories
+ .map((x) => number(x.score))
+ .filter(Number.isFinite);
+
+ if (scores.length) {
+ const average =
+ scores.reduce((a, b) => a + b, 0) /
+ scores.length;
+
+ score =
+ score * 0.65 +
+ average * 0.35;
+ }
+ }
+
+ score = Math.round(clamp(score));
+
+ let level = "low";
+
+ if (score >= 80) {
+ level = "critical";
+ } else if (score >= 60) {
+ level = "high";
+ } else if (score >= 30) {
+ level = "medium";
+ }
+
+ return {
+ score,
+ level,
+ failedChecks: failed,
+ warningChecks: warnings,
+ criticalFailures: critical,
+ };
 }
 
-/*
-|--------------------------------------------------------------------------
-| Find JSON object inside response
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ DECISION
+------------------------------------------------------- */
 
-const start = cleaned.indexOf("{");
-const end = cleaned.lastIndexOf("}");
+function makeDecision(risk, checks, limitations) {
+ const serious = checks.some((check) => {
+ const status = clean(check.status).toLowerCase();
+ const severity =
+ clean(check.severity).toLowerCase();
 
-if (start !== -1 && end !== -1 && end > start) {
-const possibleJson = cleaned.slice(start, end + 1);
+ return (
+ (
+ status === "fail" ||
+ status === "failed" ||
+ status === "suspicious" ||
+ status === "mismatch"
+ ) &&
+ (
+ severity === "high" ||
+ severity === "critical"
+ )
+ );
+ });
 
-try {
-return JSON.parse(possibleJson);
-} catch (_) {
-return null;
-}
-}
+ if (serious || risk.score >= 80) {
+ return {
+ status: "suspicious",
+ confidence: 90,
+ reason:
+ "High-risk inconsistencies detected.",
+ };
+ }
 
-return null;
-}
+ if (risk.score >= 60) {
+ return {
+ status: "manual_review",
+ confidence: 75,
+ reason:
+ "Additional manual review is recommended.",
+ };
+ }
 
-/*
-|--------------------------------------------------------------------------
-| Normalize result
-|--------------------------------------------------------------------------
-*/
+ if (
+ limitations.length > 0 ||
+ risk.score >= 30
+ ) {
+ return {
+ status: "inconclusive",
+ confidence: 60,
+ reason:
+ "Some verification checks could not be confirmed.",
+ };
+ }
 
-function normalizeResult(result) {
-if (!result || typeof result !== "object") {
-return {
-authenticity: "unknown",
-confidence: 0,
-documentType: "unknown",
-verdict: "unable_to_analyze",
-reasons: [],
-warnings: [
-"The analysis result could not be parsed.",
-],
-};
-}
-
-return {
-authenticity:
-result.authenticity ??
-result.status ??
-"unknown",
-
-confidence:
-typeof result.confidence === "number"
-? result.confidence
-: 0,
-
-documentType:
-result.documentType ??
-result.document_type ??
-"unknown",
-
-verdict:
-result.verdict ??
-"unknown",
-
-reasons:
-Array.isArray(result.reasons)
-? result.reasons
-: [],
-
-warnings:
-Array.isArray(result.warnings)
-? result.warnings
-: [],
-
-extractedData:
-result.extractedData ??
-result.extracted_data ??
-{},
-
-securityFeatures:
-result.securityFeatures ??
-result.security_features ??
-[],
-
-anomalies:
-Array.isArray(result.anomalies)
-? result.anomalies
-: [],
-
-rawAnalysis:
-result.rawAnalysis ??
-null,
-};
+ return {
+ status: "verified",
+ confidence: 85,
+ reason:
+ "No significant inconsistency was detected.",
+ };
 }
 
-/*
-|--------------------------------------------------------------------------
-| Main AI analysis
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ AI PROMPT
+------------------------------------------------------- */
 
-async function analyzeDocument(image) {
-/*
-|--------------------------------------------------------------------------
-| Check API key
-|--------------------------------------------------------------------------
-*/
+function createPrompt(documentType) {
+ return `
+You are VerifyDoc Risk Engine 2.0.
 
-const apiKey = process.env.OPENAI_API_KEY;
+Analyze the supplied document image.
 
-if (!apiKey) {
-throw new Error(
-"OPENAI_API_KEY environment variable is missing"
-);
-}
+Document type:
+${documentType}
 
-const openai = new OpenAI({
-apiKey,
-});
+This is a DOCUMENT VERIFICATION task.
 
-/*
-|--------------------------------------------------------------------------
-| System instructions
-|--------------------------------------------------------------------------
-*/
+Do not create, modify, reproduce or improve the document.
+Only analyze what is visible in the supplied image.
 
-const systemPrompt = `
-You are VerifyDoc Risk Engine.
+For a bank/payment receipt inspect:
 
-Your task is to analyze an uploaded document image for
-visual signs of authenticity, manipulation, alteration,
-inconsistency, or suspicious characteristics.
+- bank name
+- sender
+- receiver
+- sender IBAN
+- receiver IBAN
+- amount
+- currency
+- date
+- time
+- reference number
+- transaction ID
+- payment status
+- internal consistency
+- missing fields
+- unreadable fields
+- obvious visual inconsistencies
+- possible image manipulation indicators
 
-IMPORTANT:
+Never invent unreadable information.
 
-- Do NOT claim absolute authenticity.
-- Do NOT claim that an image alone can prove a document is genuine.
-- Give a risk-oriented assessment.
-- Separate visible observations from conclusions.
-- If the image quality is insufficient, say so.
-- Never invent information that cannot be seen.
-- Do not infer sensitive personal information unnecessarily.
+If something cannot be determined:
+return an empty value or mark the relevant check as unknown.
 
-Analyze:
-
-1. Document type
-2. Visible text
-3. Layout consistency
-4. Typography consistency
-5. Alignment
-6. Spacing
-7. Logos
-8. Seals
-9. Signatures
-10. Dates
-11. Numbers
-12. Fonts
-13. Compression artifacts
-14. Pixel-level inconsistencies visible in the image
-15. Signs of editing
-16. Missing or suspicious security features
-17. Overall risk
+Do not call a document fraudulent solely because something
+cannot be read.
 
 Return ONLY valid JSON.
-No markdown.
-No explanation outside JSON.
 
-Required JSON structure:
+Required structure:
 
 {
-"authenticity": "likely_authentic | suspicious | likely_manipulated | unknown",
-"confidence": 0,
-"documentType": "",
-"verdict": "",
-"reasons": [],
-"warnings": [],
-"extractedData": {},
-"securityFeatures": [],
-"anomalies": []
+ "document": {
+ "type": "",
+ "bankName": "",
+ "accountHolder": "",
+ "senderName": "",
+ "receiverName": "",
+ "senderIban": "",
+ "receiverIban": "",
+ "amount": "",
+ "currency": "",
+ "transactionDate": "",
+ "transactionTime": "",
+ "reference": "",
+ "transactionId": "",
+ "statusText": "",
+ "extractedText": ""
+ },
+
+ "categories": [
+ {
+ "id": "identity",
+ "name": "Identity",
+ "score": 0,
+ "status": "pass",
+ "details": ""
+ },
+ {
+ "id": "transaction",
+ "name": "Transaction",
+ "score": 0,
+ "status": "pass",
+ "details": ""
+ },
+ {
+ "id": "amount",
+ "name": "Amount",
+ "score": 0,
+ "status": "pass",
+ "details": ""
+ },
+ {
+ "id": "visual",
+ "name": "Visual consistency",
+ "score": 0,
+ "status": "pass",
+ "details": ""
+ }
+ ],
+
+ "checks": [
+ {
+ "id": "",
+ "name": "",
+ "status": "pass",
+ "severity": "low",
+ "score": 0,
+ "details": "",
+ "evidence": ""
+ }
+ ],
+
+ "limitations": [],
+
+ "riskResult": {
+ "score": 0,
+ "level": "low",
+ "reasons": [],
+ "details": {}
+ }
 }
-
-confidence must be between 0 and 100.
-
-If something cannot be determined from the image,
-use "unknown" rather than guessing.
 `;
-
-/*
-|--------------------------------------------------------------------------
-| User instruction
-|--------------------------------------------------------------------------
-*/
-
-const userPrompt = `
-Analyze this document image.
-
-Assess whether there are visible signs of manipulation,
-alteration, inconsistency, or suspicious editing.
-
-Be conservative.
-Do not state that the document is definitively genuine
-or definitively fake based only on the image.
-`;
-
-/*
-|--------------------------------------------------------------------------
-| OpenAI request
-|--------------------------------------------------------------------------
-*/
-
-const response = await openai.responses.create({
-model: "gpt-4.1-mini",
-
-input: [
-{
-role: "system",
-content: [
-{
-type: "input_text",
-text: systemPrompt,
-},
-],
-},
-
-{
-role: "user",
-content: [
-{
-type: "input_text",
-text: userPrompt,
-},
-
-{
-type: "input_image",
-image_url: image,
-},
-],
-},
-],
-
-temperature: 0.1,
-});
-
-/*
-|--------------------------------------------------------------------------
-| Get output text
-|--------------------------------------------------------------------------
-*/
-
-const outputText =
-response.output_text ||
-"";
-
-if (!outputText) {
-throw new Error(
-"OpenAI returned an empty response"
-);
 }
 
-/*
-|--------------------------------------------------------------------------
-| Parse result
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ OPENAI VISION
+------------------------------------------------------- */
 
-const parsed = extractJson(outputText);
+async function analyzeImage(image, documentType) {
+ const prompt = createPrompt(documentType);
 
-if (!parsed) {
-return {
-...normalizeResult(null),
-rawAnalysis: outputText,
-};
+ const result =
+ await openai.responses.create({
+ model:
+ process.env.OPENAI_VISION_MODEL ||
+ "gpt-4.1-mini",
+
+ temperature: 0,
+
+ input: [
+ {
+ role: "user",
+
+ content: [
+ {
+ type: "input_text",
+ text: prompt,
+ },
+
+ {
+ type: "input_image",
+ image_url: image,
+ detail: "high",
+ },
+ ],
+ },
+ ],
+ });
+
+ return result.output_text || "";
 }
 
-return normalizeResult(parsed);
+/* -------------------------------------------------------
+ FINAL RESULT
+------------------------------------------------------- */
+
+function buildResult(aiResult, documentType) {
+ const document =
+ normalizeDocument(
+ aiResult.document
+ );
+
+ document.type = documentType;
+
+ const categories =
+ normalizeCategories(
+ aiResult.categories
+ );
+
+ const checks =
+ normalizeChecks(
+ aiResult.checks
+ );
+
+ const limitations =
+ normalizeLimitations(
+ aiResult.limitations
+ );
+
+ const aiRisk =
+ getAIRisk(aiResult);
+
+ const risk =
+ calculateRisk({
+ aiRisk,
+ checks,
+ categories,
+ limitations,
+ });
+
+ const decision =
+ makeDecision(
+ risk,
+ checks,
+ limitations
+ );
+
+ return {
+ success: true,
+
+ document,
+
+ categories,
+
+ checks,
+
+ limitations,
+
+ decision,
+
+ riskResult: {
+ score: risk.score,
+
+ level: risk.level,
+
+ reasons: aiRisk.reasons,
+
+ details: {
+ ...aiRisk.details,
+
+ failedChecks:
+ risk.failedChecks,
+
+ warningChecks:
+ risk.warningChecks,
+
+ criticalFailures:
+ risk.criticalFailures,
+ },
+ },
+
+ engine: ENGINE,
+
+ meta: {
+ analyzedAt:
+ new Date().toISOString(),
+
+ analysisType:
+ "document_verification",
+ },
+ };
 }
 
-/*
-|--------------------------------------------------------------------------
-| HTTP Handler
-|--------------------------------------------------------------------------
-*/
+/* -------------------------------------------------------
+ MAIN HANDLER
+------------------------------------------------------- */
 
-export default async function handler(req, res) {
-/*
-|--------------------------------------------------------------------------
-| CORS
-|--------------------------------------------------------------------------
-*/
+export default async function handler(
+ req,
+ res
+) {
+ setCors(res);
 
-res.setHeader(
-"Access-Control-Allow-Origin",
-"*"
-);
+ /* OPTIONS */
 
-res.setHeader(
-"Access-Control-Allow-Methods",
-"POST, OPTIONS"
-);
+ if (req.method === "OPTIONS") {
+ return res.status(204).end();
+ }
 
-res.setHeader(
-"Access-Control-Allow-Headers",
-"Content-Type, Authorization"
-);
+ /* METHOD */
 
-/*
-|--------------------------------------------------------------------------
-| OPTIONS
-|--------------------------------------------------------------------------
-*/
+ if (req.method !== "POST") {
+ return send(res, 405, {
+ success: false,
+ error: "Method not allowed",
+ allowedMethods: [
+ "POST",
+ "OPTIONS",
+ ],
+ });
+ }
 
-if (req.method === "OPTIONS") {
-return res.status(200).end();
-}
+ /* API KEY */
 
-/*
-|--------------------------------------------------------------------------
-| Method check
-|--------------------------------------------------------------------------
-*/
+ if (!process.env.OPENAI_API_KEY) {
+ console.error(
+ "OPENAI_API_KEY is missing"
+ );
 
-if (req.method !== "POST") {
-return send(res, 405, {
-success: false,
-error: "Method not allowed",
-allowedMethods: ["POST", "OPTIONS"],
-});
-}
+ return send(res, 500, {
+ success: false,
+ error:
+ "OPENAI_API_KEY is not configured",
+ });
+ }
 
-/*
-|--------------------------------------------------------------------------
-| Main processing
-|--------------------------------------------------------------------------
-*/
+ try {
+ const body =
+ req.body &&
+ typeof req.body === "object"
+ ? req.body
+ : {};
 
-try {
-/*
-|--------------------------------------------------------------------------
-| Check body
-|--------------------------------------------------------------------------
-*/
+ const documentType =
+ clean(body.documentType) ||
+ "bank_receipt";
 
-if (!req.body) {
-return send(res, 400, {
-success: false,
-error: "Request body is missing",
-});
-}
+ const image =
+ getImageFromBody(body);
 
-/*
-|--------------------------------------------------------------------------
-| Extract image
-|--------------------------------------------------------------------------
-*/
+ /* IMAGE */
 
-const rawImage = getImageFromBody(req.body);
+ const validation =
+ validateImage(image);
 
-/*
-|--------------------------------------------------------------------------
-| Validate image
-|--------------------------------------------------------------------------
-*/
+ if (!validation.ok) {
+ return send(res, 400, {
+ success: false,
+ error: validation.error,
+ });
+ }
 
-const validation = validateImage(rawImage);
+ /* AI */
 
-if (!validation.valid) {
-return send(res, 400, {
-success: false,
-error: validation.error,
-});
-}
+ const aiText =
+ await analyzeImage(
+ validation.value,
+ documentType
+ );
 
-/*
-|--------------------------------------------------------------------------
-| Analyze
-|--------------------------------------------------------------------------
-*/
+ /* JSON */
 
-const result = await analyzeDocument(
-validation.image
-);
+ let aiResult;
 
-/*
-|--------------------------------------------------------------------------
-| Return successful response
-|--------------------------------------------------------------------------
-*/
+ try {
+ aiResult =
+ parseAIResponse(aiText);
+ } catch (error) {
+ console.error(
+ "AI PARSE ERROR:",
+ error
+ );
 
-return send(res, 200, {
-success: true,
+ return send(res, 502, {
+ success: false,
+ error:
+ "AI analysis returned an invalid result",
+ });
+ }
 
-data: result,
+ /* ENGINE */
 
-engine: {
-name: "VerifyDoc Risk Engine",
-version: "3.0",
-provider: "OpenAI",
-scoring: "AI-assisted visual risk analysis",
-},
+ const finalResult =
+ buildResult(
+ aiResult,
+ documentType
+ );
 
-timestamp: new Date().toISOString(),
-});
-} catch (error) {
-/*
-|--------------------------------------------------------------------------
-| Server error logging
-|--------------------------------------------------------------------------
-*/
+ return send(
+ res,
+ 200,
+ finalResult
+ );
 
-console.error(
-"VERIFYDOC API ERROR:",
-error
-);
+ } catch (error) {
+ console.error(
+ "VERIFYDOC API ERROR:",
+ error
+ );
 
-/*
-|--------------------------------------------------------------------------
-| Safe error message
-|--------------------------------------------------------------------------
-*/
+ return send(res, 500, {
+ success: false,
 
-const message =
-error?.message ||
-"Analysis failed";
+ error:
+ error?.message ||
+ "Analysis failed",
 
-return send(res, 500, {
-success: false,
-error: message,
-});
-}
+ engine: ENGINE,
+ });
+ }
 }
