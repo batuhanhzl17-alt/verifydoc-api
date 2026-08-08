@@ -4,63 +4,422 @@ const openai = new OpenAI({
  apiKey: process.env.OPENAI_API_KEY,
 });
 
+export const config = {
+ api: {
+ bodyParser: {
+ sizeLimit: "20mb",
+ },
+ },
+};
+
+function response(res, status, data) {
+ return res.status(status).json(data);
+}
+
+function getImageFromBody(body) {
+ if (!body) return null;
+
+ // JSON ile gönderilen seçenekler
+ if (typeof body === "object") {
+ if (body.image) return body.image;
+ if (body.imageData) return body.imageData;
+ if (body.base64) return body.base64;
+ if (body.document) return body.document;
+ }
+
+ // Direkt string gönderilmişse
+ if (typeof body === "string") {
+ return body;
+ }
+
+ return null;
+}
+
+function normalizeImage(image) {
+ if (!image) return null;
+
+ // Zaten data URL ise
+ if (image.startsWith("data:image/")) {
+ return image;
+ }
+
+ // Base64 olarak geldiyse
+ if (/^[A-Za-z0-9+/]+=*$/.test(image)) {
+ return `data:image/jpeg;base64,${image}`;
+ }
+
+ // URL olarak geldiyse
+ if (
+ image.startsWith("http://") ||
+ image.startsWith("https://")
+ ) {
+ return image;
+ }
+
+ return null;
+}
+
 /*
 ====================================================
-VERIFYDOC RISK ENGINE V2
+ VERIFYDOC RISK ENGINE V2
 ====================================================
 
 AI = Evidence Collector
 Risk Engine = Final Scoring System
 
-PASS = 0 risk
-REVIEW = low/moderate risk
-SUSPICIOUS = high risk
-UNKNOWN = no penalty
-
-The final score is calculated HERE,
-not by the AI.
-====================================================
+PASS = 0 - 24
+REVIEW = 25 - 49
+SUSPICIOUS = 50 - 74
+HIGH RISK = 75 - 100
+UNKNOWN = insufficient evidence
 */
 
-const CHECK_WEIGHTS = {
- ocrConsistency: 7,
- fontConsistency: 6,
- fontSizeConsistency: 4,
- characterSpacing: 4,
- lineSpacing: 3,
- textAlignment: 4,
- baselineConsistency: 3,
+function calculateRisk(ai) {
+ let score = 0;
+ const reasons = [];
 
- compressionArtifacts: 4,
- copyPasteRegions: 7,
- editingTraces: 12,
- photoshopArtifacts: 8,
- aiGeneratedIndicators: 8,
+ const add = (points, reason) => {
+ score += points;
+ if (reason) reasons.push(reason);
+ };
 
- logoConsistency: 3,
- stampConsistency: 2,
- signatureConsistency: 3,
+ if (ai.document_quality === "poor") {
+ add(15, "Document quality is poor");
+ }
 
- dateConsistency: 5,
- amountConsistency: 8,
- currencyFormatting: 3,
+ if (ai.document_quality === "very_poor") {
+ add(25, "Document quality is very poor");
+ }
 
- ibanFormatting: 5,
- swiftFormatting: 3,
- qrBarcodeConsistency: 3,
+ if (ai.edits_detected === true) {
+ add(30, "Possible digital editing detected");
+ }
 
- layoutIntegrity: 5,
- suspiciousElements: 10,
- documentTypeConsistency: 3,
+ if (ai.inconsistencies_detected === true) {
+ add(25, "Internal inconsistencies detected");
+ }
 
- imageQuality: 2,
-};
+ if (ai.text_anomalies === true) {
+ add(15, "Text anomalies detected");
+ }
 
-const STATUS_RISK = {
- pass: 0,
- review: 0.35,
- suspicious: 1,
- unknown: 0,
+ if (ai.layout_anomalies === true) {
+ add(15, "Layout anomalies detected");
+ }
+
+ if (ai.metadata_anomaly === true) {
+ add(10, "Metadata anomaly detected");
+ }
+
+ if (ai.logo_anomaly === true) {
+ add(15, "Logo or branding anomaly detected");
+ }
+
+ if (ai.font_anomaly === true) {
+ add(10, "Font inconsistency detected");
+ }
+
+ if (ai.amount_anomaly === true) {
+ add(20, "Amount or numerical anomaly detected");
+ }
+
+ if (ai.date_anomaly === true) {
+ add(15, "Date anomaly detected");
+ }
+
+ if (ai.identity_anomaly === true) {
+ add(25, "Identity information anomaly detected");
+ }
+
+ if (ai.missing_expected_fields === true) {
+ add(15, "Expected document fields are missing");
+ }
+
+ if (ai.suspicious_language === true) {
+ add(15, "Suspicious language or wording detected");
+ }
+
+ if (ai.ocr_uncertain === true) {
+ add(10, "OCR interpretation is uncertain");
+ }
+
+ score = Math.min(100, Math.max(0, score));
+
+ let decision = "PASS";
+
+ if (score >= 75) {
+ decision = "HIGH_RISK";
+ } else if (score >= 50) {
+ decision = "SUSPICIOUS";
+ } else if (score >= 25) {
+ decision = "REVIEW";
+ }
+
+ return {
+ score,
+ decision,
+ reasons,
+ };
+}
+
+async function analyzeImage(image) {
+ const prompt = `
+You are the evidence collection layer of VerifyDoc Risk Engine V2.
+
+Analyze the supplied document image carefully.
+
+IMPORTANT:
+You are NOT the final decision maker.
+Do not declare a document legally authentic or legally fraudulent.
+Only collect visible evidence and anomalies.
+
+Look for:
+
+1. Document type
+2. Document quality
+3. Text anomalies
+4. Font inconsistencies
+5. Layout inconsistencies
+6. Logo / branding anomalies
+7. Date anomalies
+8. Amount / number anomalies
+9. Identity information anomalies
+10. Missing expected fields
+11. Signs of editing or manipulation
+12. Suspicious wording
+13. OCR uncertainty
+14. Internal inconsistencies
+
+Return ONLY valid JSON with this exact structure:
+
+{
+ "document_type": "",
+ "document_quality": "good|acceptable|poor|very_poor|unknown",
+ "edits_detected": false,
+ "inconsistencies_detected": false,
+ "text_anomalies": false,
+ "layout_anomalies": false,
+ "metadata_anomaly": false,
+ "logo_anomaly": false,
+ "font_anomaly": false,
+ "amount_anomaly": false,
+ "date_anomaly": false,
+ "identity_anomaly": false,
+ "missing_expected_fields": false,
+ "suspicious_language": false,
+ "ocr_uncertain": false,
+ "categories": [],
+ "checks": [],
+ "limitations": [],
+ "evidence": [],
+ "summary": ""
+}
+
+Do not invent information that cannot be seen.
+If something cannot be determined, use false or "unknown".
+`;
+
+ const completion = await openai.chat.completions.create({
+ model: "gpt-4o",
+ temperature: 0,
+ response_format: {
+ type: "json_object",
+ },
+ messages: [
+ {
+ role: "system",
+ content: prompt,
+ },
+ {
+ role: "user",
+ content: [
+ {
+ type: "text",
+ text: "Analyze this document image.",
+ },
+ {
+ type: "image_url",
+ image_url: {
+ url: image,
+ detail: "high",
+ },
+ },
+ ],
+ },
+ ],
+ });
+
+ const content =
+ completion.choices?.[0]?.message?.content;
+
+ if (!content) {
+ throw new Error("AI returned an empty response");
+ }
+
+ try {
+ return JSON.parse(content);
+ } catch {
+ throw new Error("AI returned invalid JSON");
+ }
+}
+
+export default async function handler(req, res) {
+ /*
+ ==================================================
+ CORS
+ ==================================================
+ */
+
+ res.setHeader(
+ "Access-Control-Allow-Origin",
+ "*"
+ );
+
+ res.setHeader(
+ "Access-Control-Allow-Methods",
+ "POST, OPTIONS"
+ );
+
+ res.setHeader(
+ "Access-Control-Allow-Headers",
+ "Content-Type"
+ );
+
+ if (req.method === "OPTIONS") {
+ return res.status(200).end();
+ }
+
+ /*
+ ==================================================
+ METHOD CHECK
+ ==================================================
+ */
+
+ if (req.method !== "POST") {
+ return response(res, 405, {
+ success: false,
+ error: "Method not allowed",
+ });
+ }
+
+ /*
+ ==================================================
+ API KEY CHECK
+ ==================================================
+ */
+
+ if (!process.env.OPENAI_API_KEY) {
+ console.error("OPENAI_API_KEY is missing");
+
+ return response(res, 500, {
+ success: false,
+ error: "Server configuration error",
+ });
+ }
+
+ try {
+ /*
+ ================================================
+ IMAGE EXTRACTION
+ ================================================
+ */
+
+ const rawImage = getImageFromBody(req.body);
+
+ if (!rawImage) {
+ return response(res, 400, {
+ success: false,
+ error: "No image received",
+ expected:
+ "Send image, imageData, base64 or document",
+ });
+ }
+
+ const image = normalizeImage(rawImage);
+
+ if (!image) {
+ return response(res, 400, {
+ success: false,
+ error: "Invalid image format",
+ });
+ }
+
+ /*
+ ================================================
+ AI EVIDENCE COLLECTION
+ ================================================
+ */
+
+ const aiResult = await analyzeImage(image);
+
+ /*
+ ================================================
+ SERVER-SIDE RISK SCORING
+ ================================================
+ */
+
+ const riskResult = calculateRisk(aiResult);
+
+ /*
+ ================================================
+ FINAL RESPONSE
+ ================================================
+ */
+
+ return response(res, 200, {
+ success: true,
+
+ result: {
+ documentType:
+ aiResult.document_type || "unknown",
+
+ decision: riskResult.decision,
+
+ score: riskResult.score,
+
+ summary:
+ aiResult.summary || "",
+
+ categories:
+ aiResult.categories || [],
+
+ checks:
+ aiResult.checks || [],
+
+ evidence:
+ aiResult.evidence || [],
+
+ limitations:
+ aiResult.limitations || [],
+ },
+
+ engine: {
+ name: "VerifyDoc Risk Engine",
+ version: "2.0",
+ scoring:
+ "server-side weighted analysis",
+ },
+
+ scoringDetails: {
+ score: riskResult.score,
+ decision: riskResult.decision,
+ reasons: riskResult.reasons,
+ },
+ });
+ } catch (error) {
+ console.error(
+ "VERIFYDOC API ERROR:",
+ error
+ );
+
+ return response(res, 500, {
+ success: false,
+ error:
+ error?.message ||
+ "Analysis failed",
+ });
+ }
+}
 };
 
 function clamp(value, min = 0, max = 100) {
