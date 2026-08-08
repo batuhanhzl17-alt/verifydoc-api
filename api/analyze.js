@@ -1,973 +1,684 @@
 import OpenAI from "openai";
 
-const openai = new OpenAI({
- apiKey: process.env.OPENAI_API_KEY,
-});
+/*
+|--------------------------------------------------------------------------
+| VERIFYDOC API - IMAGE ANALYSIS ENDPOINT
+|--------------------------------------------------------------------------
+| Vercel Serverless Function
+| Endpoint:
+| POST /api/analyze
+|
+| Supported image inputs:
+| 1. { image: "data:image/jpeg;base64,..." }
+| 2. { image: "https://example.com/image.jpg" }
+| 3. { imageUrl: "https://example.com/image.jpg" }
+| 4. { imageBase64: "...." }
+|--------------------------------------------------------------------------
+*/
 
 export const config = {
- api: {
- bodyParser: {
- sizeLimit: "20mb",
- },
- },
+api: {
+bodyParser: {
+sizeLimit: "20mb",
+},
+},
 };
 
-function response(res, status, data) {
- return res.status(status).json(data);
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
+
+function send(res, status, data) {
+return res.status(status).json(data);
 }
 
-function getImageFromBody(body) {
- if (!body) return null;
-
- // JSON ile gönderilen seçenekler
- if (typeof body === "object") {
- if (body.image) return body.image;
- if (body.imageData) return body.imageData;
- if (body.base64) return body.base64;
- if (body.document) return body.document;
- }
-
- // Direkt string gönderilmişse
- if (typeof body === "string") {
- return body;
- }
-
- return null;
+function isObject(value) {
+return (
+value !== null &&
+typeof value === "object" &&
+!Array.isArray(value)
+);
 }
 
-function normalizeImage(image) {
- if (!image) return null;
+function cleanString(value) {
+if (typeof value !== "string") {
+return "";
+}
 
- // Zaten data URL ise
- if (image.startsWith("data:image/")) {
- return image;
- }
-
- // Base64 olarak geldiyse
- if (/^[A-Za-z0-9+/]+=*$/.test(image)) {
- return `data:image/jpeg;base64,${image}`;
- }
-
- // URL olarak geldiyse
- if (
- image.startsWith("http://") ||
- image.startsWith("https://")
- ) {
- return image;
- }
-
- return null;
+return value.trim();
 }
 
 /*
-====================================================
- VERIFYDOC RISK ENGINE V2
-====================================================
-
-AI = Evidence Collector
-Risk Engine = Final Scoring System
-
-PASS = 0 - 24
-REVIEW = 25 - 49
-SUSPICIOUS = 50 - 74
-HIGH RISK = 75 - 100
-UNKNOWN = insufficient evidence
+|--------------------------------------------------------------------------
+| Get image from request
+|--------------------------------------------------------------------------
 */
 
-function calculateRisk(ai) {
- let score = 0;
- const reasons = [];
-
- const add = (points, reason) => {
- score += points;
- if (reason) reasons.push(reason);
- };
-
- if (ai.document_quality === "poor") {
- add(15, "Document quality is poor");
- }
-
- if (ai.document_quality === "very_poor") {
- add(25, "Document quality is very poor");
- }
-
- if (ai.edits_detected === true) {
- add(30, "Possible digital editing detected");
- }
-
- if (ai.inconsistencies_detected === true) {
- add(25, "Internal inconsistencies detected");
- }
-
- if (ai.text_anomalies === true) {
- add(15, "Text anomalies detected");
- }
-
- if (ai.layout_anomalies === true) {
- add(15, "Layout anomalies detected");
- }
-
- if (ai.metadata_anomaly === true) {
- add(10, "Metadata anomaly detected");
- }
-
- if (ai.logo_anomaly === true) {
- add(15, "Logo or branding anomaly detected");
- }
-
- if (ai.font_anomaly === true) {
- add(10, "Font inconsistency detected");
- }
-
- if (ai.amount_anomaly === true) {
- add(20, "Amount or numerical anomaly detected");
- }
-
- if (ai.date_anomaly === true) {
- add(15, "Date anomaly detected");
- }
-
- if (ai.identity_anomaly === true) {
- add(25, "Identity information anomaly detected");
- }
-
- if (ai.missing_expected_fields === true) {
- add(15, "Expected document fields are missing");
- }
-
- if (ai.suspicious_language === true) {
- add(15, "Suspicious language or wording detected");
- }
-
- if (ai.ocr_uncertain === true) {
- add(10, "OCR interpretation is uncertain");
- }
-
- score = Math.min(100, Math.max(0, score));
-
- let decision = "PASS";
-
- if (score >= 75) {
- decision = "HIGH_RISK";
- } else if (score >= 50) {
- decision = "SUSPICIOUS";
- } else if (score >= 25) {
- decision = "REVIEW";
- }
-
- return {
- score,
- decision,
- reasons,
- };
+function getImageFromBody(body) {
+if (!body) {
+return null;
 }
 
-async function analyzeImage(image) {
- const prompt = `
-You are the evidence collection layer of VerifyDoc Risk Engine V2.
+/*
+|--------------------------------------------------------------------------
+| JSON body
+|--------------------------------------------------------------------------
+*/
 
-Analyze the supplied document image carefully.
-
-IMPORTANT:
-You are NOT the final decision maker.
-Do not declare a document legally authentic or legally fraudulent.
-Only collect visible evidence and anomalies.
-
-Look for:
-
-1. Document type
-2. Document quality
-3. Text anomalies
-4. Font inconsistencies
-5. Layout inconsistencies
-6. Logo / branding anomalies
-7. Date anomalies
-8. Amount / number anomalies
-9. Identity information anomalies
-10. Missing expected fields
-11. Signs of editing or manipulation
-12. Suspicious wording
-13. OCR uncertainty
-14. Internal inconsistencies
-
-Return ONLY valid JSON with this exact structure:
-
-{
- "document_type": "",
- "document_quality": "good|acceptable|poor|very_poor|unknown",
- "edits_detected": false,
- "inconsistencies_detected": false,
- "text_anomalies": false,
- "layout_anomalies": false,
- "metadata_anomaly": false,
- "logo_anomaly": false,
- "font_anomaly": false,
- "amount_anomaly": false,
- "date_anomaly": false,
- "identity_anomaly": false,
- "missing_expected_fields": false,
- "suspicious_language": false,
- "ocr_uncertain": false,
- "categories": [],
- "checks": [],
- "limitations": [],
- "evidence": [],
- "summary": ""
+if (isObject(body)) {
+// Most common
+if (body.image) {
+return body.image;
 }
 
-Do not invent information that cannot be seen.
-If something cannot be determined, use false or "unknown".
-`;
-
- const completion = await openai.chat.completions.create({
- model: "gpt-4o",
- temperature: 0,
- response_format: {
- type: "json_object",
- },
- messages: [
- {
- role: "system",
- content: prompt,
- },
- {
- role: "user",
- content: [
- {
- type: "text",
- text: "Analyze this document image.",
- },
- {
- type: "image_url",
- image_url: {
- url: image,
- detail: "high",
- },
- },
- ],
- },
- ],
- });
-
- const content =
- completion.choices?.[0]?.message?.content;
-
- if (!content) {
- throw new Error("AI returned an empty response");
- }
-
- try {
- return JSON.parse(content);
- } catch {
- throw new Error("AI returned invalid JSON");
- }
+// Alternative
+if (body.imageUrl) {
+return body.imageUrl;
 }
 
-export default async function handler(req, res) {
- /*
- ==================================================
- CORS
- ==================================================
- */
+// Alternative
+if (body.imageBase64) {
+const base64 = cleanString(body.imageBase64);
 
- res.setHeader(
- "Access-Control-Allow-Origin",
- "*"
- );
-
- res.setHeader(
- "Access-Control-Allow-Methods",
- "POST, OPTIONS"
- );
-
- res.setHeader(
- "Access-Control-Allow-Headers",
- "Content-Type"
- );
-
- if (req.method === "OPTIONS") {
- return res.status(200).end();
- }
-
- /*
- ==================================================
- METHOD CHECK
- ==================================================
- */
-
- if (req.method !== "POST") {
- return response(res, 405, {
- success: false,
- error: "Method not allowed",
- });
- }
-
- /*
- ==================================================
- API KEY CHECK
- ==================================================
- */
-
- if (!process.env.OPENAI_API_KEY) {
- console.error("OPENAI_API_KEY is missing");
-
- return response(res, 500, {
- success: false,
- error: "Server configuration error",
- });
- }
-
- try {
- /*
- ================================================
- IMAGE EXTRACTION
- ================================================
- */
-
- const rawImage = getImageFromBody(req.body);
-
- if (!rawImage) {
- return response(res, 400, {
- success: false,
- error: "No image received",
- expected:
- "Send image, imageData, base64 or document",
- });
- }
-
- const image = normalizeImage(rawImage);
-
- if (!image) {
- return response(res, 400, {
- success: false,
- error: "Invalid image format",
- });
- }
-
- /*
- ================================================
- AI EVIDENCE COLLECTION
- ================================================
- */
-
- const aiResult = await analyzeImage(image);
-
- /*
- ================================================
- SERVER-SIDE RISK SCORING
- ================================================
- */
-
- const riskResult = calculateRisk(aiResult);
-
- /*
- ================================================
- FINAL RESPONSE
- ================================================
- */
-
- return response(res, 200, {
- success: true,
-
- result: {
- documentType:
- aiResult.document_type || "unknown",
-
- decision: riskResult.decision,
-
- score: riskResult.score,
-
- summary:
- aiResult.summary || "",
-
- categories:
- aiResult.categories || [],
-
- checks:
- aiResult.checks || [],
-
- evidence:
- aiResult.evidence || [],
-
- limitations:
- aiResult.limitations || [],
- },
-
- engine: {
- name: "VerifyDoc Risk Engine",
- version: "2.0",
- scoring:
- "server-side weighted analysis",
- },
-
- scoringDetails: {
- score: riskResult.score,
- decision: riskResult.decision,
- reasons: riskResult.reasons,
- },
- });
- } catch (error) {
- console.error(
- "VERIFYDOC API ERROR:",
- error
- );
-
- return response(res, 500, {
- success: false,
- error:
- error?.message ||
- "Analysis failed",
- });
- }
+if (!base64) {
+return null;
 }
+
+// Already a data URL
+if (base64.startsWith("data:image/")) {
+return base64;
+}
+
+return `data:image/jpeg;base64,${base64}`;
+}
+
+// Other possible names
+if (body.file) {
+return body.file;
+}
+
+if (body.document) {
+return body.document;
+}
+
+if (body.documentImage) {
+return body.documentImage;
+}
+}
+
+/*
+|--------------------------------------------------------------------------
+| If body itself is a string
+|--------------------------------------------------------------------------
+*/
+
+if (typeof body === "string") {
+const value = body.trim();
+
+if (!value) {
+return null;
+}
+
+if (
+value.startsWith("http://") ||
+value.startsWith("https://") ||
+value.startsWith("data:image/")
+) {
+return value;
+}
+
+return `data:image/jpeg;base64,${value}`;
+}
+
+return null;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Validate image
+|--------------------------------------------------------------------------
+*/
+
+function validateImage(image) {
+if (!image) {
+return {
+valid: false,
+error: "No image received",
 };
-
-function clamp(value, min = 0, max = 100) {
- return Math.max(min, Math.min(max, value));
 }
 
-function calculateRisk(checks) {
- let totalWeight = 0;
- let weightedRisk = 0;
-
- const details = {};
-
- for (const [name, weight] of Object.entries(CHECK_WEIGHTS)) {
- const check = checks?.[name];
-
- if (!check) continue;
-
- const status = String(check.status || "unknown").toLowerCase();
-
- if (status === "unknown") {
- details[name] = {
- status: "unknown",
- contribution: 0,
- };
- continue;
- }
-
- const riskFactor = STATUS_RISK[status] ?? 0;
-
- totalWeight += weight;
- weightedRisk += weight * riskFactor;
-
- details[name] = {
- status,
- contribution: Number((weight * riskFactor).toFixed(2)),
- };
- }
-
- if (totalWeight === 0) {
- return {
- score: 0,
- details,
- };
- }
-
- const score = clamp(
- Math.round((weightedRisk / totalWeight) * 100)
- );
-
- return {
- score,
- details,
- };
+if (typeof image !== "string") {
+return {
+valid: false,
+error: "Image must be a string",
+};
 }
 
-function getRiskLabel(score) {
- if (score <= 20) return "LOW RISK";
- if (score <= 45) return "MODERATE RISK";
- if (score <= 70) return "HIGH RISK";
- return "VERY HIGH RISK";
+const value = image.trim();
+
+if (!value) {
+return {
+valid: false,
+error: "Image is empty",
+};
 }
 
-function calculateConfidence(checks) {
- const values = Object.values(checks || {});
+/*
+|--------------------------------------------------------------------------
+| Data URL
+|--------------------------------------------------------------------------
+*/
 
- const available = values.filter(
- (item) =>
- item &&
- String(item.status).toLowerCase() !== "unknown"
- );
-
- if (available.length === 0) return 0;
-
- const average =
- available.reduce(
- (sum, item) => sum + Number(item.confidence || 0),
- 0
- ) / available.length;
-
- return clamp(Math.round(average));
+if (value.startsWith("data:image/")) {
+return {
+valid: true,
+image: value,
+};
 }
 
-function calculateCategories(checks) {
- const groups = {
- visualRisk: [
- "compressionArtifacts",
- "logoConsistency",
- "stampConsistency",
- "signatureConsistency",
- "imageQuality",
- ],
+/*
+|--------------------------------------------------------------------------
+| Remote image URL
+|--------------------------------------------------------------------------
+*/
 
- textRisk: [
- "ocrConsistency",
- "fontConsistency",
- "fontSizeConsistency",
- "characterSpacing",
- "lineSpacing",
- "textAlignment",
- "baselineConsistency",
- ],
-
- layoutRisk: [
- "layoutIntegrity",
- "copyPasteRegions",
- "suspiciousElements",
- "documentTypeConsistency",
- ],
-
- financialDataRisk: [
- "dateConsistency",
- "amountConsistency",
- "currencyFormatting",
- "ibanFormatting",
- "swiftFormatting",
- "qrBarcodeConsistency",
- ],
-
- editingRisk: [
- "editingTraces",
- "photoshopArtifacts",
- "aiGeneratedIndicators",
- ],
- };
-
- const output = {};
-
- for (const [category, names] of Object.entries(groups)) {
- let totalWeight = 0;
- let weightedRisk = 0;
-
- for (const name of names) {
- const check = checks?.[name];
-
- if (!check) continue;
-
- const status = String(
- check.status || "unknown"
- ).toLowerCase();
-
- if (status === "unknown") continue;
-
- const weight = CHECK_WEIGHTS[name] || 1;
- const risk = STATUS_RISK[status] ?? 0;
-
- totalWeight += weight;
- weightedRisk += weight * risk;
- }
-
- output[category] =
- totalWeight === 0
- ? 0
- : clamp(
- Math.round(
- (weightedRisk / totalWeight) * 100
- )
- );
- }
-
- return output;
+if (
+value.startsWith("https://") ||
+value.startsWith("http://")
+) {
+return {
+valid: true,
+image: value,
+};
 }
 
-export default async function handler(req, res) {
- res.setHeader(
- "Access-Control-Allow-Origin",
- "*"
- );
+/*
+|--------------------------------------------------------------------------
+| Raw base64
+|--------------------------------------------------------------------------
+*/
 
- res.setHeader(
- "Access-Control-Allow-Methods",
- "POST, OPTIONS"
- );
+const looksLikeBase64 =
+/^[A-Za-z0-9+/=\s]+$/.test(value) &&
+value.length > 100;
 
- res.setHeader(
- "Access-Control-Allow-Headers",
- "Content-Type"
- );
+if (looksLikeBase64) {
+return {
+valid: true,
+image: `data:image/jpeg;base64,${value.replace(/\s/g, "")}`,
+};
+}
 
- if (req.method === "OPTIONS") {
- return res.status(200).end();
- }
+return {
+valid: false,
+error: "Unsupported image format",
+};
+}
 
- if (req.method !== "POST") {
- return res.status(405).json({
- success: false,
- error: "Method not allowed",
- });
- }
+/*
+|--------------------------------------------------------------------------
+| Extract JSON from AI response
+|--------------------------------------------------------------------------
+*/
 
- try {
- const {
- image,
- fileName,
- type,
- } = req.body || {};
+function extractJson(text) {
+if (!text || typeof text !== "string") {
+return null;
+}
 
- if (!image) {
- return res.status(400).json({
- success: false,
- error: "No image received",
- });
- }
+let cleaned = text.trim();
 
- const documentType =
- type || "Document";
+/*
+|--------------------------------------------------------------------------
+| Remove markdown code fences
+|--------------------------------------------------------------------------
+*/
 
- const prompt = `
-You are VerifyDoc's forensic evidence collector.
+cleaned = cleaned
+.replace(/^```json\s*/i, "")
+.replace(/^```\s*/i, "")
+.replace(/\s*```$/i, "")
+.trim();
 
-Your job is NOT to decide the final risk score.
+/*
+|--------------------------------------------------------------------------
+| Try direct JSON
+|--------------------------------------------------------------------------
+*/
 
-Your job is to inspect the uploaded ${documentType}
-and return structured evidence.
+try {
+return JSON.parse(cleaned);
+} catch (_) {
+// Continue
+}
 
-IMPORTANT RULES:
+/*
+|--------------------------------------------------------------------------
+| Find JSON object inside response
+|--------------------------------------------------------------------------
+*/
 
-1. Never invent evidence.
-2. Never assume a document is authentic.
-3. Never assume a document is fake.
-4. Only report things visible or reasonably inferable
- from the supplied image.
-5. If something cannot be determined, use "unknown".
-6. Metadata must be "unknown" unless metadata is
- actually available.
-7. A suspicious finding does not automatically prove fraud.
-8. Poor image quality should reduce confidence rather
- than create false suspicious findings.
+const start = cleaned.indexOf("{");
+const end = cleaned.lastIndexOf("}");
 
-Check:
+if (start !== -1 && end !== -1 && end > start) {
+const possibleJson = cleaned.slice(start, end + 1);
 
-- OCR consistency
-- Font consistency
-- Font size consistency
-- Character spacing
-- Line spacing
-- Text alignment
-- Baseline consistency
-- Compression artifacts
-- Copy/paste regions
-- Editing traces
-- Photoshop-like artifacts
-- AI-generated indicators
-- Logo consistency
-- Stamp consistency
-- Signature consistency
-- Date consistency
-- Amount consistency
-- Currency formatting
-- IBAN formatting
-- SWIFT/BIC formatting
-- QR/barcode consistency
-- Layout integrity
-- Suspicious elements
-- Document type consistency
-- Image quality
+try {
+return JSON.parse(possibleJson);
+} catch (_) {
+return null;
+}
+}
 
-For EVERY check return:
+return null;
+}
 
-status:
-"pass"
-"review"
-"suspicious"
-"unknown"
+/*
+|--------------------------------------------------------------------------
+| Normalize result
+|--------------------------------------------------------------------------
+*/
+
+function normalizeResult(result) {
+if (!result || typeof result !== "object") {
+return {
+authenticity: "unknown",
+confidence: 0,
+documentType: "unknown",
+verdict: "unable_to_analyze",
+reasons: [],
+warnings: [
+"The analysis result could not be parsed.",
+],
+};
+}
+
+return {
+authenticity:
+result.authenticity ??
+result.status ??
+"unknown",
 
 confidence:
-0-100
+typeof result.confidence === "number"
+? result.confidence
+: 0,
 
-evidence:
-short explanation based on visible evidence.
+documentType:
+result.documentType ??
+result.document_type ??
+"unknown",
 
-Return ONLY JSON.
+verdict:
+result.verdict ??
+"unknown",
 
-Use exactly this structure:
+reasons:
+Array.isArray(result.reasons)
+? result.reasons
+: [],
+
+warnings:
+Array.isArray(result.warnings)
+? result.warnings
+: [],
+
+extractedData:
+result.extractedData ??
+result.extracted_data ??
+{},
+
+securityFeatures:
+result.securityFeatures ??
+result.security_features ??
+[],
+
+anomalies:
+Array.isArray(result.anomalies)
+? result.anomalies
+: [],
+
+rawAnalysis:
+result.rawAnalysis ??
+null,
+};
+}
+
+/*
+|--------------------------------------------------------------------------
+| Main AI analysis
+|--------------------------------------------------------------------------
+*/
+
+async function analyzeDocument(image) {
+/*
+|--------------------------------------------------------------------------
+| Check API key
+|--------------------------------------------------------------------------
+*/
+
+const apiKey = process.env.OPENAI_API_KEY;
+
+if (!apiKey) {
+throw new Error(
+"OPENAI_API_KEY environment variable is missing"
+);
+}
+
+const openai = new OpenAI({
+apiKey,
+});
+
+/*
+|--------------------------------------------------------------------------
+| System instructions
+|--------------------------------------------------------------------------
+*/
+
+const systemPrompt = `
+You are VerifyDoc Risk Engine.
+
+Your task is to analyze an uploaded document image for
+visual signs of authenticity, manipulation, alteration,
+inconsistency, or suspicious characteristics.
+
+IMPORTANT:
+
+- Do NOT claim absolute authenticity.
+- Do NOT claim that an image alone can prove a document is genuine.
+- Give a risk-oriented assessment.
+- Separate visible observations from conclusions.
+- If the image quality is insufficient, say so.
+- Never invent information that cannot be seen.
+- Do not infer sensitive personal information unnecessarily.
+
+Analyze:
+
+1. Document type
+2. Visible text
+3. Layout consistency
+4. Typography consistency
+5. Alignment
+6. Spacing
+7. Logos
+8. Seals
+9. Signatures
+10. Dates
+11. Numbers
+12. Fonts
+13. Compression artifacts
+14. Pixel-level inconsistencies visible in the image
+15. Signs of editing
+16. Missing or suspicious security features
+17. Overall risk
+
+Return ONLY valid JSON.
+No markdown.
+No explanation outside JSON.
+
+Required JSON structure:
 
 {
- "checks": {
- "ocrConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "fontConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "fontSizeConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "characterSpacing": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "lineSpacing": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "textAlignment": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "baselineConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "compressionArtifacts": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "copyPasteRegions": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "editingTraces": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "photoshopArtifacts": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "aiGeneratedIndicators": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "logoConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "stampConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "signatureConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "dateConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "amountConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "currencyFormatting": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "ibanFormatting": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "swiftFormatting": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "qrBarcodeConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "layoutIntegrity": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "suspiciousElements": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "documentTypeConsistency": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- },
-
- "imageQuality": {
- "status": "",
- "confidence": 0,
- "evidence": ""
- }
- },
-
- "summary": "",
- "limitations": []
+"authenticity": "likely_authentic | suspicious | likely_manipulated | unknown",
+"confidence": 0,
+"documentType": "",
+"verdict": "",
+"reasons": [],
+"warnings": [],
+"extractedData": {},
+"securityFeatures": [],
+"anomalies": []
 }
+
+confidence must be between 0 and 100.
+
+If something cannot be determined from the image,
+use "unknown" rather than guessing.
 `;
 
- const response =
- await openai.responses.create({
- model: "gpt-5",
+/*
+|--------------------------------------------------------------------------
+| User instruction
+|--------------------------------------------------------------------------
+*/
 
- input: [
- {
- role: "user",
- content: [
- {
- type: "input_text",
- text: prompt,
- },
- {
- type: "input_image",
- image_url:
- `data:image/jpeg;base64,${image}`,
- },
- ],
- },
- ],
- });
+const userPrompt = `
+Analyze this document image.
 
- let aiResult;
+Assess whether there are visible signs of manipulation,
+alteration, inconsistency, or suspicious editing.
 
- try {
- aiResult = JSON.parse(
- response.output_text
- );
- } catch (error) {
- console.error(
- "AI JSON ERROR:",
- response.output_text
- );
+Be conservative.
+Do not state that the document is definitively genuine
+or definitively fake based only on the image.
+`;
 
- return res.status(500).json({
- success: false,
- error: "AI returned invalid JSON",
- });
- }
+/*
+|--------------------------------------------------------------------------
+| OpenAI request
+|--------------------------------------------------------------------------
+*/
 
- /*
- ================================================
- HERE THE REAL VERIFYDOC ENGINE STARTS
- ================================================
- */
+const response = await openai.responses.create({
+model: "gpt-4.1-mini",
 
- const checks =
- aiResult.checks || {};
+input: [
+{
+role: "system",
+content: [
+{
+type: "input_text",
+text: systemPrompt,
+},
+],
+},
 
- const riskResult =
- calculateRisk(checks);
+{
+role: "user",
+content: [
+{
+type: "input_text",
+text: userPrompt,
+},
 
- const overallRisk =
- riskResult.score;
+{
+type: "input_image",
+image_url: image,
+},
+],
+},
+],
 
- const riskLabel =
- getRiskLabel(overallRisk);
+temperature: 0.1,
+});
 
- const confidence =
- calculateConfidence(checks);
+/*
+|--------------------------------------------------------------------------
+| Get output text
+|--------------------------------------------------------------------------
+*/
 
- const categories =
- calculateCategories(checks);
+const outputText =
+response.output_text ||
+"";
 
- /*
- ================================================
- FINAL RESPONSE
- ================================================
- */
+if (!outputText) {
+throw new Error(
+"OpenAI returned an empty response"
+);
+}
 
- return res.status(200).json({
- success: true,
+/*
+|--------------------------------------------------------------------------
+| Parse result
+|--------------------------------------------------------------------------
+*/
 
- fileName:
- fileName || "document.jpg",
+const parsed = extractJson(outputText);
 
- type: documentType,
+if (!parsed) {
+return {
+...normalizeResult(null),
+rawAnalysis: outputText,
+};
+}
 
- overallRisk,
+return normalizeResult(parsed);
+}
 
- riskLabel,
+/*
+|--------------------------------------------------------------------------
+| HTTP Handler
+|--------------------------------------------------------------------------
+*/
 
- confidence,
+export default async function handler(req, res) {
+/*
+|--------------------------------------------------------------------------
+| CORS
+|--------------------------------------------------------------------------
+*/
 
- summary:
- aiResult.summary ||
- "No summary available.",
+res.setHeader(
+"Access-Control-Allow-Origin",
+"*"
+);
 
- categories,
+res.setHeader(
+"Access-Control-Allow-Methods",
+"POST, OPTIONS"
+);
 
- checks,
+res.setHeader(
+"Access-Control-Allow-Headers",
+"Content-Type, Authorization"
+);
 
- limitations:
- aiResult.limitations || [],
+/*
+|--------------------------------------------------------------------------
+| OPTIONS
+|--------------------------------------------------------------------------
+*/
 
- engine: {
- name: "VerifyDoc Risk Engine",
- version: "2.0",
- scoring: "server-side weighted analysis",
- },
+if (req.method === "OPTIONS") {
+return res.status(200).end();
+}
 
- scoringDetails:
- riskResult.details,
- });
+/*
+|--------------------------------------------------------------------------
+| Method check
+|--------------------------------------------------------------------------
+*/
 
- } catch (error) {
- console.error(
- "VERIFYDOC API ERROR:",
- error
- );
+if (req.method !== "POST") {
+return send(res, 405, {
+success: false,
+error: "Method not allowed",
+allowedMethods: ["POST", "OPTIONS"],
+});
+}
 
- return res.status(500).json({
- success: false,
- error:
- error.message ||
- "Analysis failed",
- });
- }
+/*
+|--------------------------------------------------------------------------
+| Main processing
+|--------------------------------------------------------------------------
+*/
+
+try {
+/*
+|--------------------------------------------------------------------------
+| Check body
+|--------------------------------------------------------------------------
+*/
+
+if (!req.body) {
+return send(res, 400, {
+success: false,
+error: "Request body is missing",
+});
+}
+
+/*
+|--------------------------------------------------------------------------
+| Extract image
+|--------------------------------------------------------------------------
+*/
+
+const rawImage = getImageFromBody(req.body);
+
+/*
+|--------------------------------------------------------------------------
+| Validate image
+|--------------------------------------------------------------------------
+*/
+
+const validation = validateImage(rawImage);
+
+if (!validation.valid) {
+return send(res, 400, {
+success: false,
+error: validation.error,
+});
+}
+
+/*
+|--------------------------------------------------------------------------
+| Analyze
+|--------------------------------------------------------------------------
+*/
+
+const result = await analyzeDocument(
+validation.image
+);
+
+/*
+|--------------------------------------------------------------------------
+| Return successful response
+|--------------------------------------------------------------------------
+*/
+
+return send(res, 200, {
+success: true,
+
+data: result,
+
+engine: {
+name: "VerifyDoc Risk Engine",
+version: "3.0",
+provider: "OpenAI",
+scoring: "AI-assisted visual risk analysis",
+},
+
+timestamp: new Date().toISOString(),
+});
+} catch (error) {
+/*
+|--------------------------------------------------------------------------
+| Server error logging
+|--------------------------------------------------------------------------
+*/
+
+console.error(
+"VERIFYDOC API ERROR:",
+error
+);
+
+/*
+|--------------------------------------------------------------------------
+| Safe error message
+|--------------------------------------------------------------------------
+*/
+
+const message =
+error?.message ||
+"Analysis failed";
+
+return send(res, 500, {
+success: false,
+error: message,
+});
+}
 }
