@@ -1,258 +1,353 @@
 import OpenAI from "openai";
 
 const openai = new OpenAI({
-apiKey: process.env.OPENAI_API_KEY,
+ apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Vercel JSON body limitini artır
+export const config = {
+ api: {
+ bodyParser: {
+ sizeLimit: "10mb",
+ },
+ },
+};
+
 const CHECK_NAMES = [
-"ocrConsistency",
-"fontConsistency",
-"fontSizeConsistency",
-"characterSpacing",
-"lineSpacing",
-"textAlignment",
-"baselineConsistency",
-"compressionArtifacts",
-"copyPasteRegions",
-"editingTraces",
-"photoshopArtifacts",
-"aiGeneratedIndicators",
-"logoConsistency",
-"stampConsistency",
-"signatureConsistency",
-"dateConsistency",
-"amountConsistency",
-"currencyFormatting",
-"ibanFormatting",
-"swiftFormatting",
-"qrBarcodeConsistency",
-"layoutIntegrity",
-"suspiciousElements",
-"documentTypeConsistency",
-"imageQuality"
+ "ocrConsistency",
+ "fontConsistency",
+ "fontSizeConsistency",
+ "characterSpacing",
+ "lineSpacing",
+ "textAlignment",
+ "baselineConsistency",
+ "compressionArtifacts",
+ "copyPasteRegions",
+ "editingTraces",
+ "photoshopArtifacts",
+ "aiGeneratedIndicators",
+ "logoConsistency",
+ "stampConsistency",
+ "signatureConsistency",
+ "dateConsistency",
+ "amountConsistency",
+ "currencyFormatting",
+ "ibanFormatting",
+ "swiftFormatting",
+ "qrBarcodeConsistency",
+ "layoutIntegrity",
+ "suspiciousElements",
+ "documentTypeConsistency",
+ "imageQuality",
 ];
 
 const CHECK_SCHEMA = Object.fromEntries(
-CHECK_NAMES.map((name) => [
-name,
-{
-type: "object",
-properties: {
-status: {
-type: "string",
-enum: ["pass", "review", "suspicious", "unknown"]
-},
-score: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
-evidence: {
-type: "string"
-}
-},
-required: ["status", "score", "evidence"],
-additionalProperties: false
-}
-])
+ CHECK_NAMES.map((name) => [
+ name,
+ {
+ type: "object",
+ properties: {
+ status: {
+ type: "string",
+ enum: [
+ "pass",
+ "review",
+ "suspicious",
+ "unknown",
+ ],
+ },
+
+ score: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
+
+ evidence: {
+ type: "string",
+ },
+ },
+
+ required: [
+ "status",
+ "score",
+ "evidence",
+ ],
+
+ additionalProperties: false,
+ },
+ ])
 );
 
 const RESPONSE_SCHEMA = {
-type: "object",
-properties: {
-overallRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
+ type: "object",
 
-riskLabel: {
-type: "string",
-enum: [
-"LOW RISK",
-"MODERATE RISK",
-"HIGH RISK",
-"VERY HIGH RISK"
-]
-},
+ properties: {
+ overallRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-confidence: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
+ riskLabel: {
+ type: "string",
+ enum: [
+ "LOW RISK",
+ "MODERATE RISK",
+ "HIGH RISK",
+ "VERY HIGH RISK",
+ ],
+ },
 
-summary: {
-type: "string"
-},
+ confidence: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-categories: {
-type: "object",
-properties: {
-visualRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
-textRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
-layoutRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
-financialDataRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
-editingRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100
-}
-},
-required: [
-"visualRisk",
-"textRisk",
-"layoutRisk",
-"financialDataRisk",
-"editingRisk"
-],
-additionalProperties: false
-},
+ summary: {
+ type: "string",
+ },
 
-checks: {
-type: "object",
-properties: CHECK_SCHEMA,
-required: CHECK_NAMES,
-additionalProperties: false
-},
+ categories: {
+ type: "object",
 
-limitations: {
-type: "array",
-items: {
-type: "string"
-}
-}
-},
+ properties: {
+ visualRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-required: [
-"overallRisk",
-"riskLabel",
-"confidence",
-"summary",
-"categories",
-"checks",
-"limitations"
-],
+ textRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-additionalProperties: false
+ layoutRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
+
+ financialDataRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
+
+ editingRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
+ },
+
+ required: [
+ "visualRisk",
+ "textRisk",
+ "layoutRisk",
+ "financialDataRisk",
+ "editingRisk",
+ ],
+
+ additionalProperties: false,
+ },
+
+ checks: {
+ type: "object",
+
+ properties: CHECK_SCHEMA,
+
+ required: CHECK_NAMES,
+
+ additionalProperties: false,
+ },
+
+ limitations: {
+ type: "array",
+
+ items: {
+ type: "string",
+ },
+ },
+ },
+
+ required: [
+ "overallRisk",
+ "riskLabel",
+ "confidence",
+ "summary",
+ "categories",
+ "checks",
+ "limitations",
+ ],
+
+ additionalProperties: false,
 };
 
-function normalizeImage(image) {
-if (!image || typeof image !== "string") {
-throw new Error("No image received");
-}
-
-const value = image.trim();
-
-if (
-/^data:image\/(jpeg|jpg|png|webp|gif);base64,/i.test(value)
-) {
-return value;
-}
-
-if (/^https?:\/\//i.test(value)) {
-return value;
-}
-
-const clean = value.replace(/\s/g, "");
-
-if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) {
-throw new Error(
-"Invalid image format. Send a data URL, image URL, or raw base64."
-);
-}
-
-return `data:image/jpeg;base64,${clean}`;
-}
 
 function parseJsonSafely(text) {
-if (!text || typeof text !== "string") {
-throw new Error("AI returned an empty response");
+ if (!text || typeof text !== "string") {
+ throw new Error(
+ "AI returned an empty response"
+ );
+ }
+
+ const cleaned = text
+ .trim()
+ .replace(/^```json\s*/i, "")
+ .replace(/^```\s*/i, "")
+ .replace(/\s*```$/i, "");
+
+ try {
+ return JSON.parse(cleaned);
+ } catch {
+ const start = cleaned.indexOf("{");
+ const end = cleaned.lastIndexOf("}");
+
+ if (start >= 0 && end > start) {
+ return JSON.parse(
+ cleaned.slice(start, end + 1)
+ );
+ }
+
+ throw new Error(
+ "AI returned invalid JSON"
+ );
+ }
 }
 
-const cleaned = text
-.trim()
-.replace(/^```json\s*/i, "")
-.replace(/^```\s*/i, "")
-.replace(/\s*```$/i, "");
 
-try {
-return JSON.parse(cleaned);
-} catch {
-const start = cleaned.indexOf("{");
-const end = cleaned.lastIndexOf("}");
+function validateDataUrl(value) {
+ if (
+ !value ||
+ typeof value !== "string"
+ ) {
+ throw new Error(
+ "Dosya verisi alınamadı."
+ );
+ }
 
-if (start >= 0 && end > start) {
-return JSON.parse(
-cleaned.slice(start, end + 1)
-);
+ const trimmed = value.trim();
+
+ if (
+ !trimmed.startsWith("data:")
+ ) {
+ throw new Error(
+ "Geçersiz dosya formatı."
+ );
+ }
+
+ return trimmed;
 }
 
-throw new Error("AI returned invalid JSON");
-}
-}
 
 export default async function handler(req, res) {
-res.setHeader(
-"Access-Control-Allow-Origin",
-"*"
-);
 
-res.setHeader(
-"Access-Control-Allow-Methods",
-"POST, OPTIONS"
-);
+ // ==========================
+ // CORS
+ // ==========================
 
-res.setHeader(
-"Access-Control-Allow-Headers",
-"Content-Type"
-);
+ res.setHeader(
+ "Access-Control-Allow-Origin",
+ "*"
+ );
 
-if (req.method === "OPTIONS") {
-return res.status(200).end();
-}
+ res.setHeader(
+ "Access-Control-Allow-Methods",
+ "POST, OPTIONS"
+ );
 
-if (req.method !== "POST") {
-return res.status(405).json({
-success: false,
-error: "Method not allowed"
-});
-}
+ res.setHeader(
+ "Access-Control-Allow-Headers",
+ "Content-Type"
+ );
 
-try {
-const body = req.body || {};
+ if (req.method === "OPTIONS") {
+ return res.status(200).end();
+ }
 
-const image = body.image;
 
-const fileName =
-body.fileName || "document.jpg";
+ // ==========================
+ // METHOD
+ // ==========================
 
-const type =
-body.type || "Document";
+ if (req.method !== "POST") {
+ return res.status(405).json({
+ success: false,
+ error: "Method not allowed",
+ });
+ }
 
-const imageUrl =
-normalizeImage(image);
 
-const prompt = `
+ try {
+
+ console.log(
+ "=============================="
+ );
+
+ console.log(
+ "VERIFYDOC API REQUEST"
+ );
+
+
+ // ==========================
+ // BODY
+ // ==========================
+
+ const body = req.body || {};
+
+ const fileData =
+ body.fileData ||
+ body.image ||
+ body.file;
+
+ const fileName =
+ body.fileName ||
+ "document";
+
+ const fileType =
+ body.type ||
+ "image";
+
+
+ console.log(
+ "FILE NAME:",
+ fileName
+ );
+
+ console.log(
+ "FILE TYPE:",
+ fileType
+ );
+
+ console.log(
+ "HAS FILE DATA:",
+ !!fileData
+ );
+
+
+ if (!fileData) {
+ throw new Error(
+ "No file received"
+ );
+ }
+
+
+ const dataUrl =
+ validateDataUrl(fileData);
+
+
+ // ==========================
+ // PROMPT
+ // ==========================
+
+ const prompt = `
 You are VerifyDoc, an AI-assisted document forensic screening system.
 
-Analyze the uploaded document image carefully.
+Analyze the supplied document carefully.
 
 This is a screening assessment only, not a legal determination.
 
@@ -260,11 +355,13 @@ Never claim that a document is definitely authentic or definitely fake.
 
 Do not invent evidence.
 
-If something cannot be reliably determined from the image, use status "unknown" and explain why.
+If something cannot be reliably determined from the supplied document, use status "unknown" and explain why.
 
 A clean-looking document does NOT prove authenticity.
 
-Metadata cannot be verified from a screenshot or photo unless metadata is actually available.
+Metadata cannot be verified unless metadata is actually supplied.
+
+Analyze visible evidence only.
 
 Check these 25 areas:
 
@@ -303,7 +400,9 @@ For every check:
 - evidence must be concise
 - evidence must be based ONLY on visible evidence
 
-Calculate these category scores:
+Do not treat unknown checks as suspicious.
+
+Calculate:
 
 visualRisk
 textRisk
@@ -311,9 +410,7 @@ layoutRisk
 financialDataRisk
 editingRisk
 
-Calculate overallRisk from 0-100 using the evidence across all checks.
-
-Do not treat unknown checks as suspicious.
+Calculate overallRisk from 0-100.
 
 Risk labels:
 
@@ -324,7 +421,7 @@ Risk labels:
 
 Confidence must be 0-100.
 
-Confidence should decrease when the image is:
+Confidence should decrease when the document is:
 
 - blurry
 - cropped
@@ -336,63 +433,166 @@ Confidence should decrease when the image is:
 Return ONLY the JSON object matching the supplied schema.
 `;
 
-const response =
-await openai.responses.create({
-model: "gpt-5",
 
-input: [
-{
-role: "user",
+ // ==========================
+ // OPENAI CONTENT
+ // ==========================
 
-content: [
-{
-type: "input_text",
-text: prompt
-},
+ let content;
 
-{
-type: "input_image",
-image_url: imageUrl,
-detail: "high"
-}
-]
-}
-],
 
-text: {
-format: {
-type: "json_schema",
-name: "verifydoc_analysis",
-strict: true,
-schema: RESPONSE_SCHEMA
-}
-}
-});
+ // ==========================
+ // IMAGE
+ // ==========================
 
-const result =
-parseJsonSafely(
-response.output_text
-);
+ if (
+ fileType === "image"
+ ) {
 
-return res.status(200).json({
-success: true,
-fileName,
-type,
-...result
-});
+ console.log(
+ "OPENAI INPUT: IMAGE"
+ );
 
-} catch (err) {
+ content = [
+ {
+ type: "input_text",
+ text: prompt,
+ },
 
-console.error(
-"VerifyDoc API error:",
-err
-);
+ {
+ type: "input_image",
+ image_url: dataUrl,
+ detail: "high",
+ },
+ ];
+ }
 
-return res.status(500).json({
-success: false,
-error:
-err?.message ||
-"Analysis failed"
-});
-}
+
+ // ==========================
+ // PDF
+ // ==========================
+
+ else if (
+ fileType === "pdf"
+ ) {
+
+ console.log(
+ "OPENAI INPUT: PDF"
+ );
+
+ content = [
+ {
+ type: "input_text",
+ text: prompt,
+ },
+
+ {
+ type: "input_file",
+ file_data: dataUrl,
+ },
+ ];
+ }
+
+
+ // ==========================
+ // VIDEO
+ // ==========================
+
+ else {
+
+ throw new Error(
+ "Video analizi şu anda desteklenmiyor. Lütfen JPG, PNG veya PDF yükleyin."
+ );
+ }
+
+
+ // ==========================
+ // OPENAI
+ // ==========================
+
+ console.log(
+ "OPENAI REQUEST START"
+ );
+
+
+ const response =
+ await openai.responses.create({
+
+ model: "gpt-5",
+
+ input: [
+ {
+ role: "user",
+
+ content,
+ },
+ ],
+
+ text: {
+ format: {
+ type: "json_schema",
+
+ name:
+ "verifydoc_analysis",
+
+ strict: true,
+
+ schema:
+ RESPONSE_SCHEMA,
+ },
+ },
+ });
+
+
+ console.log(
+ "OPENAI RESPONSE RECEIVED"
+ );
+
+
+ // ==========================
+ // RESULT
+ // ==========================
+
+ const result =
+ parseJsonSafely(
+ response.output_text
+ );
+
+
+ console.log(
+ "ANALYSIS SUCCESS"
+ );
+
+
+ return res.status(200).json({
+
+ success: true,
+
+ fileName,
+
+ type: fileType,
+
+ ...result,
+
+ });
+
+
+ } catch (err) {
+
+ console.error(
+ "VerifyDoc API error:",
+ err
+ );
+
+
+ return res.status(500).json({
+
+ success: false,
+
+ error:
+ err?.message ||
+ "Analysis failed",
+
+ });
+ }
 }
