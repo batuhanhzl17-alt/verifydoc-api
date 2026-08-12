@@ -1,5 +1,6 @@
 // =====================================================
 // VERIFYDOC - TRC20 CRYPTO SECURITY ANALYSIS
+// TRC20 TOKEN + TRON WALLET
 // =====================================================
 
 export const config = {
