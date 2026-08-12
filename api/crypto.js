@@ -583,6 +583,27 @@ export default async function handler(
  tokenResponse
  ?.trc20_tokens?.[0] || null;
 
+  // -------------------------------------------------
+// TRON CÜZDAN DATA
+// -------------------------------------------------
+
+let account = null;
+
+try {
+
+ account = await tronScanRequest(
+ `/accountv2?address=${encodeURIComponent(address)}`
+ );
+
+} catch (accountError) {
+
+ console.error(
+ "Cüzdan bilgisi alınamadı:",
+ accountError
+ );
+
+}
+
 
  // -------------------------------------------------
  // SECURITY DATA
