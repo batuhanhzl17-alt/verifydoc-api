@@ -63,6 +63,18 @@ async function tronScanRequest(
  endpoint
 ) {
 
+ // =====================================================
+// TRON CÜZDAN KONTROLÜ
+// =====================================================
+
+async function getAccountData(address) {
+
+return tronScanRequest(
+`/accountv2?address=${encodeURIComponent(address)}`
+);
+
+}
+
  const apiKey =
  process.env.TRONSCAN_API_KEY;
 
