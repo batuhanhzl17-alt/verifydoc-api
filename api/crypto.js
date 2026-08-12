@@ -1,5 +1,5 @@
 // =====================================================
-// VERIFYDOC - TRC20 CRYPTO SECURITY ANALYSIS
+// VERIFYDOC - TRON CRYPTO SECURITY ANALYSIS
 // TRC20 TOKEN + TRON WALLET
 // =====================================================
 
@@ -8,11 +8,6 @@ export const config = {
  bodyParser: true,
  },
 };
-
-
-// =====================================================
-// TRONSCAN
-// =====================================================
 
 const TRONSCAN_API =
  "https://apilist.tronscanapi.com/api";
@@ -41,14 +36,11 @@ function setCors(res) {
 
 
 // =====================================================
-// TRON ADRES KONTROLÜ
+// TRON ADDRESS
 // =====================================================
 
 function isValidTronAddress(address) {
-
- if (!address) {
- return false;
- }
+ if (!address) return false;
 
  return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(
  address
@@ -57,24 +49,10 @@ function isValidTronAddress(address) {
 
 
 // =====================================================
-// TRONSCAN İSTEK
+// TRONSCAN REQUEST
 // =====================================================
 
-async function tronScanRequest(
- endpoint
-) {
-
- // =====================================================
-// TRON CÜZDAN KONTROLÜ
-// =====================================================
-
-async function getAccountData(address) {
-
-return tronScanRequest(
-`/accountv2?address=${encodeURIComponent(address)}`
-);
-
-}
+async function tronScanRequest(endpoint) {
 
  const apiKey =
  process.env.TRONSCAN_API_KEY;
@@ -85,80 +63,61 @@ return tronScanRequest(
  );
  }
 
- const response =
- await fetch(
+ const response = await fetch(
  `${TRONSCAN_API}${endpoint}`,
  {
  method: "GET",
 
  headers: {
- "TRON-PRO-API-KEY":
- apiKey,
-
- "Accept":
- "application/json",
+ "TRON-PRO-API-KEY": apiKey,
+ "Accept": "application/json",
  },
  }
  );
 
+ const text = await response.text();
 
- if (!response.ok) {
+ let data;
 
+ try {
+ data = JSON.parse(text);
+ } catch {
  throw new Error(
- `TRONSCAN API hata verdi: ${response.status}`
+ `TRONSCAN JSON olmayan cevap döndürdü: ${text.slice(0, 200)}`
  );
-
  }
 
+ if (!response.ok) {
+ throw new Error(
+ data?.message ||
+ `TRONSCAN API hata verdi: ${response.status}`
+ );
+ }
 
- return response.json();
-
+ return data;
 }
 
 
 // =====================================================
-// RİSK SKORU
+// TOKEN ANALYSIS
 // =====================================================
 
-function calculateRisk(
+function calculateTokenRisk(
  token,
- security,
- contract
+ security
 ) {
 
  let risk = 0;
 
  const warnings = [];
 
- // ---------------------------------------------------
- // TOKEN BULUNAMADI
- // ---------------------------------------------------
 
- if (!token) {
-
- return {
- score: 100,
-
- label:
- "VERY HIGH RISK",
-
- warnings: [
- "Bu adres için geçerli bir TRC20 token bulunamadı.",
- ],
- };
-
- }
-
-
- // ---------------------------------------------------
  // TOKEN LEVEL
- // ---------------------------------------------------
 
  const tokenLevel =
  Number(
  security?.token_level
  );
-
 
  if (tokenLevel === 4) {
 
@@ -168,9 +127,7 @@ function calculateRisk(
  "TRONSCAN tokenı güvensiz olarak işaretliyor."
  );
 
- }
-
- else if (tokenLevel === 3) {
+ } else if (tokenLevel === 3) {
 
  risk += 30;
 
@@ -178,22 +135,17 @@ function calculateRisk(
  "TRONSCAN tokenı şüpheli olarak işaretliyor."
  );
 
- }
-
- else if (tokenLevel === 0) {
+ } else if (tokenLevel === 0) {
 
  risk += 10;
 
  warnings.push(
  "Token güvenlik seviyesi bilinmiyor."
  );
-
  }
 
 
- // ---------------------------------------------------
  // VIP
- // ---------------------------------------------------
 
  if (
  security?.is_vip === false
@@ -204,13 +156,10 @@ function calculateRisk(
  warnings.push(
  "Token TRONSCAN VIP/kurumsal token olarak doğrulanmamış."
  );
-
  }
 
 
- // ---------------------------------------------------
- // SUPPLY ARTIRMA
- // ---------------------------------------------------
+ // SUPPLY
 
  if (
  Number(
@@ -221,15 +170,12 @@ function calculateRisk(
  risk += 20;
 
  warnings.push(
- "Toplam token arzının artırılabilmesi mümkün."
+ "Toplam token arzı artırılabilir."
  );
-
  }
 
 
- // ---------------------------------------------------
  // BLACKLIST
- // ---------------------------------------------------
 
  if (
  Number(
@@ -242,13 +188,10 @@ function calculateRisk(
  warnings.push(
  "Token blacklist/freeze özelliğine sahip olabilir."
  );
-
  }
 
 
- // ---------------------------------------------------
  // OPEN SOURCE
- // ---------------------------------------------------
 
  if (
  security?.open_source === false
@@ -259,13 +202,10 @@ function calculateRisk(
  warnings.push(
  "Token kontratı açık kaynak olarak doğrulanmamış."
  );
-
  }
 
 
- // ---------------------------------------------------
  // PROXY
- // ---------------------------------------------------
 
  if (
  security?.is_proxy === true
@@ -276,23 +216,17 @@ function calculateRisk(
  warnings.push(
  "Token proxy kontrat kullanıyor."
  );
-
  }
 
 
- // ---------------------------------------------------
  // LIQUIDITY
- // ---------------------------------------------------
 
  const liquidity =
  Number(
  security?.sun_liquidity || 0
  );
 
-
- if (
- liquidity === 0
- ) {
+ if (liquidity === 0) {
 
  risk += 15;
 
@@ -300,136 +234,203 @@ function calculateRisk(
  "SunSwap likiditesi bulunamadı veya sıfır görünüyor."
  );
 
- }
-
- else if (
- liquidity < 1000
- ) {
+ } else if (liquidity < 1000) {
 
  risk += 10;
 
  warnings.push(
  "Token likiditesi çok düşük."
  );
-
  }
 
 
- // ---------------------------------------------------
- // HOLDER SAYISI
- // ---------------------------------------------------
-
- const holders =
- Number(
- token?.holders_count || 0
+ risk = Math.min(
+ 100,
+ risk
  );
 
+
+ let label;
+
+ if (risk <= 20) {
+
+ label = "LOW RISK";
+
+ } else if (risk <= 45) {
+
+ label = "MODERATE RISK";
+
+ } else if (risk <= 70) {
+
+ label = "HIGH RISK";
+
+ } else {
+
+ label = "VERY HIGH RISK";
+ }
+
+
+ return {
+ score: risk,
+ label,
+ warnings,
+ };
+}
+
+
+// =====================================================
+// WALLET RISK
+// =====================================================
+
+function calculateWalletRisk(
+ account,
+ transfers,
+ security
+) {
+
+ let risk = 0;
+
+ const warnings = [];
+
+
+ // ---------------------------------------------------
+ // ACCOUNT RISK
+ // ---------------------------------------------------
 
  if (
- holders === 0
+ account?.risk === true ||
+ account?.risk === "true"
  ) {
 
- risk += 20;
+ risk += 60;
 
  warnings.push(
- "Token için holder bilgisi bulunamadı."
+ "TRONSCAN bu adresi riskli olarak işaretliyor."
+ );
+ }
+
+
+ // ---------------------------------------------------
+ // PUBLIC RISK TAG
+ // ---------------------------------------------------
+
+ if (
+ account?.publicTag
+ ) {
+
+ warnings.push(
+ `Adres etiketi: ${account.publicTag}`
+ );
+ }
+
+
+ // ---------------------------------------------------
+ // VIP
+ // ---------------------------------------------------
+
+ if (
+ account?.vip === true
+ ) {
+
+ warnings.push(
+ "Adres TRONSCAN üzerinde doğrulanmış/VIP bir hesap olarak işaretli."
  );
 
  }
 
- else if (
- holders < 10
+
+ // ---------------------------------------------------
+ // TRANSACTIONS
+ // ---------------------------------------------------
+
+ const transactionCount =
+ Number(
+ account?.transactions || 0
+ );
+
+ if (
+ transactionCount === 0
+ ) {
+
+ risk += 10;
+
+ warnings.push(
+ "Adres için işlem geçmişi bulunamadı."
+ );
+ }
+
+
+ // ---------------------------------------------------
+ // TRC20 TRANSFERS
+ // ---------------------------------------------------
+
+ const transferCount =
+ Array.isArray(transfers)
+ ? transfers.length
+ : 0;
+
+ if (
+ transferCount > 0
+ ) {
+
+ warnings.push(
+ `Son işlemler arasında ${transferCount} TRC20 transferi bulundu.`
+ );
+
+ } else {
+
+ warnings.push(
+ "Son TRC20 transferleri bulunamadı."
+ );
+ }
+
+
+ // ---------------------------------------------------
+ // ACCOUNT CREATED
+ // ---------------------------------------------------
+
+ if (
+ account?.date_created
+ ) {
+
+ const created =
+ Number(
+ account.date_created
+ );
+
+ const ageDays =
+ (
+ Date.now() -
+ created * 1000
+ ) /
+ 86400000;
+
+ if (
+ ageDays < 7
  ) {
 
  risk += 15;
 
  warnings.push(
- "Tokenın holder sayısı çok düşük."
+ "Adres çok yeni oluşturulmuş görünüyor."
  );
 
- }
-
- else if (
- holders < 100
+ } else if (
+ ageDays < 30
  ) {
 
  risk += 5;
 
  warnings.push(
- "Tokenın holder sayısı düşük."
+ "Adres nispeten yeni."
  );
-
+ }
  }
 
 
  // ---------------------------------------------------
- // CONTRACT VERIFICATION
+ // CAP
  // ---------------------------------------------------
-
- const verifyStatus =
- Number(
- contract?.verify_status
- );
-
-
- if (
- verifyStatus === 0
- ) {
-
- risk += 15;
-
- warnings.push(
- "Smart contract doğrulanmamış."
- );
-
- }
-
- else if (
- verifyStatus === 1
- ) {
-
- risk += 5;
-
- warnings.push(
- "Smart contract yalnızca kısmen doğrulanmış."
- );
-
- }
-
-
- // ---------------------------------------------------
- // FEEDBACK RISK
- // ---------------------------------------------------
-
- if (
- contract?.feedbackRisk === true
- ) {
-
- risk += 30;
-
- warnings.push(
- "Kontrat için TRONSCAN üzerinde risk geri bildirimi bulunuyor."
- );
-
- }
-
-
- // ---------------------------------------------------
- // RED TAG
- // ---------------------------------------------------
-
- if (
- contract?.redTag
- ) {
-
- risk += 35;
-
- warnings.push(
- "Kontrat üzerinde TRONSCAN risk etiketi bulunuyor."
- );
-
- }
-
 
  risk =
  Math.min(
@@ -440,29 +441,27 @@ function calculateRisk(
 
  let label;
 
-
- if (risk <= 20) {
+ if (
+ risk <= 20
+ ) {
 
  label = "LOW RISK";
 
- }
-
- else if (risk <= 45) {
+ } else if (
+ risk <= 45
+ ) {
 
  label = "MODERATE RISK";
 
- }
-
- else if (risk <= 70) {
+ } else if (
+ risk <= 70
+ ) {
 
  label = "HIGH RISK";
 
- }
-
- else {
+ } else {
 
  label = "VERY HIGH RISK";
-
  }
 
 
@@ -471,7 +470,6 @@ function calculateRisk(
  label,
  warnings,
  };
-
 }
 
 
@@ -487,9 +485,7 @@ export default async function handler(
  setCors(res);
 
 
- // ---------------------------------------------------
  // OPTIONS
- // ---------------------------------------------------
 
  if (
  req.method === "OPTIONS"
@@ -498,13 +494,10 @@ export default async function handler(
  return res
  .status(200)
  .end();
-
  }
 
 
- // ---------------------------------------------------
  // POST
- // ---------------------------------------------------
 
  if (
  req.method !== "POST"
@@ -514,10 +507,8 @@ export default async function handler(
  .status(405)
  .json({
  success: false,
- error:
- "Method not allowed",
+ error: "Method not allowed",
  });
-
  }
 
 
@@ -528,7 +519,7 @@ export default async function handler(
  );
 
  console.log(
- "TRC20 ANALYSIS START"
+ "TRON CRYPTO ANALYSIS START"
  );
 
 
@@ -555,10 +546,9 @@ export default async function handler(
  success: false,
 
  error:
- "Geçerli bir TRON/TRC20 kontrat adresi girin.",
+ "Geçerli bir TRON adresi girin.",
 
  });
-
  }
 
 
@@ -568,94 +558,73 @@ export default async function handler(
  );
 
 
- // -------------------------------------------------
- // TRONSCAN TOKEN DATA
- // -------------------------------------------------
+ // =================================================
+ // 1. ÖNCE TOKEN KONTRATI OLARAK KONTROL
+ // =================================================
 
- const tokenResponse =
+ let tokenResponse = null;
+
+ try {
+
+ tokenResponse =
  await tronScanRequest(
  `/token_trc20?contract=${encodeURIComponent(
  address
  )}&showAll=1`
  );
 
+ } catch (error) {
+
+ console.log(
+ "Token kontrolü başarısız:",
+ error.message
+ );
+ }
+
 
  const token =
  tokenResponse
- ?.trc20_tokens?.[0] || null;
+ ?.trc20_tokens?.[0] ||
+ null;
 
-  // -------------------------------------------------
-// TRON CÜZDAN DATA
-// -------------------------------------------------
 
-let account = null;
+ // =================================================
+ // TOKEN BULUNDU
+ // =================================================
 
-try {
+ if (token) {
 
- account = await tronScanRequest(
- `/accountv2?address=${encodeURIComponent(address)}`
+ console.log(
+ "ADDRESS TYPE: TRC20 TOKEN"
  );
 
-} catch (accountError) {
 
- console.error(
- "Cüzdan bilgisi alınamadı:",
- accountError
- );
+ let security = null;
 
-}
+ try {
 
-
- // -------------------------------------------------
- // SECURITY DATA
- // -------------------------------------------------
-
- const security =
+ security =
  await tronScanRequest(
  `/security/token/data?address=${encodeURIComponent(
  address
  )}`
  );
 
+ } catch (error) {
 
- // -------------------------------------------------
- // CONTRACT DATA
- // -------------------------------------------------
-
- let contract = null;
-
-
- try {
-
- const contractResponse =
- await tronScanRequest(
- `/contract?contract=${encodeURIComponent(
- address
- )}`
+ console.log(
+ "Token security alınamadı:",
+ error.message
  );
-
-
- contract =
- contractResponse
- ?.data?.[0] || null;
-
- }
-
- catch (contractError) {
-
- console.error(
- "Contract bilgisi alınamadı:",
- contractError
- );
-
  }
 
 
- // -------------------------------------------------
- // TOKEN YOK
- // -------------------------------------------------
+ const risk =
+ calculateTokenRisk(
+ token,
+ security
+ );
 
- if (!token) {
 
  return res
  .status(200)
@@ -665,55 +634,14 @@ try {
 
  address,
 
- isTRC20: false,
-
- riskScore: 100,
-
- riskLabel:
- "VERY HIGH RISK",
-
- warnings: [
- "Bu adres TRONSCAN üzerinde geçerli bir TRC20 token olarak bulunamadı.",
- ],
-
- token: null,
-
- security,
-
- contract,
-
- });
-
- }
-
-
- // -------------------------------------------------
- // RİSK
- // -------------------------------------------------
-
- const risk =
- calculateRisk(
- token,
- security,
- contract
- );
-
-
- // -------------------------------------------------
- // RESULT
- // -------------------------------------------------
-
- const result = {
-
- success: true,
+ addressType:
+ "TOKEN_CONTRACT",
 
  network:
  "TRON",
 
  tokenType:
  "TRC20",
-
- address,
 
  isTRC20:
  true,
@@ -727,34 +655,38 @@ try {
  warnings:
  risk.warnings,
 
+
  token: {
 
  name:
- token.name,
+ token.name || null,
 
  symbol:
- token.symbol,
+ token.symbol || null,
 
  contractName:
- token.contract_name,
+ token.contract_name || null,
+
+ contractAddress:
+ token.contract_address || address,
 
  issuer:
- token.issue_address,
+ token.issue_address || null,
 
  decimals:
- token.decimals,
+ token.decimals ?? null,
 
  totalSupply:
- token.total_supply,
+ token.total_supply || null,
 
  holders:
- token.holders_count,
+ token.holders_count || null,
 
  transfers:
- token.transfer_num,
+ token.transfer_num || null,
 
  transfers24h:
- token.transfer24h,
+ token.transfer24h || null,
 
  priceUsd:
  token.market_info
@@ -772,13 +704,16 @@ try {
 
  },
 
+
  security: {
 
  vip:
- security?.is_vip ?? null,
+ security?.is_vip ??
+ null,
 
  blacklist:
- security?.black_list_type ?? null,
+ security?.black_list_type ??
+ null,
 
  canIncreaseSupply:
  security?.increase_total_supply ??
@@ -810,60 +745,199 @@ try {
 
  },
 
- contract: {
-
- verified:
- contract?.verify_status ??
- null,
-
- creator:
- contract?.creator?.address ||
- null,
-
- feedbackRisk:
- contract?.feedbackRisk ??
- null,
-
- redTag:
- contract?.redTag ||
- null,
-
- blueTag:
- contract?.blueTag ||
- null,
-
- publicTag:
- contract?.publicTag ||
- null,
-
- activeDays:
- contract?.activeDay ??
- null,
-
- },
 
  disclaimer:
  "Bu sonuç blockchain verilerine dayalı otomatik güvenlik taramasıdır. Kesin olarak sahte veya gerçek olduğunu kanıtlamaz.",
 
- };
+ });
+ }
 
+
+ // =================================================
+ // 2. TOKEN DEĞİL → CÜZDAN KONTROLÜ
+ // =================================================
 
  console.log(
- "TRC20 ANALYSIS SUCCESS"
+ "ADDRESS TYPE: WALLET"
  );
 
 
- return res
- .status(200)
- .json(result);
+ // -------------------------------------------------
+ // ACCOUNT DETAIL
+ // -------------------------------------------------
+
+ const account =
+ await tronScanRequest(
+ `/accountv2?address=${encodeURIComponent(
+ address
+ )}`
+ );
 
 
+ // -------------------------------------------------
+ // TRC20 TRANSFERS
+ // -------------------------------------------------
+
+ let transferResponse = null;
+
+ try {
+
+ transferResponse =
+ await tronScanRequest(
+ `/token_trc20/transfers-with-status?address=${encodeURIComponent(
+ address
+ )}&limit=20&start=0`
+ );
+
+ } catch (error) {
+
+ console.log(
+ "TRC20 transfer alınamadı:",
+ error.message
+ );
  }
 
- catch (error) {
+
+ const transfers =
+ transferResponse?.token_transfers ||
+ transferResponse?.data ||
+ [];
+
+
+ // -------------------------------------------------
+ // WALLET RISK
+ // -------------------------------------------------
+
+ const risk =
+ calculateWalletRisk(
+ account,
+ transfers,
+ null
+ );
+
+
+ // -------------------------------------------------
+ // RESULT
+ // -------------------------------------------------
+
+ return res
+ .status(200)
+ .json({
+
+ success: true,
+
+ address,
+
+ addressType:
+ "WALLET",
+
+ network:
+ "TRON",
+
+ tokenType:
+ null,
+
+ isTRC20:
+ false,
+
+ riskScore:
+ risk.score,
+
+ riskLabel:
+ risk.label,
+
+ warnings:
+ risk.warnings,
+
+
+ wallet: {
+
+ balanceTRX:
+ account?.balance ??
+ null,
+
+ transactions:
+ account?.transactions ??
+ null,
+
+ dateCreated:
+ account?.date_created ??
+ null,
+
+ name:
+ account?.name ||
+ null,
+
+ vip:
+ account?.vip ??
+ null,
+
+ risk:
+ account?.risk ??
+ null,
+
+ publicTag:
+ account?.publicTag ??
+ null,
+
+ publicTagDesc:
+ account?.publicTagDesc ??
+ null,
+
+ },
+
+
+ recentTransfers:
+ transfers
+ .slice(0, 20)
+ .map(
+ (tx) => ({
+
+ transactionHash:
+ tx?.transaction_id ||
+ tx?.transactionHash ||
+ null,
+
+ from:
+ tx?.from_address ||
+ tx?.fromAddress ||
+ null,
+
+ to:
+ tx?.to_address ||
+ tx?.toAddress ||
+ null,
+
+ token:
+ tx?.tokenInfo
+ ?.tokenAbbr ||
+ tx?.tokenAbbr ||
+ null,
+
+ amount:
+ tx?.quant ??
+ tx?.amount ??
+ null,
+
+ timestamp:
+ tx?.block_ts ??
+ tx?.timestamp ??
+ null,
+
+ })
+ ),
+
+
+ disclaimer:
+ "Bu sonuç blockchain verilerine dayalı otomatik güvenlik taramasıdır. Kesin olarak sahte veya gerçek olduğunu kanıtlamaz.",
+
+ });
+
+
+ } catch (error) {
 
  console.error(
- "TRC20 ANALYSIS ERROR:",
+ "TRON CRYPTO ANALYSIS ERROR:",
  error
  );
 
@@ -876,10 +950,8 @@ try {
 
  error:
  error?.message ||
- "TRC20 analizinde hata oluştu.",
+ "Crypto analizinde hata oluştu.",
 
  });
-
  }
-
 }
