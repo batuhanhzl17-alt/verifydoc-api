@@ -705,6 +705,127 @@ Never invent the PDF's internal structure if it cannot actually be determined.
 If the distinction between native digital PDF and image-based PDF cannot be
 reliably determined, use "unknown".
 
+=====================================================
+BANK / INSTITUTION TEMPLATE & STYLE ANALYSIS
+=====================================================
+
+Identify the apparent bank, financial institution, company, government
+organization, or document issuer ONLY when there is sufficient visible
+evidence.
+
+If the issuer cannot be reliably identified, use "unknown".
+
+Do NOT guess the issuer.
+
+Analyze whether the document's visual and textual characteristics are
+internally consistent with the apparent issuer and document type.
+
+IMPORTANT:
+
+Do NOT assume that every document from the same institution uses exactly
+the same font, layout, spacing, colors, or visual design.
+
+Different versions, channels, dates, applications, web banking systems,
+mobile banking systems, PDF generators, branches, transaction types,
+languages, and software versions may legitimately produce different
+document designs.
+
+Therefore:
+
+A different font, layout, color, or spacing by itself is NOT evidence of
+fraud.
+
+Look for MULTIPLE independent inconsistencies before treating something as
+suspicious.
+
+Analyze the following:
+
+1. Apparent issuer / institution identity
+2. Logo and branding consistency
+3. Header and title structure
+4. Font family appearance
+5. Font weight and typography consistency
+6. Font size hierarchy
+7. Turkish character rendering
+8. Date and time formatting
+9. Currency and amount formatting
+10. IBAN formatting
+11. SWIFT / BIC formatting if visible
+12. Transaction reference formatting if visible
+13. Sender / recipient field structure
+14. Account information formatting
+15. Alignment and spacing
+16. Section ordering
+17. Color and visual hierarchy
+18. Footer / legal text structure if visible
+19. QR / barcode placement and consistency if visible
+20. Overall template coherence
+
+TURKISH CHARACTER ANALYSIS:
+
+Pay special attention to Turkish characters:
+
+ç Ç
+ğ Ğ
+ı I İ i
+ö Ö
+ş Ş
+ü Ü
+
+Check whether Turkish characters appear visually consistent with the rest
+of the document.
+
+Do NOT treat normal font rendering differences as suspicious.
+
+Only flag a character-related issue when there is visible evidence such as:
+
+- inconsistent glyph appearance within the same text style
+- unusual character spacing
+- incorrect character substitution
+- a character appearing to have been inserted from another font
+- visibly different rendering between otherwise identical text fields
+
+BANK / INSTITUTION TEMPLATE REASONING:
+
+If the apparent institution is identifiable, compare the document's
+different sections against each other.
+
+For example:
+
+- Does the header style match the transaction details?
+- Does the amount field visually belong to the same document?
+- Does the IBAN field use a consistent typography and spacing pattern?
+- Does the date/time format remain consistent?
+- Do sender and recipient fields follow the same visual structure?
+- Are there isolated elements that look composited or inserted?
+- Does the logo appear naturally integrated with the surrounding document?
+- Are there unusual gaps, misalignments, or inconsistent text blocks?
+
+Do NOT claim that a document is fake merely because its template differs
+from another document from the same institution.
+
+Do NOT claim that a document is authentic merely because its template looks
+familiar.
+
+If there is insufficient evidence to determine whether a particular
+institutional style is normal, use "unknown" or "review".
+
+IMPORTANT:
+
+This is a forensic consistency check, NOT a definitive authenticity test.
+
+A familiar-looking bank template does not prove authenticity.
+
+An unfamiliar-looking bank template does not prove fraud.
+
+Use the available visible evidence only.
+
+If the issuer is identifiable, mention it in the summary only when supported
+by visible evidence.
+
+If the issuer cannot be reliably identified, do not invent a bank or
+institution name.
+
 Return ONLY the JSON object matching the supplied schema.
 
 `;
