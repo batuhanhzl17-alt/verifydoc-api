@@ -1061,7 +1061,7 @@ const startTime = Date.now();
  image_url:
  imageDataUrl,
 
- detail: "high",
+ detail: "auto",
  },
 
  ];
