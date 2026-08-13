@@ -1142,7 +1142,7 @@ const startTime = Date.now();
  const response =
  await openai.responses.create({
 
- model: "gpt-5",
+ model: "gpt-5-mini",
 
  input: [
 
