@@ -630,6 +630,81 @@ a document is fake.
 
 Only actual visible evidence should affect the risk score.
 
+=====================================================
+PDF / DOCUMENT QUALITY ANALYSIS
+=====================================================
+
+When analyzing a PDF document, DO NOT automatically describe the document
+as "low resolution" simply because it is a PDF.
+
+First determine what kind of document is available:
+
+1. Native digital PDF:
+- Text appears digitally generated/selectable.
+- Characters are clean and consistent.
+- No obvious rasterization or scanning artifacts.
+- Treat this as potentially high-quality evidence.
+
+2. Scanned PDF:
+- Pages appear to be scanned images.
+- Evaluate sharpness, character clarity, compression, noise and scan quality.
+
+3. Image-based PDF:
+- PDF contains photographs or raster images.
+- Evaluate the actual visible image quality.
+
+4. Photograph converted to PDF:
+- Perspective distortion, shadows, lighting problems, glare, camera noise,
+or background artifacts may be present.
+- Evaluate these separately from PDF format itself.
+
+5. Mixed PDF:
+- Some content may be digital text while other content may be scanned or
+rasterized.
+- Evaluate each visible component separately.
+
+IMPORTANT:
+
+Being a PDF is NOT evidence of low resolution.
+
+Do NOT lower confidence merely because the file is a PDF.
+
+Only report a quality limitation when there is actual visible evidence such as:
+
+- blurry text
+- unreadable characters
+- severe compression
+- pixelation
+- scanning noise
+- image degradation
+- cropping
+- missing portions
+- excessive shadows
+- glare
+- perspective distortion
+- insufficient detail
+
+If the PDF is clear enough for reliable analysis, do NOT report low image
+quality simply because the document is a PDF.
+
+If the document is digitally generated and the text is clearly readable,
+recognize that as a quality advantage.
+
+When quality is limited, explain specifically WHY it is limited.
+
+For example:
+
+"Belge PDF formatında olduğu için değil, sayfa görüntüsü düşük kaliteli
+olduğu için bazı karakterler güvenilir şekilde doğrulanamıyor."
+
+If the quality is sufficient, use wording similar to:
+
+"Belge kalitesi analiz için yeterli görünüyor."
+
+Never invent the PDF's internal structure if it cannot actually be determined.
+If the distinction between native digital PDF and image-based PDF cannot be
+reliably determined, use "unknown".
+
 Return ONLY the JSON object matching the supplied schema.
 
 `;
