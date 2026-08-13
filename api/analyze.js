@@ -897,6 +897,7 @@ export default async function handler(
  console.log(
  "VERIFYDOC API START"
  );
+const startTime = Date.now();
 
 
  // -------------------------------------------------
@@ -1177,7 +1178,11 @@ export default async function handler(
  console.log(
  "OPENAI RESPONSE RECEIVED"
  );
-
+console.log(
+"OPENAI SURE:",
+((Date.now() - startTime) / 1000).toFixed(2),
+"seconds"
+);
 
  // -------------------------------------------------
  // PARSE
@@ -1192,7 +1197,11 @@ export default async function handler(
  console.log(
  "ANALYSIS SUCCESS"
  );
-
+console.log(
+"TOTAL SURE:",
+((Date.now() - startTime) / 1000).toFixed(2),
+"seconds"
+);
 
  console.log(
  "=============================="
