@@ -233,22 +233,67 @@ const RESPONSE_SCHEMA = {
 // FORMIDABLE
 // =====================================================
 
+// =====================================================
+// FORMIDABLE
+// =====================================================
+
 function parseMultipart(req) {
- // =====================================================
+
+return new Promise((resolve, reject) => {
+
+const form = formidable({
+multiples: false,
+keepExtensions: true,
+maxFileSize: 25 * 1024 * 1024,
+});
+
+form.parse(
+req,
+(err, fields, files) => {
+
+if (err) {
+
+reject(err);
+
+return;
+
+}
+
+resolve({
+fields,
+files,
+});
+
+}
+);
+
+});
+
+}
+
+
+// =====================================================
 // VIDEO → FRAME ÇIKARMA
 // =====================================================
 
 async function extractVideoFrames(videoPath) {
-const outputDir = `/tmp/verifydoc-${Date.now()}`;
 
-await fs.mkdir(outputDir, {
+const outputDir =
+`/tmp/verifydoc-${Date.now()}`;
+
+await fs.mkdir(
+outputDir,
+{
 recursive: true,
-});
+}
+);
 
-const outputPattern = `${outputDir}/frame-%03d.jpg`;
+const outputPattern =
+`${outputDir}/frame-%03d.jpg`;
 
 await execFileAsync(
 ffmpegPath,
+
 [
 "-i",
 videoPath,
@@ -264,195 +309,249 @@ videoPath,
 
 outputPattern,
 ],
+
 {
-maxBuffer: 10 * 1024 * 1024,
+maxBuffer:
+10 * 1024 * 1024,
 }
 );
 
-const files = await fs.readdir(outputDir);
+const files =
+await fs.readdir(
+outputDir
+);
 
-const frameFiles = files
-.filter((file) => file.endsWith(".jpg"))
+const frameFiles =
+files
+.filter(
+(file) =>
+file.endsWith(".jpg")
+)
 .sort();
 
-if (!frameFiles.length) {
+if (
+!frameFiles.length
+) {
+
 throw new Error(
 "Videodan analiz edilecek kare çıkarılamadı."
 );
+
 }
 
 const frames = [];
 
-for (const file of frameFiles) {
-const framePath = `${outputDir}/${file}`;
+for (
+const file of frameFiles
+) {
 
-const buffer = await fs.readFile(framePath);
+const framePath =
+`${outputDir}/${file}`;
+
+const buffer =
+await fs.readFile(
+framePath
+);
 
 frames.push({
+
 file,
-base64: buffer.toString("base64"),
+
+base64:
+buffer.toString(
+"base64"
+),
+
 });
+
 }
 
 return frames;
+
 }
-async function analyzeVideoFrames(frames) {
- if (!frames || !frames.length) {
- throw new Error("Analiz edilecek video karesi bulunamadı.");
- }
 
- console.log("VIDEO FRAME SAYISI:", frames.length);
 
- const imageMessages = frames.map((frame) => ({
- type: "image_url",
- image_url: {
- url: `data:image/jpeg;base64,${frame.base64}`,
- detail: "high",
- },
- }));
+// =====================================================
+// VIDEO FRAME ANALİZİ
+// =====================================================
 
- const response = await openai.chat.completions.create({
- model: "gpt-5-mini",
+async function analyzeVideoFrames(
+frames
+) {
 
- messages: [
- {
- role: "system",
+if (
+!frames ||
+!frames.length
+) {
 
- content: `
-You are a document verification assistant.
+throw new Error(
+"Analiz edilecek video karesi bulunamadı."
+);
 
-Analyze all supplied video frames together as a sequence.
+}
 
-Your task is to determine whether the document appears visually consistent
-or whether there are signs that it may have been digitally manipulated.
+console.log(
+"VIDEO FRAME SAYISI:",
+frames.length
+);
 
-Look carefully for:
+const imageMessages =
+frames.map(
+(frame) => ({
 
-- document manipulation
-- editing traces
-- inconsistent text
-- inconsistent fonts
-- inconsistent font sizes
-- inconsistent spacing
-- suspicious layout changes
-- duplicated or pasted regions
-- visual discontinuities between frames
-- suspicious overlays
-- unnatural edges
-- different image compression around specific regions
-- text or numbers appearing to change between frames
-- signs that the document may have been digitally altered
+type:
+"image_url",
 
-IMPORTANT:
+image_url: {
 
-Do not declare a document fake merely because the video quality is poor.
+url:
+`data:image/jpeg;base64,${frame.base64}`,
 
-Compare the frames against each other.
+detail:
+"high",
 
-Return ONLY valid JSON using exactly this structure:
+},
+
+})
+);
+
+const response =
+await openai.chat.completions.create({
+
+model:
+"gpt-5-mini",
+
+messages: [
 
 {
- "verdict": "consistent",
- "confidence": 0,
- "suspicious": false,
- "reasons": [],
- "observations": [],
- "recommendation": ""
+
+role:
+"system",
+
+content: `
+
+Sen VerifyDoc isimli belge inceleme sistemisin.
+
+Video içerisindeki tüm kareleri birlikte analiz et.
+
+Belgenin farklı karelerde tutarlı olup olmadığını incele.
+
+Özellikle şunlara dikkat et:
+
+- yazıların değişmesi
+- rakamların değişmesi
+- IBAN değişiklikleri
+- isim değişiklikleri
+- tarih değişiklikleri
+- tutar değişiklikleri
+- font değişiklikleri
+- hizalama değişiklikleri
+- yapıştırılmış bölgeler
+- dijital montaj izleri
+- farklı sıkıştırma bölgeleri
+- görüntü üzerinde sonradan eklenmiş alanlar
+- belge üzerinde oynama ihtimali
+- kareler arasında görsel tutarsızlık
+
+Video kalitesi düşükse bunu otomatik olarak sahtecilik olarak değerlendirme.
+
+Görülemeyen veya doğrulanamayan şeyleri uydurma.
+
+Analiz sonucunu SADECE geçerli JSON olarak döndür.
+
+JSON:
+
+{
+"verdict": "consistent",
+"confidence": 0,
+"suspicious": false,
+"reasons": [],
+"observations": [],
+"recommendation": ""
 }
 
-The verdict must be one of:
+verdict sadece:
 
 "consistent"
 "potentially_manipulated"
 "inconclusive"
 
-confidence must be a number between 0 and 100.
+olabilir.
 
-suspicious must be true or false.
+confidence 0-100 arasında olmalıdır.
 
-reasons and observations must be arrays of strings.
+suspicious true veya false olmalıdır.
 
-Do not invent evidence that is not visible.
- `,
- },
+Tüm açıklamalar TÜRKÇE olmalıdır.
 
- {
- role: "user",
+`,
 
- content: [
- {
- type: "text",
+},
 
- text: `
-Analyze these video frames together.
+{
 
-Determine whether the document shown in the video appears
-consistent or potentially manipulated.
+role:
+"user",
 
-Pay particular attention to changes between frames.
- `,
- },
+content: [
 
- ...imageMessages,
- ],
- },
- ],
+{
 
- response_format: {
- type: "json_object",
- },
- });
+type:
+"text",
 
- const content = response?.choices?.[0]?.message?.content;
+text: `
 
- if (!content) {
- throw new Error("OpenAI'dan analiz sonucu alınamadı.");
- }
+Bu video karelerini birlikte incele.
 
- console.log("OPENAI VIDEO ANALYSIS:", content);
+Belgenin kareler arasında tutarlı olup olmadığını
+ve dijital manipülasyon belirtisi bulunup bulunmadığını değerlendir.
 
- return JSON.parse(content);
-}
+`,
 
- return new Promise((resolve, reject) => {
+},
 
- const form =
- formidable({
+...imageMessages,
 
- multiples: false,
+],
 
- keepExtensions: true,
+},
 
- maxFileSize:
- 25 * 1024 * 1024,
+],
 
- });
+response_format: {
 
+type:
+"json_object",
 
- form.parse(
- req,
- (err, fields, files) => {
+},
 
- if (err) {
+});
 
- reject(err);
+const content =
+response
+?.choices?.[0]
+?.message
+?.content;
 
- return;
+if (!content) {
 
- }
-
- resolve({
- fields,
- files,
- });
-
- }
- );
-
- });
+throw new Error(
+"OpenAI'dan video analiz sonucu alınamadı."
+);
 
 }
 
+console.log(
+"OPENAI VIDEO ANALYSIS:",
+content
+);
+
+return JSON.parse(
+content
+);
+
+}
 
 // =====================================================
 // ARRAY'DEN İLK DEĞERİ AL
@@ -1292,20 +1391,21 @@ const startTime = Date.now();
  }
 
 
- // =================================================
- // VIDEO
- // =================================================
+// =====================================================
+// VIDEO
+// =====================================================
 
- else if (
- type === "video"
- ) {
+else if (type === "video") {
+console.log("VIDEO ANALYSIS START");
 
- throw new Error(
- "Video analizi şu aşamada aktif değil. Önce görsel ve PDF analizini çalıştırıyoruz."
- );
-
- }
-
+// Video analizini artık burada engellemiyoruz.
+// Video kareleri biraz aşağıda işlenecek.
+}
+else {
+throw new Error(
+"Desteklenmeyen dosya türü."
+);
+}
 
  else {
 
