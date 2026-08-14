@@ -2,6 +2,13 @@ import OpenAI from "openai";
 import formidable from "formidable";
 import fs from "fs/promises";
 
+import { execFile } from "child_process";
+import { promisify } from "util";
+import ffmpegPath from "ffmpeg-static";
+
+const execFileAsync = promisify(execFile);
+
+
 export const config = {
  api: {
  bodyParser: false,
@@ -227,7 +234,134 @@ const RESPONSE_SCHEMA = {
 // =====================================================
 
 function parseMultipart(req) {
+ // =====================================================
+// VIDEO → FRAME ÇIKARMA
+// =====================================================
 
+async function extractVideoFrames(videoPath) {
+const outputDir = `/tmp/verifydoc-${Date.now()}`;
+
+await fs.mkdir(outputDir, {
+recursive: true,
+});
+
+const outputPattern = `${outputDir}/frame-%03d.jpg`;
+
+await execFileAsync(
+ffmpegPath,
+[
+"-i",
+videoPath,
+
+"-vf",
+"fps=1/2,scale=1280:-2",
+
+"-frames:v",
+"8",
+
+"-q:v",
+"5",
+
+outputPattern,
+],
+{
+maxBuffer: 10 * 1024 * 1024,
+}
+);
+
+const files = await fs.readdir(outputDir);
+
+const frameFiles = files
+.filter((file) => file.endsWith(".jpg"))
+.sort();
+
+if (!frameFiles.length) {
+throw new Error(
+"Videodan analiz edilecek kare çıkarılamadı."
+);
+}
+
+const frames = [];
+
+for (const file of frameFiles) {
+const framePath = `${outputDir}/${file}`;
+
+const buffer = await fs.readFile(framePath);
+
+frames.push({
+file,
+base64: buffer.toString("base64"),
+});
+}
+
+return frames;
+}
+ async function analyzeVideoFrames(frames) {
+const imageMessages = frames.map((frame) => ({
+type: "image_url",
+image_url: {
+url: `data:image/jpeg;base64,${frame.base64}`,
+},
+}));
+
+const response = await openai.chat.completions.create({
+model: "gpt-5-mini",
+
+messages: [
+{
+role: "system",
+content: `
+You are a document verification assistant.
+
+Analyze the supplied video frames as a sequence.
+
+Look for:
+- document manipulation
+- editing traces
+- inconsistent text
+- inconsistent fonts
+- inconsistent spacing
+- suspicious layout changes
+- duplicated or pasted regions
+- visual discontinuities between frames
+- suspicious overlays
+- signs that the document may have been digitally altered
+
+Do not assume that a document is fake merely because video quality is low.
+
+Return the result as JSON.
+`,
+},
+
+{
+role: "user",
+content: [
+{
+type: "text",
+text: `
+Analyze these video frames together.
+
+Determine whether the document shown in the video appears
+consistent or potentially manipulated.
+
+Pay particular attention to changes between frames.
+`,
+},
+
+...imageMessages,
+],
+},
+],
+
+response_format: {
+type: "json_object",
+},
+});
+
+return JSON.parse(
+response.choices[0].message.content
+);
+}
  return new Promise((resolve, reject) => {
 
  const form =
