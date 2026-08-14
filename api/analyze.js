@@ -254,7 +254,7 @@ ffmpegPath,
 videoPath,
 
 "-vf",
-"fps=1/2,scale=1280:-2",
+"fps=2,scale=1280:-2",
 
 "-frames:v",
 "8",
@@ -296,69 +296,123 @@ base64: buffer.toString("base64"),
 
 return frames;
 }
- async function analyzeVideoFrames(frames) {
-const imageMessages = frames.map((frame) => ({
-type: "image_url",
-image_url: {
-url: `data:image/jpeg;base64,${frame.base64}`,
-},
-}));
+async function analyzeVideoFrames(frames) {
+ if (!frames || !frames.length) {
+ throw new Error("Analiz edilecek video karesi bulunamadı.");
+ }
 
-const response = await openai.chat.completions.create({
-model: "gpt-5-mini",
+ console.log("VIDEO FRAME SAYISI:", frames.length);
 
-messages: [
-{
-role: "system",
-content: `
+ const imageMessages = frames.map((frame) => ({
+ type: "image_url",
+ image_url: {
+ url: `data:image/jpeg;base64,${frame.base64}`,
+ detail: "high",
+ },
+ }));
+
+ const response = await openai.chat.completions.create({
+ model: "gpt-5-mini",
+
+ messages: [
+ {
+ role: "system",
+
+ content: `
 You are a document verification assistant.
 
-Analyze the supplied video frames as a sequence.
+Analyze all supplied video frames together as a sequence.
 
-Look for:
+Your task is to determine whether the document appears visually consistent
+or whether there are signs that it may have been digitally manipulated.
+
+Look carefully for:
+
 - document manipulation
 - editing traces
 - inconsistent text
 - inconsistent fonts
+- inconsistent font sizes
 - inconsistent spacing
 - suspicious layout changes
 - duplicated or pasted regions
 - visual discontinuities between frames
 - suspicious overlays
+- unnatural edges
+- different image compression around specific regions
+- text or numbers appearing to change between frames
 - signs that the document may have been digitally altered
 
-Do not assume that a document is fake merely because video quality is low.
+IMPORTANT:
 
-Return the result as JSON.
-`,
-},
+Do not declare a document fake merely because the video quality is poor.
+
+Compare the frames against each other.
+
+Return ONLY valid JSON using exactly this structure:
 
 {
-role: "user",
-content: [
-{
-type: "text",
-text: `
+ "verdict": "consistent",
+ "confidence": 0,
+ "suspicious": false,
+ "reasons": [],
+ "observations": [],
+ "recommendation": ""
+}
+
+The verdict must be one of:
+
+"consistent"
+"potentially_manipulated"
+"inconclusive"
+
+confidence must be a number between 0 and 100.
+
+suspicious must be true or false.
+
+reasons and observations must be arrays of strings.
+
+Do not invent evidence that is not visible.
+ `,
+ },
+
+ {
+ role: "user",
+
+ content: [
+ {
+ type: "text",
+
+ text: `
 Analyze these video frames together.
 
 Determine whether the document shown in the video appears
 consistent or potentially manipulated.
 
 Pay particular attention to changes between frames.
-`,
-},
+ `,
+ },
 
-...imageMessages,
-],
-},
-],
+ ...imageMessages,
+ ],
+ },
+ ],
 
-response_format: {
-type: "json_object",
-},
-});
+ response_format: {
+ type: "json_object",
+ },
+ });
 
-return JSON.parse(
+ const content = response?.choices?.[0]?.message?.content;
+
+ if (!content) {
+ throw new Error("OpenAI'dan analiz sonucu alınamadı.");
+ }
+
+ console.log("OPENAI VIDEO ANALYSIS:", content);
+
+ return JSON.parse(content);
+}
 response.choices[0].message.content
 );
 }
