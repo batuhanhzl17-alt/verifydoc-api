@@ -1395,14 +1395,55 @@ const startTime = Date.now();
 // VIDEO
 // =====================================================
 
+// =================================================
+// VIDEO
+// =================================================
+
 else if (type === "video") {
+
 console.log("VIDEO ANALYSIS START");
 
-}
-else {
+const frames =
+await extractVideoFrames(filePath);
+
+console.log(
+"VIDEO FRAMES EXTRACTED:",
+frames.length
+);
+
+const videoResult =
+await analyzeVideoFrames(frames);
+
+console.log(
+"VIDEO ANALYSIS COMPLETE"
+);
+
+console.log(
+"VIDEO RESULT:",
+videoResult
+);
+
+return res
+.status(200)
+.json({
+
+success: true,
+
+fileName,
+
+type,
+
+videoAnalysis:
+videoResult,
+
+});
+
+} else {
+
 throw new Error(
 "Desteklenmeyen dosya türü."
 );
+
 }
 
 
