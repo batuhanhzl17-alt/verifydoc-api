@@ -413,9 +413,7 @@ Pay particular attention to changes between frames.
 
  return JSON.parse(content);
 }
-response.choices[0].message.content
-);
-}
+
  return new Promise((resolve, reject) => {
 
  const form =
