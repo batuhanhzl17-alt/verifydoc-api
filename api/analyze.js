@@ -1398,8 +1398,6 @@ const startTime = Date.now();
 else if (type === "video") {
 console.log("VIDEO ANALYSIS START");
 
-// Video analizini artık burada engellemiyoruz.
-// Video kareleri biraz aşağıda işlenecek.
 }
 else {
 throw new Error(
@@ -1407,13 +1405,7 @@ throw new Error(
 );
 }
 
- else {
 
- throw new Error(
- "Desteklenmeyen dosya türü."
- );
-
- }
 
 
  // -------------------------------------------------
