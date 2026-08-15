@@ -937,41 +937,6 @@ return null;
 // =====================================================
 
 async function analyzeAmountCharacters(
- base64,
- mime,
- amountCharacters
-) {
- try {
- if (!base64 || !amountCharacters || !amountCharacters.length) {
- return {
- suspicious: false,
- score: 0,
- evidence: "Tutar karakterleri analiz edilemedi.",
- comparisons: []
- };
- }
-
- const imageDataUrl =
- `data:${mime || "image/jpeg"};base64,${base64}`;
-
- console.log(
- "======================================"
- );
-
- console.log(
- "AMOUNT FONT ANALYSIS START"
- );
-
- console.log(
- "CHARACTER COUNT:",
- amountCharacters.length
- );
-
-// =====================================================
-// TUTAR ALANI - KARAKTER / FONT TUTARLILIK ANALİZİ
-// =====================================================
-
-async function analyzeAmountCharacters(
 base64,
 mime,
 amountCharacters
