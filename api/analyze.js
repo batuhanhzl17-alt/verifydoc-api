@@ -713,6 +713,270 @@ count,
 }
 
 // =====================================================
+// TUTAR ALANI - KARAKTER GÖRSEL ANALİZİ
+// =====================================================
+
+async function analyzeAmountCharacters(
+base64,
+mime,
+amountCharacters
+) {
+
+if (
+!base64 ||
+!amountCharacters ||
+!amountCharacters.length
+) {
+
+return {
+suspicious: false,
+score: 0,
+evidence:
+"Tutar karakterleri için yeterli görüntü verisi bulunamadı.",
+};
+
+}
+
+try {
+
+const imageBuffer =
+Buffer.from(
+base64,
+"base64"
+);
+
+const results = [];
+
+for (
+const character of amountCharacters
+) {
+
+if (
+!character ||
+typeof character.x !== "number" ||
+typeof character.y !== "number" ||
+typeof character.width !== "number" ||
+typeof character.height !== "number"
+) {
+
+continue;
+
+}
+
+const padding = 3;
+
+const left =
+Math.max(
+0,
+Math.floor(
+character.x - padding
+)
+);
+
+const top =
+Math.max(
+0,
+Math.floor(
+character.y - padding
+)
+);
+
+const width =
+Math.max(
+1,
+Math.floor(
+character.width + padding * 2
+)
+);
+
+const height =
+Math.max(
+1,
+Math.floor(
+character.height + padding * 2
+)
+);
+
+const glyphBuffer =
+await sharp(imageBuffer)
+.extract({
+left,
+top,
+width,
+height,
+})
+.resize(
+32,
+48,
+{
+fit: "contain",
+background: {
+r: 255,
+g: 255,
+b: 255,
+alpha: 1,
+},
+}
+)
+.grayscale()
+.raw()
+.toBuffer();
+
+results.push({
+char: character.char,
+buffer: glyphBuffer,
+});
+
+}
+
+if (
+results.length < 2
+) {
+
+return {
+suspicious: false,
+score: 0,
+evidence:
+"Karakter karşılaştırması için yeterli görüntü bulunamadı.",
+};
+
+}
+
+const comparisons = [];
+
+for (
+let i = 0;
+i < results.length;
+i++
+) {
+
+for (
+let j = i + 1;
+j < results.length;
+j++
+) {
+
+if (
+results[i].char !==
+results[j].char
+) {
+
+continue;
+
+}
+
+const a =
+results[i].buffer;
+
+const b =
+results[j].buffer;
+
+const length =
+Math.min(
+a.length,
+b.length
+);
+
+let difference = 0;
+
+for (
+let k = 0;
+k < length;
+k++
+) {
+
+difference +=
+Math.abs(
+a[k] - b[k]
+);
+
+}
+
+const averageDifference =
+difference /
+length;
+
+comparisons.push({
+
+char:
+results[i].char,
+
+difference:
+Number(
+averageDifference.toFixed(2)
+),
+
+});
+
+}
+
+}
+
+if (
+!comparisons.length
+) {
+
+return {
+suspicious: false,
+score: 0,
+evidence:
+"Tutar içerisinde karşılaştırılabilecek aynı rakam bulunamadı.",
+};
+
+}
+
+const suspiciousComparisons =
+comparisons.filter(
+(item) =>
+item.difference > 35
+);
+
+const score =
+Math.min(
+100,
+suspiciousComparisons.length *
+25
+);
+
+return {
+
+suspicious:
+suspiciousComparisons.length > 0,
+
+score,
+
+evidence:
+suspiciousComparisons.length
+? `Tutar alanında ${suspiciousComparisons.length} adet aynı rakam arasında belirgin görsel farklılık tespit edildi.`
+: "Tutar alanındaki aynı rakamların görsel yapısı genel olarak tutarlı.",
+
+comparisons,
+
+};
+
+} catch (error) {
+
+console.error(
+"AMOUNT CHARACTER ANALYSIS ERROR:",
+error
+);
+
+return {
+
+suspicious: false,
+
+score: 0,
+
+evidence:
+"Karakter görüntü analizi gerçekleştirilemedi.",
+
+};
+
+}
+
+}
+
+// =====================================================
 // JSON RESPONSE
 // =====================================================
 
