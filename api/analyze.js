@@ -713,6 +713,226 @@ count,
 }
 
 // =====================================================
+// ANA TUTAR VE KARAKTER KOORDİNATLARINI BUL
+// =====================================================
+
+async function locateAmountCharacters(
+base64,
+mime
+) {
+
+if (!base64) {
+return null;
+}
+
+try {
+
+const imageDataUrl =
+`data:${mime || "image/jpeg"};base64,${base64}`;
+
+const response =
+await openai.responses.create({
+
+model: "gpt-5-mini",
+
+input: [
+{
+role: "user",
+
+content: [
+
+{
+type: "input_text",
+
+text: `
+Bu belgeyi adli görsel inceleme amacıyla analiz et.
+
+Özellikle belgedeki ANA İŞLEM TUTARINI bul.
+
+Örneğin:
+
+1000 TL
+1.000,00 TL
+1000,00 EUR
+€1,000.00
+
+gibi ana tutarı tespit et.
+
+ÇOK ÖNEMLİ:
+
+Tutar içerisindeki HER karakterin görüntü üzerindeki
+yaklaşık koordinatlarını ayrı ayrı belirle.
+
+Örneğin:
+
+1000,00
+
+için:
+
+1
+0
+0
+0
+,
+0
+0
+
+şeklinde ayrı karakterler döndür.
+
+Koordinatlar 0-1000 arasında normalize edilmelidir.
+
+x = karakterin sol kenarı
+y = karakterin üst kenarı
+width = karakter genişliği
+height = karakter yüksekliği
+
+Ana işlem tutarını;
+
+- IBAN
+- hesap numarası
+- işlem numarası
+- tarih
+- referans numarası
+- başka bir tutar
+
+ile karıştırma.
+
+Belgede ana işlem tutarı açıkça bulunamıyorsa:
+
+amount = null
+characters = []
+
+döndür.
+
+SADECE JSON döndür.
+`,
+},
+
+{
+type: "input_image",
+
+image_url:
+imageDataUrl,
+
+detail: "high",
+},
+
+],
+},
+],
+
+text: {
+
+format: {
+
+type: "json_schema",
+
+name:
+"amount_character_locations",
+
+strict: true,
+
+schema: {
+
+type: "object",
+
+properties: {
+
+amount: {
+type: ["string", "null"],
+},
+
+characters: {
+
+type: "array",
+
+items: {
+
+type: "object",
+
+properties: {
+
+char: {
+type: "string",
+},
+
+x: {
+type: "number",
+},
+
+y: {
+type: "number",
+},
+
+width: {
+type: "number",
+},
+
+height: {
+type: "number",
+},
+
+},
+
+required: [
+"char",
+"x",
+"y",
+"width",
+"height",
+],
+
+additionalProperties: false,
+
+},
+
+},
+
+},
+
+required: [
+"amount",
+"characters",
+],
+
+additionalProperties: false,
+
+},
+
+},
+
+},
+
+});
+
+const result =
+JSON.parse(
+response.output_text
+);
+
+console.log(
+"AMOUNT LOCATION:",
+result
+);
+
+return result;
+
+} catch (error) {
+
+console.error(
+"AMOUNT LOCATION ERROR:",
+error
+);
+
+return null;
+
+}
+
+}
+
+
+
+// =====================================================
 // TUTAR ALANI - KARAKTER GÖRSEL ANALİZİ
 // =====================================================
 
@@ -1885,7 +2105,12 @@ const startTime = Date.now();
  const mime =
  uploadedFile.mimetype ||
  "application/octet-stream";
-
+  
+// ANA TUTARIN KARAKTER KOORDİNATLARINI BUL
+const amountLocation = await locateAmountCharacters(
+base64,
+mime
+);
 
  // -------------------------------------------------
  // OPENAI INPUT
@@ -2114,6 +2339,8 @@ console.log(
  type,
 
  ...result,
+
+  amountLocation,
 
  });
 
