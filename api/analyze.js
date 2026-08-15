@@ -991,7 +991,6 @@ async function analyzeAmountCharacterCrossCheck(
  comparisons: []
  };
 
- }
 
  try {
 
