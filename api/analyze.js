@@ -613,7 +613,103 @@ function findUploadedFile(files) {
  return null;
 
 }
+// =====================================================
+// MİKRO KARAKTER / RAKAM TUTARLILIK ANALİZİ
+// =====================================================
 
+function analyzeTextCharacterConsistency(text) {
+
+if (
+!text ||
+typeof text !== "string"
+) {
+
+return {
+score: 0,
+suspicious: false,
+reason: "Analiz edilecek metin bulunamadı.",
+};
+
+}
+
+const characters =
+[...text].filter(
+(char) =>
+/[0-9]/.test(char)
+);
+
+if (
+characters.length < 2
+) {
+
+return {
+score: 0,
+suspicious: false,
+reason:
+"Karşılaştırma için yeterli rakam bulunamadı.",
+};
+
+}
+
+const frequency = {};
+
+for (
+const char of characters
+) {
+
+frequency[char] =
+(frequency[char] || 0) + 1;
+
+}
+
+const repeatedDigits =
+Object.entries(
+frequency
+).filter(
+([, count]) =>
+count >= 2
+);
+
+if (
+!repeatedDigits.length
+) {
+
+return {
+score: 0,
+suspicious: false,
+reason:
+"Aynı rakamın yeterli tekrarı bulunamadı.",
+};
+
+}
+
+/*
+* Bu aşamada OCR metnindeki karakterleri
+* karşılaştırıyoruz.
+*
+* ÖNEMLİ:
+* Bu fonksiyon tek başına görüntüdeki
+* piksel/font farkını kesin olarak ölçmez.
+*
+* Asıl görsel değerlendirme GPT tarafından
+* yapılmaya devam eder.
+*/
+
+return {
+score: 0,
+suspicious: false,
+reason:
+"Rakam karakterleri mikro tutarlılık analizi için hazır.",
+repeatedDigits:
+repeatedDigits.map(
+([digit, count]) => ({
+digit,
+count,
+})
+),
+};
+
+}
 
 // =====================================================
 // JSON RESPONSE
