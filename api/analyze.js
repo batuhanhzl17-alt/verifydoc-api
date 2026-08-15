@@ -933,7 +933,7 @@ return null;
 
 
 // =====================================================
-// TUTAR ALANI - KARAKTER GÖRSEL ANALİZİ
+// TUTAR ALANI - KARAKTER / FONT TUTARLILIK ANALİZİ
 // =====================================================
 
 async function analyzeAmountCharacters(
@@ -941,475 +941,294 @@ async function analyzeAmountCharacters(
  mime,
  amountCharacters
 ) {
-
- if (
- !base64 ||
- !amountCharacters ||
- !amountCharacters.length
- ) {
-
+ try {
+ if (!base64 || !amountCharacters || !amountCharacters.length) {
  return {
  suspicious: false,
  score: 0,
- evidence:
- "Tutar karakterleri için yeterli görüntü verisi bulunamadı.",
+ evidence: "Tutar karakterleri analiz edilemedi.",
+ comparisons: []
  };
-
  }
 
- try {
-
- const imageBuffer =
- Buffer.from(
- base64,
- "base64"
- );
-
- // -------------------------------------------------
- // GERÇEK GÖRÜNTÜ BOYUTLARINI AL
- // -------------------------------------------------
-
- const metadata =
- await sharp(imageBuffer).metadata();
-
- const imageWidth =
- metadata.width;
-
- const imageHeight =
- metadata.height;
-
- if (
- !imageWidth ||
- !imageHeight
- ) {
-
- throw new Error(
- "Görüntü boyutları alınamadı."
- );
-
- }
+ const imageDataUrl =
+ `data:${mime || "image/jpeg"};base64,${base64}`;
 
  console.log(
- "AMOUNT IMAGE SIZE:",
- imageWidth,
- "x",
- imageHeight
+ "======================================"
  );
 
- const results = [];
-
- // -------------------------------------------------
- // KARAKTERLERİ GERÇEK PİKSELE ÇEVİR
- // -------------------------------------------------
-
- for (
- const character of amountCharacters
- ) {
-
- if (
- !character ||
- typeof character.x !== "number" ||
- typeof character.y !== "number" ||
- typeof character.width !== "number" ||
- typeof character.height !== "number"
- ) {
-
- continue;
-
- }
-
- // GPT koordinatları 0-1000 arası.
- // Gerçek piksel koordinatına çeviriyoruz.
-
- let x =
- Math.round(
- (character.x / 1000) *
- imageWidth
+ console.log(
+ "AMOUNT FONT ANALYSIS START"
  );
 
- let y =
- Math.round(
- (character.y / 1000) *
- imageHeight
- );
-
- let width =
- Math.round(
- (character.width / 1000) *
- imageWidth
- );
-
- let height =
- Math.round(
- (character.height / 1000) *
- imageHeight
+ console.log(
+ "CHARACTER COUNT:",
+ amountCharacters.length
  );
 
  // -------------------------------------------------
- // PADDING
+ // KARAKTER BİLGİLERİNİ MODELE HAZIRLA
  // -------------------------------------------------
 
- const padding = 5;
-
- x -= padding;
- y -= padding;
-
- width +=
- padding * 2;
-
- height +=
- padding * 2;
+ const characterInfo = amountCharacters
+ .map((item, index) => ({
+ index,
+ char: item.char,
+ x: item.x,
+ y: item.y,
+ width: item.width,
+ height: item.height
+ }));
 
  // -------------------------------------------------
- // SINIRLARI KORU
+ // OPENAI GÖRSEL ANALİZ
  // -------------------------------------------------
 
- x =
- Math.max(
- 0,
- Math.min(
- x,
- imageWidth - 1
- )
- );
+ const response = await openai.responses.create({
+ model: "gpt-5-mini",
 
- y =
- Math.max(
- 0,
- Math.min(
- y,
- imageHeight - 1
- )
- );
-
- width =
- Math.max(
- 1,
- Math.min(
- width,
- imageWidth - x
- )
- );
-
- height =
- Math.max(
- 1,
- Math.min(
- height,
- imageHeight - y
- )
- );
-
- try {
-
- const glyphBuffer =
- await sharp(imageBuffer)
- .extract({
- left: x,
- top: y,
- width,
- height,
- })
- .resize(
- 48,
- 64,
+ input: [
  {
- fit: "contain",
- background: {
- r: 255,
- g: 255,
- b: 255,
- alpha: 1,
- },
+ role: "user",
+
+ content: [
+ {
+ type: "input_text",
+
+ text: `
+Sen belge ve finansal doküman görsellerindeki
+TUTAR ALANI KARAKTERLERİNİN GÖRSEL TUTARLILIĞINI
+inceleyen bir analiz sistemisin.
+
+ÇOK ÖNEMLİ:
+
+Buradaki amaç rakamların şekillerinin birbirine
+benzemesini kontrol etmek DEĞİLDİR.
+
+Örneğin:
+
+1250
+
+içindeki 1, 2, 5 ve 0 doğal olarak farklı şekillerdedir.
+Bunları şekilleri farklı diye şüpheli kabul etme.
+
+AMAÇ:
+
+Aynı tutar içerisindeki farklı rakamların aynı yazı
+tipi / font ailesi / baskı karakteristiği / dijital
+üretim karakteristiği ile yazılmış olup olmadığını
+incelemektir.
+
+Örneğin:
+
+1250 TL
+
+içerisinde 1, 2 ve 0 aynı font karakteristiğine sahipken
+5 belirgin şekilde farklı bir font veya yazım karakteristiği
+gösteriyorsa bunu tespit etmeye çalış.
+
+İNCELE:
+
+1. Karakter yüksekliği
+2. Karakter genişliği
+3. Stroke / çizgi kalınlığı
+4. Kenarların yumuşaklığı
+5. Anti-aliasing karakteristiği
+6. Piksel yoğunluğu
+7. Font ağırlığı
+8. Karakterlerin baseline hizası
+9. Karakterlerin dikey hizası
+10. Yazı tipi karakteristiği
+11. Baskı / render görünümü
+12. Aynı tutardaki diğer karakterlerle görsel tutarlılık
+
+ÖNEMLİ:
+
+Fotoğrafın çekim açısı, perspektif, ışık, JPEG sıkıştırması,
+bulanıklık veya ekran fotoğrafı kaynaklı bozulmaları
+font farklılığı olarak yorumlama.
+
+Tek başına küçük bir fark şüpheli değildir.
+
+Ancak bir karakter diğerlerinden belirgin biçimde farklı
+bir font/render/baskı karakteristiği gösteriyorsa
+şüpheli olarak işaretle.
+
+Karakter koordinatları:
+
+${JSON.stringify(characterInfo, null, 2)}
+
+SONUCU SADECE GEÇERLİ JSON OLARAK DÖNDÜR.
+
+Şu formatı kullan:
+
+{
+ "fontConsistent": true,
+ "suspicious": false,
+ "score": 0,
+ "suspiciousCharacters": [],
+ "comparisons": [
+ {
+ "char": "1",
+ "index": 0,
+ "consistency": 95,
+ "reason": "Diğer karakterlerle aynı görsel yazım karakteristiğinde."
  }
- )
- .grayscale()
- .raw()
- .toBuffer();
+ ],
+ "evidence": "Tutar içerisindeki karakterlerin görsel yazım karakteristiği genel olarak tutarlı."
+}
 
- results.push({
+SKOR:
 
- char:
- character.char,
+0-20 = normal / çok düşük şüphe
+21-40 = düşük şüphe
+41-60 = orta şüphe
+61-80 = yüksek şüphe
+81-100 = çok yüksek şüphe
 
- buffer:
- glyphBuffer,
+Bir karakterin diğerlerinden farklı olması tek başına
+sahtecilik kanıtı değildir.
 
- x,
- y,
- width,
- height,
+Sadece görsel tutarsızlık tespit edildiğinde suspicious=true yap.
+`
+ },
 
+ {
+ type: "input_image",
+ image_url: imageDataUrl
+ }
+ ]
+ }
+ ]
  });
 
- } catch (cropError) {
+ // -------------------------------------------------
+ // OPENAI CEVABI
+ // -------------------------------------------------
+
+ const rawText =
+ response.output_text || "";
+
+ console.log(
+ "AMOUNT FONT AI RESPONSE:"
+ );
+
+ console.log(rawText);
+
+ // -------------------------------------------------
+ // JSON TEMİZLE
+ // -------------------------------------------------
+
+ let cleaned = rawText
+ .trim()
+ .replace(/^```json/i, "")
+ .replace(/^```/i, "")
+ .replace(/```$/i, "")
+ .trim();
+
+ let result;
+
+ try {
+ result = JSON.parse(cleaned);
+ } catch (jsonError) {
 
  console.error(
- "GLYPH CROP ERROR:",
- cropError
+ "AMOUNT FONT JSON PARSE ERROR:",
+ jsonError
  );
-
- }
-
- }
-
- // -------------------------------------------------
- // YETERLİ KARAKTER VAR MI?
- // -------------------------------------------------
-
- if (
- results.length < 2
- ) {
 
  return {
  suspicious: false,
  score: 0,
  evidence:
- "Karakter karşılaştırması için yeterli görüntü bulunamadı.",
+ "Tutar karakterlerinin AI görsel analizi JSON olarak çözümlenemedi.",
+ comparisons: []
  };
-
  }
 
  // -------------------------------------------------
- // AYNI KARAKTERLERİ GRUPLA
+ // GÜVENLİ SONUÇ
  // -------------------------------------------------
 
- const groups = {};
+ const suspiciousCharacters =
+ Array.isArray(result.suspiciousCharacters)
+ ? result.suspiciousCharacters
+ : [];
 
- for (
- const item of results
- ) {
+ const comparisons =
+ Array.isArray(result.comparisons)
+ ? result.comparisons
+ : [];
 
- const key =
- item.char;
+ let score =
+ Number(result.score);
 
- if (!groups[key]) {
- groups[key] = [];
+ if (!Number.isFinite(score)) {
+ score = 0;
  }
 
- groups[key].push(item);
-
- }
-
- const comparisons = [];
-
- // -------------------------------------------------
- // AYNI RAKAMLARI KARŞILAŞTIR
- // -------------------------------------------------
-
- for (
- const char of Object.keys(groups)
- ) {
-
- const group =
- groups[char];
-
- // Aynı karakter en az 2 kere
- // bulunuyorsa karşılaştır.
-
- if (
- group.length < 2
- ) {
-
- continue;
-
- }
-
- for (
- let i = 0;
- i < group.length;
- i++
- ) {
-
- for (
- let j = i + 1;
- j < group.length;
- j++
- ) {
-
- const a =
- group[i].buffer;
-
- const b =
- group[j].buffer;
-
- const length =
- Math.min(
- a.length,
- b.length
+ score = Math.max(
+ 0,
+ Math.min(100, score)
  );
 
- if (!length) {
- continue;
- }
-
- let difference = 0;
-
- let squaredDifference = 0;
-
- for (
- let k = 0;
- k < length;
- k++
- ) {
-
- const diff =
- Math.abs(
- a[k] - b[k]
- );
-
- difference += diff;
-
- squaredDifference +=
- diff * diff;
-
- }
-
- const averageDifference =
- difference /
- length;
-
- const rmsDifference =
- Math.sqrt(
- squaredDifference /
- length
- );
-
- comparisons.push({
-
- char,
-
- difference:
- Number(
- averageDifference.toFixed(2)
- ),
-
- rms:
- Number(
- rmsDifference.toFixed(2)
- ),
-
- firstPosition: {
- x: group[i].x,
- y: group[i].y,
- },
-
- secondPosition: {
- x: group[j].x,
- y: group[j].y,
- },
-
- });
-
- }
-
- }
-
- }
-
- // -------------------------------------------------
- // AYNI RAKAM BULUNAMADI
- // -------------------------------------------------
-
- if (
- !comparisons.length
- ) {
-
- return {
- suspicious: false,
- score: 0,
- evidence:
- "Tutar içerisinde karşılaştırılabilecek aynı rakam bulunamadı.",
- comparisons: [],
- };
-
- }
+ const suspicious =
+ result.suspicious === true ||
+ suspiciousCharacters.length > 0;
 
  console.log(
- "AMOUNT CHARACTER COMPARISONS:",
- comparisons
- );
-
- // -------------------------------------------------
- // BELİRGİN FARKLILIK
- // -------------------------------------------------
-
- const suspiciousComparisons =
- comparisons.filter(
- (item) =>
- item.difference > 42 ||
- item.rms > 58
- );
-
- // -------------------------------------------------
- // SKOR
- // -------------------------------------------------
-
- let score = 0;
-
- if (
- suspiciousComparisons.length === 1
- ) {
-
- score = 45;
-
- } else if (
- suspiciousComparisons.length === 2
- ) {
-
- score = 65;
-
- } else if (
- suspiciousComparisons.length >= 3
- ) {
-
- score = 85;
-
+ "AMOUNT FONT ANALYSIS RESULT:",
+ {
+ suspicious,
+ score,
+ suspiciousCharacters
  }
+ );
 
- // -------------------------------------------------
- // SONUÇ
- // -------------------------------------------------
+ console.log(
+ "======================================"
+ );
 
  return {
-
- suspicious:
- suspiciousComparisons.length > 0,
-
+ suspicious,
  score,
 
- evidence:
- suspiciousComparisons.length
- ? `Tutar alanında aynı rakamlar arasında ${suspiciousComparisons.length} adet belirgin görsel farklılık tespit edildi. Bu durum farklı font, karakter yapısı veya sonradan eklenmiş/değiştirilmiş karakter ihtimalini gösterebilir.`
- : "Tutar alanındaki aynı rakamların görsel yapısı genel olarak tutarlı.",
+ fontConsistent:
+ result.fontConsistent !== false,
+
+ suspiciousCharacters,
 
  comparisons,
 
+ evidence:
+ result.evidence ||
+ "Tutar karakterleri görsel olarak analiz edildi."
  };
 
  } catch (error) {
 
  console.error(
- "AMOUNT CHARACTER ANALYSIS ERROR:",
- error
+ "AMOUNT FONT ANALYSIS ERROR:"
  );
 
+ console.error(error);
+
  return {
-
  suspicious: false,
-
  score: 0,
 
+ fontConsistent: true,
+
+ suspiciousCharacters: [],
+
+ comparisons: [],
+
  evidence:
- "Tutar karakterlerinin görsel analizi gerçekleştirilemedi.",
-
+ "Tutar karakterlerinin görsel analizi gerçekleştirilemedi."
  };
-
  }
-
 }
-
-
 
 // =====================================================
 // JSON RESPONSE
