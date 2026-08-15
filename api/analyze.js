@@ -968,110 +968,91 @@ async function analyzeAmountCharacters(
  );
 
 // =====================================================
-// TUTAR KARAKTERLERİ - BELGE İÇİ ÇAPRAZ KARŞILAŞTIRMA
+// TUTAR ALANI - KARAKTER / FONT TUTARLILIK ANALİZİ
 // =====================================================
 
-async function analyzeAmountCharacterCrossCheck(
- base64,
- mime,
- amountCharacters
+async function analyzeAmountCharacters(
+base64,
+mime,
+amountCharacters
 ) {
 
- if (
- !base64 ||
- !amountCharacters ||
- !amountCharacters.length
- ) {
+try {
 
- return {
- suspicious: false,
- score: 0,
- evidence:
- "Belge içi karakter karşılaştırması için yeterli veri bulunamadı.",
- comparisons: []
- };
+if (
+!base64 ||
+!amountCharacters ||
+!amountCharacters.length
+) {
+
+return {
+suspicious: false,
+score: 0,
+fontConsistent: true,
+suspiciousCharacters: [],
+comparisons: [],
+evidence:
+"Tutar karakterleri analiz edilemedi."
+};
+
+}
+
+const imageDataUrl =
+`data:${mime || "image/jpeg"};base64,${base64}`;
+
+const characterInfo =
+amountCharacters.map(
+(item, index) => ({
+index,
+char: item.char,
+x: item.x,
+y: item.y,
+width: item.width,
+height: item.height
+})
+);
+
+console.log(
+"======================================"
+);
+
+console.log(
+"AMOUNT FONT ANALYSIS START"
+);
+
+console.log(
+"CHARACTERS:",
+characterInfo
+);
 
 
- try {
+const response =
+await openai.responses.create({
 
- const imageDataUrl =
- `data:${mime || "image/jpeg"};base64,${base64}`;
+model: "gpt-5-mini",
 
- // -------------------------------------------------
- // SADECE TUTARDAKİ KARAKTERLERİ HAZIRLA
- // -------------------------------------------------
+input: [
 
- const amountInfo =
- amountCharacters.map(
- (item, index) => ({
+{
+role: "user",
 
- index,
+content: [
 
- char:
- item.char,
+{
+type: "input_text",
 
- x:
- item.x,
-
- y:
- item.y,
-
- width:
- item.width,
-
- height:
- item.height
-
- })
- );
-
- console.log(
- "======================================"
- );
-
- console.log(
- "AMOUNT CHARACTER CROSS CHECK START"
- );
-
- console.log(
- "AMOUNT CHARACTERS:",
- amountInfo
- );
-
- // -------------------------------------------------
- // AI GÖRSEL KARŞILAŞTIRMA
- // -------------------------------------------------
-
- const response =
- await openai.responses.create({
-
- model:
- "gpt-5-mini",
-
- input: [
-
- {
- role:
- "user",
-
- content: [
-
- {
- type:
- "input_text",
-
- text: `
-
-Sen belge adli inceleme sisteminin
-KARAKTER ÇAPRAZ KARŞILAŞTIRMA modülüsün.
-
-Gönderilen belgenin ANA İŞLEM TUTARINDA bulunan
-karakterleri, aynı belgede başka yerlerde bulunan
-aynı karakterlerle görsel olarak karşılaştır.
+text: `
+Sen belge ve finansal doküman görsellerindeki
+TUTAR ALANI KARAKTERLERİNİN GÖRSEL TUTARLILIĞINI
+inceleyen bir analiz sistemisin.
 
 AMAÇ:
 
-Örneğin ana işlem tutarı:
+Ana işlem tutarındaki karakterlerin aynı belge
+içerisindeki diğer karakterlerle görsel olarak
+tutarlı olup olmadığını değerlendir.
+
+Örneğin ana tutar:
 
 1250 TL
 
@@ -1082,99 +1063,459 @@ ise:
 5
 0
 
-karakterlerinin belgede başka yerlerde bulunan
-aynı karakterleri olup olmadığını araştır.
+karakterlerini incele.
 
-Örneğin belgede başka bir yerde:
-
-"İşlem No: 5A..."
-veya
-"Referans: ...0..."
-
-gibi karakterler bulunuyorsa bunları referans olarak
-kullanabilirsin.
-
-ÇOK ÖNEMLİ:
-
-Bir karakteri sadece farklı bir rakam olduğu için
+Farklı rakamların doğal olarak farklı şekilleri vardır.
+Bir rakam diğer rakamdan farklı görünüyor diye
 şüpheli kabul etme.
 
-Örneğin:
+Önemli olan aynı karakterin veya aynı yazı
+karakteristiğinin tutarlı olup olmadığıdır.
 
-1 ile 2 doğal olarak farklı şekillerdedir.
+İNCELE:
 
-Buradaki amaç:
+1. Karakter yüksekliği
+2. Karakter genişliği
+3. Stroke kalınlığı
+4. Kenar yumuşaklığı
+5. Anti-aliasing
+6. Piksel/render görünümü
+7. Font ağırlığı
+8. Baseline hizalaması
+9. Dikey hizalama
+10. Genel font karakteristiği
 
-"5 başka 5'lerle aynı font/görsel üretim karakteristiğinde mi?"
-
-sorusunu cevaplamaktır.
-
-HER KARAKTER İÇİN:
-
-1. Belgenin başka yerlerinde aynı karakteri ara.
-2. Varsa görsel olarak karşılaştır.
-3. Font görünümünü karşılaştır.
-4. Stroke kalınlığını karşılaştır.
-5. Karakter genişliğini karşılaştır.
-6. Karakter yüksekliğini karşılaştır.
-7. Kenar yumuşaklığını karşılaştır.
-8. Anti-aliasing görünümünü karşılaştır.
-9. Piksel/render karakteristiğini karşılaştır.
-10. Baseline ve hizalamayı karşılaştır.
-
-ÖNEMLİ:
-
-Belgenin fotoğraf olması,
-JPEG sıkıştırması,
-perspektif,
-ışık,
-bulanıklık,
-tarama kalitesi
-
-gibi faktörleri dikkate al.
-
-Bunlardan kaynaklanabilecek küçük farklılıkları
+Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması,
+bulanıklık ve görüntü kalitesi kaynaklı küçük farkları
 sahtecilik olarak değerlendirme.
 
-Aynı karakterin başka bir yerde bulunmaması
-şüpheli değildir.
+Tek başına küçük bir farklılık şüpheli değildir.
 
-Yeterli referans bulunmuyorsa:
+Gerçekten belirgin bir görsel tutarsızlık varsa
+suspicious değerini true yap.
 
-consistency = "unknown"
+Yeterli görsel kanıt yoksa bunu şüpheli kabul etme.
 
-kullan.
-
-Ana işlem tutarındaki karakter bilgileri:
+Ana tutar karakterleri:
 
 ${JSON.stringify(
- amountInfo,
- null,
- 2
+characterInfo,
+null,
+2
 )}
-
 
 SADECE GEÇERLİ JSON DÖNDÜR.
 
 JSON FORMAT:
 
 {
- "suspicious": false,
- "score": 0,
- "comparisons": [],
- "suspiciousCharacters": [],
- "evidence": ""
+"fontConsistent": true,
+"suspicious": false,
+"score": 0,
+"suspiciousCharacters": [],
+"comparisons": [],
+"evidence": ""
 }
 
-comparisons içerisinde:
+comparisons içerisindeki örnek:
 
 {
- "amountCharacter": "5",
- "referenceFound": true,
- "referenceCount": 3,
- "consistency": 94,
- "status": "consistent",
- "reason": "Tutar içerisindeki 5 karakteri belgede bulunan diğer 5 karakterleriyle görsel olarak tutarlı."
+"char": "5",
+"index": 0,
+"consistency": 94,
+"reason": "Karakter diğer görsel karakteristiklerle tutarlı."
+}
+
+SKOR:
+
+0-20 = çok düşük şüphe
+21-40 = düşük şüphe
+41-60 = orta şüphe
+61-80 = yüksek şüphe
+81-100 = çok yüksek şüphe
+
+unknown veya belirlenemeyen durumları
+şüpheli olarak değerlendirme.
+
+Tüm açıklamalar Türkçe olmalıdır.
+`
+},
+
+{
+type: "input_image",
+
+image_url: imageDataUrl,
+
+detail: "high"
+}
+
+]
+}
+
+],
+
+text: {
+
+format: {
+
+type: "json_schema",
+
+name: "amount_font_analysis",
+
+strict: true,
+
+schema: {
+
+type: "object",
+
+properties: {
+
+fontConsistent: {
+type: "boolean"
+},
+
+suspicious: {
+type: "boolean"
+},
+
+score: {
+type: "integer",
+minimum: 0,
+maximum: 100
+},
+
+suspiciousCharacters: {
+
+type: "array",
+
+items: {
+type: "string"
+}
+
+},
+
+comparisons: {
+
+type: "array",
+
+items: {
+
+type: "object",
+
+properties: {
+
+char: {
+type: "string"
+},
+
+index: {
+type: "integer"
+},
+
+consistency: {
+type: "integer",
+minimum: 0,
+maximum: 100
+},
+
+reason: {
+type: "string"
+}
+
+},
+
+required: [
+"char",
+"index",
+"consistency",
+"reason"
+],
+
+additionalProperties: false
+
+}
+
+},
+
+evidence: {
+type: "string"
+}
+
+},
+
+required: [
+"fontConsistent",
+"suspicious",
+"score",
+"suspiciousCharacters",
+"comparisons",
+"evidence"
+],
+
+additionalProperties: false
+
+}
+
+}
+
+}
+
+});
+
+
+const result =
+JSON.parse(
+response.output_text
+);
+
+
+let score =
+Number(result.score);
+
+if (
+!Number.isFinite(score)
+) {
+score = 0;
+}
+
+score =
+Math.max(
+0,
+Math.min(
+100,
+Math.round(score)
+)
+);
+
+
+const suspiciousCharacters =
+Array.isArray(
+result.suspiciousCharacters
+)
+? result.suspiciousCharacters
+: [];
+
+
+const comparisons =
+Array.isArray(
+result.comparisons
+)
+? result.comparisons
+: [];
+
+
+const suspicious =
+result.suspicious === true ||
+suspiciousCharacters.length > 0;
+
+
+console.log(
+"AMOUNT FONT ANALYSIS RESULT:",
+{
+suspicious,
+score,
+suspiciousCharacters
+}
+);
+
+
+return {
+
+suspicious,
+
+score,
+
+fontConsistent:
+result.fontConsistent !== false,
+
+suspiciousCharacters,
+
+comparisons,
+
+evidence:
+result.evidence ||
+"Tutar karakterleri görsel olarak analiz edildi."
+
+};
+
+
+} catch (error) {
+
+console.error(
+"AMOUNT FONT ANALYSIS ERROR:"
+);
+
+console.error(error);
+
+
+return {
+
+suspicious: false,
+
+score: 0,
+
+fontConsistent: true,
+
+suspiciousCharacters: [],
+
+comparisons: [],
+
+evidence:
+"Tutar karakterlerinin görsel analizi gerçekleştirilemedi."
+
+};
+
+}
+
+}
+
+
+// =====================================================
+// TUTAR KARAKTER ÇAPRAZ KARŞILAŞTIRMA
+// =====================================================
+
+async function analyzeAmountCharacterCrossCheck(
+base64,
+mime,
+amountCharacters
+) {
+
+try {
+
+if (
+!base64 ||
+!amountCharacters ||
+!amountCharacters.length
+) {
+
+return {
+
+suspicious: false,
+
+score: 0,
+
+comparisons: [],
+
+suspiciousCharacters: [],
+
+evidence:
+"Belge içi karakter karşılaştırması için yeterli veri bulunamadı."
+
+};
+
+}
+
+
+const imageDataUrl =
+`data:${mime || "image/jpeg"};base64,${base64}`;
+
+
+const amountInfo =
+amountCharacters.map(
+(item, index) => ({
+
+index,
+
+char: item.char,
+
+x: item.x,
+
+y: item.y,
+
+width: item.width,
+
+height: item.height
+
+})
+);
+
+
+const response =
+await openai.responses.create({
+
+model: "gpt-5-mini",
+
+input: [
+
+{
+
+role: "user",
+
+content: [
+
+{
+
+type: "input_text",
+
+text: `
+Sen belge adli inceleme sisteminin
+KARAKTER ÇAPRAZ KARŞILAŞTIRMA modülüsün.
+
+Ana işlem tutarındaki karakterleri aynı belgede
+başka yerlerde bulunan aynı karakterlerle
+görsel olarak karşılaştır.
+
+Örneğin ana tutar:
+
+1250 TL
+
+ise 1, 2, 5 ve 0 karakterlerini incele.
+
+Belgede başka bir yerde aynı karakter bulunuyorsa
+referans olarak kullan.
+
+Karakterin:
+
+- font görünümünü
+- stroke kalınlığını
+- genişliğini
+- yüksekliğini
+- kenar yumuşaklığını
+- anti-aliasing görünümünü
+- piksel/render karakteristiğini
+- baseline hizalamasını
+
+karşılaştır.
+
+Fotoğraf kalitesi, perspektif, ışık, JPEG sıkıştırması
+ve bulanıklık kaynaklı küçük farklılıkları şüpheli
+olarak değerlendirme.
+
+Aynı karakterin belgede başka yerde bulunmaması
+şüpheli değildir.
+
+Yeterli referans yoksa consistency değerini
+"unknown" olarak belirt.
+
+Ana işlem tutarı karakterleri:
+
+${JSON.stringify(
+amountInfo,
+null,
+2
+)}
+
+SADECE GEÇERLİ JSON DÖNDÜR.
+
+FORMAT:
+
+{
+"suspicious": false,
+"score": 0,
+"comparisons": [],
+"suspiciousCharacters": [],
+"evidence": ""
+}
+
+comparison formatı:
+
+{
+"amountCharacter": "5",
+"referenceFound": true,
+"referenceCount": 3,
+"consistency": 94,
+"status": "consistent",
+"reason": "Karakter diğer referanslarla görsel olarak tutarlı."
 }
 
 status sadece:
@@ -1185,455 +1526,234 @@ status sadece:
 
 olabilir.
 
-SKOR:
+unknown durumunu şüpheli kabul etme.
 
-0-20:
-Belge içi karakterler tutarlı.
+Tek bir küçük karakter farklılığı kesin sahtecilik
+anlamına gelmez.
 
-21-40:
-Küçük farklılıklar.
+Sadece gerçekten belirgin görsel tutarsızlık varsa
+suspicious değerini true yap.
 
-41-60:
-Orta düzey farklılık.
-
-61-80:
-Belirgin karakter farklılığı.
-
-81-100:
-Çok güçlü karakter tutarsızlığı.
-
-ÖNEMLİ:
-
-Tek bir karakter farklılığı kesin sahtecilik anlamına gelmez.
-
-SADECE GERÇEKTEN GÖRSEL OLARAK BELİRGİN BİR
-TUTARSIZLIK VARSA suspicious=true yap.
-
-`unknown` olan karakterleri şüpheli olarak değerlendirme.
-
-Tüm açıklamalar TÜRKÇE olmalıdır.
-
+Tüm açıklamalar Türkçe olmalıdır.
 `
- },
-
- {
- type:
- "input_image",
-
- image_url:
- imageDataUrl,
-
- detail:
- "high"
-
- }
-
- ]
-
- }
-
- ]
-
- });
-
- // -------------------------------------------------
- // RESPONSE
- // -------------------------------------------------
-
- const rawText =
- response.output_text ||
- "";
-
- console.log(
- "AMOUNT CROSS CHECK RESPONSE:",
- rawText
- );
-
- let cleaned =
- rawText
- .trim()
- .replace(
- /^```json/i,
- ""
- )
- .replace(
- /^```/i,
- ""
- )
- .replace(
- /```$/i,
- ""
- )
- .trim();
-
- const result =
- JSON.parse(
- cleaned
- );
-
- // -------------------------------------------------
- // GÜVENLİ SKOR
- // -------------------------------------------------
-
- let score =
- Number(
- result.score
- );
-
- if (
- !Number.isFinite(score)
- ) {
-
- score = 0;
-
- }
-
- score =
- Math.max(
- 0,
- Math.min(
- 100,
- Math.round(score)
- )
- );
-
- const suspicious =
- result.suspicious === true;
-
- console.log(
- "AMOUNT CROSS CHECK RESULT:",
- {
- score,
- suspicious,
- suspiciousCharacters:
- result.suspiciousCharacters
- }
- );
-
- console.log(
- "======================================"
- );
-
- return {
-
- suspicious,
-
- score,
-
- comparisons:
- Array.isArray(
- result.comparisons
- )
- ? result.comparisons
- : [],
-
- suspiciousCharacters:
- Array.isArray(
- result.suspiciousCharacters
- )
- ? result.suspiciousCharacters
- : [],
-
- evidence:
- result.evidence ||
- "Belge içi karakter karşılaştırması tamamlandı."
-
- };
-
- } catch (error) {
-
- console.error(
- "AMOUNT CROSS CHECK ERROR:",
- error
- );
-
- return {
-
- suspicious:
- false,
-
- score:
- 0,
-
- comparisons:
- [],
-
- suspiciousCharacters:
- [],
-
- evidence:
- "Belge içi karakter karşılaştırması gerçekleştirilemedi."
-
- };
-
- }
-
-}
-
-  
- // -------------------------------------------------
- // KARAKTER BİLGİLERİNİ MODELE HAZIRLA
- // -------------------------------------------------
-
- const characterInfo = amountCharacters
- .map((item, index) => ({
- index,
- char: item.char,
- x: item.x,
- y: item.y,
- width: item.width,
- height: item.height
- }));
-
- // -------------------------------------------------
- // OPENAI GÖRSEL ANALİZ
- // -------------------------------------------------
-
- const response = await openai.responses.create({
- model: "gpt-5-mini",
-
- input: [
- {
- role: "user",
-
- content: [
- {
- type: "input_text",
-
- text: `
-Sen belge ve finansal doküman görsellerindeki
-TUTAR ALANI KARAKTERLERİNİN GÖRSEL TUTARLILIĞINI
-inceleyen bir analiz sistemisin.
-
-ÇOK ÖNEMLİ:
-
-Buradaki amaç rakamların şekillerinin birbirine
-benzemesini kontrol etmek DEĞİLDİR.
-
-Örneğin:
-
-1250
-
-içindeki 1, 2, 5 ve 0 doğal olarak farklı şekillerdedir.
-Bunları şekilleri farklı diye şüpheli kabul etme.
-
-AMAÇ:
-
-Aynı tutar içerisindeki farklı rakamların aynı yazı
-tipi / font ailesi / baskı karakteristiği / dijital
-üretim karakteristiği ile yazılmış olup olmadığını
-incelemektir.
-
-Örneğin:
-
-1250 TL
-
-içerisinde 1, 2 ve 0 aynı font karakteristiğine sahipken
-5 belirgin şekilde farklı bir font veya yazım karakteristiği
-gösteriyorsa bunu tespit etmeye çalış.
-
-İNCELE:
-
-1. Karakter yüksekliği
-2. Karakter genişliği
-3. Stroke / çizgi kalınlığı
-4. Kenarların yumuşaklığı
-5. Anti-aliasing karakteristiği
-6. Piksel yoğunluğu
-7. Font ağırlığı
-8. Karakterlerin baseline hizası
-9. Karakterlerin dikey hizası
-10. Yazı tipi karakteristiği
-11. Baskı / render görünümü
-12. Aynı tutardaki diğer karakterlerle görsel tutarlılık
-
-ÖNEMLİ:
-
-Fotoğrafın çekim açısı, perspektif, ışık, JPEG sıkıştırması,
-bulanıklık veya ekran fotoğrafı kaynaklı bozulmaları
-font farklılığı olarak yorumlama.
-
-Tek başına küçük bir fark şüpheli değildir.
-
-Ancak bir karakter diğerlerinden belirgin biçimde farklı
-bir font/render/baskı karakteristiği gösteriyorsa
-şüpheli olarak işaretle.
-
-Karakter koordinatları:
-
-${JSON.stringify(characterInfo, null, 2)}
-
-SONUCU SADECE GEÇERLİ JSON OLARAK DÖNDÜR.
-
-Şu formatı kullan:
+},
 
 {
- "fontConsistent": true,
- "suspicious": false,
- "score": 0,
- "suspiciousCharacters": [],
- "comparisons": [
- {
- "char": "1",
- "index": 0,
- "consistency": 95,
- "reason": "Diğer karakterlerle aynı görsel yazım karakteristiğinde."
- }
- ],
- "evidence": "Tutar içerisindeki karakterlerin görsel yazım karakteristiği genel olarak tutarlı."
+
+type: "input_image",
+
+image_url: imageDataUrl,
+
+detail: "high"
+
 }
 
-SKOR:
+]
 
-0-20 = normal / çok düşük şüphe
-21-40 = düşük şüphe
-41-60 = orta şüphe
-61-80 = yüksek şüphe
-81-100 = çok yüksek şüphe
-
-Bir karakterin diğerlerinden farklı olması tek başına
-sahtecilik kanıtı değildir.
-
-Sadece görsel tutarsızlık tespit edildiğinde suspicious=true yap.
-`
- },
-
- {
- type: "input_image",
- image_url: imageDataUrl
- }
- ]
- }
- ]
- });
-
- // -------------------------------------------------
- // OPENAI CEVABI
- // -------------------------------------------------
-
- const rawText =
- response.output_text || "";
-
- console.log(
- "AMOUNT FONT AI RESPONSE:"
- );
-
- console.log(rawText);
-
- // -------------------------------------------------
- // JSON TEMİZLE
- // -------------------------------------------------
-
- let cleaned = rawText
- .trim()
- .replace(/^```json/i, "")
- .replace(/^```/i, "")
- .replace(/```$/i, "")
- .trim();
-
- let result;
-
- try {
- result = JSON.parse(cleaned);
- } catch (jsonError) {
-
- console.error(
- "AMOUNT FONT JSON PARSE ERROR:",
- jsonError
- );
-
- return {
- suspicious: false,
- score: 0,
- evidence:
- "Tutar karakterlerinin AI görsel analizi JSON olarak çözümlenemedi.",
- comparisons: []
- };
- }
-
- // -------------------------------------------------
- // GÜVENLİ SONUÇ
- // -------------------------------------------------
-
- const suspiciousCharacters =
- Array.isArray(result.suspiciousCharacters)
- ? result.suspiciousCharacters
- : [];
-
- const comparisons =
- Array.isArray(result.comparisons)
- ? result.comparisons
- : [];
-
- let score =
- Number(result.score);
-
- if (!Number.isFinite(score)) {
- score = 0;
- }
-
- score = Math.max(
- 0,
- Math.min(100, score)
- );
-
- const suspicious =
- result.suspicious === true ||
- suspiciousCharacters.length > 0;
-
- console.log(
- "AMOUNT FONT ANALYSIS RESULT:",
- {
- suspicious,
- score,
- suspiciousCharacters
- }
- );
-
- console.log(
- "======================================"
- );
-
- return {
- suspicious,
- score,
-
- fontConsistent:
- result.fontConsistent !== false,
-
- suspiciousCharacters,
-
- comparisons,
-
- evidence:
- result.evidence ||
- "Tutar karakterleri görsel olarak analiz edildi."
- };
-
- } catch (error) {
-
- console.error(
- "AMOUNT FONT ANALYSIS ERROR:"
- );
-
- console.error(error);
-
- return {
- suspicious: false,
- score: 0,
-
- fontConsistent: true,
-
- suspiciousCharacters: [],
-
- comparisons: [],
-
- evidence:
- "Tutar karakterlerinin görsel analizi gerçekleştirilemedi."
- };
- }
 }
 
+],
+
+text: {
+
+format: {
+
+type: "json_schema",
+
+name: "amount_character_cross_check",
+
+strict: true,
+
+schema: {
+
+type: "object",
+
+properties: {
+
+suspicious: {
+type: "boolean"
+},
+
+score: {
+type: "integer",
+minimum: 0,
+maximum: 100
+},
+
+comparisons: {
+
+type: "array",
+
+items: {
+
+type: "object",
+
+properties: {
+
+amountCharacter: {
+type: "string"
+},
+
+referenceFound: {
+type: "boolean"
+},
+
+referenceCount: {
+type: "integer"
+},
+
+consistency: {
+type: "integer",
+minimum: 0,
+maximum: 100
+},
+
+status: {
+type: "string",
+
+enum: [
+"consistent",
+"potentially_different",
+"unknown"
+]
+},
+
+reason: {
+type: "string"
+}
+
+},
+
+required: [
+"amountCharacter",
+"referenceFound",
+"referenceCount",
+"consistency",
+"status",
+"reason"
+],
+
+additionalProperties: false
+
+}
+
+},
+
+suspiciousCharacters: {
+
+type: "array",
+
+items: {
+type: "string"
+}
+
+},
+
+evidence: {
+type: "string"
+}
+
+},
+
+required: [
+"suspicious",
+"score",
+"comparisons",
+"suspiciousCharacters",
+"evidence"
+],
+
+additionalProperties: false
+
+}
+
+}
+
+}
+
+});
+
+
+const result =
+JSON.parse(
+response.output_text
+);
+
+
+let score =
+Number(result.score);
+
+if (
+!Number.isFinite(score)
+) {
+score = 0;
+}
+
+
+score =
+Math.max(
+0,
+Math.min(
+100,
+Math.round(score)
+)
+);
+
+
+return {
+
+suspicious:
+result.suspicious === true,
+
+score,
+
+comparisons:
+Array.isArray(
+result.comparisons
+)
+? result.comparisons
+: [],
+
+suspiciousCharacters:
+Array.isArray(
+result.suspiciousCharacters
+)
+? result.suspiciousCharacters
+: [],
+
+evidence:
+result.evidence ||
+"Belge içi karakter karşılaştırması tamamlandı."
+
+};
+
+
+} catch (error) {
+
+console.error(
+"AMOUNT CROSS CHECK ERROR:",
+error
+);
+
+
+return {
+
+suspicious: false,
+
+score: 0,
+
+comparisons: [],
+
+suspiciousCharacters: [],
+
+evidence:
+"Belge içi karakter karşılaştırması gerçekleştirilemedi."
+
+};
+
+}
+
+}
 // =====================================================
 // JSON RESPONSE
 // =====================================================
