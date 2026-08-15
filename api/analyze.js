@@ -5,6 +5,7 @@ import fs from "fs/promises";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
+import sharp from "sharp";
 
 const execFileAsync = promisify(execFile);
 
