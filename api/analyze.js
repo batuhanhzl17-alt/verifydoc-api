@@ -1049,6 +1049,8 @@ karakteristiğinin tutarlı olup olmadığıdır.
 8. Baseline hizalaması
 9. Dikey hizalama
 10. Genel font karakteristiği
+11. Aynı tutardaki diğer karakterlerle görsel tutarlılık
+
 
 Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması,
 bulanıklık ve görüntü kalitesi kaynaklı küçük farkları
