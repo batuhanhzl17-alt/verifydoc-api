@@ -1931,6 +1931,31 @@ base64,
 mime
 );
 
+// =====================================================
+// TUTAR KARAKTER / FONT ANALİZİ
+// =====================================================
+
+const amountCharacters =
+Array.isArray(amountLocation)
+? amountLocation
+: (
+amountLocation?.characters ||
+amountLocation?.results ||
+[]
+);
+
+const amountAnalysis =
+await analyzeAmountCharacters(
+base64,
+mime,
+amountCharacters
+);
+
+console.log(
+"AMOUNT FONT ANALYSIS:",
+amountAnalysis
+);
+  
  // -------------------------------------------------
  // OPENAI INPUT
  // -------------------------------------------------
@@ -2150,7 +2175,6 @@ console.log(
  return res
  .status(200)
  .json({
-
  success: true,
 
  fileName,
@@ -2159,7 +2183,16 @@ console.log(
 
  ...result,
 
-  amountLocation,
+ // ANA SKOR
+ score: finalScore,
+
+ // ANA ŞÜPHE DURUMU
+ suspicious: finalSuspicious,
+
+ // BİRLEŞTİRİLMİŞ KANIT
+ evidence: finalEvidence,
+
+ // TUTAR ANALİZİ
 
  });
 
@@ -2197,3 +2230,36 @@ console.log(
  }
 
 }
+// =====================================================
+// ANA SKOR + TUTAR FONT SKORU
+// =====================================================
+
+const originalScore =
+Number(result.score) || 0;
+
+const amountScore =
+Number(amountAnalysis.score) || 0;
+
+// Ana belge analizine %80,
+// tutar karakter analizine %20 ağırlık veriyoruz.
+
+const finalScore =
+Math.min(
+100,
+Math.round(
+originalScore * 0.80 +
+amountScore * 0.20
+)
+);
+
+const finalSuspicious =
+result.suspicious === true ||
+amountAnalysis.suspicious === true;
+
+const finalEvidence = [
+result.evidence,
+
+amountAnalysis.evidence
+]
+.filter(Boolean)
+.join(" | ");
