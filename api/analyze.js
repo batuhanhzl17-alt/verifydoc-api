@@ -967,6 +967,410 @@ async function analyzeAmountCharacters(
  amountCharacters.length
  );
 
+// =====================================================
+// TUTAR KARAKTERLERİ - BELGE İÇİ ÇAPRAZ KARŞILAŞTIRMA
+// =====================================================
+
+async function analyzeAmountCharacterCrossCheck(
+ base64,
+ mime,
+ amountCharacters
+) {
+
+ if (
+ !base64 ||
+ !amountCharacters ||
+ !amountCharacters.length
+ ) {
+
+ return {
+ suspicious: false,
+ score: 0,
+ evidence:
+ "Belge içi karakter karşılaştırması için yeterli veri bulunamadı.",
+ comparisons: []
+ };
+
+ }
+
+ try {
+
+ const imageDataUrl =
+ `data:${mime || "image/jpeg"};base64,${base64}`;
+
+ // -------------------------------------------------
+ // SADECE TUTARDAKİ KARAKTERLERİ HAZIRLA
+ // -------------------------------------------------
+
+ const amountInfo =
+ amountCharacters.map(
+ (item, index) => ({
+
+ index,
+
+ char:
+ item.char,
+
+ x:
+ item.x,
+
+ y:
+ item.y,
+
+ width:
+ item.width,
+
+ height:
+ item.height
+
+ })
+ );
+
+ console.log(
+ "======================================"
+ );
+
+ console.log(
+ "AMOUNT CHARACTER CROSS CHECK START"
+ );
+
+ console.log(
+ "AMOUNT CHARACTERS:",
+ amountInfo
+ );
+
+ // -------------------------------------------------
+ // AI GÖRSEL KARŞILAŞTIRMA
+ // -------------------------------------------------
+
+ const response =
+ await openai.responses.create({
+
+ model:
+ "gpt-5-mini",
+
+ input: [
+
+ {
+ role:
+ "user",
+
+ content: [
+
+ {
+ type:
+ "input_text",
+
+ text: `
+
+Sen belge adli inceleme sisteminin
+KARAKTER ÇAPRAZ KARŞILAŞTIRMA modülüsün.
+
+Gönderilen belgenin ANA İŞLEM TUTARINDA bulunan
+karakterleri, aynı belgede başka yerlerde bulunan
+aynı karakterlerle görsel olarak karşılaştır.
+
+AMAÇ:
+
+Örneğin ana işlem tutarı:
+
+1250 TL
+
+ise:
+
+1
+2
+5
+0
+
+karakterlerinin belgede başka yerlerde bulunan
+aynı karakterleri olup olmadığını araştır.
+
+Örneğin belgede başka bir yerde:
+
+"İşlem No: 5A..."
+veya
+"Referans: ...0..."
+
+gibi karakterler bulunuyorsa bunları referans olarak
+kullanabilirsin.
+
+ÇOK ÖNEMLİ:
+
+Bir karakteri sadece farklı bir rakam olduğu için
+şüpheli kabul etme.
+
+Örneğin:
+
+1 ile 2 doğal olarak farklı şekillerdedir.
+
+Buradaki amaç:
+
+"5 başka 5'lerle aynı font/görsel üretim karakteristiğinde mi?"
+
+sorusunu cevaplamaktır.
+
+HER KARAKTER İÇİN:
+
+1. Belgenin başka yerlerinde aynı karakteri ara.
+2. Varsa görsel olarak karşılaştır.
+3. Font görünümünü karşılaştır.
+4. Stroke kalınlığını karşılaştır.
+5. Karakter genişliğini karşılaştır.
+6. Karakter yüksekliğini karşılaştır.
+7. Kenar yumuşaklığını karşılaştır.
+8. Anti-aliasing görünümünü karşılaştır.
+9. Piksel/render karakteristiğini karşılaştır.
+10. Baseline ve hizalamayı karşılaştır.
+
+ÖNEMLİ:
+
+Belgenin fotoğraf olması,
+JPEG sıkıştırması,
+perspektif,
+ışık,
+bulanıklık,
+tarama kalitesi
+
+gibi faktörleri dikkate al.
+
+Bunlardan kaynaklanabilecek küçük farklılıkları
+sahtecilik olarak değerlendirme.
+
+Aynı karakterin başka bir yerde bulunmaması
+şüpheli değildir.
+
+Yeterli referans bulunmuyorsa:
+
+consistency = "unknown"
+
+kullan.
+
+Ana işlem tutarındaki karakter bilgileri:
+
+${JSON.stringify(
+ amountInfo,
+ null,
+ 2
+)}
+
+SADECE GEÇERLİ JSON DÖNDÜR.
+
+JSON FORMAT:
+
+{
+ "suspicious": false,
+ "score": 0,
+ "comparisons": [],
+ "suspiciousCharacters": [],
+ "evidence": ""
+}
+
+comparisons içerisinde:
+
+{
+ "amountCharacter": "5",
+ "referenceFound": true,
+ "referenceCount": 3,
+ "consistency": 94,
+ "status": "consistent",
+ "reason": "Tutar içerisindeki 5 karakteri belgede bulunan diğer 5 karakterleriyle görsel olarak tutarlı."
+}
+
+status sadece:
+
+"consistent"
+"potentially_different"
+"unknown"
+
+olabilir.
+
+SKOR:
+
+0-20:
+Belge içi karakterler tutarlı.
+
+21-40:
+Küçük farklılıklar.
+
+41-60:
+Orta düzey farklılık.
+
+61-80:
+Belirgin karakter farklılığı.
+
+81-100:
+Çok güçlü karakter tutarsızlığı.
+
+ÖNEMLİ:
+
+Tek bir karakter farklılığı kesin sahtecilik anlamına gelmez.
+
+SADECE GERÇEKTEN GÖRSEL OLARAK BELİRGİN BİR
+TUTARSIZLIK VARSA suspicious=true yap.
+
+`unknown` olan karakterleri şüpheli olarak değerlendirme.
+
+Tüm açıklamalar TÜRKÇE olmalıdır.
+
+`
+ },
+
+ {
+ type:
+ "input_image",
+
+ image_url:
+ imageDataUrl,
+
+ detail:
+ "high"
+
+ }
+
+ ]
+
+ }
+
+ ]
+
+ });
+
+ // -------------------------------------------------
+ // RESPONSE
+ // -------------------------------------------------
+
+ const rawText =
+ response.output_text ||
+ "";
+
+ console.log(
+ "AMOUNT CROSS CHECK RESPONSE:",
+ rawText
+ );
+
+ let cleaned =
+ rawText
+ .trim()
+ .replace(
+ /^```json/i,
+ ""
+ )
+ .replace(
+ /^```/i,
+ ""
+ )
+ .replace(
+ /```$/i,
+ ""
+ )
+ .trim();
+
+ const result =
+ JSON.parse(
+ cleaned
+ );
+
+ // -------------------------------------------------
+ // GÜVENLİ SKOR
+ // -------------------------------------------------
+
+ let score =
+ Number(
+ result.score
+ );
+
+ if (
+ !Number.isFinite(score)
+ ) {
+
+ score = 0;
+
+ }
+
+ score =
+ Math.max(
+ 0,
+ Math.min(
+ 100,
+ Math.round(score)
+ )
+ );
+
+ const suspicious =
+ result.suspicious === true;
+
+ console.log(
+ "AMOUNT CROSS CHECK RESULT:",
+ {
+ score,
+ suspicious,
+ suspiciousCharacters:
+ result.suspiciousCharacters
+ }
+ );
+
+ console.log(
+ "======================================"
+ );
+
+ return {
+
+ suspicious,
+
+ score,
+
+ comparisons:
+ Array.isArray(
+ result.comparisons
+ )
+ ? result.comparisons
+ : [],
+
+ suspiciousCharacters:
+ Array.isArray(
+ result.suspiciousCharacters
+ )
+ ? result.suspiciousCharacters
+ : [],
+
+ evidence:
+ result.evidence ||
+ "Belge içi karakter karşılaştırması tamamlandı."
+
+ };
+
+ } catch (error) {
+
+ console.error(
+ "AMOUNT CROSS CHECK ERROR:",
+ error
+ );
+
+ return {
+
+ suspicious:
+ false,
+
+ score:
+ 0,
+
+ comparisons:
+ [],
+
+ suspiciousCharacters:
+ [],
+
+ evidence:
+ "Belge içi karakter karşılaştırması gerçekleştirilemedi."
+
+ };
+
+ }
+
+}
+
+  
  // -------------------------------------------------
  // KARAKTER BİLGİLERİNİ MODELE HAZIRLA
  // -------------------------------------------------
@@ -1955,6 +2359,23 @@ console.log(
 "AMOUNT FONT ANALYSIS:",
 amountAnalysis
 );
+
+// =====================================================
+// BELGE İÇİ AYNI KARAKTER ÇAPRAZ ANALİZİ
+// =====================================================
+
+const amountCharacterCrossCheck =
+await analyzeAmountCharacterCrossCheck(
+base64,
+mime,
+amountLocation?.characters || []
+);
+
+console.log(
+"AMOUNT CHARACTER CROSS CHECK:",
+amountCharacterCrossCheck
+);
+
   
  // -------------------------------------------------
  // OPENAI INPUT
