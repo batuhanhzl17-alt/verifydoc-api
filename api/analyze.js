@@ -1738,7 +1738,7 @@ export default async function handler(
  req,
  res
 ) {
-
+let result ;
  // ---------------------------------------------------
  // CORS
  // ---------------------------------------------------
@@ -2152,7 +2152,7 @@ console.log(
  // PARSE
  // -------------------------------------------------
 
- const result =
+result =
  parseAIResponse(
  response.output_text
  );
