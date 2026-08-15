@@ -2156,6 +2156,45 @@ console.log(
  parseAIResponse(
  response.output_text
  );
+// =====================================================
+// ANA SKOR + TUTAR FONT SKORU
+// =====================================================
+
+const originalScore =
+Number(result.score) || 0;
+
+const amountScore =
+Number(amountAnalysis?.score) || 0;
+
+const finalScore =
+Math.min(
+100,
+Math.round(
+originalScore * 0.80 +
+amountScore * 0.20
+)
+);
+
+const finalSuspicious =
+result.suspicious === true ||
+amountAnalysis?.suspicious === true;
+
+const finalEvidence = [
+result.evidence,
+amountAnalysis?.evidence
+]
+.filter(Boolean)
+.join(" | ");
+
+console.log(
+"FINAL SCORE:",
+finalScore
+);
+
+console.log(
+"AMOUNT FONT SCORE:",
+amountScore
+);
 
 
  console.log(
