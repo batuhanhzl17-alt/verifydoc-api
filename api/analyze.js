@@ -2152,8 +2152,8 @@ console.log(
  // PARSE
  // -------------------------------------------------
 
-result =
-const parseAIResponse(
+const result =
+parseAIResponse(
  response.output_text
  );
 // =====================================================
