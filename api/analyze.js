@@ -1152,7 +1152,7 @@ ${JSON.stringify(
  null,
  2
 )}
-'
+
 
 SADECE GEÇERLİ JSON DÖNDÜR.
 
@@ -2344,7 +2344,6 @@ Array.isArray(amountLocation)
 ? amountLocation
 : (
 amountLocation?.characters ||
-amountLocation?.results ||
 []
 );
 
