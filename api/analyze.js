@@ -717,264 +717,479 @@ count,
 // =====================================================
 
 async function analyzeAmountCharacters(
-base64,
-mime,
-amountCharacters
+ base64,
+ mime,
+ amountCharacters
 ) {
 
-if (
-!base64 ||
-!amountCharacters ||
-!amountCharacters.length
-) {
+ if (
+ !base64 ||
+ !amountCharacters ||
+ !amountCharacters.length
+ ) {
 
-return {
-suspicious: false,
-score: 0,
-evidence:
-"Tutar karakterleri için yeterli görüntü verisi bulunamadı.",
-};
+ return {
+ suspicious: false,
+ score: 0,
+ evidence:
+ "Tutar karakterleri için yeterli görüntü verisi bulunamadı.",
+ };
+
+ }
+
+ try {
+
+ const imageBuffer =
+ Buffer.from(
+ base64,
+ "base64"
+ );
+
+ // -------------------------------------------------
+ // GERÇEK GÖRÜNTÜ BOYUTLARINI AL
+ // -------------------------------------------------
+
+ const metadata =
+ await sharp(imageBuffer).metadata();
+
+ const imageWidth =
+ metadata.width;
+
+ const imageHeight =
+ metadata.height;
+
+ if (
+ !imageWidth ||
+ !imageHeight
+ ) {
+
+ throw new Error(
+ "Görüntü boyutları alınamadı."
+ );
+
+ }
+
+ console.log(
+ "AMOUNT IMAGE SIZE:",
+ imageWidth,
+ "x",
+ imageHeight
+ );
+
+ const results = [];
+
+ // -------------------------------------------------
+ // KARAKTERLERİ GERÇEK PİKSELE ÇEVİR
+ // -------------------------------------------------
+
+ for (
+ const character of amountCharacters
+ ) {
+
+ if (
+ !character ||
+ typeof character.x !== "number" ||
+ typeof character.y !== "number" ||
+ typeof character.width !== "number" ||
+ typeof character.height !== "number"
+ ) {
+
+ continue;
+
+ }
+
+ // GPT koordinatları 0-1000 arası.
+ // Gerçek piksel koordinatına çeviriyoruz.
+
+ let x =
+ Math.round(
+ (character.x / 1000) *
+ imageWidth
+ );
+
+ let y =
+ Math.round(
+ (character.y / 1000) *
+ imageHeight
+ );
+
+ let width =
+ Math.round(
+ (character.width / 1000) *
+ imageWidth
+ );
+
+ let height =
+ Math.round(
+ (character.height / 1000) *
+ imageHeight
+ );
+
+ // -------------------------------------------------
+ // PADDING
+ // -------------------------------------------------
+
+ const padding = 5;
+
+ x -= padding;
+ y -= padding;
+
+ width +=
+ padding * 2;
+
+ height +=
+ padding * 2;
+
+ // -------------------------------------------------
+ // SINIRLARI KORU
+ // -------------------------------------------------
+
+ x =
+ Math.max(
+ 0,
+ Math.min(
+ x,
+ imageWidth - 1
+ )
+ );
+
+ y =
+ Math.max(
+ 0,
+ Math.min(
+ y,
+ imageHeight - 1
+ )
+ );
+
+ width =
+ Math.max(
+ 1,
+ Math.min(
+ width,
+ imageWidth - x
+ )
+ );
+
+ height =
+ Math.max(
+ 1,
+ Math.min(
+ height,
+ imageHeight - y
+ )
+ );
+
+ try {
+
+ const glyphBuffer =
+ await sharp(imageBuffer)
+ .extract({
+ left: x,
+ top: y,
+ width,
+ height,
+ })
+ .resize(
+ 48,
+ 64,
+ {
+ fit: "contain",
+ background: {
+ r: 255,
+ g: 255,
+ b: 255,
+ alpha: 1,
+ },
+ }
+ )
+ .grayscale()
+ .raw()
+ .toBuffer();
+
+ results.push({
+
+ char:
+ character.char,
+
+ buffer:
+ glyphBuffer,
+
+ x,
+ y,
+ width,
+ height,
+
+ });
+
+ } catch (cropError) {
+
+ console.error(
+ "GLYPH CROP ERROR:",
+ cropError
+ );
+
+ }
+
+ }
+
+ // -------------------------------------------------
+ // YETERLİ KARAKTER VAR MI?
+ // -------------------------------------------------
+
+ if (
+ results.length < 2
+ ) {
+
+ return {
+ suspicious: false,
+ score: 0,
+ evidence:
+ "Karakter karşılaştırması için yeterli görüntü bulunamadı.",
+ };
+
+ }
+
+ // -------------------------------------------------
+ // AYNI KARAKTERLERİ GRUPLA
+ // -------------------------------------------------
+
+ const groups = {};
+
+ for (
+ const item of results
+ ) {
+
+ const key =
+ item.char;
+
+ if (!groups[key]) {
+ groups[key] = [];
+ }
+
+ groups[key].push(item);
+
+ }
+
+ const comparisons = [];
+
+ // -------------------------------------------------
+ // AYNI RAKAMLARI KARŞILAŞTIR
+ // -------------------------------------------------
+
+ for (
+ const char of Object.keys(groups)
+ ) {
+
+ const group =
+ groups[char];
+
+ // Aynı karakter en az 2 kere
+ // bulunuyorsa karşılaştır.
+
+ if (
+ group.length < 2
+ ) {
+
+ continue;
+
+ }
+
+ for (
+ let i = 0;
+ i < group.length;
+ i++
+ ) {
+
+ for (
+ let j = i + 1;
+ j < group.length;
+ j++
+ ) {
+
+ const a =
+ group[i].buffer;
+
+ const b =
+ group[j].buffer;
+
+ const length =
+ Math.min(
+ a.length,
+ b.length
+ );
+
+ if (!length) {
+ continue;
+ }
+
+ let difference = 0;
+
+ let squaredDifference = 0;
+
+ for (
+ let k = 0;
+ k < length;
+ k++
+ ) {
+
+ const diff =
+ Math.abs(
+ a[k] - b[k]
+ );
+
+ difference += diff;
+
+ squaredDifference +=
+ diff * diff;
+
+ }
+
+ const averageDifference =
+ difference /
+ length;
+
+ const rmsDifference =
+ Math.sqrt(
+ squaredDifference /
+ length
+ );
+
+ comparisons.push({
+
+ char,
+
+ difference:
+ Number(
+ averageDifference.toFixed(2)
+ ),
+
+ rms:
+ Number(
+ rmsDifference.toFixed(2)
+ ),
+
+ firstPosition: {
+ x: group[i].x,
+ y: group[i].y,
+ },
+
+ secondPosition: {
+ x: group[j].x,
+ y: group[j].y,
+ },
+
+ });
+
+ }
+
+ }
+
+ }
+
+ // -------------------------------------------------
+ // AYNI RAKAM BULUNAMADI
+ // -------------------------------------------------
+
+ if (
+ !comparisons.length
+ ) {
+
+ return {
+ suspicious: false,
+ score: 0,
+ evidence:
+ "Tutar içerisinde karşılaştırılabilecek aynı rakam bulunamadı.",
+ comparisons: [],
+ };
+
+ }
+
+ console.log(
+ "AMOUNT CHARACTER COMPARISONS:",
+ comparisons
+ );
+
+ // -------------------------------------------------
+ // BELİRGİN FARKLILIK
+ // -------------------------------------------------
+
+ const suspiciousComparisons =
+ comparisons.filter(
+ (item) =>
+ item.difference > 42 ||
+ item.rms > 58
+ );
+
+ // -------------------------------------------------
+ // SKOR
+ // -------------------------------------------------
+
+ let score = 0;
+
+ if (
+ suspiciousComparisons.length === 1
+ ) {
+
+ score = 45;
+
+ } else if (
+ suspiciousComparisons.length === 2
+ ) {
+
+ score = 65;
+
+ } else if (
+ suspiciousComparisons.length >= 3
+ ) {
+
+ score = 85;
+
+ }
+
+ // -------------------------------------------------
+ // SONUÇ
+ // -------------------------------------------------
+
+ return {
+
+ suspicious:
+ suspiciousComparisons.length > 0,
+
+ score,
+
+ evidence:
+ suspiciousComparisons.length
+ ? `Tutar alanında aynı rakamlar arasında ${suspiciousComparisons.length} adet belirgin görsel farklılık tespit edildi. Bu durum farklı font, karakter yapısı veya sonradan eklenmiş/değiştirilmiş karakter ihtimalini gösterebilir.`
+ : "Tutar alanındaki aynı rakamların görsel yapısı genel olarak tutarlı.",
+
+ comparisons,
+
+ };
+
+ } catch (error) {
+
+ console.error(
+ "AMOUNT CHARACTER ANALYSIS ERROR:",
+ error
+ );
+
+ return {
+
+ suspicious: false,
+
+ score: 0,
+
+ evidence:
+ "Tutar karakterlerinin görsel analizi gerçekleştirilemedi.",
+
+ };
+
+ }
 
 }
 
-try {
 
-const imageBuffer =
-Buffer.from(
-base64,
-"base64"
-);
-
-const results = [];
-
-for (
-const character of amountCharacters
-) {
-
-if (
-!character ||
-typeof character.x !== "number" ||
-typeof character.y !== "number" ||
-typeof character.width !== "number" ||
-typeof character.height !== "number"
-) {
-
-continue;
-
-}
-
-const padding = 3;
-
-const left =
-Math.max(
-0,
-Math.floor(
-character.x - padding
-)
-);
-
-const top =
-Math.max(
-0,
-Math.floor(
-character.y - padding
-)
-);
-
-const width =
-Math.max(
-1,
-Math.floor(
-character.width + padding * 2
-)
-);
-
-const height =
-Math.max(
-1,
-Math.floor(
-character.height + padding * 2
-)
-);
-
-const glyphBuffer =
-await sharp(imageBuffer)
-.extract({
-left,
-top,
-width,
-height,
-})
-.resize(
-32,
-48,
-{
-fit: "contain",
-background: {
-r: 255,
-g: 255,
-b: 255,
-alpha: 1,
-},
-}
-)
-.grayscale()
-.raw()
-.toBuffer();
-
-results.push({
-char: character.char,
-buffer: glyphBuffer,
-});
-
-}
-
-if (
-results.length < 2
-) {
-
-return {
-suspicious: false,
-score: 0,
-evidence:
-"Karakter karşılaştırması için yeterli görüntü bulunamadı.",
-};
-
-}
-
-const comparisons = [];
-
-for (
-let i = 0;
-i < results.length;
-i++
-) {
-
-for (
-let j = i + 1;
-j < results.length;
-j++
-) {
-
-if (
-results[i].char !==
-results[j].char
-) {
-
-continue;
-
-}
-
-const a =
-results[i].buffer;
-
-const b =
-results[j].buffer;
-
-const length =
-Math.min(
-a.length,
-b.length
-);
-
-let difference = 0;
-
-for (
-let k = 0;
-k < length;
-k++
-) {
-
-difference +=
-Math.abs(
-a[k] - b[k]
-);
-
-}
-
-const averageDifference =
-difference /
-length;
-
-comparisons.push({
-
-char:
-results[i].char,
-
-difference:
-Number(
-averageDifference.toFixed(2)
-),
-
-});
-
-}
-
-}
-
-if (
-!comparisons.length
-) {
-
-return {
-suspicious: false,
-score: 0,
-evidence:
-"Tutar içerisinde karşılaştırılabilecek aynı rakam bulunamadı.",
-};
-
-}
-
-const suspiciousComparisons =
-comparisons.filter(
-(item) =>
-item.difference > 35
-);
-
-const score =
-Math.min(
-100,
-suspiciousComparisons.length *
-25
-);
-
-return {
-
-suspicious:
-suspiciousComparisons.length > 0,
-
-score,
-
-evidence:
-suspiciousComparisons.length
-? `Tutar alanında ${suspiciousComparisons.length} adet aynı rakam arasında belirgin görsel farklılık tespit edildi.`
-: "Tutar alanındaki aynı rakamların görsel yapısı genel olarak tutarlı.",
-
-comparisons,
-
-};
-
-} catch (error) {
-
-console.error(
-"AMOUNT CHARACTER ANALYSIS ERROR:",
-error
-);
-
-return {
-
-suspicious: false,
-
-score: 0,
-
-evidence:
-"Karakter görüntü analizi gerçekleştirilemedi.",
-
-};
-
-}
-
-}
 
 // =====================================================
 // JSON RESPONSE
