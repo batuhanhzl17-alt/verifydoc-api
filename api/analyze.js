@@ -1494,7 +1494,7 @@ amountInfo,
 null,
 2
 )}
-`
+
 
 SADECE GEÇERLİ JSON DÖNDÜR.
 
