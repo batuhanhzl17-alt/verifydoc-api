@@ -2269,36 +2269,3 @@ console.log(
  }
 
 }
-// =====================================================
-// ANA SKOR + TUTAR FONT SKORU
-// =====================================================
-
-const originalScore =
-Number(result.score) || 0;
-
-const amountScore =
-Number(amountAnalysis?.score) || 0;
-
-// Ana belge analizine %80,
-// tutar karakter analizine %20 ağırlık veriyoruz.
-
-const finalScore =
-Math.min(
-100,
-Math.round(
-originalScore * 0.80 +
-amountScore * 0.20
-)
-);
-
-const finalSuspicious =
-result.suspicious === true ||
-amountAnalysis?.suspicious === true;
-
-const finalEvidence = [
-result.evidence,
-
-amountAnalysis?.evidence
-]
-.filter(Boolean)
-.join(" | ");
