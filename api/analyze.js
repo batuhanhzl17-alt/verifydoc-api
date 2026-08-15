@@ -2153,7 +2153,7 @@ console.log(
  // -------------------------------------------------
 
 result =
- parseAIResponse(
+const parseAIResponse(
  response.output_text
  );
 // =====================================================
@@ -2277,7 +2277,7 @@ const originalScore =
 Number(result.score) || 0;
 
 const amountScore =
-Number(amountAnalysis.score) || 0;
+Number(amountAnalysis?.score) || 0;
 
 // Ana belge analizine %80,
 // tutar karakter analizine %20 ağırlık veriyoruz.
@@ -2293,12 +2293,12 @@ amountScore * 0.20
 
 const finalSuspicious =
 result.suspicious === true ||
-amountAnalysis.suspicious === true;
+amountAnalysis?.suspicious === true;
 
 const finalEvidence = [
 result.evidence,
 
-amountAnalysis.evidence
+amountAnalysis?.evidence
 ]
 .filter(Boolean)
 .join(" | ");
