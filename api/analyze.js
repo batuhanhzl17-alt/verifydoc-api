@@ -2637,7 +2637,7 @@ olarak değerlendirme.
 
 Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
 artırma. 
-`+
+
 Filename: ${fileName}`,
  },
 
