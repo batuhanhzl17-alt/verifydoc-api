@@ -1127,7 +1127,8 @@ karakteristiğinin tutarlı olup olmadığıdır.
 8. Baseline hizalaması
 9. Dikey hizalama
 10. Genel font karakteristiği
-11. Aynı tutardaki diğer karakterlerle görsel tutarlılık
+11. Aynı tutardaki diğer karakterlerle görsel tutarlılık 
+12.Gönderilen tutar ve vergiler toplamı toplam tutarla aynı mı kontrol edilsin
 
 
 Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması,
