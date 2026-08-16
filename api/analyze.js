@@ -2596,6 +2596,8 @@ amountCharacterCrossCheck
  // -------------------------------------------------
  // OPENAI INPUT
  // -------------------------------------------------
+const imageDataUrl =
+`data:${mime};base64,${base64}`;
 
  let content;
 
@@ -2608,8 +2610,6 @@ amountCharacterCrossCheck
  type === "image"
  ) {
 
- const imageDataUrl =
- `data:${mime};base64,${base64}`;
 
 
  content = [
