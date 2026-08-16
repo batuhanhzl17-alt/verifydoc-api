@@ -2591,7 +2591,7 @@ console.log(
 "AMOUNT CHARACTER CROSS CHECK:",
 amountCharacterCrossCheck
 );
-
+}
   
  // -------------------------------------------------
  // OPENAI INPUT
@@ -2637,8 +2637,8 @@ Referansla birebir aynı olmamasını tek başına sahtecilik kanıtı
 olarak değerlendirme.
 
 Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
-artırma. `
-
+artırma. 
+`+
  `\n\nFilename: ${fileName}`,
  },
 
