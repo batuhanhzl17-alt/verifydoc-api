@@ -2778,13 +2778,12 @@ ${fileName}
 },
 
 {
-type: "input_image",
+type: "input_file",
 
-image_url:
-imageDataUrl,
+ filename: fileName,
 
-detail: "auto",
-},
+ file_data: pdfDataUrl,
+ },
 
 ...(reference?.base64
 ? [
