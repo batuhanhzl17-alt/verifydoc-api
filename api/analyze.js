@@ -2672,35 +2672,8 @@ Filename: ${fileName}`,
  {
  type: "input_text",
 
- text: `${PROMPT} 
- 
-  `
-=====================================================
-REFERANS DEKONT
-=====================================================
+ text: PROMPT,
 
-Bu analizde ayrıca bir referans dekont sağlanmıştır.
-
-Referans dekont:
-${reference?.fileName || "Referans bulunamadı"}
-
-Referans dekont SADECE görsel ve yapısal karşılaştırma amacıyla
-kullanılmalıdır.
-
-Referans ile analiz edilen dekont arasındaki farklılıkları otomatik
-olarak sahtecilik kabul etme.
-
-Bankaların farklı uygulama sürümleri, web/mobil kanalları, işlem
-türleri ve belge versiyonları olabilir.
-
-Sadece referans ile analiz edilen belge arasında gerçekten anlamlı,
-bağımsız ve görsel olarak desteklenen tutarsızlıklar varsa risk artır.
-
-Referans belgedeki kişisel veya finansal bilgileri analiz edilen
-belgenin gerçekliği için kanıt olarak kullanma.
-
-
-Filename: ${fileName}`,
  },
 
  {
