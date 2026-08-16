@@ -2672,12 +2672,12 @@ Filename: ${fileName}`,
  {
  type: "input_text",
 
- text: `$ {PROMPT} 
+ text: `${PROMPT} 
  
   `
- //  =====================================================
+=====================================================
 REFERANS DEKONT
-// =====================================================
+=====================================================
 
 Bu analizde ayrıca bir referans dekont sağlanmıştır.
 
@@ -2697,7 +2697,7 @@ Sadece referans ile analiz edilen belge arasında gerçekten anlamlı,
 bağımsız ve görsel olarak desteklenen tutarsızlıklar varsa risk artır.
 
 Referans belgedeki kişisel veya finansal bilgileri analiz edilen
-belgenin gerçekliği için kanıt olarak kullanma. `
+belgenin gerçekliği için kanıt olarak kullanma.
 
 
 Filename: ${fileName}`,
