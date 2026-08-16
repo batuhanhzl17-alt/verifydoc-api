@@ -2491,9 +2491,49 @@ const startTime = Date.now();
  );
 
 
- const mime =
- uploadedFile.mimetype ||
- "application/octet-stream";
+ let mime = uploadedFile.mimetype;
+
+if (
+type === "image" &&
+(!mime || !mime.startsWith("image/"))
+) {
+const extension =
+path.extname(fileName).toLowerCase();
+
+if (extension === ".png") {
+mime = "image/png";
+} else if (
+extension === ".webp"
+) {
+mime = "image/webp";
+} else if (
+extension === ".jpg" ||
+extension === ".jpeg"
+) {
+mime = "image/jpeg";
+} else {
+mime = "image/jpeg";
+}
+}
+
+if (
+type === "pdf" &&
+(!mime || !mime.includes("pdf"))
+) {
+mime = "application/pdf";
+}
+
+if (
+type === "video" &&
+(!mime || !mime.startsWith("video/"))
+) {
+mime = "video/mp4";
+}
+
+console.log(
+"FINAL MIME:",
+mime
+);
 
   // =====================================================
 // REFERANS DEKONT
