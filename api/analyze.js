@@ -2628,6 +2628,22 @@ Bu analizde ayrıca bir referans dekont sağlanmıştır.
 Referans:
 ${reference?.fileName || "Referans bulunamadı"}
 
+Referans dekontu, analiz edilen dekont ile:
+
+- belge şablonu
+- yerleşim
+- tipografi
+- font görünümü
+- alan düzeni
+- logo
+- tarih biçimi
+- tutar biçimi
+- IBAN biçimi
+- genel görsel yapı
+
+açısından karşılaştır.
+
+
 Referansı belge şablonu, yerleşim, tipografi, alan düzeni,
 logo, tarih, tutar, IBAN biçimi ve genel görsel yapı açısından
 karşılaştırma amacıyla kullan.
@@ -2637,6 +2653,8 @@ olarak değerlendirme.
 
 Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
 artırma. 
+Referans dekontun kendisini analiz edilen dekontun
+gerçekliği için kesin kanıt olarak kabul etme.
 
 Filename: ${fileName}`,
  },
@@ -2668,28 +2686,81 @@ Filename: ${fileName}`,
 
 
  content = [
+{
+type: "input_text",
 
- {
- type: "input_text",
+text: `${PROMPT}
 
- text: PROMPT,
+=====================================================
+REFERANS DEKONT
+=====================================================
 
- },
+Bu analizde ayrıca bir referans dekont sağlanmıştır.
 
- {
- type: "input_file",
+Referans dosya:
+${reference?.fileName || "Referans bulunamadı"}
 
- filename: fileName,
+Referans dekontu, analiz edilen dekont ile:
 
- file_data:
- pdfDataUrl,
+- belge şablonu
+- yerleşim
+- tipografi
+- font görünümü
+- alan düzeni
+- logo
+- tarih biçimi
+- tutar biçimi
+- IBAN biçimi
+- genel görsel yapı
 
- },
+açısından karşılaştır.
 
- ];
+ÇOK ÖNEMLİ:
 
- }
+Referans ile analiz edilen dekontun birebir aynı olması
+beklenmemektedir.
 
+Farklı uygulama sürümleri, web/mobil bankacılık,
+işlem türleri ve belge versiyonları olabilir.
+
+Bu nedenle tek bir farklılığı sahtecilik kanıtı olarak
+değerlendirme.
+
+Birden fazla bağımsız ve anlamlı tutarsızlık varsa
+risk değerlendirmesine dahil et.
+
+Referans dekontun kendisini analiz edilen dekontun
+gerçekliği için kesin kanıt olarak kabul etme.
+
+Filename:
+${fileName}
+`,
+},
+
+{
+type: "input_image",
+
+image_url:
+imageDataUrl,
+
+detail: "auto",
+},
+
+...(reference?.base64
+? [
+{
+type: "input_file",
+
+filename:
+reference.fileName,
+
+file_data:
+`data:application/pdf;base64,${reference.base64}`,
+},
+]
+: []),
+];
+  
 // =================================================
 // VIDEO
 // =================================================
