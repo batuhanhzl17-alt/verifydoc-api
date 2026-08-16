@@ -2507,6 +2507,44 @@ console.log(
  "REFERENCE:",
  reference?.fileName || "YOK"
 );
+
+// =====================================================
+// TUTAR KARAKTER ANALİZİ
+// =====================================================
+
+let amountLocation = null;
+
+let amountCharacters = [];
+
+let amountAnalysis = {
+ suspicious: false,
+ score: 0,
+ fontConsistent: true,
+ suspiciousCharacters: [],
+ comparisons: [],
+ evidence:
+ "Tutar karakter analizi bu dosya türünde çalıştırılmadı."
+};
+
+let amountCharacterCrossCheck = {
+ suspicious: false,
+ score: 0,
+ comparisons: [],
+ suspiciousCharacters: [],
+ evidence:
+ "Belge içi karakter karşılaştırması bu dosya türünde çalıştırılmadı."
+};
+
+
+// =====================================================
+// SADECE IMAGE İÇİN
+// =====================================================
+
+if (type === "image") {
+
+ console.log(
+ "IMAGE AMOUNT ANALYSIS START"
+ );
   
 // ANA TUTARIN KARAKTER KOORDİNATLARINI BUL
 const amountLocation = await locateAmountCharacters(
@@ -2807,7 +2845,7 @@ parseAIResponse(
 // =====================================================
 
 const originalScore =
-Number(result.score) || 0;
+Number(result.overallRisk) || 0;
 
 const amountScore =
 Number(amountAnalysis?.score) || 0;
@@ -2822,11 +2860,10 @@ amountScore * 0.20
 );
 
 const finalSuspicious =
-result.suspicious === true ||
-amountAnalysis?.suspicious === true;
+amountAnalysis?.suspicious === true ||
+originalScore >=46;
 
 const finalEvidence = [
-result.evidence,
 amountAnalysis?.evidence
 ]
 .filter(Boolean)
