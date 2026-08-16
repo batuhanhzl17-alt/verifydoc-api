@@ -2618,8 +2618,8 @@ amountCharacterCrossCheck
  type: "input_text",
 
  text:
- PROMPT +
-   `
+`${PROMPT}
+   
   =====================================================
 REFERANS DEKONT
 =====================================================
@@ -2674,7 +2674,7 @@ artırma.
  type: "input_text",
 
  text:
- PROMPT +
+ `$ {PROMPT} 
  
   `
   // =====================================================
