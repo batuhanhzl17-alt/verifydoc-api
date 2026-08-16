@@ -2547,7 +2547,7 @@ if (type === "image") {
  );
   
 // ANA TUTARIN KARAKTER KOORDİNATLARINI BUL
-const amountLocation = await locateAmountCharacters(
+ amountLocation = await locateAmountCharacters(
 base64,
 mime
 );
@@ -2564,7 +2564,7 @@ amountLocation?.characters ||
 []
 );
 
-const amountAnalysis =
+ amountAnalysis =
 await analyzeAmountCharacters(
 base64,
 mime,
@@ -2580,7 +2580,7 @@ amountAnalysis
 // BELGE İÇİ AYNI KARAKTER ÇAPRAZ ANALİZİ
 // =====================================================
 
-const amountCharacterCrossCheck =
+ amountCharacterCrossCheck =
 await analyzeAmountCharacterCrossCheck(
 base64,
 mime,
