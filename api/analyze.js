@@ -2581,6 +2581,7 @@ amountCharacterCrossCheck
 
  text:
  PROMPT +
+   `
   =====================================================
 REFERANS DEKONT
 =====================================================
@@ -2598,7 +2599,7 @@ Referansla birebir aynı olmamasını tek başına sahtecilik kanıtı
 olarak değerlendirme.
 
 Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
-artırma.
+artırma. `
 
  `\n\nFilename: ${fileName}`,
  },
@@ -2636,6 +2637,8 @@ artırma.
 
  text:
  PROMPT +
+ 
+  `
   // =====================================================
 REFERANS DEKONT
 // =====================================================
@@ -2658,7 +2661,8 @@ Sadece referans ile analiz edilen belge arasında gerçekten anlamlı,
 bağımsız ve görsel olarak desteklenen tutarsızlıklar varsa risk artır.
 
 Referans belgedeki kişisel veya finansal bilgileri analiz edilen
-belgenin gerçekliği için kanıt olarak kullanma.
+belgenin gerçekliği için kanıt olarak kullanma. `
+
 
  `\n\nFilename: ${fileName}`,
  },
