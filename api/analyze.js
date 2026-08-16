@@ -1,14 +1,92 @@
 import OpenAI from "openai";
 import formidable from "formidable";
 import fs from "fs/promises";
-
+import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
 
 const execFileAsync = promisify(execFile);
+const REFERENCE_DIR =
+path.join(process.cwd(), "references");
 
+const REFERENCE_MAP = {
+akbank: "akbank.pdf",
+};
+
+function getReferenceFile(bank) {
+
+if (!bank) {
+return null;
+}
+
+const key =
+bank
+.toLowerCase()
+.trim()
+.replace(/\s+/g, "");
+
+const fileName =
+REFERENCE_MAP[key];
+
+if (!fileName) {
+return null;
+}
+
+return path.join(
+REFERENCE_DIR,
+fileName
+);
+}
+
+// =====================================================
+// REFERANS PDF OKUMA
+// =====================================================
+
+async function loadReferenceFile(bank) {
+
+ const referencePath =
+ getReferenceFile(bank);
+
+ if (!referencePath) {
+ return null;
+ }
+
+ try {
+
+ const buffer =
+ await fs.readFile(
+ referencePath
+ );
+
+ if (!buffer?.length) {
+ return null;
+ }
+
+ console.log(
+ "REFERENCE LOADED:",
+ referencePath
+ );
+
+ return {
+ bank,
+ fileName:
+ path.basename(referencePath),
+ base64:
+ buffer.toString("base64"),
+ };
+
+ } catch (error) {
+
+ console.error(
+ "REFERENCE LOAD ERROR:",
+ error
+ );
+
+ return null;
+ }
+}
 
 export const config = {
  api: {
@@ -2416,6 +2494,19 @@ const startTime = Date.now();
  const mime =
  uploadedFile.mimetype ||
  "application/octet-stream";
+
+  // =====================================================
+// REFERANS DEKONT
+// =====================================================
+
+// Şimdilik sistemdeki Akbank referansı kullanılıyor.
+const reference =
+ await loadReferenceFile("akbank");
+
+console.log(
+ "REFERENCE:",
+ reference?.fileName || "YOK"
+);
   
 // ANA TUTARIN KARAKTER KOORDİNATLARINI BUL
 const amountLocation = await locateAmountCharacters(
@@ -2490,6 +2581,25 @@ amountCharacterCrossCheck
 
  text:
  PROMPT +
+  =====================================================
+REFERANS DEKONT
+=====================================================
+
+Bu analizde ayrıca bir referans dekont sağlanmıştır.
+
+Referans:
+${reference?.fileName || "Referans bulunamadı"}
+
+Referansı belge şablonu, yerleşim, tipografi, alan düzeni,
+logo, tarih, tutar, IBAN biçimi ve genel görsel yapı açısından
+karşılaştırma amacıyla kullan.
+
+Referansla birebir aynı olmamasını tek başına sahtecilik kanıtı
+olarak değerlendirme.
+
+Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
+artırma.
+
  `\n\nFilename: ${fileName}`,
  },
 
@@ -2526,6 +2636,30 @@ amountCharacterCrossCheck
 
  text:
  PROMPT +
+  =====================================================
+REFERANS DEKONT
+=====================================================
+
+Bu analizde ayrıca bir referans dekont sağlanmıştır.
+
+Referans dekont:
+${reference?.fileName || "Referans bulunamadı"}
+
+Referans dekont SADECE görsel ve yapısal karşılaştırma amacıyla
+kullanılmalıdır.
+
+Referans ile analiz edilen dekont arasındaki farklılıkları otomatik
+olarak sahtecilik kabul etme.
+
+Bankaların farklı uygulama sürümleri, web/mobil kanalları, işlem
+türleri ve belge versiyonları olabilir.
+
+Sadece referans ile analiz edilen belge arasında gerçekten anlamlı,
+bağımsız ve görsel olarak desteklenen tutarsızlıklar varsa risk artır.
+
+Referans belgedeki kişisel veya finansal bilgileri analiz edilen
+belgenin gerçekliği için kanıt olarak kullanma.
+
  `\n\nFilename: ${fileName}`,
  },
 
