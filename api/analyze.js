@@ -2619,9 +2619,9 @@ amountCharacterCrossCheck
 
  text: `${PROMPT}
    
- // =====================================================
+=====================================================
 REFERANS DEKONT
-// =====================================================
+=====================================================
 
 Bu analizde ayrıca bir referans dekont sağlanmıştır.
 
@@ -2638,7 +2638,7 @@ olarak değerlendirme.
 Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
 artırma. 
 `+
- `\n\nFilename: ${fileName}`,
+Filename: ${fileName}`,
  },
 
  {
@@ -2700,7 +2700,7 @@ Referans belgedeki kişisel veya finansal bilgileri analiz edilen
 belgenin gerçekliği için kanıt olarak kullanma. `
 
 
- `\n\nFilename: ${fileName}`,
+Filename: ${fileName}`,
  },
 
  {
