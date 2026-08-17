@@ -1761,8 +1761,8 @@ const reference =
     bank
 );
 console.log(
-  "BANK:",
-  BANK
+  "BANK FIELD:",
+ fields?.bank
   );
 console.log(
   "SELECTED BANK:",
