@@ -1753,7 +1753,7 @@ mime
 
 // Şimdilik sistemdeki Akbank referansı kullanılıyor.
 
-const reference =
+const bank =
 first(fields?.bank) ||
   "akbank";
 const reference =
@@ -1762,7 +1762,7 @@ const reference =
 );
 console.log(
   "BANK:",
-  BANK
+  bank
   );
 
 console.log(
