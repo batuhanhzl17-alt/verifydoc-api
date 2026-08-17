@@ -1755,7 +1755,7 @@ mime
 
 const bank =
 first(fields?.bank) ||
-  "akbank";
+  "akbank , garanti , garantibbva";
 const reference =
   await loadReferenceFile(
     bank
