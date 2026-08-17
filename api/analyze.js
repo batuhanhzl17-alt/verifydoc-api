@@ -790,17 +790,25 @@ count,
 
 }
 
-// =====================================================
-// ANA TUTAR VE KARAKTER KOORDİNATLARINI BUL
-// =====================================================
-
-async function locateAmountCharacters(
-base64,
-mime
-) {
+async function analyzeAmountDetails(base64, mime) {
 
 if (!base64) {
-return null;
+return {
+amount: null,
+characters: [],
+fontConsistent: true,
+suspicious: false,
+score: 0,
+suspiciousCharacters: [],
+comparisons: [],
+subtotal: null,
+taxAmount: null,
+totalAmount: null,
+calculatedTotal: null,
+difference: null,
+calculationConsistent: true,
+evidence: "Belge görüntüsü bulunamadı."
+};
 }
 
 try {
@@ -823,48 +831,23 @@ content: [
 type: "input_text",
 
 text: `
-Bu belgeyi adli görsel inceleme amacıyla analiz et.
+Sen VerifyDoc sisteminin TUTAR ANALİZ modülüsün.
 
-Özellikle belgedeki ANA İŞLEM TUTARINI bul.
+Bu belgeyi yalnızca TUTAR ve ilgili finansal alanlar açısından incele.
 
-Örneğin:
+ANA İŞLEM TUTARI
+----------------
+
+Belgedeki ana işlem tutarını bul.
+
+Örnek:
 
 1000 TL
 1.000,00 TL
 1000,00 EUR
 €1,000.00
 
-gibi ana tutarı tespit et.
-
-ÇOK ÖNEMLİ:
-
-Tutar içerisindeki HER karakterin görüntü üzerindeki
-yaklaşık koordinatlarını ayrı ayrı belirle.
-
-Örneğin:
-
-1000,00
-
-için:
-
-1
-0
-0
-0
-,
-0
-0
-
-şeklinde ayrı karakterler döndür.
-
-Koordinatlar 0-1000 arasında normalize edilmelidir.
-
-x = karakterin sol kenarı
-y = karakterin üst kenarı
-width = karakter genişliği
-height = karakter yüksekliği
-
-Ana işlem tutarını;
+Ana tutarı;
 
 - IBAN
 - hesap numarası
@@ -875,315 +858,106 @@ Ana işlem tutarını;
 
 ile karıştırma.
 
-Belgede ana işlem tutarı açıkça bulunamıyorsa:
+Ana tutar bulunamıyorsa amount = null döndür.
 
-amount = null
-characters = []
+KARAKTER ANALİZİ
+----------------
 
-döndür.
+Ana tutardaki karakterleri ayrı ayrı değerlendir.
 
-SADECE JSON döndür.
-`,
-},
+Örneğin:
 
-{
-type: "input_image",
+1250,00
 
-image_url:
-imageDataUrl,
-
-detail: "high",
-},
-
-],
-},
-],
-
-text: {
-
-format: {
-
-type: "json_schema",
-
-name:
-"amount_character_locations",
-
-strict: true,
-
-schema: {
-
-type: "object",
-
-properties: {
-
-amount: {
-type: ["string", "null"],
-},
-
-characters: {
-
-type: "array",
-
-items: {
-
-type: "object",
-
-properties: {
-
-char: {
-type: "string",
-},
-
-x: {
-type: "number",
-},
-
-y: {
-type: "number",
-},
-
-width: {
-type: "number",
-},
-
-height: {
-type: "number",
-},
-
-},
-
-required: [
-"char",
-"x",
-"y",
-"width",
-"height",
-],
-
-additionalProperties: false,
-
-},
-
-},
-
-},
-
-required: [
-"amount",
-"characters",
-],
-
-additionalProperties: false,
-
-},
-
-},
-
-},
-
-});
-
-const result =
-JSON.parse(
-response.output_text
-);
-
-console.log(
-"AMOUNT LOCATION:",
-result
-);
-
-return result;
-
-} catch (error) {
-
-console.error(
-"AMOUNT LOCATION ERROR:",
-error
-);
-
-return null;
-
-}
-
-}
-
-
-
-// =====================================================
-// TUTAR ALANI - KARAKTER / FONT TUTARLILIK ANALİZİ
-// =====================================================
-
-async function analyzeAmountCharacters(
-base64,
-mime,
-amountCharacters
-) {
-
-try {
-
-if (
-!base64 ||
-!amountCharacters ||
-!amountCharacters.length
-) {
-
-return {
-suspicious: false,
-score: 0,
-fontConsistent: true,
-suspiciousCharacters: [],
-comparisons: [],
-evidence:
-"Tutar karakterleri analiz edilemedi."
-};
-
-}
-
-const imageDataUrl =
-`data:${mime || "image/jpeg"};base64,${base64}`;
-
-const characterInfo =
-amountCharacters.map(
-(item, index) => ({
-index,
-char: item.char,
-x: item.x,
-y: item.y,
-width: item.width,
-height: item.height
-})
-);
-
-console.log(
-"======================================"
-);
-
-console.log(
-"AMOUNT FONT ANALYSIS START"
-);
-
-console.log(
-"CHARACTERS:",
-characterInfo
-);
-
-
-const response =
-await openai.responses.create({
-
-model: "gpt-5-mini",
-
-input: [
-
-{
-role: "user",
-
-content: [
-
-{
-type: "input_text",
-
-text: `
-Sen belge ve finansal doküman görsellerindeki
-TUTAR ALANI KARAKTERLERİNİN GÖRSEL TUTARLILIĞINI
-inceleyen bir analiz sistemisin.
-
-AMAÇ:
-
-Ana işlem tutarındaki karakterlerin aynı belge
-içerisindeki diğer karakterlerle görsel olarak
-tutarlı olup olmadığını değerlendir.
-
-Örneğin ana tutar:
-
-1250 TL
-
-ise:
+için:
 
 1
 2
 5
 0
+,
+0
+0
 
 karakterlerini incele.
 
-Farklı rakamların doğal olarak farklı şekilleri vardır.
-Bir rakam diğer rakamdan farklı görünüyor diye
-şüpheli kabul etme.
+Her karakter için yaklaşık koordinat ver.
 
-Önemli olan aynı karakterin veya aynı yazı
-karakteristiğinin tutarlı olup olmadığıdır.
+Koordinatlar 0-1000 arasında normalize edilmelidir.
 
-İNCELE:
+x = sol kenar
+y = üst kenar
+width = genişlik
+height = yükseklik
 
-1. Karakter yüksekliği
-2. Karakter genişliği
-3. Stroke kalınlığı
-4. Kenar yumuşaklığı
-5. Anti-aliasing
-6. Piksel/render görünümü
-7. Font ağırlığı
-8. Baseline hizalaması
-9. Dikey hizalama
-10. Genel font karakteristiği
-11. Aynı tutardaki diğer karakterlerle görsel tutarlılık 
-12.Gönderilen tutar ve vergiler toplamı toplam tutarla aynı mı kontrol edilsin
+Karakterlerin:
 
+- yüksekliği
+- genişliği
+- stroke kalınlığı
+- font ağırlığı
+- kenar yapısı
+- anti-aliasing
+- piksel/render görünümü
+- baseline hizalaması
+- genel font karakteristiği
 
-Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması,
-bulanıklık ve görüntü kalitesi kaynaklı küçük farkları
-sahtecilik olarak değerlendirme.
+açısından tutarlı olup olmadığını değerlendir.
 
-Tek başına küçük bir farklılık şüpheli değildir.
+Aynı karakter belgede başka yerlerde bulunuyorsa mümkün olduğunda
+referans olarak karşılaştır.
 
-Gerçekten belirgin bir görsel tutarsızlık varsa
-suspicious değerini true yap.
+Örneğin tutarda bulunan "5" karakterini belgede bulunan diğer "5"
+karakterleriyle karşılaştır.
 
-Yeterli görsel kanıt yoksa bunu şüpheli kabul etme.
+Aynı karakter bulunamıyorsa bunu şüpheli kabul etme.
 
-Ana tutar karakterleri:
+Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması veya bulanıklık
+nedeniyle oluşabilecek küçük farkları sahtecilik olarak değerlendirme.
 
-${JSON.stringify(
-characterInfo,
-null,
-2
-)}
+Tek başına küçük bir karakter farklılığı sahtecilik kanıtı değildir.
+
+VERGİ VE MATEMATİKSEL KONTROL
+-----------------------------
+
+Belgede görünen finansal değerleri ayrıca hesapla.
+
+Varsa:
+
+- ara toplam
+- mal/hizmet tutarı
+- KDV
+- diğer vergiler
+- ücret
+- komisyon
+- indirim
+- toplam tutar
+
+alanlarını tespit et.
+
+Örneğin:
+
+ara toplam + KDV + diğer vergiler - indirim = toplam
+
+şeklinde matematiksel kontrol yap.
+
+Belgede birden fazla vergi varsa toplamını hesapla.
+
+Görünmeyen veya okunamayan rakamları tahmin etme.
+
+Vergi yoksa taxAmount = null.
+
+Ara toplam yoksa subtotal = null.
+
+Toplam yoksa totalAmount = null.
+
+Hesap yapılamıyorsa calculationConsistent değerini zorla true yapma.
+Nedenini evidence içinde açıkla.
+
+Çok küçük yuvarlama farklarını tek başına şüpheli kabul etme.
 
 SADECE GEÇERLİ JSON DÖNDÜR.
 
-JSON FORMAT:
-
-{
-"fontConsistent": true,
-"suspicious": false,
-"score": 0,
-"suspiciousCharacters": [],
-"comparisons": [],
-"evidence": ""
-}
-
-comparisons içerisindeki örnek:
-
-{
-"char": "5",
-"index": 0,
-"consistency": 94,
-"reason": "Karakter diğer görsel karakteristiklerle tutarlı."
-}
-
-SKOR:
-
-0-20 = çok düşük şüphe
-21-40 = düşük şüphe
-41-60 = orta şüphe
-61-80 = yüksek şüphe
-81-100 = çok yüksek şüphe
-
-unknown veya belirlenemeyen durumları
-şüpheli olarak değerlendirme.
-
-Tüm açıklamalar Türkçe olmalıdır.
 `
 },
 
@@ -1197,7 +971,6 @@ detail: "high"
 
 ]
 }
-
 ],
 
 text: {
@@ -1206,7 +979,7 @@ format: {
 
 type: "json_schema",
 
-name: "amount_font_analysis",
+name: "amount_details",
 
 strict: true,
 
@@ -1215,6 +988,54 @@ schema: {
 type: "object",
 
 properties: {
+
+amount: {
+type: ["string", "null"]
+},
+
+characters: {
+
+type: "array",
+
+items: {
+
+type: "object",
+
+properties: {
+
+char: {
+type: "string"
+},
+
+x: {
+type: "number"
+},
+
+y: {
+type: "number"
+},
+
+width: {
+type: "number"
+},
+
+height: {
+type: "number"
+}
+
+},
+
+required: [
+"char",
+"x",
+"y",
+"width",
+"height"
+],
+
+additionalProperties: false
+}
+},
 
 fontConsistent: {
 type: "boolean"
@@ -1237,394 +1058,6 @@ type: "array",
 items: {
 type: "string"
 }
-
-},
-
-comparisons: {
-
-type: "array",
-
-items: {
-
-type: "object",
-
-properties: {
-
-char: {
-type: "string"
-},
-
-index: {
-type: "integer"
-},
-
-consistency: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
-
-reason: {
-type: "string"
-}
-
-},
-
-required: [
-"char",
-"index",
-"consistency",
-"reason"
-],
-
-additionalProperties: false
-
-}
-
-},
-
-evidence: {
-type: "string"
-}
-
-},
-
-required: [
-"fontConsistent",
-"suspicious",
-"score",
-"suspiciousCharacters",
-"comparisons",
-"evidence"
-],
-
-additionalProperties: false
-
-}
-
-}
-
-}
-
-});
-
-
-const result =
-JSON.parse(
-response.output_text
-);
-
-
-let score =
-Number(result.score);
-
-if (
-!Number.isFinite(score)
-) {
-score = 0;
-}
-
-score =
-Math.max(
-0,
-Math.min(
-100,
-Math.round(score)
-)
-);
-
-
-const suspiciousCharacters =
-Array.isArray(
-result.suspiciousCharacters
-)
-? result.suspiciousCharacters
-: [];
-
-
-const comparisons =
-Array.isArray(
-result.comparisons
-)
-? result.comparisons
-: [];
-
-
-const suspicious =
-result.suspicious === true ||
-suspiciousCharacters.length > 0;
-
-
-console.log(
-"AMOUNT FONT ANALYSIS RESULT:",
-{
-suspicious,
-score,
-suspiciousCharacters
-}
-);
-
-
-return {
-
-suspicious,
-
-score,
-
-fontConsistent:
-result.fontConsistent !== false,
-
-suspiciousCharacters,
-
-comparisons,
-
-evidence:
-result.evidence ||
-"Tutar karakterleri görsel olarak analiz edildi."
-
-};
-
-
-} catch (error) {
-
-console.error(
-"AMOUNT FONT ANALYSIS ERROR:"
-);
-
-console.error(error);
-
-
-return {
-
-suspicious: false,
-
-score: 0,
-
-fontConsistent: true,
-
-suspiciousCharacters: [],
-
-comparisons: [],
-
-evidence:
-"Tutar karakterlerinin görsel analizi gerçekleştirilemedi."
-
-};
-
-}
-
-}
-
-
-// =====================================================
-// TUTAR KARAKTER ÇAPRAZ KARŞILAŞTIRMA
-// =====================================================
-
-async function analyzeAmountCharacterCrossCheck(
-base64,
-mime,
-amountCharacters
-) {
-
-try {
-
-if (
-!base64 ||
-!amountCharacters ||
-!amountCharacters.length
-) {
-
-return {
-
-suspicious: false,
-
-score: 0,
-
-comparisons: [],
-
-suspiciousCharacters: [],
-
-evidence:
-"Belge içi karakter karşılaştırması için yeterli veri bulunamadı."
-
-};
-
-}
-
-
-const imageDataUrl =
-`data:${mime || "image/jpeg"};base64,${base64}`;
-
-
-const amountInfo =
-amountCharacters.map(
-(item, index) => ({
-
-index,
-
-char: item.char,
-
-x: item.x,
-
-y: item.y,
-
-width: item.width,
-
-height: item.height
-
-})
-);
-
-
-const response =
-await openai.responses.create({
-
-model: "gpt-5-mini",
-
-input: [
-
-{
-
-role: "user",
-
-content: [
-
-{
-
-type: "input_text",
-
-text: `
-Sen belge adli inceleme sisteminin
-KARAKTER ÇAPRAZ KARŞILAŞTIRMA modülüsün.
-
-Ana işlem tutarındaki karakterleri aynı belgede
-başka yerlerde bulunan aynı karakterlerle
-görsel olarak karşılaştır.
-
-Örneğin ana tutar:
-
-1250 TL
-
-ise 1, 2, 5 ve 0 karakterlerini incele.
-
-Belgede başka bir yerde aynı karakter bulunuyorsa
-referans olarak kullan.
-
-Karakterin:
-
-- font görünümünü
-- stroke kalınlığını
-- genişliğini
-- yüksekliğini
-- kenar yumuşaklığını
-- anti-aliasing görünümünü
-- piksel/render karakteristiğini
-- baseline hizalamasını
-
-karşılaştır.
-
-Fotoğraf kalitesi, perspektif, ışık, JPEG sıkıştırması
-ve bulanıklık kaynaklı küçük farklılıkları şüpheli
-olarak değerlendirme.
-
-Aynı karakterin belgede başka yerde bulunmaması
-şüpheli değildir.
-
-Yeterli referans yoksa consistency değerini
-"unknown" olarak belirt.
-
-Ana işlem tutarı karakterleri:
-
-${JSON.stringify(
-amountInfo,
-null,
-2
-)}
-
-
-SADECE GEÇERLİ JSON DÖNDÜR.
-
-FORMAT:
-
-{
-"suspicious": false,
-"score": 0,
-"comparisons": [],
-"suspiciousCharacters": [],
-"evidence": ""
-}
-
-comparison formatı:
-
-{
-"amountCharacter": "5",
-"referenceFound": true,
-"referenceCount": 3,
-"consistency": 94,
-"status": "consistent",
-"reason": "Karakter diğer referanslarla görsel olarak tutarlı."
-}
-
-status sadece:
-
-"consistent"
-"potentially_different"
-"unknown"
-
-olabilir.
-
-unknown durumunu şüpheli kabul etme.
-
-Tek bir küçük karakter farklılığı kesin sahtecilik
-anlamına gelmez.
-
-Sadece gerçekten belirgin görsel tutarsızlık varsa
-suspicious değerini true yap.
-
-Tüm açıklamalar Türkçe olmalıdır.
-`
-},
-
-{
-
-type: "input_image",
-
-image_url: imageDataUrl,
-
-detail: "high"
-
-}
-
-]
-
-}
-
-],
-
-text: {
-
-format: {
-
-type: "json_schema",
-
-name: "amount_character_cross_check",
-
-strict: true,
-
-schema: {
-
-type: "object",
-
-properties: {
-
-suspicious: {
-type: "boolean"
-},
-
-score: {
-type: "integer",
-minimum: 0,
-maximum: 100
 },
 
 comparisons: {
@@ -1656,6 +1089,7 @@ maximum: 100
 },
 
 status: {
+
 type: "string",
 
 enum: [
@@ -1681,19 +1115,31 @@ required: [
 ],
 
 additionalProperties: false
-
 }
-
 },
 
-suspiciousCharacters: {
+subtotal: {
+type: ["number", "null"]
+},
 
-type: "array",
+taxAmount: {
+type: ["number", "null"]
+},
 
-items: {
-type: "string"
-}
+totalAmount: {
+type: ["number", "null"]
+},
 
+calculatedTotal: {
+type: ["number", "null"]
+},
+
+difference: {
+type: ["number", "null"]
+},
+
+calculationConsistent: {
+type: "boolean"
 },
 
 evidence: {
@@ -1703,103 +1149,78 @@ type: "string"
 },
 
 required: [
+"amount",
+"characters",
+"fontConsistent",
 "suspicious",
 "score",
-"comparisons",
 "suspiciousCharacters",
+"comparisons",
+"subtotal",
+"taxAmount",
+"totalAmount",
+"calculatedTotal",
+"difference",
+"calculationConsistent",
 "evidence"
 ],
 
 additionalProperties: false
-
 }
-
 }
-
 }
-
 });
 
-
 const result =
-JSON.parse(
-response.output_text
+JSON.parse(response.output_text);
+
+console.log(
+"AMOUNT DETAILS RESULT:",
+result
 );
 
-
-let score =
-Number(result.score);
-
-if (
-!Number.isFinite(score)
-) {
-score = 0;
-}
-
-
-score =
-Math.max(
-0,
-Math.min(
-100,
-Math.round(score)
-)
-);
-
-
-return {
-
-suspicious:
-result.suspicious === true,
-
-score,
-
-comparisons:
-Array.isArray(
-result.comparisons
-)
-? result.comparisons
-: [],
-
-suspiciousCharacters:
-Array.isArray(
-result.suspiciousCharacters
-)
-? result.suspiciousCharacters
-: [],
-
-evidence:
-result.evidence ||
-"Belge içi karakter karşılaştırması tamamlandı."
-
-};
-
+return result;
 
 } catch (error) {
 
 console.error(
-"AMOUNT CROSS CHECK ERROR:",
+"AMOUNT DETAILS ERROR:",
 error
 );
 
-
 return {
+
+amount: null,
+
+characters: [],
+
+fontConsistent: true,
 
 suspicious: false,
 
 score: 0,
 
-comparisons: [],
-
 suspiciousCharacters: [],
 
+comparisons: [],
+
+subtotal: null,
+
+taxAmount: null,
+
+totalAmount: null,
+
+calculatedTotal: null,
+
+difference: null,
+
+calculationConsistent: true,
+
 evidence:
-"Belge içi karakter karşılaştırması gerçekleştirilemedi."
+"Tutar analizi gerçekleştirilemedi."
 
 };
-
 }
-
 }
 // =====================================================
 // JSON RESPONSE
