@@ -10,37 +10,35 @@ import sharp from "sharp";
 const execFileAsync = promisify(execFile);
 
 const REFERENCE_DIR =
-path.join(process.cwd(), "references");
+ path.join(process.cwd(), "references");
 
 const REFERENCE_MAP = {
-akbank: "akbank.pdf",
-  garanti: "garanti.pdf",
-  garantibbva: "garanti.pdf"
+ akbank: "akbank.pdf",
 };
 
 function getReferenceFile(bank) {
 
-if (!bank) {
-return null;
-}
+ if (!bank) {
+ return null;
+ }
 
-const key =
-bank
-.toLowerCase()
-.trim()
-.replace(/\s+/g, "");
+ const key =
+ bank
+ .toLowerCase()
+ .trim()
+ .replace(/\s+/g, "");
 
-const fileName =
-REFERENCE_MAP[key];
+ const fileName =
+ REFERENCE_MAP[key];
 
-if (!fileName) {
-return null;
-}
+ if (!fileName) {
+ return null;
+ }
 
-return path.join(
-REFERENCE_DIR,
-fileName
-);
+ return path.join(
+ REFERENCE_DIR,
+ fileName
+ );
 }
 
 
@@ -50,53 +48,53 @@ fileName
 
 async function loadReferenceFile(bank) {
 
-const referencePath =
-getReferenceFile(bank);
+ const referencePath =
+ getReferenceFile(bank);
 
-if (!referencePath) {
-return null;
-}
+ if (!referencePath) {
+ return null;
+ }
 
-try {
+ try {
 
-const buffer =
-await fs.readFile(
-referencePath
-);
+ const buffer =
+ await fs.readFile(
+ referencePath
+ );
 
-if (!buffer?.length) {
-return null;
-}
+ if (!buffer?.length) {
+ return null;
+ }
 
-console.log(
-"REFERENCE LOADED:",
-referencePath
-);
+ console.log(
+ "REFERENCE LOADED:",
+ referencePath
+ );
 
-return {
-bank,
-fileName:
-path.basename(referencePath),
-base64:
-buffer.toString("base64"),
-};
+ return {
+ bank,
+ fileName:
+ path.basename(referencePath),
+ base64:
+ buffer.toString("base64"),
+ };
 
-} catch (error) {
+ } catch (error) {
 
-console.error(
-"REFERENCE LOAD ERROR:",
-error
-);
+ console.error(
+ "REFERENCE LOAD ERROR:",
+ error
+ );
 
-return null;
-}
+ return null;
+ }
 }
 
 
 export const config = {
-api: {
-bodyParser: false,
-},
+ api: {
+ bodyParser: false,
+ },
 };
 
 
@@ -105,8 +103,8 @@ bodyParser: false,
 // =====================================================
 
 const openai = new OpenAI({
-apiKey:
-process.env.OPENAI_API_KEY,
+ apiKey:
+ process.env.OPENAI_API_KEY,
 });
 
 
@@ -115,31 +113,31 @@ process.env.OPENAI_API_KEY,
 // =====================================================
 
 const CHECK_NAMES = [
-"ocrConsistency",
-"fontConsistency",
-"fontSizeConsistency",
-"characterSpacing",
-"lineSpacing",
-"textAlignment",
-"baselineConsistency",
-"compressionArtifacts",
-"copyPasteRegions",
-"editingTraces",
-"photoshopArtifacts",
-"aiGeneratedIndicators",
-"logoConsistency",
-"stampConsistency",
-"signatureConsistency",
-"dateConsistency",
-"amountConsistency",
-"currencyFormatting",
-"ibanFormatting",
-"swiftFormatting",
-"qrBarcodeConsistency",
-"layoutIntegrity",
-"suspiciousElements",
-"documentTypeConsistency",
-"imageQuality",
+ "ocrConsistency",
+ "fontConsistency",
+ "fontSizeConsistency",
+ "characterSpacing",
+ "lineSpacing",
+ "textAlignment",
+ "baselineConsistency",
+ "compressionArtifacts",
+ "copyPasteRegions",
+ "editingTraces",
+ "photoshopArtifacts",
+ "aiGeneratedIndicators",
+ "logoConsistency",
+ "stampConsistency",
+ "signatureConsistency",
+ "dateConsistency",
+ "amountConsistency",
+ "currencyFormatting",
+ "ibanFormatting",
+ "swiftFormatting",
+ "qrBarcodeConsistency",
+ "layoutIntegrity",
+ "suspiciousElements",
+ "documentTypeConsistency",
+ "imageQuality",
 ];
 
 
@@ -148,233 +146,233 @@ const CHECK_NAMES = [
 // =====================================================
 
 const CHECK_SCHEMA =
-Object.fromEntries(
+ Object.fromEntries(
 
-CHECK_NAMES.map(
-(name) => [
+ CHECK_NAMES.map(
+ (name) => [
 
-name,
+ name,
 
-{
-type: "object",
+ {
+ type: "object",
 
-properties: {
+ properties: {
 
-status: {
-type: "string",
+ status: {
+ type: "string",
 
-enum: [
-"pass",
-"review",
-"suspicious",
-"unknown",
-],
-},
+ enum: [
+ "pass",
+ "review",
+ "suspicious",
+ "unknown",
+ ],
+ },
 
-score: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
+ score: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-evidence: {
-type: "string",
-},
+ evidence: {
+ type: "string",
+ },
 
-},
+ },
 
-required: [
-"status",
-"score",
-"evidence",
-],
+ required: [
+ "status",
+ "score",
+ "evidence",
+ ],
 
-additionalProperties: false,
-},
+ additionalProperties: false,
+ },
 
-]
-)
+ ]
+ )
 
-);
+ );
 
 
 const RESPONSE_SCHEMA = {
 
-type: "object",
+ type: "object",
 
-properties: {
+ properties: {
 
-overallRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
+ overallRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-riskLabel: {
-type: "string",
+ riskLabel: {
+ type: "string",
 
-enum: [
-"LOW RISK",
-"MODERATE RISK",
-"HIGH RISK",
-"VERY HIGH RISK",
-],
-},
+ enum: [
+ "LOW RISK",
+ "MODERATE RISK",
+ "HIGH RISK",
+ "VERY HIGH RISK",
+ ],
+ },
 
-confidence: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
+ confidence: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-summary: {
-type: "string",
-},
+ summary: {
+ type: "string",
+ },
 
-categories: {
+ categories: {
 
-type: "object",
+ type: "object",
 
-properties: {
+ properties: {
 
-visualRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
+ visualRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-textRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
+ textRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-layoutRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
+ layoutRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-financialDataRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
+ financialDataRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-editingRisk: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
+ editingRisk: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
 
-},
+ },
 
-required: [
-"visualRisk",
-"textRisk",
-"layoutRisk",
-"financialDataRisk",
-"editingRisk",
-],
+ required: [
+ "visualRisk",
+ "textRisk",
+ "layoutRisk",
+ "financialDataRisk",
+ "editingRisk",
+ ],
 
-additionalProperties: false,
-},
+ additionalProperties: false,
+ },
 
-checks: {
+ checks: {
 
-type: "object",
+ type: "object",
 
-properties:
-CHECK_SCHEMA,
+ properties:
+ CHECK_SCHEMA,
 
-required:
-CHECK_NAMES,
+ required:
+ CHECK_NAMES,
 
-additionalProperties: false,
-},
+ additionalProperties: false,
+ },
 
-limitations: {
+ limitations: {
 
-type: "array",
+ type: "array",
 
-items: {
-type: "string",
-},
+ items: {
+ type: "string",
+ },
 
-},
+ },
 
-// =====================================================
-// TUTAR / VERGİ / MATEMATİKSEL KONTROL
-// =====================================================
+ // =====================================================
+ // TUTAR / VERGİ / MATEMATİKSEL KONTROL
+ // =====================================================
 
-amountAnalysis: {
+ amountAnalysis: {
 
-type: "object",
+ type: "object",
 
-properties: {
+ properties: {
 
-amount: {
-type: ["string", "null"],
-},
+ amount: {
+ type: ["string", "null"],
+ },
 
-subtotal: {
-type: ["number", "null"],
-},
+ subtotal: {
+ type: ["number", "null"],
+ },
 
-taxAmount: {
-type: ["number", "null"],
-},
+ taxAmount: {
+ type: ["number", "null"],
+ },
 
-totalAmount: {
-type: ["number", "null"],
-},
+ totalAmount: {
+ type: ["number", "null"],
+ },
 
-calculatedTotal: {
-type: ["number", "null"],
-},
+ calculatedTotal: {
+ type: ["number", "null"],
+ },
 
-difference: {
-type: ["number", "null"],
-},
+ difference: {
+ type: ["number", "null"],
+ },
 
-calculationConsistent: {
-type: "boolean",
-},
+ calculationConsistent: {
+ type: "boolean",
+ },
 
-evidence: {
-type: "string",
-},
+ evidence: {
+ type: "string",
+ },
 
-},
+ },
 
-required: [
-"amount",
-"subtotal",
-"taxAmount",
-"totalAmount",
-"calculatedTotal",
-"difference",
-"calculationConsistent",
-"evidence",
-],
+ required: [
+ "amount",
+ "subtotal",
+ "taxAmount",
+ "totalAmount",
+ "calculatedTotal",
+ "difference",
+ "calculationConsistent",
+ "evidence",
+ ],
 
-additionalProperties: false,
-},
+ additionalProperties: false,
+ },
 
-},
+ },
 
-required: [
-"overallRisk",
-"riskLabel",
-"confidence",
-"summary",
-"categories",
-"checks",
-"limitations",
-"amountAnalysis",
-],
+ required: [
+ "overallRisk",
+ "riskLabel",
+ "confidence",
+ "summary",
+ "categories",
+ "checks",
+ "limitations",
+ "amountAnalysis",
+ ],
 
-additionalProperties: false,
+ additionalProperties: false,
 };
 
 
@@ -384,42 +382,42 @@ additionalProperties: false,
 
 function parseMultipart(req) {
 
-return new Promise(
-(resolve, reject) => {
+ return new Promise(
+ (resolve, reject) => {
 
-const form =
-formidable({
-multiples: false,
-keepExtensions: true,
-maxFileSize:
-25 * 1024 * 1024,
-});
+ const form =
+ formidable({
+ multiples: false,
+ keepExtensions: true,
+ maxFileSize:
+ 25 * 1024 * 1024,
+ });
 
-form.parse(
-req,
-(
-err,
-fields,
-files
-) => {
+ form.parse(
+ req,
+ (
+ err,
+ fields,
+ files
+ ) => {
 
-if (err) {
+ if (err) {
 
-reject(err);
+ reject(err);
 
-return;
-}
+ return;
+ }
 
-resolve({
-fields,
-files,
-});
+ resolve({
+ fields,
+ files,
+ });
 
-}
-);
+ }
+ );
 
-}
-);
+ }
+ );
 
 }
 
@@ -429,98 +427,98 @@ files,
 // =====================================================
 
 async function extractVideoFrames(
-videoPath
+ videoPath
 ) {
 
-const outputDir =
-`/tmp/verifydoc-${Date.now()}`;
+ const outputDir =
+ `/tmp/verifydoc-${Date.now()}`;
 
-await fs.mkdir(
-outputDir,
-{
-recursive: true,
-}
-);
+ await fs.mkdir(
+ outputDir,
+ {
+ recursive: true,
+ }
+ );
 
-const outputPattern =
-`${outputDir}/frame-%03d.jpg`;
+ const outputPattern =
+ `${outputDir}/frame-%03d.jpg`;
 
-await execFileAsync(
-ffmpegPath,
+ await execFileAsync(
+ ffmpegPath,
 
-[
-"-i",
-videoPath,
+ [
+ "-i",
+ videoPath,
 
-"-vf",
-"fps=2,scale=1280:-2",
+ "-vf",
+ "fps=2,scale=1280:-2",
 
-"-frames:v",
-"8",
+ "-frames:v",
+ "8",
 
-"-q:v",
-"5",
+ "-q:v",
+ "5",
 
-outputPattern,
-],
+ outputPattern,
+ ],
 
-{
-maxBuffer:
-10 * 1024 * 1024,
-}
-);
+ {
+ maxBuffer:
+ 10 * 1024 * 1024,
+ }
+ );
 
-const files =
-await fs.readdir(
-outputDir
-);
+ const files =
+ await fs.readdir(
+ outputDir
+ );
 
-const frameFiles =
-files
-.filter(
-(file) =>
-file.endsWith(".jpg")
-)
-.sort();
+ const frameFiles =
+ files
+ .filter(
+ (file) =>
+ file.endsWith(".jpg")
+ )
+ .sort();
 
-if (
-!frameFiles.length
-) {
+ if (
+ !frameFiles.length
+ ) {
 
-throw new Error(
-"Videodan analiz edilecek kare çıkarılamadı."
-);
+ throw new Error(
+ "Videodan analiz edilecek kare çıkarılamadı."
+ );
 
-}
+ }
 
-const frames = [];
+ const frames = [];
 
-for (
-const file of frameFiles
-) {
+ for (
+ const file of frameFiles
+ ) {
 
-const framePath =
-`${outputDir}/${file}`;
+ const framePath =
+ `${outputDir}/${file}`;
 
-const buffer =
-await fs.readFile(
-framePath
-);
+ const buffer =
+ await fs.readFile(
+ framePath
+ );
 
-frames.push({
+ frames.push({
 
-file,
+ file,
 
-base64:
-buffer.toString(
-"base64"
-),
+ base64:
+ buffer.toString(
+ "base64"
+ ),
 
-});
+ });
 
-}
+ }
 
-return frames;
+ return frames;
 
 }
 
@@ -530,59 +528,59 @@ return frames;
 // =====================================================
 
 async function analyzeVideoFrames(
-frames
+ frames
 ) {
 
-if (
-!frames ||
-!frames.length
-) {
+ if (
+ !frames ||
+ !frames.length
+ ) {
 
-throw new Error(
-"Analiz edilecek video karesi bulunamadı."
-);
+ throw new Error(
+ "Analiz edilecek video karesi bulunamadı."
+ );
 
-}
+ }
 
-console.log(
-"VIDEO FRAME SAYISI:",
-frames.length
-);
+ console.log(
+ "VIDEO FRAME SAYISI:",
+ frames.length
+ );
 
-const imageMessages =
-frames.map(
-(frame) => ({
+ const imageMessages =
+ frames.map(
+ (frame) => ({
 
-type:
-"image_url",
+ type:
+ "image_url",
 
-image_url: {
+ image_url: {
 
-url:
-`data:image/jpeg;base64,${frame.base64}`,
+ url:
+ `data:image/jpeg;base64,${frame.base64}`,
 
-detail:
-"high",
+ detail:
+ "high",
 
-},
+ },
 
-})
-);
+ })
+ );
 
-const response =
-await openai.chat.completions.create({
+ const response =
+ await openai.chat.completions.create({
 
-model:
-"gpt-5-mini",
+ model:
+ "gpt-5-mini",
 
-messages: [
+ messages: [
 
-{
+ {
 
-role:
-"system",
+ role:
+ "system",
 
-content: `
+ content: `
 
 Sen VerifyDoc isimli belge inceleme sistemisin.
 
@@ -640,21 +638,21 @@ Tüm açıklamalar TÜRKÇE olmalıdır.
 
 `,
 
-},
+ },
 
-{
+ {
 
-role:
-"user",
+ role:
+ "user",
 
-content: [
+ content: [
 
-{
+ {
 
-type:
-"text",
+ type:
+ "text",
 
-text: `
+ text: `
 
 Bu video karelerini birlikte incele.
 
@@ -663,47 +661,47 @@ ve dijital manipülasyon belirtisi bulunup bulunmadığını değerlendir.
 
 `,
 
-},
+ },
 
-...imageMessages,
+ ...imageMessages,
 
-],
+ ],
 
-},
+ },
 
-],
+ ],
 
-response_format: {
+ response_format: {
 
-type:
-"json_object",
+ type:
+ "json_object",
 
-},
+ },
 
-});
+ });
 
-const content =
-response
-?.choices?.[0]
-?.message
-?.content;
+ const content =
+ response
+ ?.choices?.[0]
+ ?.message
+ ?.content;
 
-if (!content) {
+ if (!content) {
 
-throw new Error(
-"OpenAI'dan video analiz sonucu alınamadı."
-);
+ throw new Error(
+ "OpenAI'dan video analiz sonucu alınamadı."
+ );
 
-}
+ }
 
-console.log(
-"OPENAI VIDEO ANALYSIS:",
-content
-);
+ console.log(
+ "OPENAI VIDEO ANALYSIS:",
+ content
+ );
 
-return JSON.parse(
-content
-);
+ return JSON.parse(
+ content
+ );
 
 }
 
@@ -714,15 +712,15 @@ content
 
 function first(value) {
 
-if (
-Array.isArray(value)
-) {
+ if (
+ Array.isArray(value)
+ ) {
 
-return value[0];
+ return value[0];
 
-}
+ }
 
-return value;
+ return value;
 
 }
 
@@ -732,41 +730,41 @@ return value;
 // =====================================================
 
 function findUploadedFile(
-files
+ files
 ) {
 
-const possibleNames = [
-"image",
-"file",
-"video",
-];
+ const possibleNames = [
+ "image",
+ "file",
+ "video",
+ ];
 
-for (
-const name of possibleNames
-) {
+ for (
+ const name of possibleNames
+ ) {
 
-const value =
-files?.[name];
+ const value =
+ files?.[name];
 
-if (!value) {
+ if (!value) {
 
-continue;
+ continue;
 
-}
+ }
 
-if (
-Array.isArray(value)
-) {
+ if (
+ Array.isArray(value)
+ ) {
 
-return value[0];
+ return value[0];
 
-}
+ }
 
-return value;
+ return value;
 
-}
+ }
 
-return null;
+ return null;
 
 }
 
@@ -776,92 +774,92 @@ return null;
 // =====================================================
 
 function analyzeTextCharacterConsistency(
-text
+ text
 ) {
 
-if (
-!text ||
-typeof text !== "string"
-) {
+ if (
+ !text ||
+ typeof text !== "string"
+ ) {
 
-return {
-score: 0,
-suspicious: false,
-reason:
-"Analiz edilecek metin bulunamadı.",
-};
+ return {
+ score: 0,
+ suspicious: false,
+ reason:
+ "Analiz edilecek metin bulunamadı.",
+ };
 
-}
+ }
 
-const characters =
-[...text].filter(
-(char) =>
-/[0-9]/.test(char)
-);
+ const characters =
+ [...text].filter(
+ (char) =>
+ /[0-9]/.test(char)
+ );
 
-if (
-characters.length < 2
-) {
+ if (
+ characters.length < 2
+ ) {
 
-return {
-score: 0,
-suspicious: false,
-reason:
-"Karşılaştırma için yeterli rakam bulunamadı.",
-};
+ return {
+ score: 0,
+ suspicious: false,
+ reason:
+ "Karşılaştırma için yeterli rakam bulunamadı.",
+ };
 
-}
+ }
 
-const frequency = {};
+ const frequency = {};
 
-for (
-const char of characters
-) {
+ for (
+ const char of characters
+ ) {
 
-frequency[char] =
-(frequency[char] || 0) + 1;
+ frequency[char] =
+ (frequency[char] || 0) + 1;
 
-}
+ }
 
-const repeatedDigits =
-Object.entries(
-frequency
-).filter(
-([, count]) =>
-count >= 2
-);
+ const repeatedDigits =
+ Object.entries(
+ frequency
+ ).filter(
+ ([, count]) =>
+ count >= 2
+ );
 
-if (
-!repeatedDigits.length
-) {
+ if (
+ !repeatedDigits.length
+ ) {
 
-return {
-score: 0,
-suspicious: false,
-reason:
-"Aynı rakamın yeterli tekrarı bulunamadı.",
-};
+ return {
+ score: 0,
+ suspicious: false,
+ reason:
+ "Aynı rakamın yeterli tekrarı bulunamadı.",
+ };
 
-}
+ }
 
-return {
+ return {
 
-score: 0,
+ score: 0,
 
-suspicious: false,
+ suspicious: false,
 
-reason:
-"Rakam karakterleri mikro tutarlılık analizi için hazır.",
+ reason:
+ "Rakam karakterleri mikro tutarlılık analizi için hazır.",
 
-repeatedDigits:
-repeatedDigits.map(
-([digit, count]) => ({
-digit,
-count,
-})
-),
+ repeatedDigits:
+ repeatedDigits.map(
+ ([digit, count]) => ({
+ digit,
+ count,
+ })
+ ),
 
-};
+ };
 
 }
 
@@ -871,69 +869,69 @@ count,
 // =====================================================
 
 function parseAIResponse(
-text
+ text
 ) {
 
-if (
-!text ||
-typeof text !== "string"
-) {
+ if (
+ !text ||
+ typeof text !== "string"
+ ) {
 
-throw new Error(
-"OpenAI boş cevap döndürdü."
-);
+ throw new Error(
+ "OpenAI boş cevap döndürdü."
+ );
 
-}
+ }
 
-const cleaned =
-text
-.trim()
-.replace(
-/^```json\s*/i,
-""
-)
-.replace(
-/^```\s*/i,
-""
-)
-.replace(
-/\s*```$/i,
-""
-);
+ const cleaned =
+ text
+ .trim()
+ .replace(
+ /^```json\s*/i,
+ ""
+ )
+ .replace(
+ /^```\s*/i,
+ ""
+ )
+ .replace(
+ /\s*```$/i,
+ ""
+ );
 
-try {
+ try {
 
-return JSON.parse(
-cleaned
-);
+ return JSON.parse(
+ cleaned
+ );
 
-} catch {
+ } catch {
 
-const start =
-cleaned.indexOf("{");
+ const start =
+ cleaned.indexOf("{");
 
-const end =
-cleaned.lastIndexOf("}");
+ const end =
+ cleaned.lastIndexOf("}");
 
-if (
-start >= 0 &&
-end > start
-) {
+ if (
+ start >= 0 &&
+ end > start
+ ) {
 
-return JSON.parse(
-cleaned.slice(
-start,
-end + 1
-)
-);
+ return JSON.parse(
+ cleaned.slice(
+ start,
+ end + 1
+ )
+ );
 
-}
+ }
 
-throw new Error(
-"OpenAI geçerli JSON döndürmedi."
-);
+ throw new Error(
+ "OpenAI geçerli JSON döndürmedi."
+ );
 
-}
+ }
 
 }
 
@@ -1473,335 +1471,326 @@ Return ONLY the JSON object matching the supplied schema.
 // =====================================================
 
 export default async function handler(
-req,
-res
+ req,
+ res
 ) {
 
-let result;
+ let result;
 
-// ---------------------------------------------------
-// CORS
-// ---------------------------------------------------
+ // ---------------------------------------------------
+ // CORS
+ // ---------------------------------------------------
 
-res.setHeader(
-"Access-Control-Allow-Origin",
-"*"
-);
+ res.setHeader(
+ "Access-Control-Allow-Origin",
+ "*"
+ );
 
-res.setHeader(
-"Access-Control-Allow-Methods",
-"POST, OPTIONS"
-);
+ res.setHeader(
+ "Access-Control-Allow-Methods",
+ "POST, OPTIONS"
+ );
 
-res.setHeader(
-"Access-Control-Allow-Headers",
-"Content-Type"
-);
+ res.setHeader(
+ "Access-Control-Allow-Headers",
+ "Content-Type"
+ );
 
 
-if (
-req.method === "OPTIONS"
-) {
+ if (
+ req.method === "OPTIONS"
+ ) {
 
-return res
-.status(200)
-.end();
+ return res
+ .status(200)
+ .end();
 
-}
+ }
 
 
-if (
-req.method !== "POST"
-) {
+ if (
+ req.method !== "POST"
+ ) {
 
-return res
-.status(405)
-.json({
+ return res
+ .status(405)
+ .json({
 
-success: false,
+ success: false,
 
-error:
-"Method not allowed",
+ error:
+ "Method not allowed",
 
-});
+ });
 
-}
+ }
 
 
-try {
+ try {
 
-console.log(
-"=============================="
-);
+ console.log(
+ "=============================="
+ );
 
-console.log(
-"VERIFYDOC API START"
-);
+ console.log(
+ "VERIFYDOC API START"
+ );
 
-const startTime =
-Date.now();
+ const startTime =
+ Date.now();
 
 
-// -------------------------------------------------
-// API KEY
-// -------------------------------------------------
+ // -------------------------------------------------
+ // API KEY
+ // -------------------------------------------------
 
-if (
-!process.env.OPENAI_API_KEY
-) {
+ if (
+ !process.env.OPENAI_API_KEY
+ ) {
 
-throw new Error(
-"OPENAI_API_KEY Vercel Environment Variables içinde bulunamadı."
-);
+ throw new Error(
+ "OPENAI_API_KEY Vercel Environment Variables içinde bulunamadı."
+ );
 
-}
+ }
 
 
-// -------------------------------------------------
-// FORM DATA
-// -------------------------------------------------
+ // -------------------------------------------------
+ // FORM DATA
+ // -------------------------------------------------
 
-const {
-fields,
-files,
-} =
-await parseMultipart(req);
+ const {
+ fields,
+ files,
+ } =
+ await parseMultipart(req);
 
 
-console.log(
-"FORM PARSED"
-);
+ console.log(
+ "FORM PARSED"
+ );
 
 
-const uploadedFile =
-findUploadedFile(files);
+ const uploadedFile =
+ findUploadedFile(files);
 
 
-if (!uploadedFile) {
+ if (!uploadedFile) {
 
-throw new Error(
-"Dosya alınamadı. image, file veya video alanı bulunamadı."
-);
+ throw new Error(
+ "Dosya alınamadı. image, file veya video alanı bulunamadı."
+ );
 
-}
+ }
 
 
-const type =
-first(fields?.type) ||
-"document";
+ const type =
+ first(fields?.type) ||
+ "document";
 
 
-const fileName =
-first(fields?.fileName) ||
-uploadedFile.originalFilename ||
-"document";
+ const fileName =
+ first(fields?.fileName) ||
+ uploadedFile.originalFilename ||
+ "document";
 
 
-console.log(
-"FILE:",
-fileName
-);
+ console.log(
+ "FILE:",
+ fileName
+ );
 
 
-console.log(
-"TYPE:",
-type
-);
+ console.log(
+ "TYPE:",
+ type
+ );
 
 
-console.log(
-"MIME:",
-uploadedFile.mimetype
-);
+ console.log(
+ "MIME:",
+ uploadedFile.mimetype
+ );
 
 
-console.log(
-"SIZE:",
-uploadedFile.size
-);
+ console.log(
+ "SIZE:",
+ uploadedFile.size
+ );
 
 
-// -------------------------------------------------
-// DOSYA
-// -------------------------------------------------
+ // -------------------------------------------------
+ // DOSYA
+ // -------------------------------------------------
 
-const filePath =
-uploadedFile.filepath;
+ const filePath =
+ uploadedFile.filepath;
 
 
-if (!filePath) {
+ if (!filePath) {
 
-throw new Error(
-"Yüklenen dosyanın yolu bulunamadı."
-);
+ throw new Error(
+ "Yüklenen dosyanın yolu bulunamadı."
+ );
 
-}
+ }
 
 
-const buffer =
-await fs.readFile(
-filePath
-);
+ const buffer =
+ await fs.readFile(
+ filePath
+ );
 
 
-if (!buffer?.length) {
+ if (!buffer?.length) {
 
-throw new Error(
-"Dosya boş."
-);
+ throw new Error(
+ "Dosya boş."
+ );
 
-}
+ }
 
 
-// -------------------------------------------------
-// BASE64
-// -------------------------------------------------
+ // -------------------------------------------------
+ // BASE64
+ // -------------------------------------------------
 
-const base64 =
-buffer.toString(
-"base64"
-);
+ const base64 =
+ buffer.toString(
+ "base64"
+ );
 
 
-let mime =
-uploadedFile.mimetype;
+ let mime =
+ uploadedFile.mimetype;
 
 
-if (
-type === "image" &&
-(
-!mime ||
-!mime.startsWith("image/")
-)
-) {
+ if (
+ type === "image" &&
+ (
+ !mime ||
+ !mime.startsWith("image/")
+ )
+ ) {
 
-const extension =
-path
-.extname(fileName)
-.toLowerCase();
+ const extension =
+ path
+ .extname(fileName)
+ .toLowerCase();
 
 
-if (
-extension === ".png"
-) {
+ if (
+ extension === ".png"
+ ) {
 
-mime =
-"image/png";
+ mime =
+ "image/png";
 
-} else if (
-extension === ".webp"
-) {
+ } else if (
+ extension === ".webp"
+ ) {
 
-mime =
-"image/webp";
+ mime =
+ "image/webp";
 
-} else if (
-extension === ".jpg" ||
-extension === ".jpeg"
-) {
+ } else if (
+ extension === ".jpg" ||
+ extension === ".jpeg"
+ ) {
 
-mime =
-"image/jpeg";
+ mime =
+ "image/jpeg";
 
-} else {
+ } else {
 
-mime =
-"image/jpeg";
+ mime =
+ "image/jpeg";
 
-}
+ }
 
-}
+ }
 
 
-if (
-type === "pdf" &&
-(
-!mime ||
-!mime.includes("pdf")
-)
-) {
+ if (
+ type === "pdf" &&
+ (
+ !mime ||
+ !mime.includes("pdf")
+ )
+ ) {
 
-mime =
-"application/pdf";
+ mime =
+ "application/pdf";
 
-}
+ }
 
 
-if (
-type === "video" &&
-(
-!mime ||
-!mime.startsWith("video/")
-)
-) {
+ if (
+ type === "video" &&
+ (
+ !mime ||
+ !mime.startsWith("video/")
+ )
+ ) {
 
-mime =
-"video/mp4";
+ mime =
+ "video/mp4";
 
-}
+ }
 
 
-console.log(
-"FINAL MIME:",
-mime
-);
+ console.log(
+ "FINAL MIME:",
+ mime
+ );
 
 
-// =====================================================
-// REFERANS DEKONT
-// =====================================================
+ // =====================================================
+ // REFERANS DEKONT
+ // =====================================================
 
-// Şimdilik sistemdeki Akbank referansı kullanılıyor.
+ // Şimdilik sistemdeki Akbank referansı kullanılıyor.
 
-const bank =
-first(fields?.bank) ||
-  "akbank , garanti , garantibbva";
-const reference =
-  await loadReferenceFile(
-    bank
-);
-console.log(
-  "BANK FIELD:",
- fields?.bank
-  );
-console.log(
-  "SELECTED BANK:",
-  bank
-  );
-console.log(
-"REFERENCE:",
-reference?.fileName ||
-"YOK"
-);
+ const reference =
+ await loadReferenceFile(
+ "akbank"
+ );
 
 
-// -------------------------------------------------
-// OPENAI INPUT
-// -------------------------------------------------
+ console.log(
+ "REFERENCE:",
+ reference?.fileName ||
+ "YOK"
+ );
 
-const imageDataUrl =
-`data:${mime};base64,${base64}`;
 
+ // -------------------------------------------------
+ // OPENAI INPUT
+ // -------------------------------------------------
 
-let content;
+ const imageDataUrl =
+ `data:${mime};base64,${base64}`;
 
 
-// =================================================
-// IMAGE
-// =================================================
+ let content;
 
-if (
-type === "image"
-) {
 
-content = [
+ // =================================================
+ // IMAGE
+ // =================================================
 
-{
+ if (
+ type === "image"
+ ) {
 
-type:
-"input_text",
+ content = [
 
-text: `${PROMPT}
+ {
+
+ type:
+ "input_text",
+
+ text: `${PROMPT}
 
 =====================================================
 REFERANS DEKONT
@@ -1843,46 +1832,46 @@ gerçekliği için kesin kanıt olarak kabul etme.
 Filename:
 ${fileName}`,
 
-},
+ },
 
-{
+ {
 
-type:
-"input_image",
+ type:
+ "input_image",
 
-image_url:
-imageDataUrl,
+ image_url:
+ imageDataUrl,
 
-detail:
-"auto",
+ detail:
+ "auto",
 
-},
+ },
 
-];
+ ];
 
-}
-
-
-// =================================================
-// PDF
-// =================================================
-
-else if (
-type === "pdf"
-) {
-
-const pdfDataUrl =
-`data:application/pdf;base64,${base64}`;
+ }
 
 
-content = [
+ // =================================================
+ // PDF
+ // =================================================
 
-{
+ else if (
+ type === "pdf"
+ ) {
 
-type:
-"input_text",
+ const pdfDataUrl =
+ `data:application/pdf;base64,${base64}`;
 
-text: `${PROMPT}
+
+ content = [
+
+ {
+
+ type:
+ "input_text",
+
+ text: `${PROMPT}
 
 =====================================================
 REFERANS DEKONT
@@ -1928,305 +1917,305 @@ gerçekliği için kesin kanıt olarak kabul etme.
 Filename:
 ${fileName}`,
 
-},
+ },
 
-{
+ {
 
-type:
-"input_file",
+ type:
+ "input_file",
 
-filename:
-fileName,
+ filename:
+ fileName,
 
-file_data:
-pdfDataUrl,
+ file_data:
+ pdfDataUrl,
 
-},
+ },
 
-...(reference?.base64
+ ...(reference?.base64
 
-? [
+ ? [
 
-{
+ {
 
-type:
-"input_file",
+ type:
+ "input_file",
 
-filename:
-reference.fileName,
+ filename:
+ reference.fileName,
 
-file_data:
-`data:application/pdf;base64,${reference.base64}`,
+ file_data:
+ `data:application/pdf;base64,${reference.base64}`,
 
-},
+ },
 
-]
+ ]
 
-: []),
+ : []),
 
-];
+ ];
 
-}
+ }
 
 
-// =================================================
-// VIDEO
-// =================================================
+ // =================================================
+ // VIDEO
+ // =================================================
 
-else if (
-type === "video"
-) {
+ else if (
+ type === "video"
+ ) {
 
-console.log(
-"VIDEO ANALYSIS START"
-);
+ console.log(
+ "VIDEO ANALYSIS START"
+ );
 
 
-const frames =
-await extractVideoFrames(
-filePath
-);
+ const frames =
+ await extractVideoFrames(
+ filePath
+ );
 
 
-console.log(
-"VIDEO FRAMES EXTRACTED:",
-frames.length
-);
+ console.log(
+ "VIDEO FRAMES EXTRACTED:",
+ frames.length
+ );
 
 
-const videoResult =
-await analyzeVideoFrames(
-frames
-);
+ const videoResult =
+ await analyzeVideoFrames(
+ frames
+ );
 
 
-console.log(
-"VIDEO ANALYSIS COMPLETE"
-);
+ console.log(
+ "VIDEO ANALYSIS COMPLETE"
+ );
 
 
-console.log(
-"VIDEO RESULT:",
-videoResult
-);
+ console.log(
+ "VIDEO RESULT:",
+ videoResult
+ );
 
 
-return res
-.status(200)
-.json({
+ return res
+ .status(200)
+ .json({
 
-success: true,
+ success: true,
 
-fileName,
+ fileName,
 
-type,
+ type,
 
-videoAnalysis:
-videoResult,
+ videoAnalysis:
+ videoResult,
 
-});
+ });
 
-}
+ }
 
 
-else {
+ else {
 
-throw new Error(
-"Desteklenmeyen dosya türü."
-);
+ throw new Error(
+ "Desteklenmeyen dosya türü."
+ );
 
-}
+ }
 
 
-// -------------------------------------------------
-// OPENAI
-// -------------------------------------------------
+ // -------------------------------------------------
+ // OPENAI
+ // -------------------------------------------------
 
-console.log(
-"OPENAI REQUEST START"
-);
+ console.log(
+ "OPENAI REQUEST START"
+ );
 
 
-const response =
-await openai.responses.create({
+ const response =
+ await openai.responses.create({
 
-model:
-"gpt-5-mini",
+ model:
+ "gpt-5-mini",
 
-input: [
+ input: [
 
-{
+ {
 
-role:
-"user",
+ role:
+ "user",
 
-content,
+ content,
 
-},
+ },
 
-],
+ ],
 
-text: {
+ text: {
 
-format: {
+ format: {
 
-type:
-"json_schema",
+ type:
+ "json_schema",
 
-name:
-"verifydoc_analysis",
+ name:
+ "verifydoc_analysis",
 
-strict:
-true,
+ strict:
+ true,
 
-schema:
-RESPONSE_SCHEMA,
+ schema:
+ RESPONSE_SCHEMA,
 
-},
+ },
 
-},
+ },
 
-});
+ });
 
 
-console.log(
-"OPENAI RESPONSE RECEIVED"
-);
+ console.log(
+ "OPENAI RESPONSE RECEIVED"
+ );
 
 
-console.log(
-"OPENAI SURE:",
-(
-(Date.now() - startTime) /
-1000
-).toFixed(2),
-"seconds"
-);
+ console.log(
+ "OPENAI SURE:",
+ (
+ (Date.now() - startTime) /
+ 1000
+ ).toFixed(2),
+ "seconds"
+ );
 
 
-// -------------------------------------------------
-// PARSE
-// -------------------------------------------------
+ // -------------------------------------------------
+ // PARSE
+ // -------------------------------------------------
 
-result =
-parseAIResponse(
-response.output_text
-);
+ result =
+ parseAIResponse(
+ response.output_text
+ );
 
 
-// =====================================================
-// ANA SKOR
-// =====================================================
+ // =====================================================
+ // ANA SKOR
+ // =====================================================
 
-const finalScore =
-Number(
-result.overallRisk
-) || 0;
+ const finalScore =
+ Number(
+ result.overallRisk
+ ) || 0;
 
 
-const finalSuspicious =
-finalScore >= 46;
+ const finalSuspicious =
+ finalScore >= 46;
 
 
-const finalEvidence =
-result?.amountAnalysis?.evidence ||
-result?.summary ||
-"Analiz tamamlandı.";
+ const finalEvidence =
+ result?.amountAnalysis?.evidence ||
+ result?.summary ||
+ "Analiz tamamlandı.";
 
 
-console.log(
-"FINAL SCORE:",
-finalScore
-);
+ console.log(
+ "FINAL SCORE:",
+ finalScore
+ );
 
 
-console.log(
-"FINAL SUSPICIOUS:",
-finalSuspicious
-);
+ console.log(
+ "FINAL SUSPICIOUS:",
+ finalSuspicious
+ );
 
 
-console.log(
-"ANALYSIS SUCCESS"
-);
+ console.log(
+ "ANALYSIS SUCCESS"
+ );
 
 
-console.log(
-"TOTAL SURE:",
-(
-(Date.now() - startTime) /
-1000
-).toFixed(2),
-"seconds"
-);
+ console.log(
+ "TOTAL SURE:",
+ (
+ (Date.now() - startTime) /
+ 1000
+ ).toFixed(2),
+ "seconds"
+ );
 
 
-console.log(
-"=============================="
-);
+ console.log(
+ "=============================="
+ );
 
 
-return res
-.status(200)
-.json({
+ return res
+ .status(200)
+ .json({
 
-success: true,
+ success: true,
 
-fileName,
+ fileName,
 
-type,
+ type,
 
-...result,
+ ...result,
 
-// ANA SKOR
-score:
-finalScore,
+ // ANA SKOR
+ score:
+ finalScore,
 
-// ANA ŞÜPHE DURUMU
-suspicious:
-finalSuspicious,
+ // ANA ŞÜPHE DURUMU
+ suspicious:
+ finalSuspicious,
 
-// BİRLEŞTİRİLMİŞ KANIT
-evidence:
-finalEvidence,
+ // BİRLEŞTİRİLMİŞ KANIT
+ evidence:
+ finalEvidence,
 
-});
+ });
 
 
-} catch (err) {
+ } catch (err) {
 
-console.error(
-"=============================="
-);
+ console.error(
+ "=============================="
+ );
 
 
-console.error(
-"VERIFYDOC API ERROR:"
-);
+ console.error(
+ "VERIFYDOC API ERROR:"
+ );
 
 
-console.error(
-err
-);
+ console.error(
+ err
+ );
 
 
-console.error(
-"=============================="
-);
+ console.error(
+ "=============================="
+ );
 
 
-return res
-.status(500)
-.json({
+ return res
+ .status(500)
+ .json({
 
-success: false,
+ success: false,
 
-error:
-err?.message ||
-"Analysis failed",
+ error:
+ err?.message ||
+ "Analysis failed",
 
-});
+ });
 
-}
+ }
 
 }
