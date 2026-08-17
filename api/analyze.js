@@ -1976,8 +1976,6 @@ console.log(
 
 let amountLocation = null;
 
-let amountCharacters = [];
-
 let amountAnalysis = {
  suspicious: false,
  score: 0,
