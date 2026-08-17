@@ -1755,7 +1755,7 @@ mime
 
 const reference =
 await loadReferenceFile(
-"akbank"
+"akbank";
 const reference =
   await loadReferenceFile(
     bank
