@@ -1754,8 +1754,8 @@ mime
 // Şimdilik sistemdeki Akbank referansı kullanılıyor.
 
 const reference =
-await loadReferenceFile(
-"akbank";
+first(fields?.bank) ||
+  "akbank";
 const reference =
   await loadReferenceFile(
     bank
