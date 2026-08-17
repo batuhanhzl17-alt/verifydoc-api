@@ -2002,7 +2002,6 @@ let amountCharacterCrossCheck = {
 // SADECE IMAGE İÇİN
 // =====================================================
 
-let amountAnalysis = null;
 
 if (type === "image") {
 
