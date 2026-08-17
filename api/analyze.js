@@ -1760,7 +1760,10 @@ const reference =
   await loadReferenceFile(
     bank
 );
-
+console.log(
+  "BANK:",
+  BANK
+  );
 
 console.log(
 "REFERENCE:",
