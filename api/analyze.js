@@ -8,6 +8,7 @@ import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
 
 const execFileAsync = promisify(execFile);
+
 const REFERENCE_DIR =
 path.join(process.cwd(), "references");
 
@@ -40,58 +41,60 @@ fileName
 );
 }
 
+
 // =====================================================
 // REFERANS PDF OKUMA
 // =====================================================
 
 async function loadReferenceFile(bank) {
 
- const referencePath =
- getReferenceFile(bank);
+const referencePath =
+getReferenceFile(bank);
 
- if (!referencePath) {
- return null;
- }
-
- try {
-
- const buffer =
- await fs.readFile(
- referencePath
- );
-
- if (!buffer?.length) {
- return null;
- }
-
- console.log(
- "REFERENCE LOADED:",
- referencePath
- );
-
- return {
- bank,
- fileName:
- path.basename(referencePath),
- base64:
- buffer.toString("base64"),
- };
-
- } catch (error) {
-
- console.error(
- "REFERENCE LOAD ERROR:",
- error
- );
-
- return null;
- }
+if (!referencePath) {
+return null;
 }
 
+try {
+
+const buffer =
+await fs.readFile(
+referencePath
+);
+
+if (!buffer?.length) {
+return null;
+}
+
+console.log(
+"REFERENCE LOADED:",
+referencePath
+);
+
+return {
+bank,
+fileName:
+path.basename(referencePath),
+base64:
+buffer.toString("base64"),
+};
+
+} catch (error) {
+
+console.error(
+"REFERENCE LOAD ERROR:",
+error
+);
+
+return null;
+}
+}
+
+
 export const config = {
- api: {
- bodyParser: false,
- },
+api: {
+bodyParser: false,
+},
 };
 
 
@@ -100,7 +103,8 @@ export const config = {
 // =====================================================
 
 const openai = new OpenAI({
- apiKey: process.env.OPENAI_API_KEY,
+apiKey:
+process.env.OPENAI_API_KEY,
 });
 
 
@@ -109,31 +113,31 @@ const openai = new OpenAI({
 // =====================================================
 
 const CHECK_NAMES = [
- "ocrConsistency",
- "fontConsistency",
- "fontSizeConsistency",
- "characterSpacing",
- "lineSpacing",
- "textAlignment",
- "baselineConsistency",
- "compressionArtifacts",
- "copyPasteRegions",
- "editingTraces",
- "photoshopArtifacts",
- "aiGeneratedIndicators",
- "logoConsistency",
- "stampConsistency",
- "signatureConsistency",
- "dateConsistency",
- "amountConsistency",
- "currencyFormatting",
- "ibanFormatting",
- "swiftFormatting",
- "qrBarcodeConsistency",
- "layoutIntegrity",
- "suspiciousElements",
- "documentTypeConsistency",
- "imageQuality",
+"ocrConsistency",
+"fontConsistency",
+"fontSizeConsistency",
+"characterSpacing",
+"lineSpacing",
+"textAlignment",
+"baselineConsistency",
+"compressionArtifacts",
+"copyPasteRegions",
+"editingTraces",
+"photoshopArtifacts",
+"aiGeneratedIndicators",
+"logoConsistency",
+"stampConsistency",
+"signatureConsistency",
+"dateConsistency",
+"amountConsistency",
+"currencyFormatting",
+"ibanFormatting",
+"swiftFormatting",
+"qrBarcodeConsistency",
+"layoutIntegrity",
+"suspiciousElements",
+"documentTypeConsistency",
+"imageQuality",
 ];
 
 
@@ -141,170 +145,234 @@ const CHECK_NAMES = [
 // SCHEMA
 // =====================================================
 
-const CHECK_SCHEMA = Object.fromEntries(
+const CHECK_SCHEMA =
+Object.fromEntries(
 
- CHECK_NAMES.map((name) => [
+CHECK_NAMES.map(
+(name) => [
 
- name,
+name,
 
- {
- type: "object",
+{
+type: "object",
 
- properties: {
+properties: {
 
- status: {
- type: "string",
+status: {
+type: "string",
 
- enum: [
- "pass",
- "review",
- "suspicious",
- "unknown",
- ],
- },
+enum: [
+"pass",
+"review",
+"suspicious",
+"unknown",
+],
+},
 
- score: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+score: {
+type: "integer",
+minimum: 0,
+maximum: 100,
+},
 
- evidence: {
- type: "string",
- },
+evidence: {
+type: "string",
+},
 
- },
+},
 
- required: [
- "status",
- "score",
- "evidence",
- ],
+required: [
+"status",
+"score",
+"evidence",
+],
 
- additionalProperties: false,
- },
+additionalProperties: false,
+},
 
- ])
+]
+)
 
 );
 
 
 const RESPONSE_SCHEMA = {
 
- type: "object",
+type: "object",
 
- properties: {
+properties: {
 
- overallRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+overallRisk: {
+type: "integer",
+minimum: 0,
+maximum: 100,
+},
 
- riskLabel: {
- type: "string",
+riskLabel: {
+type: "string",
 
- enum: [
- "LOW RISK",
- "MODERATE RISK",
- "HIGH RISK",
- "VERY HIGH RISK",
- ],
- },
+enum: [
+"LOW RISK",
+"MODERATE RISK",
+"HIGH RISK",
+"VERY HIGH RISK",
+],
+},
 
- confidence: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+confidence: {
+type: "integer",
+minimum: 0,
+maximum: 100,
+},
 
- summary: {
- type: "string",
- },
+summary: {
+type: "string",
+},
 
- categories: {
+categories: {
 
- type: "object",
+type: "object",
 
- properties: {
+properties: {
 
- visualRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+visualRisk: {
+type: "integer",
+minimum: 0,
+maximum: 100,
+},
 
- textRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+textRisk: {
+type: "integer",
+minimum: 0,
+maximum: 100,
+},
 
- layoutRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+layoutRisk: {
+type: "integer",
+minimum: 0,
+maximum: 100,
+},
 
- financialDataRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+financialDataRisk: {
+type: "integer",
+minimum: 0,
+maximum: 100,
+},
 
- editingRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+editingRisk: {
+type: "integer",
+minimum: 0,
+maximum: 100,
+},
 
- },
+},
 
- required: [
- "visualRisk",
- "textRisk",
- "layoutRisk",
- "financialDataRisk",
- "editingRisk",
- ],
+required: [
+"visualRisk",
+"textRisk",
+"layoutRisk",
+"financialDataRisk",
+"editingRisk",
+],
 
- additionalProperties: false,
- },
+additionalProperties: false,
+},
 
- checks: {
+checks: {
 
- type: "object",
+type: "object",
 
- properties: CHECK_SCHEMA,
+properties:
+CHECK_SCHEMA,
 
- required: CHECK_NAMES,
+required:
+CHECK_NAMES,
 
- additionalProperties: false,
- },
+additionalProperties: false,
+},
 
- limitations: {
+limitations: {
 
- type: "array",
+type: "array",
 
- items: {
- type: "string",
- },
+items: {
+type: "string",
+},
 
- },
+},
 
- },
+// =====================================================
+// TUTAR / VERGİ / MATEMATİKSEL KONTROL
+// =====================================================
 
- required: [
- "overallRisk",
- "riskLabel",
- "confidence",
- "summary",
- "categories",
- "checks",
- "limitations",
- ],
+amountAnalysis: {
 
- additionalProperties: false,
+type: "object",
+
+properties: {
+
+amount: {
+type: ["string", "null"],
+},
+
+subtotal: {
+type: ["number", "null"],
+},
+
+taxAmount: {
+type: ["number", "null"],
+},
+
+totalAmount: {
+type: ["number", "null"],
+},
+
+calculatedTotal: {
+type: ["number", "null"],
+},
+
+difference: {
+type: ["number", "null"],
+},
+
+calculationConsistent: {
+type: "boolean",
+},
+
+evidence: {
+type: "string",
+},
+
+},
+
+required: [
+"amount",
+"subtotal",
+"taxAmount",
+"totalAmount",
+"calculatedTotal",
+"difference",
+"calculationConsistent",
+"evidence",
+],
+
+additionalProperties: false,
+},
+
+},
+
+required: [
+"overallRisk",
+"riskLabel",
+"confidence",
+"summary",
+"categories",
+"checks",
+"limitations",
+"amountAnalysis",
+],
+
+additionalProperties: false,
 };
 
 
@@ -312,30 +380,32 @@ const RESPONSE_SCHEMA = {
 // FORMIDABLE
 // =====================================================
 
-// =====================================================
-// FORMIDABLE
-// =====================================================
-
 function parseMultipart(req) {
 
-return new Promise((resolve, reject) => {
+return new Promise(
+(resolve, reject) => {
 
-const form = formidable({
+const form =
+formidable({
 multiples: false,
 keepExtensions: true,
-maxFileSize: 25 * 1024 * 1024,
+maxFileSize:
+25 * 1024 * 1024,
 });
 
 form.parse(
 req,
-(err, fields, files) => {
+(
+err,
+fields,
+files
+) => {
 
 if (err) {
 
 reject(err);
 
 return;
-
 }
 
 resolve({
@@ -346,7 +416,8 @@ files,
 }
 );
 
-});
+}
+);
 
 }
 
@@ -355,7 +426,9 @@ files,
 // VIDEO → FRAME ÇIKARMA
 // =====================================================
 
-async function extractVideoFrames(videoPath) {
+async function extractVideoFrames(
+videoPath
+) {
 
 const outputDir =
 `/tmp/verifydoc-${Date.now()}`;
@@ -632,19 +705,22 @@ content
 
 }
 
+
 // =====================================================
 // ARRAY'DEN İLK DEĞERİ AL
 // =====================================================
 
 function first(value) {
 
- if (Array.isArray(value)) {
+if (
+Array.isArray(value)
+) {
 
- return value[0];
+return value[0];
 
- }
+}
 
- return value;
+return value;
 
 }
 
@@ -653,50 +729,53 @@ function first(value) {
 // DOSYA BUL
 // =====================================================
 
-function findUploadedFile(files) {
+function findUploadedFile(
+files
+) {
 
- const possibleNames = [
- "image",
- "file",
- "video",
- ];
+const possibleNames = [
+"image",
+"file",
+"video",
+];
 
+for (
+const name of possibleNames
+) {
 
- for (
- const name of possibleNames
- ) {
+const value =
+files?.[name];
 
- const value =
- files?.[name];
+if (!value) {
 
-
- if (!value) {
-
- continue;
-
- }
-
-
- if (Array.isArray(value)) {
-
- return value[0];
-
- }
-
-
- return value;
-
- }
-
-
- return null;
+continue;
 
 }
+
+if (
+Array.isArray(value)
+) {
+
+return value[0];
+
+}
+
+return value;
+
+}
+
+return null;
+
+}
+
+
 // =====================================================
 // MİKRO KARAKTER / RAKAM TUTARLILIK ANALİZİ
 // =====================================================
 
-function analyzeTextCharacterConsistency(text) {
+function analyzeTextCharacterConsistency(
+text
+) {
 
 if (
 !text ||
@@ -706,7 +785,8 @@ typeof text !== "string"
 return {
 score: 0,
 suspicious: false,
-reason: "Analiz edilecek metin bulunamadı.",
+reason:
+"Analiz edilecek metin bulunamadı.",
 };
 
 }
@@ -762,23 +842,15 @@ reason:
 
 }
 
-/*
-* Bu aşamada OCR metnindeki karakterleri
-* karşılaştırıyoruz.
-*
-* ÖNEMLİ:
-* Bu fonksiyon tek başına görüntüdeki
-* piksel/font farkını kesin olarak ölçmez.
-*
-* Asıl görsel değerlendirme GPT tarafından
-* yapılmaya devam eder.
-*/
-
 return {
+
 score: 0,
+
 suspicious: false,
+
 reason:
 "Rakam karakterleri mikro tutarlılık analizi için hazır.",
+
 repeatedDigits:
 repeatedDigits.map(
 ([digit, count]) => ({
@@ -786,510 +858,80 @@ digit,
 count,
 })
 ),
+
 };
 
 }
 
-async function analyzeAmountDetails(base64, mime) {
 
-if (!base64) {
-return {
-amount: null,
-characters: [],
-fontConsistent: true,
-suspicious: false,
-score: 0,
-suspiciousCharacters: [],
-comparisons: [],
-subtotal: null,
-taxAmount: null,
-totalAmount: null,
-calculatedTotal: null,
-difference: null,
-calculationConsistent: true,
-evidence: "Belge görüntüsü bulunamadı."
-};
-}
-
-try {
-
-const imageDataUrl =
-`data:${mime || "image/jpeg"};base64,${base64}`;
-
-const response =
-await openai.responses.create({
-
-model: "gpt-5-mini",
-
-input: [
-{
-role: "user",
-
-content: [
-
-{
-type: "input_text",
-
-text: `
-Sen VerifyDoc sisteminin TUTAR ANALİZ modülüsün.
-
-Bu belgeyi yalnızca TUTAR ve ilgili finansal alanlar açısından incele.
-
-ANA İŞLEM TUTARI
-----------------
-
-Belgedeki ana işlem tutarını bul.
-
-Örnek:
-
-1000 TL
-1.000,00 TL
-1000,00 EUR
-€1,000.00
-
-Ana tutarı;
-
-- IBAN
-- hesap numarası
-- işlem numarası
-- tarih
-- referans numarası
-- başka bir tutar
-
-ile karıştırma.
-
-Ana tutar bulunamıyorsa amount = null döndür.
-
-KARAKTER ANALİZİ
-----------------
-
-Ana tutardaki karakterleri ayrı ayrı değerlendir.
-
-Örneğin:
-
-1250,00
-
-için:
-
-1
-2
-5
-0
-,
-0
-0
-
-karakterlerini incele.
-
-Her karakter için yaklaşık koordinat ver.
-
-Koordinatlar 0-1000 arasında normalize edilmelidir.
-
-x = sol kenar
-y = üst kenar
-width = genişlik
-height = yükseklik
-
-Karakterlerin:
-
-- yüksekliği
-- genişliği
-- stroke kalınlığı
-- font ağırlığı
-- kenar yapısı
-- anti-aliasing
-- piksel/render görünümü
-- baseline hizalaması
-- genel font karakteristiği
-
-açısından tutarlı olup olmadığını değerlendir.
-
-Aynı karakter belgede başka yerlerde bulunuyorsa mümkün olduğunda
-referans olarak karşılaştır.
-
-Örneğin tutarda bulunan "5" karakterini belgede bulunan diğer "5"
-karakterleriyle karşılaştır.
-
-Aynı karakter bulunamıyorsa bunu şüpheli kabul etme.
-
-Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması veya bulanıklık
-nedeniyle oluşabilecek küçük farkları sahtecilik olarak değerlendirme.
-
-Tek başına küçük bir karakter farklılığı sahtecilik kanıtı değildir.
-
-VERGİ VE MATEMATİKSEL KONTROL
------------------------------
-
-Belgede görünen finansal değerleri ayrıca hesapla.
-
-Varsa:
-
-- ara toplam
-- mal/hizmet tutarı
-- KDV
-- diğer vergiler
-- ücret
-- komisyon
-- indirim
-- toplam tutar
-
-alanlarını tespit et.
-
-Örneğin:
-
-ara toplam + KDV + diğer vergiler - indirim = toplam
-
-şeklinde matematiksel kontrol yap.
-
-Belgede birden fazla vergi varsa toplamını hesapla.
-
-Görünmeyen veya okunamayan rakamları tahmin etme.
-
-Vergi yoksa taxAmount = null.
-
-Ara toplam yoksa subtotal = null.
-
-Toplam yoksa totalAmount = null.
-
-Hesap yapılamıyorsa calculationConsistent değerini zorla true yapma.
-Nedenini evidence içinde açıkla.
-
-Çok küçük yuvarlama farklarını tek başına şüpheli kabul etme.
-
-SADECE GEÇERLİ JSON DÖNDÜR.
-
-`
-},
-
-{
-type: "input_image",
-
-image_url: imageDataUrl,
-
-detail: "high"
-}
-
-]
-}
-],
-
-text: {
-
-format: {
-
-type: "json_schema",
-
-name: "amount_details",
-
-strict: true,
-
-schema: {
-
-type: "object",
-
-properties: {
-
-amount: {
-type: ["string", "null"]
-},
-
-characters: {
-
-type: "array",
-
-items: {
-
-type: "object",
-
-properties: {
-
-char: {
-type: "string"
-},
-
-x: {
-type: "number"
-},
-
-y: {
-type: "number"
-},
-
-width: {
-type: "number"
-},
-
-height: {
-type: "number"
-}
-
-},
-
-required: [
-"char",
-"x",
-"y",
-"width",
-"height"
-],
-
-additionalProperties: false
-}
-},
-
-fontConsistent: {
-type: "boolean"
-},
-
-suspicious: {
-type: "boolean"
-},
-
-score: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
-
-suspiciousCharacters: {
-
-type: "array",
-
-items: {
-type: "string"
-}
-},
-
-comparisons: {
-
-type: "array",
-
-items: {
-
-type: "object",
-
-properties: {
-
-amountCharacter: {
-type: "string"
-},
-
-referenceFound: {
-type: "boolean"
-},
-
-referenceCount: {
-type: "integer"
-},
-
-consistency: {
-type: "integer",
-minimum: 0,
-maximum: 100
-},
-
-status: {
-
-type: "string",
-
-enum: [
-"consistent",
-"potentially_different",
-"unknown"
-]
-},
-
-reason: {
-type: "string"
-}
-
-},
-
-required: [
-"amountCharacter",
-"referenceFound",
-"referenceCount",
-"consistency",
-"status",
-"reason"
-],
-
-additionalProperties: false
-}
-},
-
-subtotal: {
-type: ["number", "null"]
-},
-
-taxAmount: {
-type: ["number", "null"]
-},
-
-totalAmount: {
-type: ["number", "null"]
-},
-
-calculatedTotal: {
-type: ["number", "null"]
-},
-
-difference: {
-type: ["number", "null"]
-},
-
-calculationConsistent: {
-type: "boolean"
-},
-
-evidence: {
-type: "string"
-}
-
-},
-
-required: [
-"amount",
-"characters",
-"fontConsistent",
-"suspicious",
-"score",
-"suspiciousCharacters",
-"comparisons",
-"subtotal",
-"taxAmount",
-"totalAmount",
-"calculatedTotal",
-"difference",
-"calculationConsistent",
-"evidence"
-],
-
-additionalProperties: false
-}
-}
-}
-});
-
-const result =
-JSON.parse(response.output_text);
-
-console.log(
-"AMOUNT DETAILS RESULT:",
-result
-);
-
-return result;
-
-} catch (error) {
-
-console.error(
-"AMOUNT DETAILS ERROR:",
-error
-);
-
-return {
-
-amount: null,
-
-characters: [],
-
-fontConsistent: true,
-
-suspicious: false,
-
-score: 0,
-
-suspiciousCharacters: [],
-
-comparisons: [],
-
-subtotal: null,
-
-taxAmount: null,
-
-totalAmount: null,
-
-calculatedTotal: null,
-
-difference: null,
-
-calculationConsistent: true,
-
-evidence:
-"Tutar analizi gerçekleştirilemedi."
-
-};
-}
-}
 // =====================================================
 // JSON RESPONSE
 // =====================================================
 
-function parseAIResponse(text) {
+function parseAIResponse(
+text
+) {
 
- if (
- !text ||
- typeof text !== "string"
- ) {
+if (
+!text ||
+typeof text !== "string"
+) {
 
- throw new Error(
- "OpenAI boş cevap döndürdü."
- );
+throw new Error(
+"OpenAI boş cevap döndürdü."
+);
 
- }
+}
 
+const cleaned =
+text
+.trim()
+.replace(
+/^```json\s*/i,
+""
+)
+.replace(
+/^```\s*/i,
+""
+)
+.replace(
+/\s*```$/i,
+""
+);
 
- const cleaned =
- text
- .trim()
- .replace(
- /^```json\s*/i,
- ""
- )
- .replace(
- /^```\s*/i,
- ""
- )
- .replace(
- /\s*```$/i,
- ""
- );
+try {
 
+return JSON.parse(
+cleaned
+);
 
- try {
+} catch {
 
- return JSON.parse(cleaned);
+const start =
+cleaned.indexOf("{");
 
- } catch {
+const end =
+cleaned.lastIndexOf("}");
 
- const start =
- cleaned.indexOf("{");
+if (
+start >= 0 &&
+end > start
+) {
 
- const end =
- cleaned.lastIndexOf("}");
+return JSON.parse(
+cleaned.slice(
+start,
+end + 1
+)
+);
 
+}
 
- if (
- start >= 0 &&
- end > start
- ) {
+throw new Error(
+"OpenAI geçerli JSON döndürmedi."
+);
 
- return JSON.parse(
- cleaned.slice(
- start,
- end + 1
- )
- );
-
- }
-
-
- throw new Error(
- "OpenAI geçerli JSON döndürmedi."
- );
-
- }
+}
 
 }
 
@@ -1475,6 +1117,107 @@ quality MUST NOT automatically increase the fraud risk.
 
 Only increase suspicion when there is actual visible evidence of
 inconsistency or manipulation.
+
+=====================================================
+TUTAR / VERGİ / MATEMATİKSEL KONTROL
+=====================================================
+
+Belgede görünen finansal tutarları ayrıca dikkatlice incele.
+
+Özellikle:
+
+- ana işlem tutarı
+- ara toplam
+- mal/hizmet tutarı
+- KDV
+- diğer vergiler
+- komisyon
+- ücret
+- indirim
+- toplam tutar
+
+alanlarını tespit et.
+
+Ana işlem tutarını IBAN, hesap numarası, işlem numarası,
+referans numarası, tarih veya başka bir finansal rakamla karıştırma.
+
+Varsa matematiksel ilişkiyi kontrol et.
+
+Örneğin:
+
+ara toplam + KDV + diğer vergiler + ücret + komisyon - indirim = toplam
+
+Belgede birden fazla vergi veya ücret varsa mümkün olduğunca
+toplamını hesapla.
+
+Görünmeyen, okunamayan veya belirsiz rakamları tahmin etme.
+
+Ara toplam görülemiyorsa subtotal = null.
+
+Vergi görülemiyorsa taxAmount = null.
+
+Toplam görülemiyorsa totalAmount = null.
+
+Hesaplanabilecek değerler varsa:
+
+calculatedTotal
+
+alanında matematiksel olarak hesaplanan toplamı belirt.
+
+difference alanında:
+
+hesaplanan toplam - belgede görünen toplam
+
+farkını belirt.
+
+Hesaplama için yeterli veri yoksa:
+
+calculatedTotal = null
+difference = null
+
+kullan.
+
+Yeterli veri yoksa calculationConsistent değerini otomatik olarak
+true yapma.
+
+Hesaplama için yeterli veri bulunmadığında calculationConsistent
+değerini false olarak kullan ve nedenini evidence alanında açıkla.
+
+Çok küçük yuvarlama farklarını tek başına şüpheli olarak değerlendirme.
+
+Matematiksel tutarsızlık varsa bunun nedenini amountAnalysis.evidence
+alanında açıkça belirt.
+
+=====================================================
+ANA TUTAR KARAKTER / FONT KONTROLÜ
+=====================================================
+
+Ana işlem tutarının karakterlerini görsel olarak incele.
+
+Özellikle:
+
+- karakter yüksekliği
+- karakter genişliği
+- font ağırlığı
+- stroke kalınlığı
+- karakter aralığı
+- baseline
+- hizalama
+- kenar yapısı
+- anti-aliasing
+- genel render görünümü
+
+açısından çevresindeki aynı tip metinlerle tutarlılığını değerlendir.
+
+Farklı rakamların doğal olarak farklı şekillere sahip olduğunu unutma.
+
+Tek başına bir karakterin diğer rakamlardan farklı görünmesi
+şüpheli değildir.
+
+Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması veya görüntü
+kalitesi kaynaklı küçük farklılıkları sahtecilik olarak değerlendirme.
+
+Yeterli görsel kanıt yoksa şüpheli sonuç üretme.
 
 =====================================================
 RISK CALCULATION
@@ -1722,370 +1465,333 @@ Return ONLY the JSON object matching the supplied schema.
 
 `;
 
+
 // =====================================================
 // API
 // =====================================================
 
 export default async function handler(
- req,
- res
+req,
+res
 ) {
-let result ;
- // ---------------------------------------------------
- // CORS
- // ---------------------------------------------------
 
- res.setHeader(
- "Access-Control-Allow-Origin",
- "*"
- );
+let result;
 
- res.setHeader(
- "Access-Control-Allow-Methods",
- "POST, OPTIONS"
- );
+// ---------------------------------------------------
+// CORS
+// ---------------------------------------------------
 
- res.setHeader(
- "Access-Control-Allow-Headers",
- "Content-Type"
- );
+res.setHeader(
+"Access-Control-Allow-Origin",
+"*"
+);
 
+res.setHeader(
+"Access-Control-Allow-Methods",
+"POST, OPTIONS"
+);
 
- if (
- req.method === "OPTIONS"
- ) {
+res.setHeader(
+"Access-Control-Allow-Headers",
+"Content-Type"
+);
 
- return res
- .status(200)
- .end();
 
- }
+if (
+req.method === "OPTIONS"
+) {
 
+return res
+.status(200)
+.end();
 
- if (
- req.method !== "POST"
- ) {
+}
 
- return res
- .status(405)
- .json({
 
- success: false,
+if (
+req.method !== "POST"
+) {
 
- error:
- "Method not allowed",
+return res
+.status(405)
+.json({
 
- });
+success: false,
 
- }
+error:
+"Method not allowed",
 
+});
 
- try {
+}
 
- console.log(
- "=============================="
- );
 
- console.log(
- "VERIFYDOC API START"
- );
-const startTime = Date.now();
+try {
 
+console.log(
+"=============================="
+);
 
- // -------------------------------------------------
- // API KEY
- // -------------------------------------------------
+console.log(
+"VERIFYDOC API START"
+);
 
- if (
- !process.env.OPENAI_API_KEY
- ) {
+const startTime =
+Date.now();
 
- throw new Error(
- "OPENAI_API_KEY Vercel Environment Variables içinde bulunamadı."
- );
 
- }
+// -------------------------------------------------
+// API KEY
+// -------------------------------------------------
 
+if (
+!process.env.OPENAI_API_KEY
+) {
 
- // -------------------------------------------------
- // FORM DATA
- // -------------------------------------------------
+throw new Error(
+"OPENAI_API_KEY Vercel Environment Variables içinde bulunamadı."
+);
 
- const {
- fields,
- files,
- } =
- await parseMultipart(req);
+}
 
 
- console.log(
- "FORM PARSED"
- );
+// -------------------------------------------------
+// FORM DATA
+// -------------------------------------------------
 
+const {
+fields,
+files,
+} =
+await parseMultipart(req);
 
- const uploadedFile =
- findUploadedFile(files);
 
+console.log(
+"FORM PARSED"
+);
 
- if (!uploadedFile) {
 
- throw new Error(
- "Dosya alınamadı. image, file veya video alanı bulunamadı."
- );
+const uploadedFile =
+findUploadedFile(files);
 
- }
 
+if (!uploadedFile) {
 
- const type =
- first(fields?.type) ||
- "document";
+throw new Error(
+"Dosya alınamadı. image, file veya video alanı bulunamadı."
+);
 
+}
 
- const fileName =
- first(fields?.fileName) ||
- uploadedFile.originalFilename ||
- "document";
 
+const type =
+first(fields?.type) ||
+"document";
 
- console.log(
- "FILE:",
- fileName
- );
 
+const fileName =
+first(fields?.fileName) ||
+uploadedFile.originalFilename ||
+"document";
 
- console.log(
- "TYPE:",
- type
- );
 
+console.log(
+"FILE:",
+fileName
+);
 
- console.log(
- "MIME:",
- uploadedFile.mimetype
- );
 
+console.log(
+"TYPE:",
+type
+);
 
- console.log(
- "SIZE:",
- uploadedFile.size
- );
 
+console.log(
+"MIME:",
+uploadedFile.mimetype
+);
 
- // -------------------------------------------------
- // DOSYA
- // -------------------------------------------------
 
- const filePath =
- uploadedFile.filepath;
+console.log(
+"SIZE:",
+uploadedFile.size
+);
 
 
- if (!filePath) {
+// -------------------------------------------------
+// DOSYA
+// -------------------------------------------------
 
- throw new Error(
- "Yüklenen dosyanın yolu bulunamadı."
- );
+const filePath =
+uploadedFile.filepath;
 
- }
 
+if (!filePath) {
 
- const buffer =
- await fs.readFile(
- filePath
- );
+throw new Error(
+"Yüklenen dosyanın yolu bulunamadı."
+);
 
+}
 
- if (!buffer?.length) {
 
- throw new Error(
- "Dosya boş."
- );
+const buffer =
+await fs.readFile(
+filePath
+);
 
- }
 
+if (!buffer?.length) {
 
- // -------------------------------------------------
- // BASE64
- // -------------------------------------------------
+throw new Error(
+"Dosya boş."
+);
 
- const base64 =
- buffer.toString(
- "base64"
- );
+}
 
 
- let mime = uploadedFile.mimetype;
+// -------------------------------------------------
+// BASE64
+// -------------------------------------------------
+
+const base64 =
+buffer.toString(
+"base64"
+);
+
+
+let mime =
+uploadedFile.mimetype;
+
 
 if (
 type === "image" &&
-(!mime || !mime.startsWith("image/"))
+(
+!mime ||
+!mime.startsWith("image/")
+)
 ) {
-const extension =
-path.extname(fileName).toLowerCase();
 
-if (extension === ".png") {
-mime = "image/png";
+const extension =
+path
+.extname(fileName)
+.toLowerCase();
+
+
+if (
+extension === ".png"
+) {
+
+mime =
+"image/png";
+
 } else if (
 extension === ".webp"
 ) {
-mime = "image/webp";
+
+mime =
+"image/webp";
+
 } else if (
 extension === ".jpg" ||
 extension === ".jpeg"
 ) {
-mime = "image/jpeg";
+
+mime =
+"image/jpeg";
+
 } else {
-mime = "image/jpeg";
+
+mime =
+"image/jpeg";
+
 }
+
 }
+
 
 if (
 type === "pdf" &&
-(!mime || !mime.includes("pdf"))
+(
+!mime ||
+!mime.includes("pdf")
+)
 ) {
-mime = "application/pdf";
+
+mime =
+"application/pdf";
+
 }
+
 
 if (
 type === "video" &&
-(!mime || !mime.startsWith("video/"))
+(
+!mime ||
+!mime.startsWith("video/")
+)
 ) {
-mime = "video/mp4";
+
+mime =
+"video/mp4";
+
 }
+
 
 console.log(
 "FINAL MIME:",
 mime
 );
 
-  // =====================================================
+
+// =====================================================
 // REFERANS DEKONT
 // =====================================================
 
 // Şimdilik sistemdeki Akbank referansı kullanılıyor.
+
 const reference =
- await loadReferenceFile("akbank");
+await loadReferenceFile(
+"akbank"
+);
+
 
 console.log(
- "REFERENCE:",
- reference?.fileName || "YOK"
+"REFERENCE:",
+reference?.fileName ||
+"YOK"
 );
 
-// =====================================================
-// TUTAR KARAKTER ANALİZİ
-// =====================================================
 
-let amountLocation = null;
+// -------------------------------------------------
+// OPENAI INPUT
+// -------------------------------------------------
 
-let amountAnalysis = {
- suspicious: false,
- score: 0,
- fontConsistent: true,
- suspiciousCharacters: [],
- comparisons: [],
- evidence:
- "Tutar karakter analizi bu dosya türünde çalıştırılmadı."
-};
-
-let amountCharacterCrossCheck = {
- suspicious: false,
- score: 0,
- comparisons: [],
- suspiciousCharacters: [],
- evidence:
- "Belge içi karakter karşılaştırması bu dosya türünde çalıştırılmadı."
-};
-
-
-// =====================================================
-// SADECE IMAGE İÇİN
-// =====================================================
-
-
-if (type === "image") {
-
-console.log(
-"IMAGE AMOUNT ANALYSIS START"
-);
-
-amountAnalysis =
-await analyzeAmountDetails(
-base64,
-mime
-);
-
-console.log(
-"AMOUNT ANALYSIS COMPLETE"
-);
-
-}
-
-// =====================================================
-// TUTAR KARAKTER / FONT ANALİZİ
-// =====================================================
-
-const amountCharacters =
-Array.isArray(amountLocation)
-? amountLocation
-: (
-amountLocation?.characters ||
-[]
-);
-
- amountAnalysis =
-await analyzeAmountCharacters(
-base64,
-mime,
-amountCharacters
-);
-
-console.log(
-"AMOUNT FONT ANALYSIS:",
-amountAnalysis
-);
-
-// =====================================================
-// BELGE İÇİ AYNI KARAKTER ÇAPRAZ ANALİZİ
-// =====================================================
-
- amountCharacterCrossCheck =
-await analyzeAmountCharacterCrossCheck(
-base64,
-mime,
-amountLocation?.characters || []
-);
-
-console.log(
-"AMOUNT CHARACTER CROSS CHECK:",
-amountCharacterCrossCheck
-);
-}
-  
- // -------------------------------------------------
- // OPENAI INPUT
- // -------------------------------------------------
 const imageDataUrl =
 `data:${mime};base64,${base64}`;
 
- let content;
+
+let content;
 
 
- // =================================================
- // IMAGE
- // =================================================
+// =================================================
+// IMAGE
+// =================================================
 
- if (
- type === "image"
- ) {
+if (
+type === "image"
+) {
 
+content = [
 
+{
 
- content = [
+type:
+"input_text",
 
- {
- type: "input_text",
+text: `${PROMPT}
 
- text: `${PROMPT}
-   
 =====================================================
 REFERANS DEKONT
 =====================================================
@@ -2110,7 +1816,6 @@ Referans dekontu, analiz edilen dekont ile:
 
 açısından karşılaştır.
 
-
 Referansı belge şablonu, yerleşim, tipografi, alan düzeni,
 logo, tarih, tutar, IBAN biçimi ve genel görsel yapı açısından
 karşılaştırma amacıyla kullan.
@@ -2119,42 +1824,52 @@ Referansla birebir aynı olmamasını tek başına sahtecilik kanıtı
 olarak değerlendirme.
 
 Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
-artırma. 
+artırma.
+
 Referans dekontun kendisini analiz edilen dekontun
 gerçekliği için kesin kanıt olarak kabul etme.
 
-Filename: ${fileName}`,
- },
+Filename:
+${fileName}`,
 
- {
- type: "input_image",
+},
 
- image_url:
- imageDataUrl,
-
- detail: "auto",
- },
-
- ];
-
- }
-
-
- // =================================================
- // PDF
- // =================================================
-
- else if (
- type === "pdf"
- ) {
-
- const pdfDataUrl =
- `data:application/pdf;base64,${base64}`;
-
-
- content = [
 {
-type: "input_text",
+
+type:
+"input_image",
+
+image_url:
+imageDataUrl,
+
+detail:
+"auto",
+
+},
+
+];
+
+}
+
+
+// =================================================
+// PDF
+// =================================================
+
+else if (
+type === "pdf"
+) {
+
+const pdfDataUrl =
+`data:application/pdf;base64,${base64}`;
+
+
+content = [
+
+{
+
+type:
+"input_text",
 
 text: `${PROMPT}
 
@@ -2200,62 +1915,90 @@ Referans dekontun kendisini analiz edilen dekontun
 gerçekliği için kesin kanıt olarak kabul etme.
 
 Filename:
-${fileName}
-`,
+${fileName}`,
+
 },
 
 {
-type: "input_file",
 
- filename: fileName,
+type:
+"input_file",
 
- file_data: pdfDataUrl,
- },
+filename:
+fileName,
+
+file_data:
+pdfDataUrl,
+
+},
 
 ...(reference?.base64
+
 ? [
+
 {
-type: "input_file",
+
+type:
+"input_file",
 
 filename:
 reference.fileName,
 
 file_data:
 `data:application/pdf;base64,${reference.base64}`,
+
 },
+
 ]
+
 : []),
+
 ];
+
 }
-  
-  
+
+
 // =================================================
 // VIDEO
 // =================================================
 
-else if (type === "video") {
+else if (
+type === "video"
+) {
 
-console.log("VIDEO ANALYSIS START");
+console.log(
+"VIDEO ANALYSIS START"
+);
+
 
 const frames =
-await extractVideoFrames(filePath);
+await extractVideoFrames(
+filePath
+);
+
 
 console.log(
 "VIDEO FRAMES EXTRACTED:",
 frames.length
 );
 
+
 const videoResult =
-await analyzeVideoFrames(frames);
+await analyzeVideoFrames(
+frames
+);
+
 
 console.log(
 "VIDEO ANALYSIS COMPLETE"
 );
 
+
 console.log(
 "VIDEO RESULT:",
 videoResult
 );
+
 
 return res
 .status(200)
@@ -2272,7 +2015,10 @@ videoResult,
 
 });
 
-} else {
+}
+
+
+else {
 
 throw new Error(
 "Desteklenmeyen dosya türü."
@@ -2281,179 +2027,195 @@ throw new Error(
 }
 
 
+// -------------------------------------------------
+// OPENAI
+// -------------------------------------------------
+
+console.log(
+"OPENAI REQUEST START"
+);
 
 
- // -------------------------------------------------
- // OPENAI
- // -------------------------------------------------
+const response =
+await openai.responses.create({
 
- console.log(
- "OPENAI REQUEST START"
- );
+model:
+"gpt-5-mini",
 
+input: [
 
- const response =
- await openai.responses.create({
+{
 
- model: "gpt-5-mini",
+role:
+"user",
 
- input: [
+content,
 
- {
- role: "user",
+},
 
- content,
- },
+],
 
- ],
+text: {
 
- text: {
+format: {
 
- format: {
+type:
+"json_schema",
 
- type: "json_schema",
+name:
+"verifydoc_analysis",
 
- name:
- "verifydoc_analysis",
+strict:
+true,
 
- strict: true,
+schema:
+RESPONSE_SCHEMA,
 
- schema:
- RESPONSE_SCHEMA,
+},
 
- },
+},
 
- },
-
- });
+});
 
 
- console.log(
- "OPENAI RESPONSE RECEIVED"
- );
+console.log(
+"OPENAI RESPONSE RECEIVED"
+);
+
+
 console.log(
 "OPENAI SURE:",
-((Date.now() - startTime) / 1000).toFixed(2),
+(
+(Date.now() - startTime) /
+1000
+).toFixed(2),
 "seconds"
 );
 
- // -------------------------------------------------
- // PARSE
- // -------------------------------------------------
 
-const result =
+// -------------------------------------------------
+// PARSE
+// -------------------------------------------------
+
+result =
 parseAIResponse(
- response.output_text
- );
-// =====================================================
-// ANA SKOR + TUTAR FONT SKORU
-// =====================================================
-
-const originalScore =
-Number(result.overallRisk) || 0;
-
-const amountScore =
-Number(amountAnalysis?.score) || 0;
-
-const finalScore =
-Math.min(
-100,
-Math.round(
-originalScore * 0.80 +
-amountScore * 0.20
-)
+response.output_text
 );
 
-const finalSuspicious =
-amountAnalysis?.suspicious === true ||
-originalScore >=46;
 
-const finalEvidence = [
-amountAnalysis?.evidence
-]
-.filter(Boolean)
-.join(" | ");
+// =====================================================
+// ANA SKOR
+// =====================================================
+
+const finalScore =
+Number(
+result.overallRisk
+) || 0;
+
+
+const finalSuspicious =
+finalScore >= 46;
+
+
+const finalEvidence =
+result?.amountAnalysis?.evidence ||
+result?.summary ||
+"Analiz tamamlandı.";
+
 
 console.log(
 "FINAL SCORE:",
 finalScore
 );
 
+
 console.log(
-"AMOUNT FONT SCORE:",
-amountScore
+"FINAL SUSPICIOUS:",
+finalSuspicious
 );
 
 
- console.log(
- "ANALYSIS SUCCESS"
- );
+console.log(
+"ANALYSIS SUCCESS"
+);
+
+
 console.log(
 "TOTAL SURE:",
-((Date.now() - startTime) / 1000).toFixed(2),
+(
+(Date.now() - startTime) /
+1000
+).toFixed(2),
 "seconds"
 );
 
- console.log(
- "=============================="
- );
+
+console.log(
+"=============================="
+);
 
 
- return res
- .status(200)
- .json({
- success: true,
+return res
+.status(200)
+.json({
 
- fileName,
+success: true,
 
- type,
+fileName,
 
- ...result,
+type,
 
- // ANA SKOR
- score: finalScore,
+...result,
 
- // ANA ŞÜPHE DURUMU
- suspicious: finalSuspicious,
+// ANA SKOR
+score:
+finalScore,
 
- // BİRLEŞTİRİLMİŞ KANIT
- evidence: finalEvidence,
+// ANA ŞÜPHE DURUMU
+suspicious:
+finalSuspicious,
 
- // TUTAR ANALİZİ
+// BİRLEŞTİRİLMİŞ KANIT
+evidence:
+finalEvidence,
 
- });
-
-
- } catch (err) {
-
- console.error(
- "=============================="
- );
-
- console.error(
- "VERIFYDOC API ERROR:"
- );
-
- console.error(err);
+});
 
 
- console.error(
- "=============================="
- );
+} catch (err) {
+
+console.error(
+"=============================="
+);
 
 
- return res
- .status(500)
- .json({
+console.error(
+"VERIFYDOC API ERROR:"
+);
 
- success: false,
 
- error:
- err?.message ||
- "Analysis failed",
+console.error(
+err
+);
 
- });
 
- }
+console.error(
+"=============================="
+);
+
+
+return res
+.status(500)
+.json({
+
+success: false,
+
+error:
+err?.message ||
+"Analysis failed",
+
+});
+
+}
 
 }
