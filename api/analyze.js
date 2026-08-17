@@ -1762,9 +1762,12 @@ const reference =
 );
 console.log(
   "BANK:",
+  BANK
+  );
+console.log(
+  "SELECTED BANK:",
   bank
   );
-
 console.log(
 "REFERENCE:",
 reference?.fileName ||
