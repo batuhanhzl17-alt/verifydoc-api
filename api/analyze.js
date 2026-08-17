@@ -2002,17 +2002,25 @@ let amountCharacterCrossCheck = {
 // SADECE IMAGE İÇİN
 // =====================================================
 
+let amountAnalysis = null;
+
 if (type === "image") {
 
- console.log(
- "IMAGE AMOUNT ANALYSIS START"
- );
-  
-// ANA TUTARIN KARAKTER KOORDİNATLARINI BUL
- amountLocation = await locateAmountCharacters(
+console.log(
+"IMAGE AMOUNT ANALYSIS START"
+);
+
+amountAnalysis =
+await analyzeAmountDetails(
 base64,
 mime
 );
+
+console.log(
+"AMOUNT ANALYSIS COMPLETE"
+);
+
+}
 
 // =====================================================
 // TUTAR KARAKTER / FONT ANALİZİ
