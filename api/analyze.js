@@ -14,6 +14,8 @@ path.join(process.cwd(), "references");
 
 const REFERENCE_MAP = {
 akbank: "akbank.pdf",
+  garanti: "garanti.pdf",
+  garantibbva: "garanti.pdf",
 };
 
 function getReferenceFile(bank) {
@@ -1754,6 +1756,9 @@ mime
 const reference =
 await loadReferenceFile(
 "akbank"
+const reference =
+  await loadReferenceFile(
+    bank
 );
 
 
