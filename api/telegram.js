@@ -1,3 +1,5 @@
+import { waitUntil } from "@vercel/functions";
+
 // =====================================================
 // VERIFYDOC TELEGRAM BOT
 // =====================================================
@@ -10,32 +12,60 @@ const ANALYZE_URL =
 
 
 // =====================================================
+// AYNI UPDATE'I İKİ KEZ İŞLEMEMEK
+// =====================================================
+
+const processedUpdates =
+ new Set();
+
+
+// =====================================================
 // TELEGRAM API
 // =====================================================
 
-async function telegram(method, body) {
+async function telegram(
+ method,
+ body
+) {
 
- const response = await fetch(
+ if (!TELEGRAM_BOT_TOKEN) {
+
+ throw new Error(
+ "TELEGRAM_BOT_TOKEN bulunamadı."
+ );
+
+ }
+
+ const response =
+ await fetch(
  `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
  {
  method: "POST",
+
  headers: {
- "Content-Type": "application/json",
+ "Content-Type":
+ "application/json",
  },
- body: JSON.stringify(body),
+
+ body:
+ JSON.stringify(body),
  }
  );
 
- const data = await response.json();
+ const data =
+ await response.json();
 
  if (!data.ok) {
+
  throw new Error(
  data.description ||
  `Telegram ${method} hatası`
  );
+
  }
 
  return data.result;
+
 }
 
 
@@ -51,7 +81,9 @@ async function sendMessage(
  return telegram(
  "sendMessage",
  {
- chat_id: chatId,
+ chat_id:
+ chatId,
+
  text,
  }
  );
@@ -71,11 +103,13 @@ async function downloadTelegramFile(
  await telegram(
  "getFile",
  {
- file_id: fileId,
+ file_id:
+ fileId,
  }
  );
 
- if (!file.file_path) {
+
+ if (!file?.file_path) {
 
  throw new Error(
  "Telegram dosya yolu döndürmedi."
@@ -83,11 +117,14 @@ async function downloadTelegramFile(
 
  }
 
+
  const fileUrl =
  `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
 
+
  const response =
  await fetch(fileUrl);
+
 
  if (!response.ok) {
 
@@ -97,12 +134,21 @@ async function downloadTelegramFile(
 
  }
 
+
  const arrayBuffer =
  await response.arrayBuffer();
 
+
  return {
- buffer: Buffer.from(arrayBuffer),
- filePath: file.file_path,
+
+ buffer:
+ Buffer.from(
+ arrayBuffer
+ ),
+
+ filePath:
+ file.file_path,
+
  };
 
 }
@@ -112,34 +158,54 @@ async function downloadTelegramFile(
 // BANKA BELİRLE
 // =====================================================
 
-function detectBank(text) {
+function detectBank(
+ text
+) {
 
- if (!text) {
+ if (
+ !text ||
+ typeof text !== "string"
+ ) {
+
  return null;
+
  }
+
 
  const value =
  text
  .toLowerCase()
  .trim()
- .replace(/\s+/g, "");
+ .replace(
+ /\s+/g,
+ ""
+ );
+
 
  if (
- value.includes("garanti") ||
- value.includes("garantibbva")
+ value.includes(
+ "garanti"
+ ) ||
+ value.includes(
+ "garantibbva"
+ )
  ) {
 
  return "garanti";
 
  }
 
+
  if (
- value.includes("akbank")
+ value.includes(
+ "akbank"
+ )
  ) {
 
  return "akbank";
 
  }
+
 
  return null;
 
@@ -147,7 +213,7 @@ function detectBank(text) {
 
 
 // =====================================================
-// DOSYAYI ANALYZE GÖNDER
+// DOSYAYI VERIFYDOC'A GÖNDER
 // =====================================================
 
 async function analyzeFile({
@@ -160,23 +226,52 @@ async function analyzeFile({
 
 }) {
 
+ console.log(
+ "VERIFYDOC'A GÖNDERİLİYOR:"
+ );
+
+ console.log(
+ "TYPE:",
+ type
+ );
+
+ console.log(
+ "MIME:",
+ mimeType
+ );
+
+ console.log(
+ "FILE:",
+ fileName
+ );
+
+ console.log(
+ "BANK:",
+ bank
+ );
+
+
  const form =
  new FormData();
+
 
  form.append(
  "type",
  type
  );
 
+
  form.append(
  "fileName",
  fileName
  );
 
+
  form.append(
  "bank",
  bank
  );
+
 
  const blob =
  new Blob(
@@ -189,14 +284,27 @@ async function analyzeFile({
  );
 
 
- let fieldName = "file";
+ let fieldName =
+ "file";
 
- if (type === "image") {
- fieldName = "image";
+
+ if (
+ type === "image"
+ ) {
+
+ fieldName =
+ "image";
+
  }
 
- if (type === "video") {
- fieldName = "video";
+
+ if (
+ type === "video"
+ ) {
+
+ fieldName =
+ "video";
+
  }
 
 
@@ -211,8 +319,11 @@ async function analyzeFile({
  await fetch(
  ANALYZE_URL,
  {
- method: "POST",
- body: form,
+ method:
+ "POST",
+
+ body:
+ form,
  }
  );
 
@@ -237,7 +348,7 @@ async function analyzeFile({
 
 
 // =====================================================
-// SONUCU TELEGRAM'A GÖNDER
+// ANALİZ SONUCUNU TELEGRAM'A GÖNDER
 // =====================================================
 
 async function sendAnalysisResult(
@@ -246,33 +357,55 @@ async function sendAnalysisResult(
 ) {
 
  const score =
- Number(result?.score) || 0;
+ Number(
+ result?.score
+ ) || 0;
+
 
  const confidence =
- Number(result?.confidence) || 0;
+ Number(
+ result?.confidence
+ ) || 0;
+
 
  const riskLabel =
  result?.riskLabel ||
  "UNKNOWN";
+
 
  const summary =
  result?.summary ||
  "Analiz tamamlandı.";
 
 
- let emoji = " ";
+ let emoji =
+ " ";
 
- if (score >= 71) {
 
- emoji = " ";
+ if (
+ score >= 71
+ ) {
 
- } else if (score >= 46) {
+ emoji =
+ " ";
 
- emoji = " ";
+ }
 
- } else if (score >= 21) {
+ else if (
+ score >= 46
+ ) {
 
- emoji = " ";
+ emoji =
+ " ";
+
+ }
+
+ else if (
+ score >= 21
+ ) {
+
+ emoji =
+ " ";
 
  }
 
@@ -308,50 +441,90 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
 
 
 // =====================================================
-// ANA HANDLER
+// DOSYA TİPİ BELİRLE
 // =====================================================
 
-export default async function handler(
- req,
- res
+function determineDocumentType(
+ mimeType,
+ fileName
 ) {
 
- // ---------------------------------------------------
- // TELEGRAM SADECE POST
- // ---------------------------------------------------
+ const mime =
+ (
+ mimeType ||
+ ""
+ ).toLowerCase();
 
- if (req.method !== "POST") {
 
- return res
- .status(200)
- .json({
- ok: true,
- message:
- "VerifyDoc Telegram endpoint aktif."
- });
+ const name =
+ (
+ fileName ||
+ ""
+ ).toLowerCase();
+
+
+ // PDF
+
+ if (
+ mime ===
+ "application/pdf" ||
+ name.endsWith(".pdf")
+ ) {
+
+ return "pdf";
 
  }
 
 
- try {
+ // IMAGE
 
- if (!TELEGRAM_BOT_TOKEN) {
+ if (
+ mime.startsWith(
+ "image/"
+ ) ||
 
- throw new Error(
- "TELEGRAM_BOT_TOKEN Vercel Environment Variables içinde bulunamadı."
- );
+ name.endsWith(".jpg") ||
+ name.endsWith(".jpeg") ||
+ name.endsWith(".png") ||
+ name.endsWith(".webp")
+ ) {
+
+ return "image";
 
  }
 
 
- const update =
- req.body;
+ // VIDEO
+
+ if (
+ mime.startsWith(
+ "video/"
+ ) ||
+
+ name.endsWith(".mp4") ||
+ name.endsWith(".mov") ||
+ name.endsWith(".avi") ||
+ name.endsWith(".mkv") ||
+ name.endsWith(".webm")
+ ) {
+
+ return "video";
+
+ }
 
 
- console.log(
- "TELEGRAM UPDATE ALINDI"
- );
+ return null;
 
+}
+
+
+// =====================================================
+// GERÇEK ANALİZ İŞLEMİ
+// =====================================================
+
+async function processTelegramUpdate(
+ update
+) {
 
  const message =
  update?.message;
@@ -359,17 +532,20 @@ export default async function handler(
 
  if (!message) {
 
- return res
- .status(200)
- .json({
- ok: true,
- });
+ return;
 
  }
 
 
  const chatId =
  message?.chat?.id;
+
+
+ if (!chatId) {
+
+ return;
+
+ }
 
 
  const text =
@@ -383,8 +559,11 @@ export default async function handler(
  // =================================================
 
  if (
- typeof message?.text === "string" &&
- message.text.startsWith("/start")
+ typeof message?.text ===
+ "string" &&
+ message.text.startsWith(
+ "/start"
+ )
  ) {
 
  await sendMessage(
@@ -394,37 +573,36 @@ export default async function handler(
 
 Dekont veya belge göndererek otomatik inceleme yaptırabilirsin.
 
-Banka seçmek için:
+Banka seçimi:
 
 /akbank
 /garanti
 
 Ardından belgeyi gönder.
 
-Örnek:
+İstersen belge açıklamasına da:
 
-/garanti
+Garanti
 
-sonra Garanti dekontunu gönder.`
+veya
 
+Akbank
+
+yazabilirsin.`
  );
 
-
- return res
- .status(200)
- .json({
- ok: true,
- });
+ return;
 
  }
 
 
  // =================================================
- // BANKA KOMUTU
+ // BANKA KOMUTLARI
  // =================================================
 
  if (
- message?.text === "/akbank"
+ message?.text ===
+ "/akbank"
  ) {
 
  await sendMessage(
@@ -432,17 +610,14 @@ sonra Garanti dekontunu gönder.`
  " Akbank seçildi.\n\nŞimdi Akbank dekontunu gönder."
  );
 
- return res
- .status(200)
- .json({
- ok: true,
- });
+ return;
 
  }
 
 
  if (
- message?.text === "/garanti"
+ message?.text ===
+ "/garanti"
  ) {
 
  await sendMessage(
@@ -450,28 +625,29 @@ sonra Garanti dekontunu gönder.`
  " Garanti BBVA seçildi.\n\nŞimdi Garanti dekontunu gönder."
  );
 
- return res
- .status(200)
- .json({
- ok: true,
- });
+ return;
 
  }
 
 
  // =================================================
- // DOSYA YOKSA
+ // DOSYA KONTROLÜ
  // =================================================
 
  const hasPhoto =
- Array.isArray(message.photo) &&
- message.photo.length > 0;
+ Array.isArray(
+ message?.photo
+ ) &&
+ message.photo.length >
+ 0;
+
 
  const hasDocument =
- !!message.document;
+ !!message?.document;
+
 
  const hasVideo =
- !!message.video;
+ !!message?.video;
 
 
  if (
@@ -482,23 +658,22 @@ sonra Garanti dekontunu gönder.`
 
  await sendMessage(
  chatId,
-` Lütfen analiz etmek istediğin dekontu gönder.
+
+` Lütfen analiz etmek istediğin belgeyi gönder.
 
 Desteklenen:
+
 • PDF
 • Fotoğraf
 • Video
 
 Banka seçimi:
- /akbank
- /garanti`
+
+/akbank
+/garanti`
  );
 
- return res
- .status(200)
- .json({
- ok: true,
- });
+ return;
 
  }
 
@@ -508,7 +683,9 @@ Banka seçimi:
  // =================================================
 
  const bank =
- detectBank(text);
+ detectBank(
+ text
+ );
 
 
  if (!bank) {
@@ -516,29 +693,24 @@ Banka seçimi:
  await sendMessage(
  chatId,
 
-` Önce bankayı belirtmem gerekiyor.
+` Bankayı belirtmem gerekiyor.
 
-Lütfen dekontu açıklamasına:
+Dekontu gönderirken açıklama kısmına:
 
-garanti
+Garanti
 
-veya
+veya:
 
-akbank
+Akbank
 
-yazarak gönder.
+yaz.
 
 Örneğin:
 
 Garanti dekontu`
-
  );
 
- return res
- .status(200)
- .json({
- ok: true,
- });
+ return;
 
  }
 
@@ -547,96 +719,71 @@ Garanti dekontu`
  // DOSYA BİLGİLERİ
  // =================================================
 
- let fileId;
- let fileName;
- let mimeType;
- let type;
+ let fileId =
+ null;
+
+ let fileName =
+ null;
+
+ let mimeType =
+ null;
+
+ let type =
+ null;
 
 
- // -------------------------------------------------
+ // =================================================
  // FOTOĞRAF
- // -------------------------------------------------
+ // =================================================
 
- if (hasPhoto) {
+ if (
+ hasPhoto
+ ) {
 
  const photo =
  message.photo[
  message.photo.length - 1
  ];
 
+
  fileId =
  photo.file_id;
+
 
  fileName =
  "telegram-photo.jpg";
 
+
  mimeType =
  "image/jpeg";
 
- type =
- "image";
-
- }
-
-
- // -------------------------------------------------
- // DOCUMENT
- // -------------------------------------------------
-
- else if (hasDocument) {
-
- fileId =
- message.document.file_id;
-
- fileName =
- message.document.file_name ||
- "telegram-document";
-
- mimeType =
- message.document.mime_type ||
- "application/octet-stream";
-
-
- if (
- mimeType === "application/pdf" ||
- fileName.toLowerCase().endsWith(".pdf")
- ) {
-
- type =
- "pdf";
-
- } else if (
- mimeType.startsWith("image/")
- ) {
 
  type =
  "image";
 
- } else {
-
- type =
- "pdf";
-
- }
-
  }
 
 
- // -------------------------------------------------
+ // =================================================
  // VIDEO
- // -------------------------------------------------
+ // =================================================
 
- else if (hasVideo) {
+ else if (
+ hasVideo
+ ) {
 
  fileId =
  message.video.file_id;
 
+
  fileName =
  "telegram-video.mp4";
+
 
  mimeType =
  message.video.mime_type ||
  "video/mp4";
+
 
  type =
  "video";
@@ -645,7 +792,76 @@ Garanti dekontu`
 
 
  // =================================================
- // ANALİZ BAŞLIYOR
+ // DOCUMENT
+ // =================================================
+
+ else if (
+ hasDocument
+ ) {
+
+ fileId =
+ message.document.file_id;
+
+
+ fileName =
+ message.document.file_name ||
+ "telegram-document";
+
+
+ mimeType =
+ message.document.mime_type ||
+ "application/octet-stream";
+
+
+ type =
+ determineDocumentType(
+ mimeType,
+ fileName
+ );
+
+
+ if (!type) {
+
+ throw new Error(
+ `Desteklenmeyen dosya türü: ${mimeType}`
+ );
+
+ }
+
+ }
+
+
+ console.log(
+ "================================"
+ );
+
+ console.log(
+ "TELEGRAM FILE TYPE:",
+ type
+ );
+
+ console.log(
+ "TELEGRAM MIME:",
+ mimeType
+ );
+
+ console.log(
+ "TELEGRAM FILE NAME:",
+ fileName
+ );
+
+ console.log(
+ "TELEGRAM BANK:",
+ bank
+ );
+
+ console.log(
+ "================================"
+ );
+
+
+ // =================================================
+ // ANALİZ BAŞLADI
  // =================================================
 
  await sendMessage(
@@ -658,6 +874,8 @@ Garanti dekontu`
  ? "Garanti BBVA"
  : "Akbank"
 }
+
+ Dosya türü: ${type}
 
  VerifyDoc analiz başlatıyor...`
  );
@@ -674,7 +892,7 @@ Garanti dekontu`
 
 
  // =================================================
- // VERIFYDOC'A GÖNDER
+ // VERIFYDOC ANALİZİ
  // =================================================
 
  const result =
@@ -695,7 +913,7 @@ Garanti dekontu`
 
 
  // =================================================
- // SONUCU GÖNDER
+ // SONUÇ
  // =================================================
 
  await sendAnalysisResult(
@@ -703,20 +921,38 @@ Garanti dekontu`
  result
  );
 
+}
+
+
+// =====================================================
+// ANA TELEGRAM HANDLER
+// =====================================================
+
+export default async function handler(
+ req,
+ res
+) {
+
+ // =================================================
+ // GET
+ // =================================================
+
+ if (
+ req.method !== "POST"
+ ) {
 
  return res
  .status(200)
  .json({
+
  ok: true,
+
+ message:
+ "VerifyDoc Telegram endpoint aktif.",
+
  });
 
-
- } catch (error) {
-
- console.error(
- "TELEGRAM BOT ERROR:",
- error
- );
+ }
 
 
  try {
@@ -724,11 +960,110 @@ Garanti dekontu`
  const update =
  req.body;
 
+
+ console.log(
+ "================================"
+ );
+
+ console.log(
+ "TELEGRAM UPDATE ALINDI"
+ );
+
+ console.log(
+ "UPDATE ID:",
+ update?.update_id
+ );
+
+ console.log(
+ "================================"
+ );
+
+
+ // =================================================
+ // UPDATE ID KONTROLÜ
+ // =================================================
+
+ const updateId =
+ update?.update_id;
+
+
+ if (
+ updateId !== undefined
+ ) {
+
+ if (
+ processedUpdates.has(
+ updateId
+ )
+ ) {
+
+ console.log(
+ "DUPLICATE UPDATE:",
+ updateId
+ );
+
+
+ return res
+ .status(200)
+ .json({
+ ok: true,
+ duplicate: true,
+ });
+
+ }
+
+
+ processedUpdates.add(
+ updateId
+ );
+
+
+ // Set'in sonsuza kadar büyümemesi için
+ // yaklaşık 10 dakika sonra temizle.
+
+ setTimeout(
+ () => {
+
+ processedUpdates.delete(
+ updateId
+ );
+
+ },
+ 10 * 60 * 1000
+ );
+
+ }
+
+
+ // =================================================
+ // ANALİZİ ARKA PLANDA ÇALIŞTIR
+ // =================================================
+
+ waitUntil(
+ processTelegramUpdate(
+ update
+ )
+ .catch(
+ async (error) => {
+
+ console.error(
+ "TELEGRAM PROCESS ERROR:",
+ error
+ );
+
+
+ try {
+
  const chatId =
- update?.message?.chat?.id;
+ update
+ ?.message
+ ?.chat
+ ?.id;
 
 
- if (chatId) {
+ if (
+ chatId
+ ) {
 
  await sendMessage(
  chatId,
@@ -736,9 +1071,7 @@ Garanti dekontu`
 ` Analiz sırasında hata oluştu.
 
 Hata:
-${error?.message || "Bilinmeyen hata"}
-
-Lütfen tekrar deneyin.`
+${error?.message || "Bilinmeyen hata"}`
  );
 
  }
@@ -754,11 +1087,40 @@ Lütfen tekrar deneyin.`
 
  }
 
+ }
+ )
+ );
+
+
+ // =================================================
+ // TELEGRAM'A HEMEN 200
+ // =================================================
 
  return res
  .status(200)
  .json({
+
+ ok: true,
+
+ });
+
+
+ } catch (
+ error
+ ) {
+
+ console.error(
+ "TELEGRAM WEBHOOK ERROR:",
+ error
+ );
+
+
+ return res
+ .status(200)
+ .json({
+
  ok: false,
+
  });
 
  }
