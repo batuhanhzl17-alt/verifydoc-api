@@ -14,6 +14,7 @@ const REFERENCE_DIR =
 
 const REFERENCE_MAP = {
  akbank: "akbank.pdf",
+ enpara: "enpara.pdf",
 };
 
 function getReferenceFile(bank) {
