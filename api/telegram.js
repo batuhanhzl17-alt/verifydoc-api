@@ -577,12 +577,13 @@ Banka seçimi:
 
 /akbank
 /garanti
+/ziraat
 
 Ardından belgeyi gönder.
 
 İstersen belge açıklamasına da:
 
-Garanti
+Garanti , Ziraat
 
 veya
 
@@ -628,7 +629,14 @@ yazabilirsin.`
  return;
 
  }
+await sendMessage(
+ chatId,
+ " Ziraat seçildi.\n\nŞimdi Ziraat dekontunu gönder."
+ );
 
+ return;
+
+ }
 
  // =================================================
  // DOSYA KONTROLÜ
@@ -670,7 +678,8 @@ Desteklenen:
 Banka seçimi:
 
 /akbank
-/garanti`
+/garanti
+/ziraat`
  );
 
  return;
@@ -697,7 +706,7 @@ Banka seçimi:
 
 Dekontu gönderirken açıklama kısmına:
 
-Garanti
+Garanti , Ziraat
 
 veya:
 
