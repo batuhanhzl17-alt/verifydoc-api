@@ -9,37 +9,99 @@ import sharp from "sharp";
 
 const execFileAsync = promisify(execFile);
 
+
+// =====================================================
+// REFERANS KLASÖRÜ
+// =====================================================
+
 const REFERENCE_DIR =
- path.join(process.cwd(), "references");
+path.join(process.cwd(), "references");
+
+
+// =====================================================
+// BANKA → REFERANS PDF MAP
+// =====================================================
 
 const REFERENCE_MAP = {
- akbank: "akbank.pdf",
- enpara: "enpara.pdf",
+akbank: "akbank.pdf",
+enpara: "enpara.pdf",
 };
+
+
+// =====================================================
+// BANKA NORMALİZASYONU
+// =====================================================
+
+function normalizeBank(bank) {
+
+if (
+!bank ||
+typeof bank !== "string"
+) {
+return null;
+}
+
+const value =
+bank
+.toLowerCase()
+.trim()
+.replace(/\s+/g, "")
+.replace(/ı/g, "i")
+.replace(/İ/g, "i")
+.replace(/ş/g, "s")
+.replace(/Ş/g, "s")
+.replace(/ğ/g, "g")
+.replace(/Ğ/g, "g")
+.replace(/ü/g, "u")
+.replace(/Ü/g, "u")
+.replace(/ö/g, "o")
+.replace(/Ö/g, "o")
+.replace(/ç/g, "c")
+.replace(/Ç/g, "c");
+
+if (
+value === "akbank"
+) {
+return "akbank";
+}
+
+if (
+value === "enpara" ||
+value === "enparafinans"
+) {
+return "enpara";
+}
+
+return null;
+}
+
+
+// =====================================================
+// REFERANS DOSYASI BUL
+// =====================================================
 
 function getReferenceFile(bank) {
 
- if (!bank) {
- return null;
- }
+const normalizedBank =
+normalizeBank(bank);
 
- const key =
- bank
- .toLowerCase()
- .trim()
- .replace(/\s+/g, "");
+if (!normalizedBank) {
+return null;
+}
 
- const fileName =
- REFERENCE_MAP[key];
+const fileName =
+REFERENCE_MAP[
+normalizedBank
+];
 
- if (!fileName) {
- return null;
- }
+if (!fileName) {
+return null;
+}
 
- return path.join(
- REFERENCE_DIR,
- fileName
- );
+return path.join(
+REFERENCE_DIR,
+fileName
+);
 }
 
 
@@ -49,53 +111,95 @@ function getReferenceFile(bank) {
 
 async function loadReferenceFile(bank) {
 
- const referencePath =
- getReferenceFile(bank);
+const normalizedBank =
+normalizeBank(bank);
 
- if (!referencePath) {
- return null;
- }
+if (!normalizedBank) {
 
- try {
+console.log(
+"REFERENCE BANK TANINMADI:",
+bank
+);
 
- const buffer =
- await fs.readFile(
- referencePath
- );
+return null;
+}
 
- if (!buffer?.length) {
- return null;
- }
+const referencePath =
+getReferenceFile(
+normalizedBank
+);
 
- console.log(
- "REFERENCE LOADED:",
- referencePath
- );
+if (!referencePath) {
 
- return {
- bank,
- fileName:
- path.basename(referencePath),
- base64:
- buffer.toString("base64"),
- };
+console.log(
+"REFERENCE PATH BULUNAMADI:",
+normalizedBank
+);
 
- } catch (error) {
+return null;
+}
 
- console.error(
- "REFERENCE LOAD ERROR:",
- error
- );
+try {
 
- return null;
- }
+const buffer =
+await fs.readFile(
+referencePath
+);
+
+if (
+!buffer?.length
+) {
+
+console.log(
+"REFERENCE DOSYASI BOŞ:",
+referencePath
+);
+
+return null;
+}
+
+console.log(
+"REFERENCE LOADED:",
+referencePath
+);
+
+return {
+
+bank:
+normalizedBank,
+
+fileName:
+path.basename(
+referencePath
+),
+
+base64:
+buffer.toString(
+"base64"
+),
+
+};
+
+} catch (error) {
+
+console.error(
+"REFERENCE LOAD ERROR:",
+error
+);
+
+return null;
+}
 }
 
 
 export const config = {
- api: {
- bodyParser: false,
- },
+
+api: {
+
+bodyParser: false,
+
+},
+
 };
 
 
@@ -103,9 +207,12 @@ export const config = {
 // OPENAI
 // =====================================================
 
-const openai = new OpenAI({
- apiKey:
- process.env.OPENAI_API_KEY,
+const openai =
+new OpenAI({
+
+apiKey:
+process.env.OPENAI_API_KEY,
+
 });
 
 
@@ -114,31 +221,33 @@ const openai = new OpenAI({
 // =====================================================
 
 const CHECK_NAMES = [
- "ocrConsistency",
- "fontConsistency",
- "fontSizeConsistency",
- "characterSpacing",
- "lineSpacing",
- "textAlignment",
- "baselineConsistency",
- "compressionArtifacts",
- "copyPasteRegions",
- "editingTraces",
- "photoshopArtifacts",
- "aiGeneratedIndicators",
- "logoConsistency",
- "stampConsistency",
- "signatureConsistency",
- "dateConsistency",
- "amountConsistency",
- "currencyFormatting",
- "ibanFormatting",
- "swiftFormatting",
- "qrBarcodeConsistency",
- "layoutIntegrity",
- "suspiciousElements",
- "documentTypeConsistency",
- "imageQuality",
+
+"ocrConsistency",
+"fontConsistency",
+"fontSizeConsistency",
+"characterSpacing",
+"lineSpacing",
+"textAlignment",
+"baselineConsistency",
+"compressionArtifacts",
+"copyPasteRegions",
+"editingTraces",
+"photoshopArtifacts",
+"aiGeneratedIndicators",
+"logoConsistency",
+"stampConsistency",
+"signatureConsistency",
+"dateConsistency",
+"amountConsistency",
+"currencyFormatting",
+"ibanFormatting",
+"swiftFormatting",
+"qrBarcodeConsistency",
+"layoutIntegrity",
+"suspiciousElements",
+"documentTypeConsistency",
+"imageQuality",
+
 ];
 
 
@@ -147,233 +256,371 @@ const CHECK_NAMES = [
 // =====================================================
 
 const CHECK_SCHEMA =
- Object.fromEntries(
+Object.fromEntries(
 
- CHECK_NAMES.map(
- (name) => [
+CHECK_NAMES.map(
+(name) => [
 
- name,
+name,
 
- {
- type: "object",
+{
 
- properties: {
+type:
+"object",
 
- status: {
- type: "string",
+properties: {
 
- enum: [
- "pass",
- "review",
- "suspicious",
- "unknown",
- ],
- },
+status: {
 
- score: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+type:
+"string",
 
- evidence: {
- type: "string",
- },
+enum: [
 
- },
+"pass",
+"review",
+"suspicious",
+"unknown",
 
- required: [
- "status",
- "score",
- "evidence",
- ],
+],
 
- additionalProperties: false,
- },
+},
 
- ]
- )
+score: {
 
- );
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+evidence: {
+
+type:
+"string",
+
+},
+
+},
+
+required: [
+
+"status",
+"score",
+"evidence",
+
+],
+
+additionalProperties:
+false,
+
+},
+
+]
+)
+
+);
 
 
 const RESPONSE_SCHEMA = {
 
- type: "object",
+type:
+"object",
 
- properties: {
+properties: {
 
- overallRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+overallRisk: {
 
- riskLabel: {
- type: "string",
+type:
+"integer",
 
- enum: [
- "LOW RISK",
- "MODERATE RISK",
- "HIGH RISK",
- "VERY HIGH RISK",
- ],
- },
+minimum:
+0,
 
- confidence: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+maximum:
+100,
 
- summary: {
- type: "string",
- },
+},
 
- categories: {
+riskLabel: {
 
- type: "object",
+type:
+"string",
 
- properties: {
+enum: [
 
- visualRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+"LOW RISK",
+"MODERATE RISK",
+"HIGH RISK",
+"VERY HIGH RISK",
 
- textRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+],
 
- layoutRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+},
 
- financialDataRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+confidence: {
 
- editingRisk: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
+type:
+"integer",
 
- },
+minimum:
+0,
 
- required: [
- "visualRisk",
- "textRisk",
- "layoutRisk",
- "financialDataRisk",
- "editingRisk",
- ],
+maximum:
+100,
 
- additionalProperties: false,
- },
+},
 
- checks: {
+summary: {
 
- type: "object",
+type:
+"string",
 
- properties:
- CHECK_SCHEMA,
+},
 
- required:
- CHECK_NAMES,
+categories: {
 
- additionalProperties: false,
- },
+type:
+"object",
 
- limitations: {
+properties: {
 
- type: "array",
+visualRisk: {
 
- items: {
- type: "string",
- },
+type:
+"integer",
 
- },
+minimum:
+0,
 
- // =====================================================
- // TUTAR / VERGİ / MATEMATİKSEL KONTROL
- // =====================================================
+maximum:
+100,
 
- amountAnalysis: {
+},
 
- type: "object",
+textRisk: {
 
- properties: {
+type:
+"integer",
 
- amount: {
- type: ["string", "null"],
- },
+minimum:
+0,
 
- subtotal: {
- type: ["number", "null"],
- },
+maximum:
+100,
 
- taxAmount: {
- type: ["number", "null"],
- },
+},
 
- totalAmount: {
- type: ["number", "null"],
- },
+layoutRisk: {
 
- calculatedTotal: {
- type: ["number", "null"],
- },
+type:
+"integer",
 
- difference: {
- type: ["number", "null"],
- },
+minimum:
+0,
 
- calculationConsistent: {
- type: "boolean",
- },
+maximum:
+100,
 
- evidence: {
- type: "string",
- },
+},
 
- },
+financialDataRisk: {
 
- required: [
- "amount",
- "subtotal",
- "taxAmount",
- "totalAmount",
- "calculatedTotal",
- "difference",
- "calculationConsistent",
- "evidence",
- ],
+type:
+"integer",
 
- additionalProperties: false,
- },
+minimum:
+0,
 
- },
+maximum:
+100,
 
- required: [
- "overallRisk",
- "riskLabel",
- "confidence",
- "summary",
- "categories",
- "checks",
- "limitations",
- "amountAnalysis",
- ],
+},
 
- additionalProperties: false,
+editingRisk: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+},
+
+required: [
+
+"visualRisk",
+"textRisk",
+"layoutRisk",
+"financialDataRisk",
+"editingRisk",
+
+],
+
+additionalProperties:
+false,
+
+},
+
+checks: {
+
+type:
+"object",
+
+properties:
+CHECK_SCHEMA,
+
+required:
+CHECK_NAMES,
+
+additionalProperties:
+false,
+
+},
+
+limitations: {
+
+type:
+"array",
+
+items: {
+
+type:
+"string",
+
+},
+
+},
+
+amountAnalysis: {
+
+type:
+"object",
+
+properties: {
+
+amount: {
+
+type:
+[
+"string",
+"null"
+],
+
+},
+
+subtotal: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+taxAmount: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+totalAmount: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+calculatedTotal: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+difference: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+calculationConsistent: {
+
+type:
+"boolean",
+
+},
+
+evidence: {
+
+type:
+"string",
+
+},
+
+},
+
+required: [
+
+"amount",
+"subtotal",
+"taxAmount",
+"totalAmount",
+"calculatedTotal",
+"difference",
+"calculationConsistent",
+"evidence",
+
+],
+
+additionalProperties:
+false,
+
+},
+
+},
+
+required: [
+
+"overallRisk",
+"riskLabel",
+"confidence",
+"summary",
+"categories",
+"checks",
+"limitations",
+"amountAnalysis",
+
+],
+
+additionalProperties:
+false,
+
 };
 
 
@@ -383,42 +630,50 @@ const RESPONSE_SCHEMA = {
 
 function parseMultipart(req) {
 
- return new Promise(
- (resolve, reject) => {
+return new Promise(
+(resolve, reject) => {
 
- const form =
- formidable({
- multiples: false,
- keepExtensions: true,
- maxFileSize:
- 25 * 1024 * 1024,
- });
+const form =
+formidable({
 
- form.parse(
- req,
- (
- err,
- fields,
- files
- ) => {
+multiples:
+false,
 
- if (err) {
+keepExtensions:
+true,
 
- reject(err);
+maxFileSize:
+25 * 1024 * 1024,
 
- return;
- }
+});
 
- resolve({
- fields,
- files,
- });
+form.parse(
+req,
+(
+err,
+fields,
+files
+) => {
 
- }
- );
+if (err) {
 
- }
- );
+reject(err);
+
+return;
+}
+
+resolve({
+
+fields,
+files,
+
+});
+
+}
+);
+
+}
+);
 
 }
 
@@ -428,98 +683,103 @@ function parseMultipart(req) {
 // =====================================================
 
 async function extractVideoFrames(
- videoPath
+videoPath
 ) {
 
- const outputDir =
- `/tmp/verifydoc-${Date.now()}`;
+const outputDir =
+`/tmp/verifydoc-${Date.now()}`;
 
- await fs.mkdir(
- outputDir,
- {
- recursive: true,
- }
- );
+await fs.mkdir(
+outputDir,
+{
+recursive:
+true,
+}
+);
 
- const outputPattern =
- `${outputDir}/frame-%03d.jpg`;
+const outputPattern =
+`${outputDir}/frame-%03d.jpg`;
 
- await execFileAsync(
- ffmpegPath,
+await execFileAsync(
+ffmpegPath,
 
- [
- "-i",
- videoPath,
+[
 
- "-vf",
- "fps=2,scale=1280:-2",
+"-i",
+videoPath,
 
- "-frames:v",
- "8",
+"-vf",
+"fps=2,scale=1280:-2",
 
- "-q:v",
- "5",
+"-frames:v",
+"8",
 
- outputPattern,
- ],
+"-q:v",
+"5",
 
- {
- maxBuffer:
- 10 * 1024 * 1024,
- }
- );
+outputPattern,
 
- const files =
- await fs.readdir(
- outputDir
- );
+],
 
- const frameFiles =
- files
- .filter(
- (file) =>
- file.endsWith(".jpg")
- )
- .sort();
+{
 
- if (
- !frameFiles.length
- ) {
+maxBuffer:
+10 * 1024 * 1024,
 
- throw new Error(
- "Videodan analiz edilecek kare çıkarılamadı."
- );
+}
+);
 
- }
+const files =
+await fs.readdir(
+outputDir
+);
 
- const frames = [];
+const frameFiles =
+files
+.filter(
+(file) =>
+file.endsWith(".jpg")
+)
+.sort();
 
- for (
- const file of frameFiles
- ) {
+if (
+!frameFiles.length
+) {
 
- const framePath =
- `${outputDir}/${file}`;
+throw new Error(
+"Videodan analiz edilecek kare çıkarılamadı."
+);
 
- const buffer =
- await fs.readFile(
- framePath
- );
+}
 
- frames.push({
+const frames = [];
 
- file,
+for (
+const file of frameFiles
+) {
 
- base64:
- buffer.toString(
- "base64"
- ),
+const framePath =
+`${outputDir}/${file}`;
 
- });
+const buffer =
+await fs.readFile(
+framePath
+);
 
- }
+frames.push({
 
- return frames;
+file,
+
+base64:
+buffer.toString(
+"base64"
+),
+
+});
+
+}
+
+return frames;
 
 }
 
@@ -529,59 +789,59 @@ async function extractVideoFrames(
 // =====================================================
 
 async function analyzeVideoFrames(
- frames
+frames
 ) {
 
- if (
- !frames ||
- !frames.length
- ) {
+if (
+!frames ||
+!frames.length
+) {
 
- throw new Error(
- "Analiz edilecek video karesi bulunamadı."
- );
+throw new Error(
+"Analiz edilecek video karesi bulunamadı."
+);
 
- }
+}
 
- console.log(
- "VIDEO FRAME SAYISI:",
- frames.length
- );
+console.log(
+"VIDEO FRAME SAYISI:",
+frames.length
+);
 
- const imageMessages =
- frames.map(
- (frame) => ({
+const imageMessages =
+frames.map(
+(frame) => ({
 
- type:
- "image_url",
+type:
+"image_url",
 
- image_url: {
+image_url: {
 
- url:
- `data:image/jpeg;base64,${frame.base64}`,
+url:
+`data:image/jpeg;base64,${frame.base64}`,
 
- detail:
- "high",
+detail:
+"high",
 
- },
+},
 
- })
- );
+})
+);
 
- const response =
- await openai.chat.completions.create({
+const response =
+await openai.chat.completions.create({
 
- model:
- "gpt-5-mini",
+model:
+"gpt-5-mini",
 
- messages: [
+messages: [
 
- {
+{
 
- role:
- "system",
+role:
+"system",
 
- content: `
+content: `
 
 Sen VerifyDoc isimli belge inceleme sistemisin.
 
@@ -639,21 +899,21 @@ Tüm açıklamalar TÜRKÇE olmalıdır.
 
 `,
 
- },
+},
 
- {
+{
 
- role:
- "user",
+role:
+"user",
 
- content: [
+content: [
 
- {
+{
 
- type:
- "text",
+type:
+"text",
 
- text: `
+text: `
 
 Bu video karelerini birlikte incele.
 
@@ -662,47 +922,47 @@ ve dijital manipülasyon belirtisi bulunup bulunmadığını değerlendir.
 
 `,
 
- },
+},
 
- ...imageMessages,
+...imageMessages,
 
- ],
+],
 
- },
+},
 
- ],
+],
 
- response_format: {
+response_format: {
 
- type:
- "json_object",
+type:
+"json_object",
 
- },
+},
 
- });
+});
 
- const content =
- response
- ?.choices?.[0]
- ?.message
- ?.content;
+const content =
+response
+?.choices?.[0]
+?.message
+?.content;
 
- if (!content) {
+if (!content) {
 
- throw new Error(
- "OpenAI'dan video analiz sonucu alınamadı."
- );
+throw new Error(
+"OpenAI'dan video analiz sonucu alınamadı."
+);
 
- }
+}
 
- console.log(
- "OPENAI VIDEO ANALYSIS:",
- content
- );
+console.log(
+"OPENAI VIDEO ANALYSIS:",
+content
+);
 
- return JSON.parse(
- content
- );
+return JSON.parse(
+content
+);
 
 }
 
@@ -713,15 +973,15 @@ ve dijital manipülasyon belirtisi bulunup bulunmadığını değerlendir.
 
 function first(value) {
 
- if (
- Array.isArray(value)
- ) {
+if (
+Array.isArray(value)
+) {
 
- return value[0];
+return value[0];
 
- }
+}
 
- return value;
+return value;
 
 }
 
@@ -731,41 +991,43 @@ function first(value) {
 // =====================================================
 
 function findUploadedFile(
- files
+files
 ) {
 
- const possibleNames = [
- "image",
- "file",
- "video",
- ];
+const possibleNames = [
 
- for (
- const name of possibleNames
- ) {
+"image",
+"file",
+"video",
 
- const value =
- files?.[name];
+];
 
- if (!value) {
+for (
+const name of possibleNames
+) {
 
- continue;
+const value =
+files?.[name];
 
- }
+if (!value) {
 
- if (
- Array.isArray(value)
- ) {
+continue;
 
- return value[0];
+}
 
- }
+if (
+Array.isArray(value)
+) {
 
- return value;
+return value[0];
 
- }
+}
 
- return null;
+return value;
+
+}
+
+return null;
 
 }
 
@@ -775,92 +1037,114 @@ function findUploadedFile(
 // =====================================================
 
 function analyzeTextCharacterConsistency(
- text
+text
 ) {
 
- if (
- !text ||
- typeof text !== "string"
- ) {
+if (
+!text ||
+typeof text !== "string"
+) {
 
- return {
- score: 0,
- suspicious: false,
- reason:
- "Analiz edilecek metin bulunamadı.",
- };
+return {
 
- }
+score:
+0,
 
- const characters =
- [...text].filter(
- (char) =>
- /[0-9]/.test(char)
- );
+suspicious:
+false,
 
- if (
- characters.length < 2
- ) {
+reason:
+"Analiz edilecek metin bulunamadı.",
 
- return {
- score: 0,
- suspicious: false,
- reason:
- "Karşılaştırma için yeterli rakam bulunamadı.",
- };
+};
 
- }
+}
 
- const frequency = {};
+const characters =
+[...text].filter(
+(char) =>
+/[0-9]/.test(char)
+);
 
- for (
- const char of characters
- ) {
+if (
+characters.length < 2
+) {
 
- frequency[char] =
- (frequency[char] || 0) + 1;
+return {
 
- }
+score:
+0,
 
- const repeatedDigits =
- Object.entries(
- frequency
- ).filter(
- ([, count]) =>
- count >= 2
- );
+suspicious:
+false,
 
- if (
- !repeatedDigits.length
- ) {
+reason:
+"Karşılaştırma için yeterli rakam bulunamadı.",
 
- return {
- score: 0,
- suspicious: false,
- reason:
- "Aynı rakamın yeterli tekrarı bulunamadı.",
- };
+};
 
- }
+}
 
- return {
+const frequency = {};
 
- score: 0,
+for (
+const char of characters
+) {
 
- suspicious: false,
+frequency[char] =
+(frequency[char] || 0) + 1;
 
- reason:
- "Rakam karakterleri mikro tutarlılık analizi için hazır.",
+}
 
- repeatedDigits:
- repeatedDigits.map(
- ([digit, count]) => ({
- digit,
- count,
- })
- ),
+const repeatedDigits =
+Object.entries(
+frequency
+).filter(
+([, count]) =>
+count >= 2
+);
 
- };
+if (
+!repeatedDigits.length
+) {
+
+return {
+
+score:
+0,
+
+suspicious:
+false,
+
+reason:
+"Aynı rakamın yeterli tekrarı bulunamadı.",
+
+};
+
+}
+
+return {
+
+score:
+0,
+
+suspicious:
+false,
+
+reason:
+"Rakam karakterleri mikro tutarlılık analizi için hazır.",
+
+repeatedDigits:
+repeatedDigits.map(
+([digit, count]) => ({
+
+digit,
+count,
+
+})
+),
+
+};
 
 }
 
@@ -870,69 +1154,69 @@ function analyzeTextCharacterConsistency(
 // =====================================================
 
 function parseAIResponse(
- text
+text
 ) {
 
- if (
- !text ||
- typeof text !== "string"
- ) {
+if (
+!text ||
+typeof text !== "string"
+) {
 
- throw new Error(
- "OpenAI boş cevap döndürdü."
- );
+throw new Error(
+"OpenAI boş cevap döndürdü."
+);
 
- }
+}
 
- const cleaned =
- text
- .trim()
- .replace(
- /^```json\s*/i,
- ""
- )
- .replace(
- /^```\s*/i,
- ""
- )
- .replace(
- /\s*```$/i,
- ""
- );
+const cleaned =
+text
+.trim()
+.replace(
+/^```json\s*/i,
+""
+)
+.replace(
+/^```\s*/i,
+""
+)
+.replace(
+/\s*```$/,
+""
+);
 
- try {
+try {
 
- return JSON.parse(
- cleaned
- );
+return JSON.parse(
+cleaned
+);
 
- } catch {
+} catch {
 
- const start =
- cleaned.indexOf("{");
+const start =
+cleaned.indexOf("{");
 
- const end =
- cleaned.lastIndexOf("}");
+const end =
+cleaned.lastIndexOf("}");
 
- if (
- start >= 0 &&
- end > start
- ) {
+if (
+start >= 0 &&
+end > start
+) {
 
- return JSON.parse(
- cleaned.slice(
- start,
- end + 1
- )
- );
+return JSON.parse(
+cleaned.slice(
+start,
+end + 1
+)
+);
 
- }
+}
 
- throw new Error(
- "OpenAI geçerli JSON döndürmedi."
- );
+throw new Error(
+"OpenAI geçerli JSON döndürmedi."
+);
 
- }
+}
 
 }
 
@@ -1472,332 +1756,400 @@ Return ONLY the JSON object matching the supplied schema.
 // =====================================================
 
 export default async function handler(
- req,
- res
+req,
+res
 ) {
 
- let result;
+let result;
 
- // ---------------------------------------------------
- // CORS
- // ---------------------------------------------------
 
- res.setHeader(
- "Access-Control-Allow-Origin",
- "*"
- );
+// ---------------------------------------------------
+// CORS
+// ---------------------------------------------------
 
- res.setHeader(
- "Access-Control-Allow-Methods",
- "POST, OPTIONS"
- );
+res.setHeader(
+"Access-Control-Allow-Origin",
+"*"
+);
 
- res.setHeader(
- "Access-Control-Allow-Headers",
- "Content-Type"
- );
+res.setHeader(
+"Access-Control-Allow-Methods",
+"POST, OPTIONS"
+);
 
+res.setHeader(
+"Access-Control-Allow-Headers",
+"Content-Type"
+);
 
- if (
- req.method === "OPTIONS"
- ) {
 
- return res
- .status(200)
- .end();
+if (
+req.method === "OPTIONS"
+) {
 
- }
+return res
+.status(200)
+.end();
 
+}
 
- if (
- req.method !== "POST"
- ) {
 
- return res
- .status(405)
- .json({
+if (
+req.method !== "POST"
+) {
 
- success: false,
+return res
+.status(405)
+.json({
 
- error:
- "Method not allowed",
+success:
+false,
 
- });
+error:
+"Method not allowed",
 
- }
+});
 
+}
 
- try {
 
- console.log(
- "=============================="
- );
+try {
 
- console.log(
- "VERIFYDOC API START"
- );
+console.log(
+"=============================="
+);
 
- const startTime =
- Date.now();
+console.log(
+"VERIFYDOC API START"
+);
 
+const startTime =
+Date.now();
 
- // -------------------------------------------------
- // API KEY
- // -------------------------------------------------
 
- if (
- !process.env.OPENAI_API_KEY
- ) {
+// -------------------------------------------------
+// API KEY
+// -------------------------------------------------
 
- throw new Error(
- "OPENAI_API_KEY Vercel Environment Variables içinde bulunamadı."
- );
+if (
+!process.env.OPENAI_API_KEY
+) {
 
- }
+throw new Error(
+"OPENAI_API_KEY Vercel Environment Variables içinde bulunamadı."
+);
 
+}
 
- // -------------------------------------------------
- // FORM DATA
- // -------------------------------------------------
 
- const {
- fields,
- files,
- } =
- await parseMultipart(req);
+// -------------------------------------------------
+// FORM DATA
+// -------------------------------------------------
 
+const {
+fields,
+files,
+} =
+await parseMultipart(req);
 
- console.log(
- "FORM PARSED"
- );
 
+console.log(
+"FORM PARSED"
+);
 
- const uploadedFile =
- findUploadedFile(files);
 
+const uploadedFile =
+findUploadedFile(
+files
+);
 
- if (!uploadedFile) {
 
- throw new Error(
- "Dosya alınamadı. image, file veya video alanı bulunamadı."
- );
+if (!uploadedFile) {
 
- }
+throw new Error(
+"Dosya alınamadı. image, file veya video alanı bulunamadı."
+);
 
+}
 
- const type =
- first(fields?.type) ||
- "document";
 
+const type =
+first(
+fields?.type
+) ||
+"document";
 
- const fileName =
- first(fields?.fileName) ||
- uploadedFile.originalFilename ||
- "document";
 
+const fileName =
+first(
+fields?.fileName
+) ||
+uploadedFile.originalFilename ||
+"document";
 
- console.log(
- "FILE:",
- fileName
- );
 
+// =================================================
+// BANKA
+// =================================================
 
- console.log(
- "TYPE:",
- type
- );
+const requestedBank =
+first(
+fields?.bank
+);
 
 
- console.log(
- "MIME:",
- uploadedFile.mimetype
- );
+const bank =
+normalizeBank(
+requestedBank
+);
 
 
- console.log(
- "SIZE:",
- uploadedFile.size
- );
+console.log(
+"REQUESTED BANK:",
+requestedBank ||
+"YOK"
+);
 
 
- // -------------------------------------------------
- // DOSYA
- // -------------------------------------------------
+console.log(
+"NORMALIZED BANK:",
+bank ||
+"YOK"
+);
 
- const filePath =
- uploadedFile.filepath;
 
+console.log(
+"FILE:",
+fileName
+);
 
- if (!filePath) {
 
- throw new Error(
- "Yüklenen dosyanın yolu bulunamadı."
- );
+console.log(
+"TYPE:",
+type
+);
 
- }
 
+console.log(
+"MIME:",
+uploadedFile.mimetype
+);
 
- const buffer =
- await fs.readFile(
- filePath
- );
 
+console.log(
+"SIZE:",
+uploadedFile.size
+);
 
- if (!buffer?.length) {
 
- throw new Error(
- "Dosya boş."
- );
+// =================================================
+// DOSYA
+// =================================================
 
- }
+const filePath =
+uploadedFile.filepath;
 
 
- // -------------------------------------------------
- // BASE64
- // -------------------------------------------------
+if (!filePath) {
 
- const base64 =
- buffer.toString(
- "base64"
- );
+throw new Error(
+"Yüklenen dosyanın yolu bulunamadı."
+);
 
+}
 
- let mime =
- uploadedFile.mimetype;
 
+const buffer =
+await fs.readFile(
+filePath
+);
 
- if (
- type === "image" &&
- (
- !mime ||
- !mime.startsWith("image/")
- )
- ) {
 
- const extension =
- path
- .extname(fileName)
- .toLowerCase();
+if (
+!buffer?.length
+) {
 
+throw new Error(
+"Dosya boş."
+);
 
- if (
- extension === ".png"
- ) {
+}
 
- mime =
- "image/png";
 
- } else if (
- extension === ".webp"
- ) {
+// =================================================
+// BASE64
+// =================================================
 
- mime =
- "image/webp";
+const base64 =
+buffer.toString(
+"base64"
+);
 
- } else if (
- extension === ".jpg" ||
- extension === ".jpeg"
- ) {
 
- mime =
- "image/jpeg";
+let mime =
+uploadedFile.mimetype;
 
- } else {
 
- mime =
- "image/jpeg";
+if (
+type === "image" &&
+(
+!mime ||
+!mime.startsWith(
+"image/"
+)
+)
+) {
 
- }
+const extension =
+path
+.extname(
+fileName
+)
+.toLowerCase();
 
- }
 
+if (
+extension === ".png"
+) {
 
- if (
- type === "pdf" &&
- (
- !mime ||
- !mime.includes("pdf")
- )
- ) {
+mime =
+"image/png";
 
- mime =
- "application/pdf";
+}
 
- }
+else if (
+extension === ".webp"
+) {
 
+mime =
+"image/webp";
 
- if (
- type === "video" &&
- (
- !mime ||
- !mime.startsWith("video/")
- )
- ) {
+}
 
- mime =
- "video/mp4";
+else if (
+extension === ".jpg" ||
+extension === ".jpeg"
+) {
 
- }
+mime =
+"image/jpeg";
 
+}
 
- console.log(
- "FINAL MIME:",
- mime
- );
+else {
 
+mime =
+"image/jpeg";
 
- // =====================================================
- // REFERANS DEKONT
- // =====================================================
+}
 
- // Şimdilik sistemdeki Akbank referansı kullanılıyor.
+}
 
- const reference =
- await loadReferenceFile(
- "akbank"
- );
 
+if (
+type === "pdf" &&
+(
+!mime ||
+!mime.includes(
+"pdf"
+)
+)
+) {
 
- console.log(
- "REFERENCE:",
- reference?.fileName ||
- "YOK"
- );
+mime =
+"application/pdf";
 
+}
 
- // -------------------------------------------------
- // OPENAI INPUT
- // -------------------------------------------------
 
- const imageDataUrl =
- `data:${mime};base64,${base64}`;
+if (
+type === "video" &&
+(
+!mime ||
+!mime.startsWith(
+"video/"
+)
+)
+) {
 
+mime =
+"video/mp4";
 
- let content;
+}
 
 
- // =================================================
- // IMAGE
- // =================================================
+console.log(
+"FINAL MIME:",
+mime
+);
 
- if (
- type === "image"
- ) {
 
- content = [
+// =====================================================
+// REFERANS DEKONT
+// =====================================================
 
- {
+// Gelen banka bilgisine göre doğru referans seçilir.
+//
+// Örnek:
+// akbank -> references/akbank.pdf
+// enpara -> references/enpara.pdf
 
- type:
- "input_text",
+const reference =
+await loadReferenceFile(
+bank
+);
 
- text: `${PROMPT}
+
+console.log(
+"BANK:",
+bank ||
+"YOK"
+);
+
+
+console.log(
+"REFERENCE:",
+reference?.fileName ||
+"YOK"
+);
+
+
+// -------------------------------------------------
+// OPENAI INPUT
+// -------------------------------------------------
+
+const imageDataUrl =
+`data:${mime};base64,${base64}`;
+
+
+let content;
+
+
+// =================================================
+// IMAGE
+// =================================================
+
+if (
+type === "image"
+) {
+
+content = [
+
+{
+
+type:
+"input_text",
+
+text: `${PROMPT}
 
 =====================================================
 REFERANS DEKONT
 =====================================================
 
 Bu analizde ayrıca bir referans dekont sağlanmıştır.
+
+Analiz edilen bankanın sistem tarafından belirlenen adı:
+${bank || "Banka belirtilmedi"}
 
 Referans:
 ${reference?.fileName || "Referans bulunamadı"}
@@ -1833,52 +2185,55 @@ gerçekliği için kesin kanıt olarak kabul etme.
 Filename:
 ${fileName}`,
 
- },
+},
 
- {
+{
 
- type:
- "input_image",
+type:
+"input_image",
 
- image_url:
- imageDataUrl,
+image_url:
+imageDataUrl,
 
- detail:
- "auto",
+detail:
+"auto",
 
- },
+},
 
- ];
+];
 
- }
-
-
- // =================================================
- // PDF
- // =================================================
-
- else if (
- type === "pdf"
- ) {
-
- const pdfDataUrl =
- `data:application/pdf;base64,${base64}`;
+}
 
 
- content = [
+// =================================================
+// PDF
+// =================================================
 
- {
+else if (
+type === "pdf"
+) {
 
- type:
- "input_text",
+const pdfDataUrl =
+`data:application/pdf;base64,${base64}`;
 
- text: `${PROMPT}
+
+content = [
+
+{
+
+type:
+"input_text",
+
+text: `${PROMPT}
 
 =====================================================
 REFERANS DEKONT
 =====================================================
 
 Bu analizde ayrıca bir referans dekont sağlanmıştır.
+
+Analiz edilen bankanın sistem tarafından belirlenen adı:
+${bank || "Banka belirtilmedi"}
 
 Referans dosya:
 ${reference?.fileName || "Referans bulunamadı"}
@@ -1918,305 +2273,319 @@ gerçekliği için kesin kanıt olarak kabul etme.
 Filename:
 ${fileName}`,
 
- },
+},
 
- {
+{
 
- type:
- "input_file",
+type:
+"input_file",
 
- filename:
- fileName,
+filename:
+fileName,
 
- file_data:
- pdfDataUrl,
+file_data:
+pdfDataUrl,
 
- },
+},
 
- ...(reference?.base64
+...(reference?.base64
 
- ? [
+? [
 
- {
+{
 
- type:
- "input_file",
+type:
+"input_file",
 
- filename:
- reference.fileName,
+filename:
+reference.fileName,
 
- file_data:
- `data:application/pdf;base64,${reference.base64}`,
+file_data:
+`data:application/pdf;base64,${reference.base64}`,
 
- },
+},
 
- ]
+]
 
- : []),
+: []),
 
- ];
+];
 
- }
+}
 
 
- // =================================================
- // VIDEO
- // =================================================
+// =================================================
+// VIDEO
+// =================================================
 
- else if (
- type === "video"
- ) {
+else if (
+type === "video"
+) {
 
- console.log(
- "VIDEO ANALYSIS START"
- );
+console.log(
+"VIDEO ANALYSIS START"
+);
 
 
- const frames =
- await extractVideoFrames(
- filePath
- );
+const frames =
+await extractVideoFrames(
+filePath
+);
 
 
- console.log(
- "VIDEO FRAMES EXTRACTED:",
- frames.length
- );
+console.log(
+"VIDEO FRAMES EXTRACTED:",
+frames.length
+);
 
 
- const videoResult =
- await analyzeVideoFrames(
- frames
- );
+const videoResult =
+await analyzeVideoFrames(
+frames
+);
 
 
- console.log(
- "VIDEO ANALYSIS COMPLETE"
- );
+console.log(
+"VIDEO ANALYSIS COMPLETE"
+);
 
 
- console.log(
- "VIDEO RESULT:",
- videoResult
- );
+console.log(
+"VIDEO RESULT:",
+videoResult
+);
 
 
- return res
- .status(200)
- .json({
+return res
+.status(200)
+.json({
 
- success: true,
+success:
+true,
 
- fileName,
+fileName,
 
- type,
+type,
 
- videoAnalysis:
- videoResult,
+videoAnalysis:
+videoResult,
 
- });
+});
 
- }
+}
 
 
- else {
+else {
 
- throw new Error(
- "Desteklenmeyen dosya türü."
- );
+throw new Error(
+"Desteklenmeyen dosya türü."
+);
 
- }
+}
 
 
- // -------------------------------------------------
- // OPENAI
- // -------------------------------------------------
+// -------------------------------------------------
+// OPENAI
+// -------------------------------------------------
 
- console.log(
- "OPENAI REQUEST START"
- );
+console.log(
+"OPENAI REQUEST START"
+);
 
 
- const response =
- await openai.responses.create({
+const response =
+await openai.responses.create({
 
- model:
- "gpt-5-mini",
+model:
+"gpt-5-mini",
 
- input: [
+input: [
 
- {
+{
 
- role:
- "user",
+role:
+"user",
 
- content,
+content,
 
- },
+},
 
- ],
+],
 
- text: {
+text: {
 
- format: {
+format: {
 
- type:
- "json_schema",
+type:
+"json_schema",
 
- name:
- "verifydoc_analysis",
+name:
+"verifydoc_analysis",
 
- strict:
- true,
+strict:
+true,
 
- schema:
- RESPONSE_SCHEMA,
+schema:
+RESPONSE_SCHEMA,
 
- },
+},
 
- },
+},
 
- });
+});
 
 
- console.log(
- "OPENAI RESPONSE RECEIVED"
- );
+console.log(
+"OPENAI RESPONSE RECEIVED"
+);
 
 
- console.log(
- "OPENAI SURE:",
- (
- (Date.now() - startTime) /
- 1000
- ).toFixed(2),
- "seconds"
- );
+console.log(
+"OPENAI SURE:",
+(
+(Date.now() - startTime) /
+1000
+).toFixed(2),
+"seconds"
+);
 
 
- // -------------------------------------------------
- // PARSE
- // -------------------------------------------------
+// -------------------------------------------------
+// PARSE
+// -------------------------------------------------
 
- result =
- parseAIResponse(
- response.output_text
- );
+result =
+parseAIResponse(
+response.output_text
+);
 
 
- // =====================================================
- // ANA SKOR
- // =====================================================
+// =====================================================
+// ANA SKOR
+// =====================================================
 
- const finalScore =
- Number(
- result.overallRisk
- ) || 0;
+const finalScore =
+Number(
+result.overallRisk
+) || 0;
 
 
- const finalSuspicious =
- finalScore >= 46;
+const finalSuspicious =
+finalScore >= 46;
 
 
- const finalEvidence =
- result?.amountAnalysis?.evidence ||
- result?.summary ||
- "Analiz tamamlandı.";
+const finalEvidence =
+result?.amountAnalysis?.evidence ||
+result?.summary ||
+"Analiz tamamlandı.";
 
 
- console.log(
- "FINAL SCORE:",
- finalScore
- );
+console.log(
+"FINAL SCORE:",
+finalScore
+);
 
 
- console.log(
- "FINAL SUSPICIOUS:",
- finalSuspicious
- );
+console.log(
+"FINAL SUSPICIOUS:",
+finalSuspicious
+);
 
 
- console.log(
- "ANALYSIS SUCCESS"
- );
+console.log(
+"ANALYSIS SUCCESS"
+);
 
 
- console.log(
- "TOTAL SURE:",
- (
- (Date.now() - startTime) /
- 1000
- ).toFixed(2),
- "seconds"
- );
+console.log(
+"TOTAL SURE:",
+(
+(Date.now() - startTime) /
+1000
+).toFixed(2),
+"seconds"
+);
 
 
- console.log(
- "=============================="
- );
+console.log(
+"=============================="
+);
 
 
- return res
- .status(200)
- .json({
+return res
+.status(200)
+.json({
 
- success: true,
+success:
+true,
 
- fileName,
+fileName,
 
- type,
+type,
 
- ...result,
+// Kullanılan banka
+bank:
+bank,
 
- // ANA SKOR
- score:
- finalScore,
+// Kullanılan referans
+reference:
+reference?.fileName ||
+null,
 
- // ANA ŞÜPHE DURUMU
- suspicious:
- finalSuspicious,
+...result,
 
- // BİRLEŞTİRİLMİŞ KANIT
- evidence:
- finalEvidence,
+// ANA SKOR
+score:
+finalScore,
 
- });
+// ANA ŞÜPHE DURUMU
+suspicious:
+finalSuspicious,
 
+// BİRLEŞTİRİLMİŞ KANIT
+evidence:
+finalEvidence,
 
- } catch (err) {
+});
 
- console.error(
- "=============================="
- );
 
+}
 
- console.error(
- "VERIFYDOC API ERROR:"
- );
+catch (err) {
 
+console.error(
+"=============================="
+);
 
- console.error(
- err
- );
 
+console.error(
+"VERIFYDOC API ERROR:"
+);
 
- console.error(
- "=============================="
- );
 
+console.error(
+err
+);
 
- return res
- .status(500)
- .json({
 
- success: false,
+console.error(
+"=============================="
+);
 
- error:
- err?.message ||
- "Analysis failed",
 
- });
+return res
+.status(500)
+.json({
 
- }
+success:
+false,
+
+error:
+err?.message ||
+"Analysis failed",
+
+});
+
+}
 
 }
