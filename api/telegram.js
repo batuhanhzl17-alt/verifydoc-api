@@ -5,10 +5,10 @@ import { waitUntil } from "@vercel/functions";
 // =====================================================
 
 const TELEGRAM_BOT_TOKEN =
- process.env.TELEGRAM_BOT_TOKEN;
+process.env.TELEGRAM_BOT_TOKEN;
 
 const ANALYZE_URL =
- "https://verifydoc-api.vercel.app/api/analyze";
+"https://verifydoc-api.vercel.app/api/analyze";
 
 
 // =====================================================
@@ -16,7 +16,7 @@ const ANALYZE_URL =
 // =====================================================
 
 const processedUpdates =
- new Set();
+new Set();
 
 
 // =====================================================
@@ -24,47 +24,47 @@ const processedUpdates =
 // =====================================================
 
 async function telegram(
- method,
- body
+method,
+body
 ) {
 
- if (!TELEGRAM_BOT_TOKEN) {
+if (!TELEGRAM_BOT_TOKEN) {
 
- throw new Error(
- "TELEGRAM_BOT_TOKEN bulunamadı."
- );
+throw new Error(
+"TELEGRAM_BOT_TOKEN bulunamadı."
+);
 
- }
+}
 
- const response =
- await fetch(
- `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
- {
- method: "POST",
+const response =
+await fetch(
+`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+{
+method: "POST",
 
- headers: {
- "Content-Type":
- "application/json",
- },
+headers: {
+"Content-Type":
+"application/json",
+},
 
- body:
- JSON.stringify(body),
- }
- );
+body:
+JSON.stringify(body),
+}
+);
 
- const data =
- await response.json();
+const data =
+await response.json();
 
- if (!data.ok) {
+if (!data.ok) {
 
- throw new Error(
- data.description ||
- `Telegram ${method} hatası`
- );
+throw new Error(
+data.description ||
+`Telegram ${method} hatası`
+);
 
- }
+}
 
- return data.result;
+return data.result;
 
 }
 
@@ -74,19 +74,19 @@ async function telegram(
 // =====================================================
 
 async function sendMessage(
- chatId,
- text
+chatId,
+text
 ) {
 
- return telegram(
- "sendMessage",
- {
- chat_id:
- chatId,
+return telegram(
+"sendMessage",
+{
+chat_id:
+chatId,
 
- text,
- }
- );
+text,
+}
+);
 
 }
 
@@ -96,60 +96,60 @@ async function sendMessage(
 // =====================================================
 
 async function downloadTelegramFile(
- fileId
+fileId
 ) {
 
- const file =
- await telegram(
- "getFile",
- {
- file_id:
- fileId,
- }
- );
+const file =
+await telegram(
+"getFile",
+{
+file_id:
+fileId,
+}
+);
 
 
- if (!file?.file_path) {
+if (!file?.file_path) {
 
- throw new Error(
- "Telegram dosya yolu döndürmedi."
- );
+throw new Error(
+"Telegram dosya yolu döndürmedi."
+);
 
- }
-
-
- const fileUrl =
- `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+}
 
 
- const response =
- await fetch(fileUrl);
+const fileUrl =
+`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
 
 
- if (!response.ok) {
-
- throw new Error(
- "Telegram dosyası indirilemedi."
- );
-
- }
+const response =
+await fetch(fileUrl);
 
 
- const arrayBuffer =
- await response.arrayBuffer();
+if (!response.ok) {
+
+throw new Error(
+"Telegram dosyası indirilemedi."
+);
+
+}
 
 
- return {
+const arrayBuffer =
+await response.arrayBuffer();
 
- buffer:
- Buffer.from(
- arrayBuffer
- ),
 
- filePath:
- file.file_path,
+return {
 
- };
+buffer:
+Buffer.from(
+arrayBuffer
+),
+
+filePath:
+file.file_path,
+
+};
 
 }
 
@@ -159,55 +159,70 @@ async function downloadTelegramFile(
 // =====================================================
 
 function detectBank(
- text
+text
 ) {
 
- if (
- !text ||
- typeof text !== "string"
- ) {
+if (
+!text ||
+typeof text !== "string"
+) {
 
- return null;
+return null;
 
- }
-
-
- const value =
- text
- .toLowerCase()
- .trim()
- .replace(
- /\s+/g,
- ""
- );
+}
 
 
- if (
- value.includes(
- "garanti"
- ) ||
- value.includes(
- "garantibbva"
- )
- ) {
-
- return "garanti";
-
- }
+const value =
+text
+.toLowerCase()
+.trim()
+.replace(
+/\s+/g,
+""
+);
 
 
- if (
- value.includes(
- "akbank"
- )
- ) {
+if (
+value.includes(
+"garanti"
+) ||
+value.includes(
+"garantibbva"
+)
+) {
 
- return "akbank";
+return "garanti";
 
- }
+}
 
 
- return null;
+if (
+value.includes(
+"akbank"
+)
+) {
+
+return "akbank";
+
+}
+
+
+// =====================================================
+// ENPARA
+// =====================================================
+
+if (
+value.includes(
+"enpara"
+)
+) {
+
+return "enpara";
+
+}
+
+
+return null;
 
 }
 
@@ -218,131 +233,131 @@ function detectBank(
 
 async function analyzeFile({
 
- buffer,
- fileName,
- mimeType,
- type,
- bank,
+buffer,
+fileName,
+mimeType,
+type,
+bank,
 
 }) {
 
- console.log(
- "VERIFYDOC'A GÖNDERİLİYOR:"
- );
+console.log(
+"VERIFYDOC'A GÖNDERİLİYOR:"
+);
 
- console.log(
- "TYPE:",
- type
- );
+console.log(
+"TYPE:",
+type
+);
 
- console.log(
- "MIME:",
- mimeType
- );
+console.log(
+"MIME:",
+mimeType
+);
 
- console.log(
- "FILE:",
- fileName
- );
+console.log(
+"FILE:",
+fileName
+);
 
- console.log(
- "BANK:",
- bank
- );
-
-
- const form =
- new FormData();
+console.log(
+"BANK:",
+bank
+);
 
 
- form.append(
- "type",
- type
- );
+const form =
+new FormData();
 
 
- form.append(
- "fileName",
- fileName
- );
+form.append(
+"type",
+type
+);
 
 
- form.append(
- "bank",
- bank
- );
+form.append(
+"fileName",
+fileName
+);
 
 
- const blob =
- new Blob(
- [buffer],
- {
- type:
- mimeType ||
- "application/octet-stream",
- }
- );
+form.append(
+"bank",
+bank
+);
 
 
- let fieldName =
- "file";
+const blob =
+new Blob(
+[buffer],
+{
+type:
+mimeType ||
+"application/octet-stream",
+}
+);
 
 
- if (
- type === "image"
- ) {
-
- fieldName =
- "image";
-
- }
+let fieldName =
+"file";
 
 
- if (
- type === "video"
- ) {
+if (
+type === "image"
+) {
 
- fieldName =
- "video";
+fieldName =
+"image";
 
- }
-
-
- form.append(
- fieldName,
- blob,
- fileName
- );
+}
 
 
- const response =
- await fetch(
- ANALYZE_URL,
- {
- method:
- "POST",
+if (
+type === "video"
+) {
 
- body:
- form,
- }
- );
+fieldName =
+"video";
+
+}
 
 
- const result =
- await response.json();
+form.append(
+fieldName,
+blob,
+fileName
+);
 
 
- if (!response.ok) {
+const response =
+await fetch(
+ANALYZE_URL,
+{
+method:
+"POST",
 
- throw new Error(
- result?.error ||
- "VerifyDoc analiz API hatası."
- );
-
- }
+body:
+form,
+}
+);
 
 
- return result;
+const result =
+await response.json();
+
+
+if (!response.ok) {
+
+throw new Error(
+result?.error ||
+"VerifyDoc analiz API hatası."
+);
+
+}
+
+
+return result;
 
 }
 
@@ -352,65 +367,65 @@ async function analyzeFile({
 // =====================================================
 
 async function sendAnalysisResult(
- chatId,
- result
+chatId,
+result
 ) {
 
- const score =
- Number(
- result?.score
- ) || 0;
+const score =
+Number(
+result?.score
+) || 0;
 
 
- const confidence =
- Number(
- result?.confidence
- ) || 0;
+const confidence =
+Number(
+result?.confidence
+) || 0;
 
 
- const riskLabel =
- result?.riskLabel ||
- "UNKNOWN";
+const riskLabel =
+result?.riskLabel ||
+"UNKNOWN";
 
 
- const summary =
- result?.summary ||
- "Analiz tamamlandı.";
+const summary =
+result?.summary ||
+"Analiz tamamlandı.";
 
 
- let emoji =
- " ";
+let emoji =
+" ";
 
 
- if (
- score >= 71
- ) {
+if (
+score >= 71
+) {
 
- emoji =
- " ";
+emoji =
+" ";
 
- }
+}
 
- else if (
- score >= 46
- ) {
+else if (
+score >= 46
+) {
 
- emoji =
- " ";
+emoji =
+" ";
 
- }
+}
 
- else if (
- score >= 21
- ) {
+else if (
+score >= 21
+) {
 
- emoji =
- " ";
+emoji =
+" ";
 
- }
+}
 
 
- const text =
+const text =
 
 `${emoji} VERIFYDOC ANALİZ SONUCU
 
@@ -432,10 +447,10 @@ Bu sonuç yalnızca otomatik ön inceleme sonucudur.
 Kesin gerçeklik veya sahtecilik kararı değildir.`;
 
 
- await sendMessage(
- chatId,
- text
- );
+await sendMessage(
+chatId,
+text
+);
 
 }
 
@@ -445,75 +460,75 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
 // =====================================================
 
 function determineDocumentType(
- mimeType,
- fileName
+mimeType,
+fileName
 ) {
 
- const mime =
- (
- mimeType ||
- ""
- ).toLowerCase();
+const mime =
+(
+mimeType ||
+""
+).toLowerCase();
 
 
- const name =
- (
- fileName ||
- ""
- ).toLowerCase();
+const name =
+(
+fileName ||
+""
+).toLowerCase();
 
 
- // PDF
+// PDF
 
- if (
- mime ===
- "application/pdf" ||
- name.endsWith(".pdf")
- ) {
+if (
+mime ===
+"application/pdf" ||
+name.endsWith(".pdf")
+) {
 
- return "pdf";
+return "pdf";
 
- }
-
-
- // IMAGE
-
- if (
- mime.startsWith(
- "image/"
- ) ||
-
- name.endsWith(".jpg") ||
- name.endsWith(".jpeg") ||
- name.endsWith(".png") ||
- name.endsWith(".webp")
- ) {
-
- return "image";
-
- }
+}
 
 
- // VIDEO
+// IMAGE
 
- if (
- mime.startsWith(
- "video/"
- ) ||
+if (
+mime.startsWith(
+"image/"
+) ||
 
- name.endsWith(".mp4") ||
- name.endsWith(".mov") ||
- name.endsWith(".avi") ||
- name.endsWith(".mkv") ||
- name.endsWith(".webm")
- ) {
+name.endsWith(".jpg") ||
+name.endsWith(".jpeg") ||
+name.endsWith(".png") ||
+name.endsWith(".webp")
+) {
 
- return "video";
+return "image";
 
- }
+}
 
 
- return null;
+// VIDEO
+
+if (
+mime.startsWith(
+"video/"
+) ||
+
+name.endsWith(".mp4") ||
+name.endsWith(".mov") ||
+name.endsWith(".avi") ||
+name.endsWith(".mkv") ||
+name.endsWith(".webm")
+) {
+
+return "video";
+
+}
+
+
+return null;
 
 }
 
@@ -523,51 +538,51 @@ function determineDocumentType(
 // =====================================================
 
 async function processTelegramUpdate(
- update
+update
 ) {
 
- const message =
- update?.message;
+const message =
+update?.message;
 
 
- if (!message) {
+if (!message) {
 
- return;
+return;
 
- }
-
-
- const chatId =
- message?.chat?.id;
+}
 
 
- if (!chatId) {
-
- return;
-
- }
+const chatId =
+message?.chat?.id;
 
 
- const text =
- message?.text ||
- message?.caption ||
- "";
+if (!chatId) {
+
+return;
+
+}
 
 
- // =================================================
- // START
- // =================================================
+const text =
+message?.text ||
+message?.caption ||
+"";
 
- if (
- typeof message?.text ===
- "string" &&
- message.text.startsWith(
- "/start"
- )
- ) {
 
- await sendMessage(
- chatId,
+// =================================================
+// START
+// =================================================
+
+if (
+typeof message?.text ===
+"string" &&
+message.text.startsWith(
+"/start"
+)
+) {
+
+await sendMessage(
+chatId,
 
 ` VerifyDoc'a hoş geldin.
 
@@ -577,6 +592,7 @@ Banka seçimi:
 
 /akbank
 /garanti
+/enpara
 
 Ardından belgeyi gönder.
 
@@ -588,76 +604,99 @@ veya
 
 Akbank
 
+veya
+
+Enpara
+
 yazabilirsin.`
- );
+);
 
- return;
+return;
 
- }
-
-
- // =================================================
- // BANKA KOMUTLARI
- // =================================================
-
- if (
- message?.text ===
- "/akbank"
- ) {
-
- await sendMessage(
- chatId,
- " Akbank seçildi.\n\nŞimdi Akbank dekontunu gönder."
- );
-
- return;
-
- }
+}
 
 
- if (
- message?.text ===
- "/garanti"
- ) {
+// =================================================
+// BANKA KOMUTLARI
+// =================================================
 
- await sendMessage(
- chatId,
- " Garanti BBVA seçildi.\n\nŞimdi Garanti dekontunu gönder."
- );
+if (
+message?.text ===
+"/akbank"
+) {
 
- return;
+await sendMessage(
+chatId,
+" Akbank seçildi.\n\nŞimdi Akbank dekontunu gönder."
+);
 
- }
+return;
 
-
- // =================================================
- // DOSYA KONTROLÜ
- // =================================================
-
- const hasPhoto =
- Array.isArray(
- message?.photo
- ) &&
- message.photo.length >
- 0;
+}
 
 
- const hasDocument =
- !!message?.document;
+if (
+message?.text ===
+"/garanti"
+) {
+
+await sendMessage(
+chatId,
+" Garanti BBVA seçildi.\n\nŞimdi Garanti dekontunu gönder."
+);
+
+return;
+
+}
 
 
- const hasVideo =
- !!message?.video;
+// =====================================================
+// ENPARA KOMUTU
+// =====================================================
+
+if (
+message?.text ===
+"/enpara"
+) {
+
+await sendMessage(
+chatId,
+" Enpara seçildi.\n\nŞimdi Enpara dekontunu gönder."
+);
+
+return;
+
+}
 
 
- if (
- !hasPhoto &&
- !hasDocument &&
- !hasVideo
- ) {
+// =================================================
+// DOSYA KONTROLÜ
+// =================================================
 
- await sendMessage(
- chatId,
+const hasPhoto =
+Array.isArray(
+message?.photo
+) &&
+message.photo.length >
+0;
+
+
+const hasDocument =
+!!message?.document;
+
+
+const hasVideo =
+!!message?.video;
+
+
+if (
+!hasPhoto &&
+!hasDocument &&
+!hasVideo
+) {
+
+await sendMessage(
+chatId,
 
 ` Lütfen analiz etmek istediğin belgeyi gönder.
 
@@ -670,28 +709,29 @@ Desteklenen:
 Banka seçimi:
 
 /akbank
-/garanti`
- );
+/garanti
+/enpara`
+);
 
- return;
+return;
 
- }
-
-
- // =================================================
- // BANKA
- // =================================================
-
- const bank =
- detectBank(
- text
- );
+}
 
 
- if (!bank) {
+// =================================================
+// BANKA
+// =================================================
 
- await sendMessage(
- chatId,
+const bank =
+detectBank(
+text
+);
+
+
+if (!bank) {
+
+await sendMessage(
+chatId,
 
 ` Bankayı belirtmem gerekiyor.
 
@@ -703,223 +743,229 @@ veya:
 
 Akbank
 
+veya:
+
+Enpara
+
 yaz.
 
 Örneğin:
 
-Garanti dekontu`
- );
+Enpara dekontu`
+);
 
- return;
+return;
 
- }
-
-
- // =================================================
- // DOSYA BİLGİLERİ
- // =================================================
-
- let fileId =
- null;
-
- let fileName =
- null;
-
- let mimeType =
- null;
-
- let type =
- null;
+}
 
 
- // =================================================
- // FOTOĞRAF
- // =================================================
+// =================================================
+// DOSYA BİLGİLERİ
+// =================================================
 
- if (
- hasPhoto
- ) {
+let fileId =
+null;
 
- const photo =
- message.photo[
- message.photo.length - 1
- ];
+let fileName =
+null;
 
+let mimeType =
+null;
 
- fileId =
- photo.file_id;
-
-
- fileName =
- "telegram-photo.jpg";
+let type =
+null;
 
 
- mimeType =
- "image/jpeg";
+// =================================================
+// FOTOĞRAF
+// =================================================
+
+if (
+hasPhoto
+) {
+
+const photo =
+message.photo[
+message.photo.length - 1
+];
 
 
- type =
- "image";
-
- }
+fileId =
+photo.file_id;
 
 
- // =================================================
- // VIDEO
- // =================================================
-
- else if (
- hasVideo
- ) {
-
- fileId =
- message.video.file_id;
+fileName =
+"telegram-photo.jpg";
 
 
- fileName =
- "telegram-video.mp4";
+mimeType =
+"image/jpeg";
 
 
- mimeType =
- message.video.mime_type ||
- "video/mp4";
+type =
+"image";
+
+}
 
 
- type =
- "video";
+// =================================================
+// VIDEO
+// =================================================
 
- }
+else if (
+hasVideo
+) {
 
-
- // =================================================
- // DOCUMENT
- // =================================================
-
- else if (
- hasDocument
- ) {
-
- fileId =
- message.document.file_id;
+fileId =
+message.video.file_id;
 
 
- fileName =
- message.document.file_name ||
- "telegram-document";
+fileName =
+"telegram-video.mp4";
 
 
- mimeType =
- message.document.mime_type ||
- "application/octet-stream";
+mimeType =
+message.video.mime_type ||
+"video/mp4";
 
 
- type =
- determineDocumentType(
- mimeType,
- fileName
- );
+type =
+"video";
+
+}
 
 
- if (!type) {
+// =================================================
+// DOCUMENT
+// =================================================
 
- throw new Error(
- `Desteklenmeyen dosya türü: ${mimeType}`
- );
+else if (
+hasDocument
+) {
 
- }
-
- }
-
-
- console.log(
- "================================"
- );
-
- console.log(
- "TELEGRAM FILE TYPE:",
- type
- );
-
- console.log(
- "TELEGRAM MIME:",
- mimeType
- );
-
- console.log(
- "TELEGRAM FILE NAME:",
- fileName
- );
-
- console.log(
- "TELEGRAM BANK:",
- bank
- );
-
- console.log(
- "================================"
- );
+fileId =
+message.document.file_id;
 
 
- // =================================================
- // ANALİZ BAŞLADI
- // =================================================
+fileName =
+message.document.file_name ||
+"telegram-document";
 
- await sendMessage(
- chatId,
+
+mimeType =
+message.document.mime_type ||
+"application/octet-stream";
+
+
+type =
+determineDocumentType(
+mimeType,
+fileName
+);
+
+
+if (!type) {
+
+throw new Error(
+`Desteklenmeyen dosya türü: ${mimeType}`
+);
+
+}
+
+}
+
+
+console.log(
+"================================"
+);
+
+console.log(
+"TELEGRAM FILE TYPE:",
+type
+);
+
+console.log(
+"TELEGRAM MIME:",
+mimeType
+);
+
+console.log(
+"TELEGRAM FILE NAME:",
+fileName
+);
+
+console.log(
+"TELEGRAM BANK:",
+bank
+);
+
+console.log(
+"================================"
+);
+
+
+// =================================================
+// ANALİZ BAŞLADI
+// =================================================
+
+await sendMessage(
+chatId,
 
 ` Belge alındı.
 
  Banka: ${
- bank === "garanti"
- ? "Garanti BBVA"
- : "Akbank"
+bank === "garanti"
+? "Garanti BBVA"
+: bank === "enpara"
+? "Enpara"
+: "Akbank"
 }
 
  Dosya türü: ${type}
 
  VerifyDoc analiz başlatıyor...`
- );
+);
 
 
- // =================================================
- // TELEGRAM'DAN İNDİR
- // =================================================
+// =================================================
+// TELEGRAM'DAN İNDİR
+// =================================================
 
- const downloaded =
- await downloadTelegramFile(
- fileId
- );
-
-
- // =================================================
- // VERIFYDOC ANALİZİ
- // =================================================
-
- const result =
- await analyzeFile({
-
- buffer:
- downloaded.buffer,
-
- fileName,
-
- mimeType,
-
- type,
-
- bank,
-
- });
+const downloaded =
+await downloadTelegramFile(
+fileId
+);
 
 
- // =================================================
- // SONUÇ
- // =================================================
+// =================================================
+// VERIFYDOC ANALİZİ
+// =================================================
 
- await sendAnalysisResult(
- chatId,
- result
- );
+const result =
+await analyzeFile({
+
+buffer:
+downloaded.buffer,
+
+fileName,
+
+mimeType,
+
+type,
+
+bank,
+
+});
+
+
+// =================================================
+// SONUÇ
+// =================================================
+
+await sendAnalysisResult(
+chatId,
+result
+);
 
 }
 
@@ -929,200 +975,200 @@ Garanti dekontu`
 // =====================================================
 
 export default async function handler(
- req,
- res
+req,
+res
 ) {
 
- // =================================================
- // GET
- // =================================================
+// =================================================
+// GET
+// =================================================
 
- if (
- req.method !== "POST"
- ) {
+if (
+req.method !== "POST"
+) {
 
- return res
- .status(200)
- .json({
+return res
+.status(200)
+.json({
 
- ok: true,
+ok: true,
 
- message:
- "VerifyDoc Telegram endpoint aktif.",
+message:
+"VerifyDoc Telegram endpoint aktif.",
 
- });
+});
 
- }
-
-
- try {
-
- const update =
- req.body;
+}
 
 
- console.log(
- "================================"
- );
+try {
 
- console.log(
- "TELEGRAM UPDATE ALINDI"
- );
-
- console.log(
- "UPDATE ID:",
- update?.update_id
- );
-
- console.log(
- "================================"
- );
+const update =
+req.body;
 
 
- // =================================================
- // UPDATE ID KONTROLÜ
- // =================================================
+console.log(
+"================================"
+);
 
- const updateId =
- update?.update_id;
+console.log(
+"TELEGRAM UPDATE ALINDI"
+);
 
+console.log(
+"UPDATE ID:",
+update?.update_id
+);
 
- if (
- updateId !== undefined
- ) {
-
- if (
- processedUpdates.has(
- updateId
- )
- ) {
-
- console.log(
- "DUPLICATE UPDATE:",
- updateId
- );
+console.log(
+"================================"
+);
 
 
- return res
- .status(200)
- .json({
- ok: true,
- duplicate: true,
- });
+// =================================================
+// UPDATE ID KONTROLÜ
+// =================================================
 
- }
+const updateId =
+update?.update_id;
 
 
- processedUpdates.add(
- updateId
- );
+if (
+updateId !== undefined
+) {
+
+if (
+processedUpdates.has(
+updateId
+)
+) {
+
+console.log(
+"DUPLICATE UPDATE:",
+updateId
+);
 
 
- // Set'in sonsuza kadar büyümemesi için
- // yaklaşık 10 dakika sonra temizle.
+return res
+.status(200)
+.json({
+ok: true,
+duplicate: true,
+});
 
- setTimeout(
- () => {
-
- processedUpdates.delete(
- updateId
- );
-
- },
- 10 * 60 * 1000
- );
-
- }
+}
 
 
- // =================================================
- // ANALİZİ ARKA PLANDA ÇALIŞTIR
- // =================================================
-
- waitUntil(
- processTelegramUpdate(
- update
- )
- .catch(
- async (error) => {
-
- console.error(
- "TELEGRAM PROCESS ERROR:",
- error
- );
+processedUpdates.add(
+updateId
+);
 
 
- try {
+// Set'in sonsuza kadar büyümemesi için
+// yaklaşık 10 dakika sonra temizle.
 
- const chatId =
- update
- ?.message
- ?.chat
- ?.id;
+setTimeout(
+() => {
+
+processedUpdates.delete(
+updateId
+);
+
+},
+10 * 60 * 1000
+);
+
+}
 
 
- if (
- chatId
- ) {
+// =================================================
+// ANALİZİ ARKA PLANDA ÇALIŞTIR
+// =================================================
 
- await sendMessage(
- chatId,
+waitUntil(
+processTelegramUpdate(
+update
+)
+.catch(
+async (error) => {
+
+console.error(
+"TELEGRAM PROCESS ERROR:",
+error
+);
+
+
+try {
+
+const chatId =
+update
+?.message
+?.chat
+?.id;
+
+
+if (
+chatId
+) {
+
+await sendMessage(
+chatId,
 
 ` Analiz sırasında hata oluştu.
 
 Hata:
 ${error?.message || "Bilinmeyen hata"}`
- );
+);
 
- }
+}
 
- } catch (
- telegramError
- ) {
+} catch (
+telegramError
+) {
 
- console.error(
- "TELEGRAM ERROR MESSAGE FAILED:",
- telegramError
- );
+console.error(
+"TELEGRAM ERROR MESSAGE FAILED:",
+telegramError
+);
 
- }
+}
 
- }
- )
- );
-
-
- // =================================================
- // TELEGRAM'A HEMEN 200
- // =================================================
-
- return res
- .status(200)
- .json({
-
- ok: true,
-
- });
+}
+)
+);
 
 
- } catch (
- error
- ) {
+// =================================================
+// TELEGRAM'A HEMEN 200
+// =================================================
 
- console.error(
- "TELEGRAM WEBHOOK ERROR:",
- error
- );
+return res
+.status(200)
+.json({
+
+ok: true,
+
+});
 
 
- return res
- .status(200)
- .json({
+} catch (
+error
+) {
 
- ok: false,
+console.error(
+"TELEGRAM WEBHOOK ERROR:",
+error
+);
 
- });
 
- }
+return res
+.status(200)
+.json({
+
+ok: false,
+
+});
+
+}
 
 }
