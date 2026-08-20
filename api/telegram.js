@@ -182,6 +182,10 @@ text
 );
 
 
+// =================================================
+// GARANTİ
+// =================================================
+
 if (
 value.includes(
 "garanti"
@@ -196,6 +200,10 @@ return "garanti";
 }
 
 
+// =================================================
+// AKBANK
+// =================================================
+
 if (
 value.includes(
 "akbank"
@@ -207,17 +215,38 @@ return "akbank";
 }
 
 
-// =====================================================
+// =================================================
 // ENPARA
-// =====================================================
+// =================================================
 
 if (
 value.includes(
 "enpara"
+) ||
+value.includes(
+"enparacom"
 )
 ) {
 
 return "enpara";
+
+}
+
+
+// =================================================
+// VAKIFBANK
+// =================================================
+
+if (
+value.includes(
+"vakıfbank"
+) ||
+value.includes(
+"vakifbank"
+)
+) {
+
+return "vakifbank";
 
 }
 
@@ -394,7 +423,7 @@ result?.summary ||
 
 
 let emoji =
-" ";
+"🟢";
 
 
 if (
@@ -402,7 +431,7 @@ score >= 71
 ) {
 
 emoji =
-" ";
+"🔴";
 
 }
 
@@ -411,7 +440,7 @@ score >= 46
 ) {
 
 emoji =
-" ";
+"🟠";
 
 }
 
@@ -420,7 +449,7 @@ score >= 21
 ) {
 
 emoji =
-" ";
+"🟡";
 
 }
 
@@ -584,7 +613,7 @@ message.text.startsWith(
 await sendMessage(
 chatId,
 
-` VerifyDoc'a hoş geldin.
+`🤖 VerifyDoc'a hoş geldin.
 
 Dekont veya belge göndererek otomatik inceleme yaptırabilirsin.
 
@@ -593,6 +622,7 @@ Banka seçimi:
 /akbank
 /garanti
 /enpara
+/vakifbank
 
 Ardından belgeyi gönder.
 
@@ -607,6 +637,10 @@ Akbank
 veya
 
 Enpara
+
+veya
+
+VakıfBank
 
 yazabilirsin.`
 );
@@ -627,7 +661,7 @@ message?.text ===
 
 await sendMessage(
 chatId,
-" Akbank seçildi.\n\nŞimdi Akbank dekontunu gönder."
+"🏦 Akbank seçildi.\n\nŞimdi Akbank dekontunu gönder."
 );
 
 return;
@@ -642,17 +676,13 @@ message?.text ===
 
 await sendMessage(
 chatId,
-" Garanti BBVA seçildi.\n\nŞimdi Garanti dekontunu gönder."
+"🏦 Garanti BBVA seçildi.\n\nŞimdi Garanti dekontunu gönder."
 );
 
 return;
 
 }
 
-
-// =====================================================
-// ENPARA KOMUTU
-// =====================================================
 
 if (
 message?.text ===
@@ -661,7 +691,22 @@ message?.text ===
 
 await sendMessage(
 chatId,
-" Enpara seçildi.\n\nŞimdi Enpara dekontunu gönder."
+"🏦 Enpara seçildi.\n\nŞimdi Enpara dekontunu gönder."
+);
+
+return;
+
+}
+
+
+if (
+message?.text ===
+"/vakifbank"
+) {
+
+await sendMessage(
+chatId,
+"🏦 VakıfBank seçildi.\n\nŞimdi VakıfBank dekontunu gönder."
 );
 
 return;
@@ -698,7 +743,7 @@ if (
 await sendMessage(
 chatId,
 
-` Lütfen analiz etmek istediğin belgeyi gönder.
+`📄 Lütfen analiz etmek istediğin belgeyi gönder.
 
 Desteklenen:
 
@@ -710,7 +755,8 @@ Banka seçimi:
 
 /akbank
 /garanti
-/enpara`
+/enpara
+/vakifbank`
 );
 
 return;
@@ -733,25 +779,20 @@ if (!bank) {
 await sendMessage(
 chatId,
 
-` Bankayı belirtmem gerekiyor.
+`🏦 Bankayı belirtmem gerekiyor.
 
 Dekontu gönderirken açıklama kısmına:
 
 Garanti
-
-veya:
-
 Akbank
-
-veya:
-
 Enpara
+VakıfBank
 
 yaz.
 
 Örneğin:
 
-Enpara dekontu`
+VakıfBank dekontu`
 );
 
 return;
@@ -911,19 +952,21 @@ console.log(
 await sendMessage(
 chatId,
 
-` Belge alındı.
+`🔎 Belge alındı.
 
- Banka: ${
+🏦 Banka: ${
 bank === "garanti"
 ? "Garanti BBVA"
+: bank === "akbank"
+? "Akbank"
 : bank === "enpara"
 ? "Enpara"
-: "Akbank"
+: "VakıfBank"
 }
 
- Dosya türü: ${type}
+📁 Dosya türü: ${type}
 
- VerifyDoc analiz başlatıyor...`
+⏳ VerifyDoc analiz başlatıyor...`
 );
 
 
@@ -1114,7 +1157,7 @@ chatId
 await sendMessage(
 chatId,
 
-` Analiz sırasında hata oluştu.
+`❌ Analiz sırasında hata oluştu.
 
 Hata:
 ${error?.message || "Bilinmeyen hata"}`
