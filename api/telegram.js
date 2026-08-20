@@ -306,6 +306,15 @@ if (
  return "denizbank";
 } 
 
+// =================================================
+// HALKBANK
+// =================================================
+if (
+ value.includes("halkbank")
+ ){
+ return "halkbank";
+} 
+ 
 return null;
 
 }
@@ -838,6 +847,14 @@ return "Denizbank";
 
 }
 
+if (
+bank === "halkbank"
+) {
+
+return "Halkbank";
+
+}
+ 
 return bank;
 
 }
@@ -907,6 +924,7 @@ Banka seçimi:
 /isbankasi
 /ziraat
 /denizbank
+/halkbank
 
 Ardından belgeyi gönder.
 
@@ -1087,7 +1105,28 @@ return;
 
 }
  
+// =================================================
+// HALKBANK
+// =================================================
 
+if (
+message?.text ===
+"/halkbank"
+) {
+
+selectedBanks.set(
+chatId,
+"halkbank"
+);
+
+await sendMessage(
+chatId,
+" Halkbank seçildi.\n\nŞimdi Halkbank dekontunu gönder."
+);
+
+return;
+
+}
 
 // =================================================
 // DOSYA KONTROLÜ
