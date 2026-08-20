@@ -1835,12 +1835,12 @@ fileName,
 mimeType,
 
 type:
-statamentMode
+statementMode
 ? "statament"
 :type,
 
 bank:
-statamentMode
+statementMode
  ? null
  : bank,
 
