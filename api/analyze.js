@@ -1904,7 +1904,11 @@ const bank =
 normalizeBank(
 requestedBank
 );
-
+  
+console.log(
+  "REFERENCE BANK GELEN:",
+  bank || "YOK"
+  );
 
 console.log(
 "REQUESTED BANK:",
