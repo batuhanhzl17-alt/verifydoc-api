@@ -29,6 +29,7 @@ vakifbank: "vakifbank.pdf",
 isbankasi: "isbankasi.pdf",
 ziraat: "ziraat.pdf",
 denizbank: "denizbank.pdf",
+halkbank: "halkbank.pdf",
 };
 
 
