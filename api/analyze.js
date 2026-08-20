@@ -25,6 +25,7 @@ path.join(process.cwd(), "references");
 const REFERENCE_MAP = {
 akbank: "akbank.pdf",
 enpara: "enpara.pdf",
+  vakifbank: "vakifbank.pdf",
 };
 
 
