@@ -28,6 +28,7 @@ enpara: "enpara.pdf",
 vakifbank: "vakifbank.pdf",
 isbankasi: "isbankasi.pdf",
 ziraat: "ziraat.pdf",
+denizbank: "denizbank.pdf",
 };
 
 
@@ -105,6 +106,12 @@ value.includes("garanti")
 ) {
 return "garanti";
 }
+
+if (
+  value.includes("denizbank")
+  ){
+  return "denizbank";
+ } 
 
 
 return null;
