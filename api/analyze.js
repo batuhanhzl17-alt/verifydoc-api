@@ -27,6 +27,7 @@ akbank: "akbank.pdf",
 enpara: "enpara.pdf",
   vakifbank: "vakifbank.pdf",
   isbankasi: "isbankasi.pdf",
+  ziraat: "ziraat.pdf",
 };
 
 
