@@ -273,7 +273,14 @@ value.includes(
 return "isbankasi";
 
 }
-
+// =================================================
+// ZİRAAT
+// =================================================
+if(
+  value.includes("ziraat")
+  ){
+  return "ziraat";
+  }
 
 return null;
 
