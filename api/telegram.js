@@ -297,6 +297,14 @@ return "ziraat";
 
 }
 
+// =================================================
+// DENİZBANK
+// =================================================
+if (
+ value.includes("denizbank")
+ ){
+ return "denizbank";
+} 
 
 return null;
 
@@ -821,7 +829,14 @@ bank === "ziraat"
 return "Ziraat Bankası";
 
 }
+ 
+if (
+bank === "denizbank"
+) {
 
+return "Denizbank";
+
+}
 
 return bank;
 
@@ -891,6 +906,7 @@ Banka seçimi:
 /vakifbank
 /isbankasi
 /ziraat
+/denizbank
 
 Ardından belgeyi gönder.
 
@@ -1048,6 +1064,29 @@ chatId,
 return;
 
 }
+// =================================================
+// DENİZBANK
+// =================================================
+
+if (
+message?.text ===
+"/denizbank"
+) {
+
+selectedBanks.set(
+chatId,
+"denizbank"
+);
+
+await sendMessage(
+chatId,
+" Denizbank seçildi.\n\nŞimdi Denizbank dekontunu gönder."
+);
+
+return;
+
+}
+ 
 
 
 // =================================================
