@@ -113,6 +113,12 @@ if (
   ){
   return "denizbank";
  } 
+  
+if (
+  value.includes("halkbank")
+  ){
+  return "halkbank";
+ } 
 
 
 return null;
