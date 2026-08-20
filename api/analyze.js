@@ -2094,6 +2094,7 @@ mime
 // Örnek:
 // akbank -> references/akbank.pdf
 // enpara -> references/enpara.pdf
+// vakifbank ->references/vakifbank.pdf
 
 const reference =
 await loadReferenceFile(
