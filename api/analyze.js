@@ -30,6 +30,7 @@ isbankasi: "isbankasi.pdf",
 ziraat: "ziraat.pdf",
 denizbank: "denizbank.pdf",
 halkbank: "halkbank.pdf",
+yapikredi: "yapikredi.pdf",
 };
 
 
@@ -118,6 +119,13 @@ if (
   value.includes("halkbank")
   ){
   return "halkbank";
+ } 
+
+if (
+  value.includes("yapikredi") ||
+  value.includes("yapıkredi")
+  ){
+  return "yapikredi";
  } 
 
 
