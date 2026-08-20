@@ -314,6 +314,16 @@ if (
  ){
  return "halkbank";
 } 
+
+// =================================================
+// YAPI KREDİ
+// =================================================
+if (
+ value.includes("yapikredi") ||
+ value.includes("yapıkredi")
+ ){
+ return "yapikredi";
+} 
  
 return null;
 
@@ -854,6 +864,15 @@ bank === "halkbank"
 return "Halkbank";
 
 }
+
+
+if (
+bank === "yapikredi"
+) {
+
+return "Yapı Kredi";
+
+}
  
 return bank;
 
@@ -925,6 +944,7 @@ Banka seçimi:
 /ziraat
 /denizbank
 /halkbank
+/yapikredi
 
 Ardından belgeyi gönder.
 
@@ -1128,6 +1148,30 @@ return;
 
 }
 
+
+// =================================================
+// YAPI KREDİ
+// =================================================
+
+if (
+message?.text ===
+"/yapikredi"
+) {
+
+selectedBanks.set(
+chatId,
+"yapikredi"
+);
+
+await sendMessage(
+chatId,
+" Yapı Kredi seçildi.\n\nŞimdi Yapı Kredi dekontunu gönder."
+);
+
+return;
+
+}
+ 
 // =================================================
 // DOSYA KONTROLÜ
 // =================================================
