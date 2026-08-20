@@ -26,7 +26,7 @@ const REFERENCE_MAP = {
 akbank: "akbank.pdf",
 enpara: "enpara.pdf",
   vakifbank: "vakifbank.pdf",
-  isbankasi: "işbankası.pdf",
+  isbankasi: "isbankasi.pdf",
 };
 
 
