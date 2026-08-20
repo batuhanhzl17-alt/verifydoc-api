@@ -20,6 +20,14 @@ new Set();
 
 
 // =====================================================
+// CHAT → SEÇİLİ BANKA
+// =====================================================
+
+const selectedBanks =
+new Map();
+
+
+// =====================================================
 // TELEGRAM API
 // =====================================================
 
@@ -179,13 +187,7 @@ text
 .replace(
 /\s+/g,
 ""
-)
-.replace(/ı/g, "i")
-.replace(/ş/g, "s")
-.replace(/ğ/g, "g")
-.replace(/ü/g, "u")
-.replace(/ö/g, "o")
-.replace(/ç/g, "c");
+);
 
 
 // =================================================
@@ -245,6 +247,9 @@ return "enpara";
 
 if (
 value.includes(
+"vakıfbank"
+) ||
+value.includes(
 "vakifbank"
 )
 ) {
@@ -260,7 +265,13 @@ return "vakifbank";
 
 if (
 value.includes(
+"işbankası"
+) ||
+value.includes(
 "isbankasi"
+) ||
+value.includes(
+"işbank"
 ) ||
 value.includes(
 "isbank"
@@ -349,7 +360,7 @@ fileName
 
 form.append(
 "bank",
-bank || ""
+bank
 );
 
 
@@ -437,177 +448,13 @@ result
 ) {
 
 
-// =====================================================
-// VİDEO ANALİZİ
-// =====================================================
-
-if (
-result?.type === "video" &&
-result?.videoAnalysis
-) {
-
-const video =
-result.videoAnalysis;
-
-
-const confidence =
-Number(
-video?.confidence
-) || 0;
-
-
-const suspicious =
-video?.suspicious === true;
-
-
-let emoji =
-" ";
-
-
-if (
-suspicious
-) {
-
-emoji =
-" ";
-
-}
-
-
-const verdict =
-video?.verdict ||
-"inconclusive";
-
-
-let verdictText =
-"Sonuç kesinleştirilemedi.";
-
-
-if (
-verdict === "consistent"
-) {
-
-verdictText =
-"Video kareleri arasında belirgin bir tutarsızlık tespit edilmedi.";
-
-}
-
-else if (
-verdict === "potentially_manipulated"
-) {
-
-verdictText =
-"Video karelerinde olası dijital manipülasyon belirtileri tespit edildi.";
-
-}
-
-else if (
-verdict === "inconclusive"
-) {
-
-verdictText =
-"Video kalitesi veya mevcut kareler kesin değerlendirme için yeterli değil.";
-
-}
-
-
-const reasons =
-Array.isArray(
-video?.reasons
-)
-&&
-video.reasons.length
-?
-
-video.reasons
-.map(
-(reason) =>
-`• ${reason}`
-)
-.join("\n")
-
-:
-
-"• Belirgin bir ek bulgu bulunamadı.";
-
-
-const observations =
-Array.isArray(
-video?.observations
-)
-&&
-video.observations.length
-?
-
-video.observations
-.map(
-(observation) =>
-`• ${observation}`
-)
-.join("\n")
-
-:
-
-"• Ek gözlem bulunamadı.";
-
-
-const recommendation =
-video?.recommendation ||
-"Ek doğrulama yapılması önerilir.";
-
-
-const text =
-
-`${emoji} VERIFYDOC VİDEO ANALİZİ
-
-Sonuç:
-${verdictText}
-
-Güven:
-${confidence}/100
-
-━━━━━━━━━━━━━━
-
- Nedenler:
-
-${reasons}
-
-━━━━━━━━━━━━━━
-
- Gözlemler:
-
-${observations}
-
-━━━━━━━━━━━━━━
-
- Öneri:
-
-${recommendation}
-
-━━━━━━━━━━━━━━
-
-Bu sonuç yalnızca otomatik ön inceleme sonucudur.
-Kesin gerçeklik veya sahtecilik kararı değildir.`;
-
-
-await sendMessage(
-chatId,
-text
-);
-
-return;
-
-}
-
-
-// =====================================================
-// NORMAL PDF / FOTOĞRAF ANALİZİ
-// =====================================================
+// =================================================
+// NORMAL ANALİZ
+// =================================================
 
 const score =
 Number(
-result?.score ??
-result?.overallRisk
+result?.score
 ) || 0;
 
 
@@ -627,11 +474,146 @@ result?.summary ||
 "Analiz tamamlandı.";
 
 
-const evidence =
-result?.evidence ||
-result?.amountAnalysis?.evidence ||
-"Ek kanıt bilgisi bulunamadı.";
+// =================================================
+// VİDEO ANALİZİ
+// =================================================
 
+if (
+result?.videoAnalysis
+) {
+
+const videoAnalysis =
+result.videoAnalysis;
+
+
+const videoConfidence =
+Number(
+videoAnalysis?.confidence
+) || 0;
+
+
+const videoSuspicious =
+videoAnalysis?.suspicious === true;
+
+
+let videoEmoji =
+" ";
+
+
+if (
+videoSuspicious
+) {
+
+videoEmoji =
+" ";
+
+}
+
+
+const verdict =
+videoAnalysis?.verdict ||
+"inconclusive";
+
+
+const reasons =
+Array.isArray(
+videoAnalysis?.reasons
+)
+? videoAnalysis.reasons
+: [];
+
+
+const observations =
+Array.isArray(
+videoAnalysis?.observations
+)
+? videoAnalysis.observations
+: [];
+
+
+const recommendation =
+videoAnalysis?.recommendation ||
+"";
+
+
+let videoText =
+
+`${videoEmoji} VERIFYDOC VİDEO ANALİZ SONUCU
+
+Sonuç:
+${verdict}
+
+Şüpheli:
+${videoSuspicious ? "EVET" : "HAYIR"}
+
+Güven:
+${videoConfidence}/100
+
+━━━━━━━━━━━━━━`;
+
+
+if (
+reasons.length
+) {
+
+videoText +=
+
+`\n\nNedenler:\n• ${
+reasons.join(
+"\n• "
+)
+}`;
+
+}
+
+
+if (
+observations.length
+) {
+
+videoText +=
+
+`\n\nGözlemler:\n• ${
+observations.join(
+"\n• "
+)
+}`;
+
+}
+
+
+if (
+recommendation
+) {
+
+videoText +=
+
+`\n\nÖneri:\n${recommendation}`;
+
+}
+
+
+videoText +=
+
+`\n\n━━━━━━━━━━━━━━
+
+Bu sonuç yalnızca otomatik ön inceleme sonucudur.
+Kesin gerçeklik veya sahtecilik kararı değildir.`;
+
+
+await sendMessage(
+chatId,
+videoText
+);
+
+return;
+
+}
+
+
+// =================================================
+// NORMAL ANALİZ SKORU
+// =================================================
 
 let emoji =
 " ";
@@ -665,47 +647,21 @@ emoji =
 }
 
 
-const bankText =
-result?.bank
-?
-`\n Banka: ${getBankDisplayName(result.bank)}`
-:
-"";
-
-
-const referenceText =
-result?.reference
-?
-`\n Referans: ${result.reference}`
-:
-"";
-
-
 const text =
 
 `${emoji} VERIFYDOC ANALİZ SONUCU
 
-Risk Skoru:
-${score}/100
+Risk Skoru: ${score}/100
 
 Risk Seviyesi:
 ${riskLabel}
 
 Güven:
 ${confidence}/100
-${bankText}${referenceText}
 
 ━━━━━━━━━━━━━━
-
- Özet:
 
 ${summary}
-
-━━━━━━━━━━━━━━
-
- Bulgular:
-
-${evidence}
 
 ━━━━━━━━━━━━━━
 
@@ -821,6 +777,7 @@ return "Garanti BBVA";
 
 }
 
+
 if (
 bank === "akbank"
 ) {
@@ -828,6 +785,7 @@ bank === "akbank"
 return "Akbank";
 
 }
+
 
 if (
 bank === "enpara"
@@ -837,6 +795,7 @@ return "Enpara";
 
 }
 
+
 if (
 bank === "vakifbank"
 ) {
@@ -844,6 +803,7 @@ bank === "vakifbank"
 return "VakıfBank";
 
 }
+
 
 if (
 bank === "isbankasi"
@@ -853,6 +813,7 @@ return "İş Bankası";
 
 }
 
+
 if (
 bank === "ziraat"
 ) {
@@ -861,8 +822,8 @@ return "Ziraat Bankası";
 
 }
 
-return bank ||
-"Bilinmiyor";
+
+return bank;
 
 }
 
@@ -937,7 +898,7 @@ Ardından belgeyi gönder.
 
 Örneğin:
 
-Ziraat dekontu`
+İş Bankası dekontu`
 );
 
 return;
@@ -953,6 +914,11 @@ if (
 message?.text ===
 "/akbank"
 ) {
+
+selectedBanks.set(
+chatId,
+"akbank"
+);
 
 await sendMessage(
 chatId,
@@ -973,6 +939,11 @@ message?.text ===
 "/garanti"
 ) {
 
+selectedBanks.set(
+chatId,
+"garanti"
+);
+
 await sendMessage(
 chatId,
 " Garanti BBVA seçildi.\n\nŞimdi Garanti dekontunu gönder."
@@ -991,6 +962,11 @@ if (
 message?.text ===
 "/enpara"
 ) {
+
+selectedBanks.set(
+chatId,
+"enpara"
+);
 
 await sendMessage(
 chatId,
@@ -1011,6 +987,11 @@ message?.text ===
 "/vakifbank"
 ) {
 
+selectedBanks.set(
+chatId,
+"vakifbank"
+);
+
 await sendMessage(
 chatId,
 " VakıfBank seçildi.\n\nŞimdi VakıfBank dekontunu gönder."
@@ -1029,6 +1010,11 @@ if (
 message?.text ===
 "/isbankasi"
 ) {
+
+selectedBanks.set(
+chatId,
+"isbankasi"
+);
 
 await sendMessage(
 chatId,
@@ -1049,9 +1035,14 @@ message?.text ===
 "/ziraat"
 ) {
 
+selectedBanks.set(
+chatId,
+"ziraat"
+);
+
 await sendMessage(
 chatId,
-" Ziraat Bankası seçildi.\n\nŞimdi Ziraat dekontunu gönder."
+" Ziraat Bankası seçildi.\n\nŞimdi Ziraat Bankası dekontunu gönder."
 );
 
 return;
@@ -1115,11 +1106,49 @@ return;
 // BANKA
 // =================================================
 
-const bank =
+// Önce gönderilen açıklamadan bankayı bul
+const detectedBank =
 detectBank(
 text
 );
 
+
+// Açıklamada banka yoksa,
+// daha önce komut ile seçilmiş bankayı kullan.
+const selectedBank =
+selectedBanks.get(
+chatId
+);
+
+
+const bank =
+detectedBank ||
+selectedBank;
+
+
+// LOG
+console.log(
+"DETECTED BANK:",
+detectedBank ||
+"YOK"
+);
+
+console.log(
+"SELECTED BANK:",
+selectedBank ||
+"YOK"
+);
+
+console.log(
+"FINAL BANK:",
+bank ||
+"YOK"
+);
+
+
+// =================================================
+// BANKA YOKSA
+// =================================================
 
 if (!bank) {
 
@@ -1128,20 +1157,18 @@ chatId,
 
 ` Bankayı belirtmem gerekiyor.
 
-Dekontu gönderirken açıklama kısmına:
+Önce bir banka seç:
 
-Garanti
-Akbank
-Enpara
-VakıfBank
-İş Bankası
-Ziraat
+/akbank
+/garanti
+/enpara
+/vakifbank
+/isbankasi
+/ziraat
 
-yaz.
+ve ardından belgeyi gönder.
 
-Örneğin:
-
-Ziraat dekontu`
+İstersen belge açıklamasına da banka adını yazabilirsin.`
 );
 
 return;
@@ -1265,6 +1292,10 @@ throw new Error(
 }
 
 
+// =================================================
+// LOG
+// =================================================
+
 console.log(
 "================================"
 );
@@ -1351,6 +1382,22 @@ chatId,
 result
 );
 
+
+// =================================================
+// BAŞARILI ANALİZDEN SONRA
+// BANKA SEÇİMİNİ TEMİZLE
+// =================================================
+
+selectedBanks.delete(
+chatId
+);
+
+
+console.log(
+"SELECTED BANK TEMİZLENDİ:",
+chatId
+);
+
 }
 
 
@@ -1376,7 +1423,8 @@ return res
 .status(200)
 .json({
 
-ok: true,
+ok:
+true,
 
 message:
 "VerifyDoc Telegram endpoint aktif.",
@@ -1437,8 +1485,10 @@ updateId
 return res
 .status(200)
 .json({
-ok: true,
-duplicate: true,
+ok:
+true,
+duplicate:
+true,
 });
 
 }
@@ -1531,7 +1581,8 @@ return res
 .status(200)
 .json({
 
-ok: true,
+ok:
+true,
 
 });
 
@@ -1550,7 +1601,8 @@ return res
 .status(200)
 .json({
 
-ok: false,
+ok:
+false,
 
 });
 
