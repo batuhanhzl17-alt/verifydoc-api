@@ -251,6 +251,30 @@ return "vakifbank";
 }
 
 
+// =================================================
+// İŞ BANKASI
+// =================================================
+
+if (
+value.includes(
+"işbankası"
+) ||
+value.includes(
+"isbankasi"
+) ||
+value.includes(
+"işbank"
+) ||
+value.includes(
+"isbank"
+)
+) {
+
+return "isbankasi";
+
+}
+
+
 return null;
 
 }
@@ -563,6 +587,59 @@ return null;
 
 
 // =====================================================
+// BANKA GÖRÜNÜR ADI
+// =====================================================
+
+function getBankDisplayName(
+bank
+) {
+
+if (
+bank === "garanti"
+) {
+
+return "Garanti BBVA";
+
+}
+
+if (
+bank === "akbank"
+) {
+
+return "Akbank";
+
+}
+
+if (
+bank === "enpara"
+) {
+
+return "Enpara";
+
+}
+
+if (
+bank === "vakifbank"
+) {
+
+return "VakıfBank";
+
+}
+
+if (
+bank === "isbankasi"
+) {
+
+return "İş Bankası";
+
+}
+
+return bank;
+
+}
+
+
+// =====================================================
 // GERÇEK ANALİZ İŞLEMİ
 // =====================================================
 
@@ -623,26 +700,15 @@ Banka seçimi:
 /garanti
 /enpara
 /vakifbank
+/isbankasi
 
 Ardından belgeyi gönder.
 
-İstersen belge açıklamasına da:
+İstersen belge açıklamasına banka adını da yazabilirsin.
 
-Garanti
+Örneğin:
 
-veya
-
-Akbank
-
-veya
-
-Enpara
-
-veya
-
-VakıfBank
-
-yazabilirsin.`
+İş Bankası dekontu`
 );
 
 return;
@@ -651,7 +717,7 @@ return;
 
 
 // =================================================
-// BANKA KOMUTLARI
+// AKBANK
 // =================================================
 
 if (
@@ -669,6 +735,10 @@ return;
 }
 
 
+// =================================================
+// GARANTİ
+// =================================================
+
 if (
 message?.text ===
 "/garanti"
@@ -683,6 +753,10 @@ return;
 
 }
 
+
+// =================================================
+// ENPARA
+// =================================================
 
 if (
 message?.text ===
@@ -699,6 +773,10 @@ return;
 }
 
 
+// =================================================
+// VAKIFBANK
+// =================================================
+
 if (
 message?.text ===
 "/vakifbank"
@@ -707,6 +785,25 @@ message?.text ===
 await sendMessage(
 chatId,
 "🏦 VakıfBank seçildi.\n\nŞimdi VakıfBank dekontunu gönder."
+);
+
+return;
+
+}
+
+
+// =================================================
+// İŞ BANKASI
+// =================================================
+
+if (
+message?.text ===
+"/isbankasi"
+) {
+
+await sendMessage(
+chatId,
+"🏦 İş Bankası seçildi.\n\nŞimdi İş Bankası dekontunu gönder."
 );
 
 return;
@@ -756,7 +853,8 @@ Banka seçimi:
 /akbank
 /garanti
 /enpara
-/vakifbank`
+/vakifbank
+/isbankasi`
 );
 
 return;
@@ -787,12 +885,13 @@ Garanti
 Akbank
 Enpara
 VakıfBank
+İş Bankası
 
 yaz.
 
 Örneğin:
 
-VakıfBank dekontu`
+İş Bankası dekontu`
 );
 
 return;
@@ -954,15 +1053,7 @@ chatId,
 
 `🔎 Belge alındı.
 
-🏦 Banka: ${
-bank === "garanti"
-? "Garanti BBVA"
-: bank === "akbank"
-? "Akbank"
-: bank === "enpara"
-? "Enpara"
-: "VakıfBank"
-}
+🏦 Banka: ${getBankDisplayName(bank)}
 
 📁 Dosya türü: ${type}
 
