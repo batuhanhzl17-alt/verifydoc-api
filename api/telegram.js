@@ -1834,9 +1834,15 @@ fileName,
 
 mimeType,
 
-type,
+type:
+statamentMode
+? "statament"
+:type,
 
-bank,
+bank:
+statamentMode
+ ? null
+ : bank,
 
 statementMode,
 
