@@ -3047,12 +3047,21 @@ throw new Error(
 }
 
 
-const type =
+const rawType =
 first(
 fields?.type
 ) ||
 "document";
 
+const statementMode =
+first(
+fields?.statementMode
+) === "true";
+
+const type =
+statementMode
+? "statement"
+: rawType;
 
 const fileName =
 first(
