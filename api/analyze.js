@@ -25,9 +25,9 @@ path.join(process.cwd(), "references");
 const REFERENCE_MAP = {
 akbank: "akbank.pdf",
 enpara: "enpara.pdf",
-  vakifbank: "vakifbank.pdf",
-  isbankasi: "isbankasi.pdf",
-  ziraat: "ziraat.pdf",
+vakifbank: "vakifbank.pdf",
+isbankasi: "isbankasi.pdf",
+ziraat: "ziraat.pdf",
 };
 
 
@@ -62,11 +62,13 @@ bank
 .replace(/ç/g, "c")
 .replace(/Ç/g, "c");
 
+
 if (
 value === "akbank"
 ) {
 return "akbank";
 }
+
 
 if (
 value === "enpara" ||
@@ -75,13 +77,36 @@ value === "enparafinans"
 return "enpara";
 }
 
+
 if (
-value.includes ("ziraat")
+value.includes("vakifbank")
+) {
+return "vakifbank";
+}
+
+
+if (
+value.includes("isbankasi") ||
+value.includes("isbank")
+) {
+return "isbankasi";
+}
+
+
+if (
+value.includes("ziraat")
 ) {
 return "ziraat";
 }
 
-  
+
+if (
+value.includes("garanti")
+) {
+return "garanti";
+}
+
+
 return null;
 }
 
@@ -134,10 +159,12 @@ bank
 return null;
 }
 
+
 const referencePath =
 getReferenceFile(
 normalizedBank
 );
+
 
 if (!referencePath) {
 
@@ -149,12 +176,14 @@ normalizedBank
 return null;
 }
 
+
 try {
 
 const buffer =
 await fs.readFile(
 referencePath
 );
+
 
 if (
 !buffer?.length
@@ -168,10 +197,12 @@ referencePath
 return null;
 }
 
+
 console.log(
 "REFERENCE LOADED:",
 referencePath
 );
+
 
 return {
 
@@ -206,7 +237,8 @@ export const config = {
 
 api: {
 
-bodyParser: false,
+bodyParser:
+false,
 
 },
 
@@ -262,7 +294,7 @@ const CHECK_NAMES = [
 
 
 // =====================================================
-// SCHEMA
+// CHECK SCHEMA
 // =====================================================
 
 const CHECK_SCHEMA =
@@ -336,6 +368,10 @@ false,
 
 );
 
+
+// =====================================================
+// RESPONSE SCHEMA
+// =====================================================
 
 const RESPONSE_SCHEMA = {
 
@@ -657,6 +693,7 @@ maxFileSize:
 
 });
 
+
 form.parse(
 req,
 (
@@ -671,6 +708,7 @@ reject(err);
 
 return;
 }
+
 
 resolve({
 
@@ -699,6 +737,7 @@ videoPath
 const outputDir =
 `/tmp/verifydoc-${Date.now()}`;
 
+
 await fs.mkdir(
 outputDir,
 {
@@ -707,8 +746,10 @@ true,
 }
 );
 
+
 const outputPattern =
 `${outputDir}/frame-%03d.jpg`;
+
 
 await execFileAsync(
 ffmpegPath,
@@ -739,10 +780,12 @@ maxBuffer:
 }
 );
 
+
 const files =
 await fs.readdir(
 outputDir
 );
+
 
 const frameFiles =
 files
@@ -751,6 +794,7 @@ files
 file.endsWith(".jpg")
 )
 .sort();
+
 
 if (
 !frameFiles.length
@@ -762,7 +806,9 @@ throw new Error(
 
 }
 
+
 const frames = [];
+
 
 for (
 const file of frameFiles
@@ -771,10 +817,12 @@ const file of frameFiles
 const framePath =
 `${outputDir}/${file}`;
 
+
 const buffer =
 await fs.readFile(
 framePath
 );
+
 
 frames.push({
 
@@ -789,6 +837,7 @@ buffer.toString(
 
 }
 
+
 return frames;
 
 }
@@ -796,6 +845,7 @@ return frames;
 
 // =====================================================
 // VIDEO FRAME ANALİZİ
+// REFERANS KULLANILMAZ
 // =====================================================
 
 async function analyzeVideoFrames(
@@ -813,103 +863,271 @@ throw new Error(
 
 }
 
+
 console.log(
 "VIDEO FRAME SAYISI:",
 frames.length
 );
+
+
+// =====================================================
+// KARELERİ OPENAI INPUT FORMATINA ÇEVİR
+// =====================================================
 
 const imageMessages =
 frames.map(
 (frame) => ({
 
 type:
-"image_url",
+"input_image",
 
-image_url: {
-
-url:
+image_url:
 `data:image/jpeg;base64,${frame.base64}`,
 
 detail:
 "high",
 
-},
-
 })
 );
 
+
+// =====================================================
+// VIDEO PROMPT
+// =====================================================
+
+const videoPrompt = `
+
+${PROMPT}
+
+=====================================================
+VİDEO ANALİZİ
+=====================================================
+
+Bu belge bir video içerisinden çıkarılmış
+${frames.length} ayrı kare üzerinden analiz edilmektedir.
+
+ÇOK ÖNEMLİ:
+
+Bu video analizinde REFERANS DEKONT KULLANMA.
+
+Banka referans PDF'i,
+referans şablon,
+referans belge
+veya başka bir referans dosya
+video analizine dahil edilmemelidir.
+
+Yalnızca video karelerinde gerçekten görülebilen
+bilgilere dayan.
+
+Tüm video karelerini birlikte değerlendir.
+
+=====================================================
+KARELER ARASI TUTARLILIK
+=====================================================
+
+Özellikle kareler arasında şu bilgilerin değişip
+değişmediğini kontrol et:
+
+- isim
+- soy isim
+- gönderici
+- alıcı
+- IBAN
+- hesap numarası
+- işlem numarası
+- referans numarası
+- tarih
+- saat
+- tutar
+- para birimi
+- açıklama
+- banka adı
+- logo
+- QR kod
+- barkod
+- metin
+- rakamlar
+
+Ayrıca:
+
+- sonradan eklenmiş alan
+- sonradan silinmiş alan
+- yapıştırılmış bölge
+- dijital montaj
+- farklı font
+- farklı karakter kalitesi
+- farklı sıkıştırma
+- farklı keskinlik
+- farklı görüntü yapısı
+- hareket sırasında ortaya çıkan tutarsızlık
+- ekran üzerinde sonradan değiştirilmiş alan
+
+olup olmadığını kontrol et.
+
+=====================================================
+DOĞAL VİDEO DEĞİŞİKLİKLERİ
+=====================================================
+
+Aşağıdaki durumları tek başına sahtecilik kanıtı
+olarak değerlendirme:
+
+- kamera hareketi
+- zoom
+- odak değişimi
+- ışık değişimi
+- perspektif değişimi
+- görüntü titremesi
+- JPEG sıkıştırması
+- video sıkıştırması
+- hafif bulanıklık
+- farklı karelerde farklı parlaklık
+- doğal gölge değişimleri
+
+Bunlar tek başına risk skorunu yükseltmemelidir.
+
+=====================================================
+VİDEO MANİPÜLASYON KONTROLÜ
+=====================================================
+
+Belgenin farklı karelerinde aynı alanları mümkün
+olduğunca karşılaştır.
+
+Örneğin:
+
+Bir karede tutar:
+
+"25.000 TL"
+
+iken başka bir karede:
+
+"35.000 TL"
+
+görülüyorsa bunu önemli bir tutarsızlık olarak
+değerlendir.
+
+Aynı şekilde:
+
+IBAN değişiyorsa,
+isim değişiyorsa,
+tarih değişiyorsa,
+alıcı değişiyorsa,
+işlem numarası değişiyorsa
+
+bunu açıkça evidence alanında belirt.
+
+Ancak görüntü kalitesi nedeniyle bir bilginin
+okunamadığı durumda değer tahmin etme.
+
+=====================================================
+TUTAR KONTROLÜ
+=====================================================
+
+Videoda görünen finansal tutarları ayrıca kontrol et.
+
+Ana işlem tutarını:
+
+- IBAN
+- hesap numarası
+- işlem numarası
+- referans numarası
+- tarih
+- saat
+
+gibi diğer rakamlarla karıştırma.
+
+Eğer ara toplam, vergi, ücret, komisyon veya
+toplam tutar görünüyorsa matematiksel olarak
+kontrol et.
+
+Yeterli veri yoksa değerleri tahmin etme.
+
+=====================================================
+VİDEO KALİTESİ
+=====================================================
+
+Video kalitesi düşükse otomatik olarak sahtecilik
+kararı verme.
+
+Eğer bazı karelerde belge okunamıyorsa bunu
+limitations alanında belirt.
+
+Örneğin:
+
+"Video karelerinin bazı bölümlerinde görüntü
+bulanıklığı nedeniyle karakterler güvenilir şekilde
+doğrulanamadı."
+
+Eğer kalite yeterliyse:
+
+"Video kareleri analiz için yeterli kalitede
+görünüyor."
+
+şeklinde değerlendirme yapılabilir.
+
+=====================================================
+RİSK
+=====================================================
+
+Kareler arasında gerçek ve anlamlı bir tutarsızlık
+bulunmadıkça risk skorunu gereksiz şekilde artırma.
+
+Tek başına video kalitesinin düşük olması:
+
+HIGH RISK
+
+veya
+
+VERY HIGH RISK
+
+anlamına gelmez.
+
+Belirsiz durumlarda confidence değerini düşür.
+
+=====================================================
+SONUÇ
+=====================================================
+
+Sonuç normal VerifyDoc analiz formatıyla
+uyumlu olmalıdır.
+
+Şu alanların tamamını doldur:
+
+overallRisk
+riskLabel
+confidence
+summary
+categories
+checks
+limitations
+amountAnalysis
+
+25 kontrolün tamamını değerlendir.
+
+Kesin olarak "sahte" veya "gerçek" deme.
+
+Bu yalnızca otomatik ön incelemedir.
+
+SONUCU SADECE JSON OLARAK DÖNDÜR.
+
+`;
+
+
+// =====================================================
+// OPENAI VIDEO REQUEST
+// =====================================================
+
+console.log(
+"OPENAI VIDEO REQUEST START"
+);
+
+
 const response =
-await openai.chat.completions.create({
+await openai.responses.create({
 
 model:
 "gpt-5-mini",
 
-messages: [
-
-{
-
-role:
-"system",
-
-content: `
-
-Sen VerifyDoc isimli belge inceleme sistemisin.
-
-Video içerisindeki tüm kareleri birlikte analiz et.
-
-Belgenin farklı karelerde tutarlı olup olmadığını incele.
-
-Özellikle şunlara dikkat et:
-
-- yazıların değişmesi
-- rakamların değişmesi
-- IBAN değişiklikleri
-- isim değişiklikleri
-- tarih değişiklikleri
-- tutar değişiklikleri
-- font değişiklikleri
-- hizalama değişiklikleri
-- yapıştırılmış bölgeler
-- dijital montaj izleri
-- farklı sıkıştırma bölgeleri
-- görüntü üzerinde sonradan eklenmiş alanlar
-- belge üzerinde oynama ihtimali
-- kareler arasında görsel tutarsızlık
-
-Video kalitesi düşükse bunu otomatik olarak sahtecilik olarak değerlendirme.
-
-Görülemeyen veya doğrulanamayan şeyleri uydurma.
-
-Analiz sonucunu SADECE geçerli JSON olarak döndür.
-
-JSON:
-
-{
-"verdict": "consistent",
-"confidence": 0,
-"suspicious": false,
-"reasons": [],
-"observations": [],
-"recommendation": ""
-}
-
-verdict sadece:
-
-"consistent"
-"potentially_manipulated"
-"inconclusive"
-
-olabilir.
-
-confidence 0-100 arasında olmalıdır.
-
-suspicious true veya false olmalıdır.
-
-Tüm açıklamalar TÜRKÇE olmalıdır.
-
-`,
-
-},
+input: [
 
 {
 
@@ -921,16 +1139,10 @@ content: [
 {
 
 type:
-"text",
+"input_text",
 
-text: `
-
-Bu video karelerini birlikte incele.
-
-Belgenin kareler arasında tutarlı olup olmadığını
-ve dijital manipülasyon belirtisi bulunup bulunmadığını değerlendir.
-
-`,
+text:
+videoPrompt,
 
 },
 
@@ -942,22 +1154,45 @@ ve dijital manipülasyon belirtisi bulunup bulunmadığını değerlendir.
 
 ],
 
-response_format: {
+text: {
+
+format: {
 
 type:
-"json_object",
+"json_schema",
+
+name:
+"verifydoc_video_analysis",
+
+strict:
+true,
+
+schema:
+RESPONSE_SCHEMA,
+
+},
 
 },
 
 });
 
-const content =
-response
-?.choices?.[0]
-?.message
-?.content;
 
-if (!content) {
+console.log(
+"OPENAI VIDEO RESPONSE RECEIVED"
+);
+
+
+// =====================================================
+// OPENAI RESPONSE
+// =====================================================
+
+const content =
+response?.output_text;
+
+
+if (
+!content
+) {
 
 throw new Error(
 "OpenAI'dan video analiz sonucu alınamadı."
@@ -965,14 +1200,54 @@ throw new Error(
 
 }
 
+
 console.log(
 "OPENAI VIDEO ANALYSIS:",
 content
 );
 
-return JSON.parse(
+
+// =====================================================
+// JSON PARSE
+// =====================================================
+
+const result =
+parseAIResponse(
 content
 );
+
+
+if (
+!result ||
+typeof result !== "object"
+) {
+
+throw new Error(
+"Video analiz sonucu geçersiz."
+);
+
+}
+
+
+console.log(
+"VIDEO OVERALL RISK:",
+result.overallRisk
+);
+
+
+console.log(
+"VIDEO RISK LABEL:",
+result.riskLabel
+);
+
+
+console.log(
+"VIDEO CONFIDENCE:",
+result.confidence
+);
+
+
+return result;
 
 }
 
@@ -1012,6 +1287,7 @@ const possibleNames = [
 
 ];
 
+
 for (
 const name of possibleNames
 ) {
@@ -1019,11 +1295,13 @@ const name of possibleNames
 const value =
 files?.[name];
 
+
 if (!value) {
 
 continue;
 
 }
+
 
 if (
 Array.isArray(value)
@@ -1033,9 +1311,11 @@ return value[0];
 
 }
 
+
 return value;
 
 }
+
 
 return null;
 
@@ -1070,11 +1350,13 @@ reason:
 
 }
 
+
 const characters =
 [...text].filter(
 (char) =>
 /[0-9]/.test(char)
 );
+
 
 if (
 characters.length < 2
@@ -1095,7 +1377,9 @@ reason:
 
 }
 
+
 const frequency = {};
+
 
 for (
 const char of characters
@@ -1106,6 +1390,7 @@ frequency[char] =
 
 }
 
+
 const repeatedDigits =
 Object.entries(
 frequency
@@ -1113,6 +1398,7 @@ frequency
 ([, count]) =>
 count >= 2
 );
+
 
 if (
 !repeatedDigits.length
@@ -1132,6 +1418,7 @@ reason:
 };
 
 }
+
 
 return {
 
@@ -1178,6 +1465,7 @@ throw new Error(
 
 }
 
+
 const cleaned =
 text
 .trim()
@@ -1194,6 +1482,7 @@ text
 ""
 );
 
+
 try {
 
 return JSON.parse(
@@ -1205,8 +1494,10 @@ cleaned
 const start =
 cleaned.indexOf("{");
 
+
 const end =
 cleaned.lastIndexOf("}");
+
 
 if (
 start >= 0 &&
@@ -1221,6 +1512,7 @@ end + 1
 );
 
 }
+
 
 throw new Error(
 "OpenAI geçerli JSON döndürmedi."
@@ -1782,10 +2074,12 @@ res.setHeader(
 "*"
 );
 
+
 res.setHeader(
 "Access-Control-Allow-Methods",
 "POST, OPTIONS"
 );
+
 
 res.setHeader(
 "Access-Control-Allow-Headers",
@@ -1829,9 +2123,11 @@ console.log(
 "=============================="
 );
 
+
 console.log(
 "VERIFYDOC API START"
 );
+
 
 const startTime =
 Date.now();
@@ -1874,7 +2170,9 @@ files
 );
 
 
-if (!uploadedFile) {
+if (
+!uploadedFile
+) {
 
 throw new Error(
 "Dosya alınamadı. image, file veya video alanı bulunamadı."
@@ -1912,11 +2210,14 @@ const bank =
 normalizeBank(
 requestedBank
 );
-  
+
+
 console.log(
-  "REFERENCE BANK GELEN:",
-  bank || "YOK"
-  );
+"REFERENCE BANK GELEN:",
+bank ||
+"YOK"
+);
+
 
 console.log(
 "REQUESTED BANK:",
@@ -1964,7 +2265,9 @@ const filePath =
 uploadedFile.filepath;
 
 
-if (!filePath) {
+if (
+!filePath
+) {
 
 throw new Error(
 "Yüklenen dosyanın yolu bulunamadı."
@@ -2102,12 +2405,8 @@ mime
 // REFERANS DEKONT
 // =====================================================
 
-// Gelen banka bilgisine göre doğru referans seçilir.
-//
-// Örnek:
-// akbank -> references/akbank.pdf
-// enpara -> references/enpara.pdf
-// vakifbank ->references/vakifbank.pdf
+// Video analizinde kullanılmayacak.
+// Fotoğraf ve PDF analizlerinde kullanılacak.
 
 const reference =
 await loadReferenceFile(
@@ -2303,7 +2602,8 @@ pdfDataUrl,
 
 },
 
-...(reference?.base64
+...(
+reference?.base64
 
 ? [
 
@@ -2322,7 +2622,8 @@ file_data:
 
 ]
 
-: []),
+: []
+),
 
 ];
 
@@ -2354,6 +2655,13 @@ frames.length
 );
 
 
+// =================================================
+// VIDEO ANALİZİ
+// =================================================
+// Burada reference kullanılmaz.
+// analyzeVideoFrames yalnızca video karelerini
+// inceler ve normal RESPONSE_SCHEMA döndürür.
+
 const videoResult =
 await analyzeVideoFrames(
 frames
@@ -2371,6 +2679,22 @@ videoResult
 );
 
 
+const videoScore =
+Number(
+videoResult?.overallRisk
+) || 0;
+
+
+const videoSuspicious =
+videoScore >= 46;
+
+
+const videoEvidence =
+videoResult?.amountAnalysis?.evidence ||
+videoResult?.summary ||
+"Video analizi tamamlandı.";
+
+
 return res
 .status(200)
 .json({
@@ -2382,8 +2706,26 @@ fileName,
 
 type,
 
-videoAnalysis:
-videoResult,
+// Video için referans yok
+bank:
+bank,
+
+reference:
+null,
+
+videoFrames:
+frames.length,
+
+...videoResult,
+
+score:
+videoScore,
+
+suspicious:
+videoSuspicious,
+
+evidence:
+videoEvidence,
 
 });
 
