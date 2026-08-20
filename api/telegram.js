@@ -28,6 +28,16 @@ new Map();
 
 
 // =====================================================
+// CHAT → ANALİZ MODU
+// =====================================================
+// normal = normal dekont analizi
+// statement = hesap özeti analizi
+
+const selectedModes =
+new Map();
+
+
+// =====================================================
 // TELEGRAM API
 // =====================================================
 
@@ -297,34 +307,55 @@ return "ziraat";
 
 }
 
+
 // =================================================
 // DENİZBANK
 // =================================================
+
 if (
- value.includes("denizbank")
- ){
- return "denizbank";
-} 
+value.includes(
+"denizbank"
+)
+) {
+
+return "denizbank";
+
+}
+
 
 // =================================================
 // HALKBANK
 // =================================================
+
 if (
- value.includes("halkbank")
- ){
- return "halkbank";
-} 
+value.includes(
+"halkbank"
+)
+) {
+
+return "halkbank";
+
+}
+
 
 // =================================================
 // YAPI KREDİ
 // =================================================
+
 if (
- value.includes("yapikredi") ||
- value.includes("yapıkredi")
- ){
- return "yapikredi";
-} 
- 
+value.includes(
+"yapikredi"
+) ||
+value.includes(
+"yapıkredi"
+)
+) {
+
+return "yapikredi";
+
+}
+
+
 return null;
 
 }
@@ -341,6 +372,7 @@ fileName,
 mimeType,
 type,
 bank,
+statementMode,
 
 }) {
 
@@ -365,9 +397,19 @@ fileName
 
 console.log(
 "BANK:",
-bank
+bank ||
+"YOK"
 );
 
+console.log(
+"STATEMENT MODE:",
+statementMode
+);
+
+
+// =================================================
+// FORM DATA
+// =================================================
 
 const form =
 new FormData();
@@ -385,11 +427,43 @@ fileName
 );
 
 
+// =================================================
+// HESAP ÖZETİ MODU
+// =================================================
+
+if (
+statementMode
+) {
+
+form.append(
+"statementMode",
+"true"
+);
+
+}
+
+
+// =================================================
+// BANKA
+// =================================================
+// Hesap özetinde banka gönderilmez.
+// Böylece referans kullanılmaz.
+
+if (
+bank
+) {
+
 form.append(
 "bank",
 bank
 );
 
+}
+
+
+// =================================================
+// DOSYA
+// =================================================
 
 const blob =
 new Blob(
@@ -433,6 +507,10 @@ fileName
 );
 
 
+// =================================================
+// API
+// =================================================
+
 const response =
 await fetch(
 ANALYZE_URL,
@@ -471,7 +549,8 @@ return result;
 
 async function sendAnalysisResult(
 chatId,
-result
+result,
+statementMode
 ) {
 
 
@@ -523,20 +602,6 @@ const videoSuspicious =
 videoAnalysis?.suspicious === true;
 
 
-let videoEmoji =
-" ";
-
-
-if (
-videoSuspicious
-) {
-
-videoEmoji =
-" ";
-
-}
-
-
 const verdict =
 videoAnalysis?.verdict ||
 "inconclusive";
@@ -565,7 +630,7 @@ videoAnalysis?.recommendation ||
 
 let videoText =
 
-`${videoEmoji} VERIFYDOC VİDEO ANALİZ SONUCU
+`VERIFYDOC VİDEO ANALİZ SONUCU
 
 Sonuç:
 ${verdict}
@@ -631,6 +696,78 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
 await sendMessage(
 chatId,
 videoText
+);
+
+return;
+
+}
+
+
+// =================================================
+// HESAP ÖZETİ SONUCU
+// =================================================
+
+if (
+statementMode
+) {
+
+let statementEmoji =
+" ";
+
+
+if (
+score >= 71
+) {
+
+statementEmoji =
+" ";
+
+}
+
+else if (
+score >= 46
+) {
+
+statementEmoji =
+" ";
+
+}
+
+else if (
+score >= 21
+) {
+
+statementEmoji =
+" ";
+
+}
+
+
+const statementText =
+
+`${statementEmoji} VERIFYDOC HESAP ÖZETİ ANALİZİ
+
+Risk Skoru: ${score}/100
+
+Risk Seviyesi:
+${riskLabel}
+
+Güven:
+${confidence}/100
+
+━━━━━━━━━━━━━━
+
+${summary}
+
+━━━━━━━━━━━━━━
+
+Bu sonuç yalnızca otomatik ön inceleme sonucudur.
+Kesin gerçeklik veya sahtecilik kararı değildir.`;
+
+
+await sendMessage(
+chatId,
+statementText
 );
 
 return;
@@ -848,7 +985,8 @@ bank === "ziraat"
 return "Ziraat Bankası";
 
 }
- 
+
+
 if (
 bank === "denizbank"
 ) {
@@ -856,6 +994,7 @@ bank === "denizbank"
 return "Denizbank";
 
 }
+
 
 if (
 bank === "halkbank"
@@ -873,7 +1012,8 @@ bank === "yapikredi"
 return "Yapı Kredi";
 
 }
- 
+
+
 return bank;
 
 }
@@ -932,7 +1072,7 @@ chatId,
 
 ` VerifyDoc'a hoş geldin.
 
-Dekont veya belge göndererek otomatik inceleme yaptırabilirsin.
+Dekont, hesap özeti veya belge göndererek otomatik inceleme yaptırabilirsin.
 
 Banka seçimi:
 
@@ -946,6 +1086,12 @@ Banka seçimi:
 /halkbank
 /yapikredi
 
+Hesap özeti analizi:
+
+/hesapozeti
+
+Hesap özeti seçildiğinde banka seçmene gerek yoktur.
+
 Ardından belgeyi gönder.
 
 İstersen belge açıklamasına banka adını da yazabilirsin.
@@ -953,6 +1099,51 @@ Ardından belgeyi gönder.
 Örneğin:
 
 İş Bankası dekontu`
+);
+
+return;
+
+}
+
+
+// =================================================
+// HESAP ÖZETİ
+// =================================================
+
+if (
+message?.text ===
+"/hesapozeti"
+) {
+
+selectedModes.set(
+chatId,
+"statement"
+);
+
+
+// Önceden seçilmiş bankayı temizle.
+// Hesap özetinde referans kullanılmayacak.
+
+selectedBanks.delete(
+chatId
+);
+
+
+await sendMessage(
+chatId,
+
+` HESAP ÖZETİ ANALİZİ SEÇİLDİ.
+
+Banka seçmene gerek yok.
+
+Şimdi hesap özetini:
+
+• PDF
+• Fotoğraf
+
+olarak gönder.
+
+Referans dekont kullanılmadan analiz edilecek.`
 );
 
 return;
@@ -972,6 +1163,11 @@ message?.text ===
 selectedBanks.set(
 chatId,
 "akbank"
+);
+
+selectedModes.set(
+chatId,
+"normal"
 );
 
 await sendMessage(
@@ -998,6 +1194,11 @@ chatId,
 "garanti"
 );
 
+selectedModes.set(
+chatId,
+"normal"
+);
+
 await sendMessage(
 chatId,
 " Garanti BBVA seçildi.\n\nŞimdi Garanti dekontunu gönder."
@@ -1020,6 +1221,11 @@ message?.text ===
 selectedBanks.set(
 chatId,
 "enpara"
+);
+
+selectedModes.set(
+chatId,
+"normal"
 );
 
 await sendMessage(
@@ -1046,6 +1252,11 @@ chatId,
 "vakifbank"
 );
 
+selectedModes.set(
+chatId,
+"normal"
+);
+
 await sendMessage(
 chatId,
 " VakıfBank seçildi.\n\nŞimdi VakıfBank dekontunu gönder."
@@ -1068,6 +1279,11 @@ message?.text ===
 selectedBanks.set(
 chatId,
 "isbankasi"
+);
+
+selectedModes.set(
+chatId,
+"normal"
 );
 
 await sendMessage(
@@ -1094,6 +1310,11 @@ chatId,
 "ziraat"
 );
 
+selectedModes.set(
+chatId,
+"normal"
+);
+
 await sendMessage(
 chatId,
 " Ziraat Bankası seçildi.\n\nŞimdi Ziraat Bankası dekontunu gönder."
@@ -1102,6 +1323,8 @@ chatId,
 return;
 
 }
+
+
 // =================================================
 // DENİZBANK
 // =================================================
@@ -1116,6 +1339,11 @@ chatId,
 "denizbank"
 );
 
+selectedModes.set(
+chatId,
+"normal"
+);
+
 await sendMessage(
 chatId,
 " Denizbank seçildi.\n\nŞimdi Denizbank dekontunu gönder."
@@ -1124,7 +1352,8 @@ chatId,
 return;
 
 }
- 
+
+
 // =================================================
 // HALKBANK
 // =================================================
@@ -1137,6 +1366,11 @@ message?.text ===
 selectedBanks.set(
 chatId,
 "halkbank"
+);
+
+selectedModes.set(
+chatId,
+"normal"
 );
 
 await sendMessage(
@@ -1163,6 +1397,11 @@ chatId,
 "yapikredi"
 );
 
+selectedModes.set(
+chatId,
+"normal"
+);
+
 await sendMessage(
 chatId,
 " Yapı Kredi seçildi.\n\nŞimdi Yapı Kredi dekontunu gönder."
@@ -1171,7 +1410,8 @@ chatId,
 return;
 
 }
- 
+
+
 // =================================================
 // DOSYA KONTROLÜ
 // =================================================
@@ -1209,14 +1449,21 @@ Desteklenen:
 • Fotoğraf
 • Video
 
-Banka seçimi:
+Normal dekont için önce banka seç:
 
 /akbank
 /garanti
 /enpara
 /vakifbank
 /isbankasi
-/ziraat`
+/ziraat
+/denizbank
+/halkbank
+/yapikredi
+
+Hesap özeti için:
+
+/hesapozeti`
 );
 
 return;
@@ -1225,35 +1472,57 @@ return;
 
 
 // =================================================
+// ANALİZ MODU
+// =================================================
+
+const selectedMode =
+selectedModes.get(
+chatId
+);
+
+
+const statementMode =
+selectedMode ===
+"statement";
+
+
+// =================================================
 // BANKA
 // =================================================
 
-// Önce gönderilen açıklamadan bankayı bul
+// Hesap özeti modunda banka kesinlikle kullanılmaz.
+
+let bank =
+null;
+
+
+if (
+!statementMode
+) {
+
 const detectedBank =
 detectBank(
 text
 );
 
 
-// Açıklamada banka yoksa,
-// daha önce komut ile seçilmiş bankayı kullan.
 const selectedBank =
 selectedBanks.get(
 chatId
 );
 
 
-const bank =
+bank =
 detectedBank ||
 selectedBank;
 
 
-// LOG
 console.log(
 "DETECTED BANK:",
 detectedBank ||
 "YOK"
 );
+
 
 console.log(
 "SELECTED BANK:",
@@ -1261,18 +1530,24 @@ selectedBank ||
 "YOK"
 );
 
+
 console.log(
 "FINAL BANK:",
 bank ||
 "YOK"
 );
 
+}
+
 
 // =================================================
-// BANKA YOKSA
+// NORMAL MODDA BANKA YOKSA
 // =================================================
 
-if (!bank) {
+if (
+!statementMode &&
+!bank
+) {
 
 await sendMessage(
 chatId,
@@ -1287,6 +1562,9 @@ chatId,
 /vakifbank
 /isbankasi
 /ziraat
+/denizbank
+/halkbank
+/yapikredi
 
 ve ardından belgeyi gönder.
 
@@ -1334,7 +1612,9 @@ photo.file_id;
 
 
 fileName =
-"telegram-photo.jpg";
+statementMode
+? "telegram-hesap-ozeti.jpg"
+: "telegram-photo.jpg";
 
 
 mimeType =
@@ -1354,6 +1634,26 @@ type =
 else if (
 hasVideo
 ) {
+
+
+// Hesap özeti için video kabul etmiyoruz.
+
+if (
+statementMode
+) {
+
+await sendMessage(
+chatId,
+
+` Hesap özeti analizi için video desteklenmiyor.
+
+Lütfen hesap özetini PDF veya fotoğraf olarak gönder.`
+);
+
+return;
+
+}
+
 
 fileId =
 message.video.file_id;
@@ -1411,6 +1711,26 @@ throw new Error(
 
 }
 
+
+// Hesap özeti için yalnızca PDF veya görsel.
+
+if (
+statementMode &&
+type === "video"
+) {
+
+await sendMessage(
+chatId,
+
+` Hesap özeti analizi için video desteklenmiyor.
+
+Lütfen hesap özetini PDF veya fotoğraf olarak gönder.`
+);
+
+return;
+
+}
+
 }
 
 
@@ -1439,7 +1759,13 @@ fileName
 
 console.log(
 "TELEGRAM BANK:",
-bank
+bank ||
+"YOK"
+);
+
+console.log(
+"TELEGRAM STATEMENT MODE:",
+statementMode
 );
 
 console.log(
@@ -1450,6 +1776,24 @@ console.log(
 // =================================================
 // ANALİZ BAŞLADI
 // =================================================
+
+if (
+statementMode
+) {
+
+await sendMessage(
+chatId,
+
+` Hesap özeti alındı.
+
+ Dosya türü: ${type}
+
+ VerifyDoc hesap özeti analizini başlatıyor...`
+);
+
+}
+
+else {
 
 await sendMessage(
 chatId,
@@ -1462,6 +1806,8 @@ chatId,
 
  VerifyDoc analiz başlatıyor...`
 );
+
+}
 
 
 // =================================================
@@ -1492,6 +1838,8 @@ type,
 
 bank,
 
+statementMode,
+
 });
 
 
@@ -1501,22 +1849,27 @@ bank,
 
 await sendAnalysisResult(
 chatId,
-result
+result,
+statementMode
 );
 
 
 // =================================================
 // BAŞARILI ANALİZDEN SONRA
-// BANKA SEÇİMİNİ TEMİZLE
+// SEÇİMLERİ TEMİZLE
 // =================================================
 
 selectedBanks.delete(
 chatId
 );
 
+selectedModes.delete(
+chatId
+);
+
 
 console.log(
-"SELECTED BANK TEMİZLENDİ:",
+"SEÇİMLER TEMİZLENDİ:",
 chatId
 );
 
