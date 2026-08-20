@@ -109,24 +109,26 @@ value.includes("garanti")
 return "garanti";
 }
 
-if (
-  value.includes("denizbank")
-  ){
-  return "denizbank";
- } 
-  
-if (
-  value.includes("halkbank")
-  ){
-  return "halkbank";
- } 
 
 if (
-  value.includes("yapikredi") ||
-  value.includes("yapıkredi")
-  ){
-  return "yapikredi";
- } 
+value.includes("denizbank")
+) {
+return "denizbank";
+}
+
+
+if (
+value.includes("halkbank")
+) {
+return "halkbank";
+}
+
+
+if (
+value.includes("yapikredi")
+) {
+return "yapikredi";
+}
 
 
 return null;
@@ -392,7 +394,7 @@ false,
 
 
 // =====================================================
-// RESPONSE SCHEMA
+// NORMAL DEKONT RESPONSE SCHEMA
 // =====================================================
 
 const RESPONSE_SCHEMA = {
@@ -693,6 +695,374 @@ false,
 
 
 // =====================================================
+// HESAP ÖZETİ RESPONSE SCHEMA
+// =====================================================
+
+const STATEMENT_RESPONSE_SCHEMA = {
+
+type:
+"object",
+
+properties: {
+
+overallRisk: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+riskLabel: {
+
+type:
+"string",
+
+enum: [
+
+"LOW RISK",
+"MODERATE RISK",
+"HIGH RISK",
+"VERY HIGH RISK",
+
+],
+
+},
+
+confidence: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+summary: {
+
+type:
+"string",
+
+},
+
+categories: {
+
+type:
+"object",
+
+properties: {
+
+visualRisk: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+textRisk: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+layoutRisk: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+financialDataRisk: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+editingRisk: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+},
+
+required: [
+
+"visualRisk",
+"textRisk",
+"layoutRisk",
+"financialDataRisk",
+"editingRisk",
+
+],
+
+additionalProperties:
+false,
+
+},
+
+balanceAnalysis: {
+
+type:
+"object",
+
+properties: {
+
+openingBalance: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+totalIncoming: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+totalOutgoing: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+calculatedClosingBalance: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+documentClosingBalance: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+difference: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+calculationConsistent: {
+
+type:
+"boolean",
+
+},
+
+evidence: {
+
+type:
+"string",
+
+},
+
+},
+
+required: [
+
+"openingBalance",
+"totalIncoming",
+"totalOutgoing",
+"calculatedClosingBalance",
+"documentClosingBalance",
+"difference",
+"calculationConsistent",
+"evidence",
+
+],
+
+additionalProperties:
+false,
+
+},
+
+transactionAnalysis: {
+
+type:
+"object",
+
+properties: {
+
+transactionCount: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+},
+
+dateConsistency: {
+
+type:
+"string",
+
+},
+
+duplicateTransactions: {
+
+type:
+"array",
+
+items: {
+
+type:
+"string",
+
+},
+
+},
+
+suspiciousTransactions: {
+
+type:
+"array",
+
+items: {
+
+type:
+"string",
+
+},
+
+},
+
+},
+
+required: [
+
+"transactionCount",
+"dateConsistency",
+"duplicateTransactions",
+"suspiciousTransactions",
+
+],
+
+additionalProperties:
+false,
+
+},
+
+limitations: {
+
+type:
+"array",
+
+items: {
+
+type:
+"string",
+
+},
+
+},
+
+evidence: {
+
+type:
+"array",
+
+items: {
+
+type:
+"string",
+
+},
+
+},
+
+},
+
+required: [
+
+"overallRisk",
+"riskLabel",
+"confidence",
+"summary",
+"categories",
+"balanceAnalysis",
+"transactionAnalysis",
+"limitations",
+"evidence",
+
+],
+
+additionalProperties:
+false,
+
+};
+
+
+// =====================================================
 // FORMIDABLE
 // =====================================================
 
@@ -892,10 +1262,6 @@ frames.length
 );
 
 
-// =====================================================
-// KARELERİ OPENAI INPUT FORMATINA ÇEVİR
-// =====================================================
-
 const imageMessages =
 frames.map(
 (frame) => ({
@@ -912,10 +1278,6 @@ detail:
 })
 );
 
-
-// =====================================================
-// VIDEO PROMPT
-// =====================================================
 
 const videoPrompt = `
 
@@ -1073,18 +1435,7 @@ kararı verme.
 Eğer bazı karelerde belge okunamıyorsa bunu
 limitations alanında belirt.
 
-Örneğin:
-
-"Video karelerinin bazı bölümlerinde görüntü
-bulanıklığı nedeniyle karakterler güvenilir şekilde
-doğrulanamadı."
-
-Eğer kalite yeterliyse:
-
-"Video kareleri analiz için yeterli kalitede
-görünüyor."
-
-şeklinde değerlendirme yapılabilir.
+Eğer kalite yeterliyse bunu açıkça belirt.
 
 =====================================================
 RİSK
@@ -1133,10 +1484,6 @@ SONUCU SADECE JSON OLARAK DÖNDÜR.
 
 `;
 
-
-// =====================================================
-// OPENAI VIDEO REQUEST
-// =====================================================
 
 console.log(
 "OPENAI VIDEO REQUEST START"
@@ -1204,10 +1551,6 @@ console.log(
 );
 
 
-// =====================================================
-// OPENAI RESPONSE
-// =====================================================
-
 const content =
 response?.output_text;
 
@@ -1228,10 +1571,6 @@ console.log(
 content
 );
 
-
-// =====================================================
-// JSON PARSE
-// =====================================================
 
 const result =
 parseAIResponse(
@@ -2076,6 +2415,511 @@ Return ONLY the JSON object matching the supplied schema.
 
 
 // =====================================================
+// HESAP ÖZETİ PROMPT
+// REFERANS KULLANILMAZ
+// =====================================================
+
+const STATEMENT_PROMPT = `
+
+Sen VerifyDoc isimli AI destekli belge inceleme sistemisin.
+
+Bu belge bir banka hesap özeti / hesap ekstresi olarak
+incelenmektedir.
+
+ÇOK ÖNEMLİ:
+
+Bu analizde banka referans PDF'i KULLANMA.
+
+Referans şablon kullanma.
+
+Referans belge kullanma.
+
+Başka banka belgesi ile karşılaştırma yapma.
+
+Yalnızca gönderilen hesap özeti üzerinden analiz yap.
+
+Bu analiz kesin gerçeklik veya sahtecilik kararı değildir.
+
+Kesin olarak "gerçek" deme.
+
+Kesin olarak "sahte" deme.
+
+Yalnızca gerçekten görülebilen veya güvenilir şekilde
+hesaplanabilen bilgiler üzerinden değerlendirme yap.
+
+Görülemeyen bilgileri tahmin etme.
+
+=====================================================
+HESAP ÖZETİ TANIMLAMA
+=====================================================
+
+Belgenin hesap özeti / hesap ekstresi niteliğinde olup
+olmadığını değerlendir.
+
+Görülebiliyorsa:
+
+- banka
+- hesap sahibi
+- IBAN
+- hesap numarası
+- hesap dönemi
+- para birimi
+- açılış bakiyesi
+- kapanış bakiyesi
+
+bilgilerini incele.
+
+Banka adı kesin olarak görülemiyorsa banka adı uydurma.
+
+=====================================================
+İŞLEM SATIRLARI
+=====================================================
+
+Görünen işlem satırlarını incele.
+
+Özellikle:
+
+- işlem tarihi
+- işlem açıklaması
+- para girişi
+- para çıkışı
+- işlem tutarı
+- işlem sonrası bakiye
+- gönderen
+- alıcı
+- işlem/ref numarası
+
+alanlarını kontrol et.
+
+Bir rakamın ne olduğu kesin değilse tahmin etme.
+
+=====================================================
+BAKİYE MATEMATİĞİ
+=====================================================
+
+Yeterli veri varsa:
+
+önceki bakiye
++
+para girişleri
+-
+para çıkışları
+=
+sonraki bakiye
+
+ilişkisini kontrol et.
+
+Birden fazla işlem varsa mümkün olduğunca ardışık
+bakiyeleri kontrol et.
+
+Örneğin:
+
+Başlangıç bakiyesi: 10.000 TL
+
+Giriş: 2.000 TL
+
+Çıkış: 500 TL
+
+Beklenen bakiye: 11.500 TL
+
+Belgede farklı bir bakiye görünüyorsa bunu açıkça belirt.
+
+Ancak:
+
+- ücret
+- komisyon
+- faiz
+- kur farkı
+- bloke
+- otomatik tahsilat
+- başka finansal hareket
+
+gibi görünür kalemleri de hesaba kat.
+
+Yeterli veri yoksa matematiksel tutarlılık hakkında
+kesin sonuç verme.
+
+=====================================================
+TOPLAM GİRİŞ / ÇIKIŞ
+=====================================================
+
+Belgede toplam giriş ve çıkış tutarları görünüyorsa
+işlem satırlarıyla karşılaştır.
+
+Hesaplanabiliyorsa:
+
+- toplam giriş
+- toplam çıkış
+- net hareket
+- hesaplanan kapanış bakiyesi
+
+değerlerini hesapla.
+
+Eksik veri varsa tahmin etme.
+
+=====================================================
+TARİH KONTROLÜ
+=====================================================
+
+İşlem tarihlerini kontrol et.
+
+Özellikle:
+
+- hesap dönemi
+- işlem tarihleri
+- tarih sıralaması
+- dönem dışı işlem
+- imkansız veya şüpheli tarih
+- farklı tarih formatları
+
+incelenmelidir.
+
+Farklı tarih formatı tek başına sahtecilik kanıtı değildir.
+
+=====================================================
+BAKİYE DEVAMLILIĞI
+=====================================================
+
+Bir işlem sonrası bakiye ile sonraki işlem öncesi
+bakiye arasında tutarlılık varsa kontrol et.
+
+Sayfalar arasında bakiye devamlılığı varsa ayrıca
+kontrol et.
+
+Birinci sayfanın son bakiyesi ile ikinci sayfanın
+başlangıç/devam bakiyesi arasında tutarsızlık varsa
+açıkça belirt.
+
+=====================================================
+TEKRARLAYAN İŞLEMLER
+=====================================================
+
+Aynı:
+
+- tarih
+- tutar
+- açıklama
+- gönderen/alıcı
+
+kombinasyonlarının olağandışı tekrar edip etmediğini
+incele.
+
+Tekrar tek başına sahtecilik kanıtı değildir.
+
+=====================================================
+GÖRSEL MANİPÜLASYON
+=====================================================
+
+Hesap özetinde:
+
+- font farklılığı
+- font boyutu farklılığı
+- karakter aralığı
+- baseline
+- hizalama
+- farklı sıkıştırma
+- kopyala-yapıştır bölgeleri
+- sonradan eklenmiş alan
+- sonradan silinmiş alan
+- farklı keskinlik
+- farklı render
+- dijital montaj
+- Photoshop benzeri düzenleme
+- yapay olarak değiştirilmiş rakamlar
+- sayfalar arası görsel tutarsızlık
+
+olup olmadığını incele.
+
+Görüntü kalitesinden kaynaklanan küçük farklılıkları
+otomatik olarak sahtecilik kabul etme.
+
+=====================================================
+SAYFALAR ARASI KONTROL
+=====================================================
+
+Birden fazla sayfa varsa:
+
+- hesap sahibi
+- IBAN
+- hesap numarası
+- hesap dönemi
+- para birimi
+- işlem sırası
+- bakiye devamlılığı
+- sayfa numarası
+
+alanlarını karşılaştır.
+
+Farklı sayfalarda aynı bilgiler farklı görünüyorsa
+bunu incele.
+
+Ancak normal PDF oluşturma farklılıklarını otomatik
+olarak manipülasyon olarak değerlendirme.
+
+=====================================================
+PDF KALİTESİ
+=====================================================
+
+PDF olması tek başına düşük kalite değildir.
+
+Belge okunabiliyorsa bunu olumlu kalite göstergesi
+olarak değerlendir.
+
+Yalnızca gerçekten:
+
+- bulanıklık
+- pikselizasyon
+- okunamayan rakam
+- kırpılma
+- ciddi sıkıştırma
+- tarama gürültüsü
+- gölge
+- parlama
+- perspektif bozulması
+
+varsa limitation belirt.
+
+=====================================================
+RİSK HESAPLAMA
+=====================================================
+
+Şunları hesapla:
+
+visualRisk
+textRisk
+layoutRisk
+financialDataRisk
+editingRisk
+
+overallRisk:
+
+0-20 LOW RISK
+21-45 MODERATE RISK
+46-70 HIGH RISK
+71-100 VERY HIGH RISK
+
+Confidence 0-100 arasında olmalıdır.
+
+Matematiksel bakiye tutarsızlığı varsa
+financialDataRisk'i artır.
+
+Görsel manipülasyon kanıtı varsa
+editingRisk'i artır.
+
+Yalnızca belirsizlik varsa confidence düşür.
+
+Belirsizliği otomatik olarak HIGH RISK yapma.
+
+=====================================================
+SONUÇ
+=====================================================
+
+Sonuç yalnızca geçerli JSON olmalıdır.
+
+Tüm açıklamalar TÜRKÇE olmalıdır.
+
+Şu alanların tamamını döndür:
+
+overallRisk
+riskLabel
+confidence
+summary
+categories
+balanceAnalysis
+transactionAnalysis
+limitations
+evidence
+
+Kesin gerçek veya kesin sahte kararı verme.
+
+`;
+
+
+// =====================================================
+// HESAP ÖZETİ ANALİZ FONKSİYONU
+// REFERANS KULLANILMAZ
+// =====================================================
+
+async function analyzeStatement(
+base64,
+mime,
+fileName
+) {
+
+console.log(
+"================================================"
+);
+
+console.log(
+"HESAP ÖZETİ ANALİZİ BAŞLADI"
+);
+
+console.log(
+"HESAP ÖZETİ REFERANS KULLANILMAYACAK"
+);
+
+console.log(
+"FILE:",
+fileName
+);
+
+console.log(
+"MIME:",
+mime
+);
+
+console.log(
+"================================================"
+);
+
+
+let fileContent;
+
+
+if (
+mime === "application/pdf" ||
+mime.includes("pdf")
+) {
+
+fileContent = {
+
+type:
+"input_file",
+
+filename:
+fileName,
+
+file_data:
+`data:application/pdf;base64,${base64}`,
+
+};
+
+}
+
+else {
+
+fileContent = {
+
+type:
+"input_image",
+
+image_url:
+`data:${mime};base64,${base64}`,
+
+detail:
+"high",
+
+};
+
+}
+
+
+const response =
+await openai.responses.create({
+
+model:
+"gpt-5-mini",
+
+input: [
+
+{
+
+role:
+"user",
+
+content: [
+
+{
+
+type:
+"input_text",
+
+text:
+STATEMENT_PROMPT,
+
+},
+
+fileContent,
+
+],
+
+},
+
+],
+
+text: {
+
+format: {
+
+type:
+"json_schema",
+
+name:
+"verifydoc_statement_analysis",
+
+strict:
+true,
+
+schema:
+STATEMENT_RESPONSE_SCHEMA,
+
+},
+
+},
+
+});
+
+
+console.log(
+"HESAP ÖZETİ OPENAI RESPONSE RECEIVED"
+);
+
+
+const output =
+response?.output_text;
+
+
+if (
+!output
+) {
+
+throw new Error(
+"OpenAI'dan hesap özeti analiz sonucu alınamadı."
+);
+
+}
+
+
+console.log(
+"HESAP ÖZETİ ANALİZ SONUCU:",
+output
+);
+
+
+const result =
+parseAIResponse(
+output
+);
+
+
+if (
+!result ||
+typeof result !== "object"
+) {
+
+throw new Error(
+"Hesap özeti analiz sonucu geçersiz."
+);
+
+}
+
+
+return result;
+
+}
+
+
+// =====================================================
 // API
 // =====================================================
 
@@ -2176,7 +3020,7 @@ throw new Error(
 
 const {
 fields,
-files,
+files
 } =
 await parseMultipart(req);
 
@@ -2329,8 +3173,15 @@ let mime =
 uploadedFile.mimetype;
 
 
+// =================================================
+// IMAGE MIME
+// =================================================
+
 if (
-type === "image" &&
+(
+type === "image" ||
+type === "statement"
+) &&
 (
 !mime ||
 !mime.startsWith(
@@ -2385,8 +3236,15 @@ mime =
 }
 
 
+// =================================================
+// PDF MIME
+// =================================================
+
 if (
-type === "pdf" &&
+(
+type === "pdf" ||
+type === "statement"
+) &&
 (
 !mime ||
 !mime.includes(
@@ -2395,11 +3253,29 @@ type === "pdf" &&
 )
 ) {
 
+const extension =
+path
+.extname(
+fileName
+)
+.toLowerCase();
+
+
+if (
+extension === ".pdf"
+) {
+
 mime =
 "application/pdf";
 
 }
 
+}
+
+
+// =================================================
+// VIDEO MIME
+// =================================================
 
 if (
 type === "video" &&
@@ -2424,16 +3300,132 @@ mime
 
 
 // =====================================================
+// HESAP ÖZETİ
+// =====================================================
+
+// ÇOK ÖNEMLİ:
+//
+// Hesap özeti analizinde referans yüklenmez.
+//
+// Bu bölüm normal referans sisteminden tamamen bağımsızdır.
+
+if (
+type === "statement"
+) {
+
+console.log(
+"HESAP ÖZETİ MODU"
+);
+
+console.log(
+"REFERANS: KULLANILMIYOR"
+);
+
+
+const statementResult =
+await analyzeStatement(
+base64,
+mime,
+fileName
+);
+
+
+const statementScore =
+Number(
+statementResult?.overallRisk
+) || 0;
+
+
+const statementSuspicious =
+statementScore >= 46;
+
+
+const statementEvidence =
+Array.isArray(
+statementResult?.evidence
+)
+?
+statementResult.evidence
+:
+[];
+
+
+console.log(
+"HESAP ÖZETİ RİSK:",
+statementScore
+);
+
+
+console.log(
+"HESAP ÖZETİ ŞÜPHE:",
+statementSuspicious
+);
+
+
+console.log(
+"HESAP ÖZETİ ANALİZ TAMAMLANDI"
+);
+
+
+return res
+.status(200)
+.json({
+
+success:
+true,
+
+fileName,
+
+type:
+"statement",
+
+bank:
+bank ||
+null,
+
+reference:
+null,
+
+...statementResult,
+
+score:
+statementScore,
+
+suspicious:
+statementSuspicious,
+
+evidence:
+statementEvidence,
+
+});
+
+}
+
+
+// =====================================================
 // REFERANS DEKONT
 // =====================================================
 
 // Video analizinde kullanılmayacak.
-// Fotoğraf ve PDF analizlerinde kullanılacak.
+// Hesap özetinde de kullanılmayacak.
+//
+// Sadece normal image/pdf dekont analizlerinde kullanılır.
 
-const reference =
+let reference =
+null;
+
+
+if (
+type !== "video" &&
+type !== "statement"
+) {
+
+reference =
 await loadReferenceFile(
 bank
 );
+
+}
 
 
 console.log(
@@ -2677,13 +3669,6 @@ frames.length
 );
 
 
-// =================================================
-// VIDEO ANALİZİ
-// =================================================
-// Burada reference kullanılmaz.
-// analyzeVideoFrames yalnızca video karelerini
-// inceler ve normal RESPONSE_SCHEMA döndürür.
-
 const videoResult =
 await analyzeVideoFrames(
 frames
@@ -2728,7 +3713,6 @@ fileName,
 
 type,
 
-// Video için referans yok
 bank:
 bank,
 
@@ -2902,26 +3886,21 @@ fileName,
 
 type,
 
-// Kullanılan banka
 bank:
 bank,
 
-// Kullanılan referans
 reference:
 reference?.fileName ||
 null,
 
 ...result,
 
-// ANA SKOR
 score:
 finalScore,
 
-// ANA ŞÜPHE DURUMU
 suspicious:
 finalSuspicious,
 
-// BİRLEŞTİRİLMİŞ KANIT
 evidence:
 finalEvidence,
 
