@@ -267,7 +267,406 @@ false,
 },
 
 };
+// =====================================================
+// OTOMATİK BELGE + BANKA TESPİTİ
+// =====================================================
+//
+// Kullanıcı /akbank veya /hesapozeti yazmak zorunda değil.
+//
+// Önce belge görüntüsü AI'a gönderilir.
+// AI:
+// - hesap özeti mi?
+// - dekont mu?
+// - hangi banka?
+// sorularını belirler.
+//
+// Dosya adına güvenilmez.
+// =====================================================
 
+async function detectDocumentAndBank(
+ base64,
+ mime,
+ fileName,
+ type
+) {
+
+ console.log(
+ "================================================"
+ );
+
+ console.log(
+ "OTOMATİK BELGE TESPİTİ BAŞLADI"
+ );
+
+ console.log(
+ "FILE:",
+ fileName
+ );
+
+ console.log(
+ "MIME:",
+ mime
+ );
+
+ console.log(
+ "================================================"
+ );
+
+
+ const DETECTION_SCHEMA = {
+
+ type: "object",
+
+ properties: {
+
+ documentType: {
+
+ type: "string",
+
+ enum: [
+ "receipt",
+ "statement",
+ "unknown"
+ ],
+
+ },
+
+ bank: {
+
+ type: [
+ "string",
+ "null"
+ ],
+
+ enum: [
+ "akbank",
+ "garanti",
+ "enpara",
+ "vakifbank",
+ "isbankasi",
+ "ziraat",
+ "denizbank",
+ "halkbank",
+ "yapikredi",
+ null
+ ],
+
+ },
+
+ confidence: {
+
+ type: "integer",
+
+ minimum: 0,
+
+ maximum: 100,
+
+ },
+
+ evidence: {
+
+ type: "string",
+
+ },
+
+ },
+
+ required: [
+ "documentType",
+ "bank",
+ "confidence",
+ "evidence"
+ ],
+
+ additionalProperties: false,
+
+ };
+
+
+ let fileContent;
+
+
+ // ===================================================
+ // PDF
+ // ===================================================
+
+ if (
+ mime === "application/pdf" ||
+ mime.includes("pdf")
+ ) {
+
+ fileContent = {
+
+ type: "input_file",
+
+ filename: fileName,
+
+ file_data:
+ `data:application/pdf;base64,${base64}`,
+
+ };
+
+ }
+
+
+ // ===================================================
+ // IMAGE
+ // ===================================================
+
+ else {
+
+ fileContent = {
+
+ type: "input_image",
+
+ image_url:
+ `data:${mime};base64,${base64}`,
+
+ detail: "high",
+
+ };
+
+ }
+
+
+ const detectionPrompt = `
+
+Sen VerifyDoc belge sınıflandırma motorusun.
+
+Görevin yalnızca gönderilen belgeyi sınıflandırmaktır.
+
+Kullanıcının yazdığı dosya adına GÜVENME.
+
+Dosya adı banka veya belge türünü belirlemek için
+kanıt değildir.
+
+Belgenin GÖRÜNEN İÇERİĞİNİ incele.
+
+=====================================================
+BELGE TÜRÜ
+=====================================================
+
+Belge:
+
+1. Banka dekontu / işlem dekontu ise:
+
+documentType = "receipt"
+
+2. Banka hesap özeti / hesap ekstresi ise:
+
+documentType = "statement"
+
+3. Belge türü güvenilir şekilde belirlenemiyorsa:
+
+documentType = "unknown"
+
+=====================================================
+BANKA TESPİTİ
+=====================================================
+
+Aşağıdaki bankalardan hangisinin belgesi olduğunu
+görsel ve metinsel kanıtlara göre belirle:
+
+- akbank
+- garanti
+- enpara
+- vakifbank
+- isbankasi
+- ziraat
+- denizbank
+- halkbank
+- yapikredi
+
+Özellikle şunları incele:
+
+- banka adı
+- logo
+- üst başlık
+- mobil bankacılık tasarımı
+- web bankacılık tasarımı
+- belge şablonu
+- renkler
+- alan isimleri
+- IBAN / hesap bilgisi yapısı
+- işlem alanları
+- hesap özeti yapısı
+- kurum adı
+- görünen marka ifadeleri
+
+=====================================================
+ÇOK ÖNEMLİ
+=====================================================
+
+Dosyanın adı:
+
+akbank.pdf
+dekont.pdf
+12345.pdf
+abc.pdf
+hesap.pdf
+
+olabilir.
+
+Dosya adına bakarak banka belirleme.
+
+Yalnızca belgenin içeriğine dayan.
+
+=====================================================
+BANKA TESPİTİ BELİRSİZSE
+=====================================================
+
+Banka adı açıkça görülemiyorsa tahmin etme.
+
+bank = null
+
+kullan.
+
+Örneğin yalnızca genel bir banka dekontu
+görülüyor ve hangi banka olduğu belirlenemiyorsa
+banka uydurma.
+
+=====================================================
+HESAP ÖZETİ
+=====================================================
+
+Belge hesap özeti ise:
+
+documentType = "statement"
+
+olarak belirle.
+
+Banka ayrıca görülebiliyorsa bank alanına yaz.
+
+Ancak hesap özeti analizinde banka referansı
+KULLANILMAYACAKTIR.
+
+=====================================================
+DEKONT
+=====================================================
+
+Belge dekont ise:
+
+documentType = "receipt"
+
+olarak belirle.
+
+Banka güvenilir şekilde belirlenebiliyorsa bank
+alanına yaz.
+
+Banka belirlenemiyorsa null kullan.
+
+=====================================================
+CONFIDENCE
+=====================================================
+
+0-100 arasında güven değeri ver.
+
+Belge açık ve banka adı görünüyorsa yüksek güven.
+
+Banka yalnızca tasarımdan tahmin ediliyorsa daha
+düşük güven.
+
+Belge çok bulanıksa confidence düşür.
+
+=====================================================
+EVIDENCE
+=====================================================
+
+Kısa Türkçe açıklama yaz.
+
+Örneğin:
+
+"Belgenin üst kısmında Akbank logosu ve Akbank
+işlem ekranına ait görsel yapı görülüyor."
+
+veya:
+
+"Belge hesap özeti yapısında; işlem satırları ve
+bakiye alanları bulunuyor."
+
+Kanıt yoksa uydurma.
+
+=====================================================
+
+SADECE JSON DÖNDÜR.
+
+`;
+
+
+ const response =
+ await openai.responses.create({
+
+ model: "gpt-5-mini",
+
+ input: [
+
+ {
+
+ role: "user",
+
+ content: [
+
+ {
+
+ type: "input_text",
+
+ text: detectionPrompt,
+
+ },
+
+ fileContent,
+
+ ],
+
+ },
+
+ ],
+
+ text: {
+
+ format: {
+
+ type: "json_schema",
+
+ name: "verifydoc_document_detection",
+
+ strict: true,
+
+ schema: DETECTION_SCHEMA,
+
+ },
+
+ },
+
+ });
+
+
+ const output =
+ response?.output_text;
+
+
+ if (!output) {
+
+ throw new Error(
+ "Belge otomatik tespit sonucu alınamadı."
+ );
+
+ }
+
+
+ const detected =
+ parseAIResponse(output);
+
+
+ console.log(
+ "OTOMATİK BELGE TESPİTİ:",
+ detected
+ );
+
+
+ return detected;
+
+}
 
 // =====================================================
 // OPENAI
@@ -3473,7 +3872,7 @@ fields?.type
 ) ||
 "document";
 
-const statementMode =
+let statementMode =
 first(
 fields?.statementMode
 ) === "true";
@@ -3501,7 +3900,7 @@ fields?.bank
 );
 
 
-const bank =
+let bank =
 normalizeBank(
 requestedBank
 );
@@ -3726,7 +4125,102 @@ console.log(
 "FINAL MIME:",
 mime
 );
+// =====================================================
+// OTOMATİK BELGE / BANKA TESPİTİ
+// =====================================================
 
+let automaticDetection = null;
+
+
+// Kullanıcı banka veya mod yazmamışsa
+// otomatik tespit çalıştır.
+
+if (
+!requestedBank &&
+!statementMode
+) {
+
+automaticDetection =
+await detectDocumentAndBank(
+base64,
+mime,
+fileName,
+type
+);
+
+
+console.log(
+"AUTOMATIC DETECTION RESULT:",
+automaticDetection
+);
+// =====================================================
+// OTOMATİK HESAP ÖZETİ
+// =====================================================
+
+if (
+automaticDetection?.documentType ===
+"statement"
+) {
+
+statementMode = true;
+
+console.log(
+"BELGE TÜRÜ OTOMATİK OLARAK HESAP ÖZETİ."
+);
+
+}
+
+
+// ===================================================
+// BELGE TÜRÜ
+// ===================================================
+
+if (
+automaticDetection?.documentType ===
+"statement"
+) {
+
+console.log(
+"OTOMATİK OLARAK HESAP ÖZETİ ALGILANDI"
+);
+
+// Çok önemli:
+// Telegram /hesapozeti yazılmasa bile
+// hesap özeti moduna geç.
+
+statementMode = true;
+
+}
+
+
+// ===================================================
+// BANKA
+// ===================================================
+
+if (
+automaticDetection?.bank
+) {
+
+bank =
+normalizeBank(
+automaticDetection.bank
+);
+
+}
+
+
+console.log(
+"AUTO BANK:",
+bank || "YOK"
+);
+
+console.log(
+"AUTO DOCUMENT TYPE:",
+automaticDetection?.documentType ||
+"unknown"
+);
+
+}
 
 // =====================================================
 // HESAP ÖZETİ
