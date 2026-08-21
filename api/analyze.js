@@ -255,7 +255,205 @@ error
 return null;
 }
 }
+async function detectBankAgain(
+ base64,
+ mime,
+ fileName
+) {
 
+ const BANK_SCHEMA = {
+
+ type: "object",
+
+ properties: {
+
+ bank: {
+ type: [
+ "string",
+ "null"
+ ],
+ },
+
+ confidence: {
+ type: "integer",
+ minimum: 0,
+ maximum: 100,
+ },
+
+ evidence: {
+ type: "string",
+ },
+
+ },
+
+ required: [
+ "bank",
+ "confidence",
+ "evidence"
+ ],
+
+ additionalProperties: false,
+
+ };
+
+
+ let fileContent;
+
+
+ if (
+ mime === "application/pdf" ||
+ mime.includes("pdf")
+ ) {
+
+ fileContent = {
+
+ type: "input_file",
+
+ filename: fileName,
+
+ file_data:
+ `data:application/pdf;base64,${base64}`,
+
+ };
+
+ } else {
+
+ fileContent = {
+
+ type: "input_image",
+
+ image_url:
+ `data:${mime};base64,${base64}`,
+
+ detail: "high",
+
+ };
+
+ }
+
+
+ const response =
+ await openai.responses.create({
+
+ model: "gpt-5-mini",
+
+ input: [
+
+ {
+
+ role: "user",
+
+ content: [
+
+ {
+
+ type: "input_text",
+
+ text: `
+
+Bu belge VerifyDoc tarafından inceleniyor.
+
+Görevin SADECE bankayı belirlemek.
+
+Dosya adına kesinlikle güvenme.
+
+Belgenin kendisini incele.
+
+Desteklenen bankalar:
+
+akbank
+garanti
+enpara
+vakifbank
+isbankasi
+ziraat
+denizbank
+halkbank
+yapikredi
+
+Özellikle şunları karşılaştır:
+
+- logo
+- banka adı
+- renkler
+- başlık
+- mobil uygulama tasarımı
+- web bankacılığı tasarımı
+- tipografi
+- alan isimleri
+- IBAN yapısı
+- işlem yapısı
+- belge yerleşimi
+- hesap özeti yapısı
+- footer
+- ikonlar
+- kurum terminolojisi
+
+Banka adı açıkça görünmese bile birden fazla
+bağımsız görsel gösterge aynı bankayı işaret
+ediyorsa bankayı seç.
+
+Tek bir küçük benzerlik varsa rastgele seçim yapma.
+
+Gerçekten belirlenemiyorsa null döndür.
+
+Kanıtı Türkçe yaz.
+
+Sadece JSON döndür.
+
+ `,
+
+ },
+
+ fileContent,
+
+ ],
+
+ },
+
+ ],
+
+ text: {
+
+ format: {
+
+ type: "json_schema",
+
+ name: "verifydoc_bank_detection_retry",
+
+ strict: true,
+
+ schema: BANK_SCHEMA,
+
+ },
+
+ },
+
+ });
+
+
+ const output =
+ response?.output_text;
+
+
+ if (!output) {
+
+ return null;
+
+ }
+
+
+ try {
+
+ return parseAIResponse(output);
+
+ } catch {
+
+ return null;
+
+ }
+
+}
 
 export const config = {
 
@@ -3866,7 +4064,7 @@ first(
 fields?.statementMode
 ) === "true";
 
-const type =
+let type =
 statementMode
 ? "statement"
 : rawType;
@@ -4143,9 +4341,48 @@ console.log(
 automaticDetection
 );
 // =====================================================
-// OTOMATİK HESAP ÖZETİ
+// OTOMATİK BELGE / BANKA TESPİTİ
 // =====================================================
 
+let automaticDetection = null;
+
+
+// Kullanıcı manuel olarak banka veya
+// hesap özeti belirtmediyse otomatik tespit yap.
+
+if (
+!requestedBank &&
+!statementMode
+) {
+
+automaticDetection =
+await detectDocumentAndBank(
+base64,
+mime,
+fileName
+);
+
+
+console.log(
+"AUTO DOCUMENT TYPE:",
+automaticDetection?.documentType
+);
+
+console.log(
+"AUTO BANK:",
+automaticDetection?.bank
+);
+
+console.log(
+"AUTO CONFIDENCE:",
+automaticDetection?.confidence
+);
+
+
+// ===================================================
+// HESAP ÖZETİ
+// ===================================================
+
 if (
 automaticDetection?.documentType ===
 "statement"
@@ -4153,31 +4390,11 @@ automaticDetection?.documentType ===
 
 statementMode = true;
 
-console.log(
-"BELGE TÜRÜ OTOMATİK OLARAK HESAP ÖZETİ."
-);
-
-}
-
-
-// ===================================================
-// BELGE TÜRÜ
-// ===================================================
-
-if (
-automaticDetection?.documentType ===
-"statement"
-) {
+type = "statement";
 
 console.log(
-"OTOMATİK OLARAK HESAP ÖZETİ ALGILANDI"
+"AUTO MODE: STATEMENT"
 );
-
-// Çok önemli:
-// Telegram /hesapozeti yazılmasa bile
-// hesap özeti moduna geç.
-
-statementMode = true;
 
 }
 
@@ -4198,121 +4415,91 @@ automaticDetection.bank
 }
 
 
-console.log(
-"AUTO BANK:",
-bank || "YOK"
-);
-
-console.log(
-"AUTO DOCUMENT TYPE:",
-automaticDetection?.documentType ||
-"unknown"
-);
-
-}
-
-// =====================================================
-// HESAP ÖZETİ
-// =====================================================
-
-// ÇOK ÖNEMLİ:
-//
-// Hesap özeti analizinde referans yüklenmez.
-//
-// Bu bölüm normal referans sisteminden tamamen bağımsızdır.
+// ===================================================
+// BANKA BULUNAMADI → İKİNCİ DENEME
+// ===================================================
 
 if (
-type === "statement"
+!bank &&
+automaticDetection?.documentType !==
+"statement"
 ) {
 
 console.log(
-"HESAP ÖZETİ MODU"
+"BANK NOT DETECTED."
 );
 
 console.log(
-"REFERANS: KULLANILMIYOR"
+"SECOND BANK DETECTION START."
 );
 
 
-const statementResult =
-await analyzeStatement(
+const retry =
+await detectBankAgain(
 base64,
 mime,
 fileName
 );
 
 
-const statementScore =
-Number(
-statementResult?.overallRisk
-) || 0;
-
-
-const statementSuspicious =
-statementScore >= 46;
-
-
-const statementEvidence =
-Array.isArray(
-statementResult?.evidence
-)
-?
-statementResult.evidence
-:
-[];
-
-
 console.log(
-"HESAP ÖZETİ RİSK:",
-statementScore
+"BANK RETRY RESULT:",
+retry
 );
 
 
-console.log(
-"HESAP ÖZETİ ŞÜPHE:",
-statementSuspicious
+if (
+retry?.bank
+) {
+
+bank =
+normalizeBank(
+retry.bank
 );
 
 
-console.log(
-"HESAP ÖZETİ ANALİZ TAMAMLANDI"
-);
+automaticDetection = {
 
-
-return res
-.status(200)
-.json({
-
-success:
-true,
-
-fileName,
-
-type:
-"statement",
+...automaticDetection,
 
 bank:
-bank ||
-null,
+retry.bank,
 
-reference:
-null,
-
-...statementResult,
-
-score:
-statementScore,
-
-suspicious:
-statementSuspicious,
+confidence:
+retry.confidence,
 
 evidence:
-statementEvidence,
+retry.evidence,
 
-});
+};
 
 }
 
+}
+
+}
+
+ // =====================================================
+// TYPE SON KARAR
+// =====================================================
+
+if (
+statementMode
+) {
+
+type = "statement";
+
+}
+else {
+
+// Dekontun gerçek dosya türünü koru.
+// image → image
+// pdf → pdf
+// video → video
+
+type = rawType;
+
+}
 
 // =====================================================
 // REFERANS DEKONT
