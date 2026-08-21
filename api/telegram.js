@@ -103,13 +103,20 @@ text,
 };
 
 if (
-replyToMessageId
+replyToMessageId !== null &&
+replyToMessageId !== undfined
 ) {
 
-body.reply_to_message_id =
-replyToMessageId;
+body.reply_parameters= {
+message_id: Number(replyToMessageId),
+};
  
 }
+console.log(
+ "TELEGRAM REPLY MESSAGE ID:",
+ replyToMessageId
+ );
+
 return telegram(
 "sendMessage",
 body
@@ -1059,6 +1066,13 @@ if (!chatId) {
 return;
 
 }
+const messageId =
+ message?.message_id;
+
+console.log(
+ "ORİGİNAL MESSAGE ID:",
+ messageId
+ );
 
 
 const text =
