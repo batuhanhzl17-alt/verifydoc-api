@@ -255,205 +255,7 @@ error
 return null;
 }
 }
-async function detectBankAgain(
- base64,
- mime,
- fileName
-) {
 
- const BANK_SCHEMA = {
-
- type: "object",
-
- properties: {
-
- bank: {
- type: [
- "string",
- "null"
- ],
- },
-
- confidence: {
- type: "integer",
- minimum: 0,
- maximum: 100,
- },
-
- evidence: {
- type: "string",
- },
-
- },
-
- required: [
- "bank",
- "confidence",
- "evidence"
- ],
-
- additionalProperties: false,
-
- };
-
-
- let fileContent;
-
-
- if (
- mime === "application/pdf" ||
- mime.includes("pdf")
- ) {
-
- fileContent = {
-
- type: "input_file",
-
- filename: fileName,
-
- file_data:
- `data:application/pdf;base64,${base64}`,
-
- };
-
- } else {
-
- fileContent = {
-
- type: "input_image",
-
- image_url:
- `data:${mime};base64,${base64}`,
-
- detail: "high",
-
- };
-
- }
-
-
- const response =
- await openai.responses.create({
-
- model: "gpt-5-mini",
-
- input: [
-
- {
-
- role: "user",
-
- content: [
-
- {
-
- type: "input_text",
-
- text: `
-
-Bu belge VerifyDoc tarafından inceleniyor.
-
-Görevin SADECE bankayı belirlemek.
-
-Dosya adına kesinlikle güvenme.
-
-Belgenin kendisini incele.
-
-Desteklenen bankalar:
-
-akbank
-garanti
-enpara
-vakifbank
-isbankasi
-ziraat
-denizbank
-halkbank
-yapikredi
-
-Özellikle şunları karşılaştır:
-
-- logo
-- banka adı
-- renkler
-- başlık
-- mobil uygulama tasarımı
-- web bankacılığı tasarımı
-- tipografi
-- alan isimleri
-- IBAN yapısı
-- işlem yapısı
-- belge yerleşimi
-- hesap özeti yapısı
-- footer
-- ikonlar
-- kurum terminolojisi
-
-Banka adı açıkça görünmese bile birden fazla
-bağımsız görsel gösterge aynı bankayı işaret
-ediyorsa bankayı seç.
-
-Tek bir küçük benzerlik varsa rastgele seçim yapma.
-
-Gerçekten belirlenemiyorsa null döndür.
-
-Kanıtı Türkçe yaz.
-
-Sadece JSON döndür.
-
- `,
-
- },
-
- fileContent,
-
- ],
-
- },
-
- ],
-
- text: {
-
- format: {
-
- type: "json_schema",
-
- name: "verifydoc_bank_detection_retry",
-
- strict: true,
-
- schema: BANK_SCHEMA,
-
- },
-
- },
-
- });
-
-
- const output =
- response?.output_text;
-
-
- if (!output) {
-
- return null;
-
- }
-
-
- try {
-
- return parseAIResponse(output);
-
- } catch {
-
- return null;
-
- }
-
-}
 
 export const config = {
 
@@ -465,395 +267,7 @@ false,
 },
 
 };
-// =====================================================
-// OTOMATİK BELGE + BANKA TESPİTİ
-// =====================================================
 
-async function detectDocumentAndBank(
-base64,
-mime,
-fileName
-) {
-
-console.log("======================================");
-console.log("AUTO DOCUMENT DETECTION START");
-console.log("FILE:", fileName);
-console.log("MIME:", mime);
-console.log("======================================");
-
-const DETECTION_SCHEMA = {
-
-type: "object",
-
-properties: {
-
-documentType: {
-type: "string",
-enum: [
-"receipt",
-"statement",
-"unknown"
-],
-},
-
-bank: {
-type: [
-"string",
-"null"
-],
-},
-
-confidence: {
-type: "integer",
-minimum: 0,
-maximum: 100,
-},
-
-evidence: {
-type: "string",
-},
-
-},
-
-required: [
-"documentType",
-"bank",
-"confidence",
-"evidence"
-],
-
-additionalProperties: false,
-
-};
-
-
-let fileContent;
-
-
-// ===================================================
-// PDF
-// ===================================================
-
-if (
-mime === "application/pdf" ||
-mime.includes("pdf")
-) {
-
-fileContent = {
-
-type: "input_file",
-
-filename: fileName,
-
-file_data:
-`data:application/pdf;base64,${base64}`,
-
-};
-
-}
-
-// ===================================================
-// IMAGE
-// ===================================================
-
-else {
-
-fileContent = {
-
-type: "input_image",
-
-image_url:
-`data:${mime};base64,${base64}`,
-
-detail: "high",
-
-};
-
-}
-
-
-const prompt = `
-
-Sen VerifyDoc otomatik belge sınıflandırma motorusun.
-
-Kullanıcının herhangi bir komut yazmadığını varsay.
-
-Dosya adını KESİNLİKLE banka tespitinde kullanma.
-
-Dosya adı:
-
-${fileName}
-
-BANKA TESPİTİ SADECE BELGENİN KENDİSİNE GÖRE YAPILMALIDIR.
-
-=====================================================
-DESTEKLENEN BANKALAR
-=====================================================
-
-Sadece aşağıdaki bankalardan birini seç:
-
-- akbank
-- garanti
-- enpara
-- vakifbank
-- isbankasi
-- ziraat
-- denizbank
-- halkbank
-- yapikredi
-
-=====================================================
-BELGE TÜRÜ
-=====================================================
-
-Belge banka tarafından oluşturulmuş bir işlem dekontu
-veya para transferi dekontu ise:
-
-receipt
-
-Belge banka hesap ekstresi / hesap özeti ise:
-
-statement
-
-Belge türü güvenilir şekilde belirlenemiyorsa:
-
-unknown
-
-=====================================================
-BANKA TESPİTİ
-=====================================================
-
-Öncelikle belgenin tamamını dikkatlice incele.
-
-Özellikle:
-
-- banka logosu
-- banka adı
-- uygulama adı
-- internet bankacılığı başlığı
-- mobil bankacılık tasarımı
-- renkler
-- ikonlar
-- yazı tipi
-- alan isimleri
-- IBAN biçimi
-- işlem alanları
-- hesap özeti başlıkları
-- footer
-- belge yapısı
-- banka tarafından kullanılan tipik terminoloji
-
-alanlarını değerlendir.
-
-=====================================================
-ÖNEMLİ
-=====================================================
-
-Banka adı belgede açıkça yazmıyorsa bile,
-görsel şablon ve diğer bağımsız göstergelerden
-güvenilir şekilde belirlenebiliyorsa bankayı belirle.
-
-Örneğin:
-
-Logo + renk yapısı + ekran tasarımı + alan yapısı
-aynı bankayı güçlü şekilde gösteriyorsa bankayı seç.
-
-Ancak yalnızca tek bir küçük benzerlik varsa
-rastgele banka seçme.
-
-=====================================================
-BANKA SEÇİMİ
-=====================================================
-
-Belgede Akbank'a ait güçlü görsel/metinsel kanıt
-varsa:
-
-"akbank"
-
-Belgede Garanti BBVA'ya ait güçlü kanıt varsa:
-
-"garanti"
-
-Enpara ise:
-
-"enpara"
-
-VakıfBank ise:
-
-"vakifbank"
-
-İş Bankası ise:
-
-"isbankasi"
-
-Ziraat ise:
-
-"ziraat"
-
-DenizBank ise:
-
-"denizbank"
-
-Halkbank ise:
-
-"halkbank"
-
-Yapı Kredi ise:
-
-"yapikredi"
-
-=====================================================
-NULL KULLANMA
-=====================================================
-
-Banka adı görünmüyor diye hemen null döndürme.
-
-Önce:
-
-- logo
-- renk
-- layout
-- tipografi
-- başlık
-- uygulama arayüzü
-- alan isimleri
-- belge yapısı
-
-gibi bağımsız göstergeleri birlikte değerlendir.
-
-Ancak gerçekten yeterli kanıt yoksa:
-
-bank = null
-
-kullan.
-
-=====================================================
-DOSYA ADI
-=====================================================
-
-Aşağıdaki dosya adlarının hiçbirinin banka
-tespitinde kullanılmasına izin verilmez:
-
-akbank.pdf
-garanti.pdf
-dekont.pdf
-hesap.pdf
-12345.pdf
-abc.pdf
-IMG_1234.pdf
-random.pdf
-
-Dosya adı sadece teknik dosya adı olarak kabul edilir.
-
-=====================================================
-CONFIDENCE
-=====================================================
-
-Banka adı açıkça görünüyorsa:
-
-90-100
-
-Logo + tasarım + metin güçlü şekilde uyuyorsa:
-
-75-89
-
-Sadece görsel benzerlik varsa:
-
-50-74
-
-Yetersiz kanıt varsa:
-
-0-49
-
-=====================================================
-EVIDENCE
-=====================================================
-
-Kısa ama somut Türkçe kanıt yaz.
-
-Örnek:
-
-"Belgede Akbank logosu, turuncu başlık yapısı ve
-Akbank mobil bankacılık işlem ekranıyla uyumlu alan
-düzeni görülüyor."
-
-Kanıt yoksa uydurma.
-
-SONUCU SADECE JSON OLARAK DÖNDÜR.
-`;
-
-
-const response =
-await openai.responses.create({
-
-model: "gpt-5-mini",
-
-input: [
-
-{
-
-role: "user",
-
-content: [
-
-{
-type: "input_text",
-text: prompt,
-},
-
-fileContent,
-
-],
-
-},
-
-],
-
-text: {
-
-format: {
-
-type: "json_schema",
-
-name: "verifydoc_auto_detection",
-
-strict: true,
-
-schema: DETECTION_SCHEMA,
-
-},
-
-},
-
-});
-
-
-const output =
-response?.output_text;
-
-
-if (!output) {
-
-throw new Error(
-"Otomatik belge tespitinden cevap alınamadı."
-);
-
-}
-
-
-const result =
-parseAIResponse(output);
-
-
-console.log(
-"AUTO DETECTION RESULT:",
-result
-);
-
-
-return result;
-
-}
 
 // =====================================================
 // OPENAI
@@ -4059,12 +3473,12 @@ fields?.type
 ) ||
 "document";
 
-let statementMode =
+const statementMode =
 first(
 fields?.statementMode
 ) === "true";
 
-let type =
+const type =
 statementMode
 ? "statement"
 : rawType;
@@ -4087,7 +3501,7 @@ fields?.bank
 );
 
 
-let bank =
+const bank =
 normalizeBank(
 requestedBank
 );
@@ -4312,194 +3726,110 @@ console.log(
 "FINAL MIME:",
 mime
 );
+
+
 // =====================================================
-// OTOMATİK BELGE / BANKA TESPİTİ
-// =====================================================
-
-let automaticDetection = null;
-
-
-// Kullanıcı banka veya mod yazmamışsa
-// otomatik tespit çalıştır.
-
-if (
-!requestedBank &&
-!statementMode
-) {
-
-automaticDetection =
-await detectDocumentAndBank(
-base64,
-mime,
-fileName,
-type
-);
-
-
-console.log(
-"AUTOMATIC DETECTION RESULT:",
-automaticDetection
-);
-// =====================================================
-// OTOMATİK BELGE / BANKA TESPİTİ
-// =====================================================
-
-let automaticDetection = null;
-
-
-// Kullanıcı manuel olarak banka veya
-// hesap özeti belirtmediyse otomatik tespit yap.
-
-if (
-!requestedBank &&
-!statementMode
-) {
-
-automaticDetection =
-await detectDocumentAndBank(
-base64,
-mime,
-fileName
-);
-
-
-console.log(
-"AUTO DOCUMENT TYPE:",
-automaticDetection?.documentType
-);
-
-console.log(
-"AUTO BANK:",
-automaticDetection?.bank
-);
-
-console.log(
-"AUTO CONFIDENCE:",
-automaticDetection?.confidence
-);
-
-
-// ===================================================
 // HESAP ÖZETİ
-// ===================================================
+// =====================================================
+
+// ÇOK ÖNEMLİ:
+//
+// Hesap özeti analizinde referans yüklenmez.
+//
+// Bu bölüm normal referans sisteminden tamamen bağımsızdır.
 
 if (
-automaticDetection?.documentType ===
-"statement"
-) {
-
-statementMode = true;
-
-type = "statement";
-
-console.log(
-"AUTO MODE: STATEMENT"
-);
-
-}
-
-
-// ===================================================
-// BANKA
-// ===================================================
-
-if (
-automaticDetection?.bank
-) {
-
-bank =
-normalizeBank(
-automaticDetection.bank
-);
-
-}
-
-
-// ===================================================
-// BANKA BULUNAMADI → İKİNCİ DENEME
-// ===================================================
-
-if (
-!bank &&
-automaticDetection?.documentType !==
-"statement"
+type === "statement"
 ) {
 
 console.log(
-"BANK NOT DETECTED."
+"HESAP ÖZETİ MODU"
 );
 
 console.log(
-"SECOND BANK DETECTION START."
+"REFERANS: KULLANILMIYOR"
 );
 
 
-const retry =
-await detectBankAgain(
+const statementResult =
+await analyzeStatement(
 base64,
 mime,
 fileName
 );
 
 
+const statementScore =
+Number(
+statementResult?.overallRisk
+) || 0;
+
+
+const statementSuspicious =
+statementScore >= 46;
+
+
+const statementEvidence =
+Array.isArray(
+statementResult?.evidence
+)
+?
+statementResult.evidence
+:
+[];
+
+
 console.log(
-"BANK RETRY RESULT:",
-retry
+"HESAP ÖZETİ RİSK:",
+statementScore
 );
 
 
-if (
-retry?.bank
-) {
-
-bank =
-normalizeBank(
-retry.bank
+console.log(
+"HESAP ÖZETİ ŞÜPHE:",
+statementSuspicious
 );
 
 
-automaticDetection = {
+console.log(
+"HESAP ÖZETİ ANALİZ TAMAMLANDI"
+);
 
-...automaticDetection,
+
+return res
+.status(200)
+.json({
+
+success:
+true,
+
+fileName,
+
+type:
+"statement",
 
 bank:
-retry.bank,
+bank ||
+null,
 
-confidence:
-retry.confidence,
+reference:
+null,
+
+...statementResult,
+
+score:
+statementScore,
+
+suspicious:
+statementSuspicious,
 
 evidence:
-retry.evidence,
+statementEvidence,
 
-};
-
-}
+});
 
 }
 
-}
-
- // =====================================================
-// TYPE SON KARAR
-// =====================================================
-
-if (
-statementMode
-) {
-
-type = "statement";
-
-}
-else {
-
-// Dekontun gerçek dosya türünü koru.
-// image → image
-// pdf → pdf
-// video → video
-
-type = rawType;
-
-}
 
 // =====================================================
 // REFERANS DEKONT
