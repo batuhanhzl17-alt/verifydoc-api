@@ -1703,12 +1703,9 @@ if (
 await sendMessage(
 chatId,
 
-`Belgenin banka bilgisi güvenilir şekilde tespit edilemedi.
+`🏦 Bankayı belirtmem gerekiyor.
 
-Lütfen belgeyi daha net bir PDF/fotoğraf olarak gönder.
-
-Banka adı belgede görünmüyorsa aşağıdaki komutlardan
-birini kullanabilirsin:
+Önce bir banka seç:
 
 /akbank
 /garanti
@@ -1718,9 +1715,12 @@ birini kullanabilirsin:
 /ziraat
 /denizbank
 /halkbank
-/yapikredi`
-);
+/yapikredi
 
+ve ardından belgeyi gönder.
+
+İstersen belge açıklamasına da banka adını yazabilirsin.`
+);
 
 return;
 
