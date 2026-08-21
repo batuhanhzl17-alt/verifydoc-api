@@ -93,19 +93,28 @@ return data.result;
 
 async function sendMessage(
 chatId,
-text
+text,
+replyToMessageId = null
+) {
+ 
+const body = {
+chat_id: chatId,
+text,
+};
+
+if (
+replyToMessageId
 ) {
 
+body.reply_to_message_id =
+replyToMessageId;
+ 
+}
 return telegram(
 "sendMessage",
-{
-chat_id:
-chatId,
-
-text,
-}
-);
-
+body
+) ;
+ 
 }
 
 
@@ -550,7 +559,8 @@ return result;
 async function sendAnalysisResult(
 chatId,
 result,
-statementMode
+statementMode,
+replyToMessageId
 ) {
 
 
@@ -767,7 +777,8 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
 
 await sendMessage(
 chatId,
-statementText
+statementText,
+replyToMessageId
 );
 
 return;
@@ -835,7 +846,8 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
 
 await sendMessage(
 chatId,
-text
+text,
+replyToMessageId
 );
 
 }
