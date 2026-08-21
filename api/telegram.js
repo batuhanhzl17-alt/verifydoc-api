@@ -38,6 +38,24 @@ new Map();
 
 
 // =====================================================
+// CHAT → BEKLEYEN BELGE
+// =====================================================
+// Kullanıcı belgeyi gönderir.
+// Banka butonuna basılana kadar belge bilgileri burada tutulur.
+//
+// ÖNEMLİ:
+// Dosyanın binary içeriğini değil,
+// Telegram file_id değerini tutuyoruz.
+//
+// Kullanıcı banka seçtiğinde aynı dosya
+// Telegram'dan tekrar indirilip analize gönderilir.
+// =====================================================
+
+const pendingDocuments =
+new Map();
+
+
+// =====================================================
 // TELEGRAM API
 // =====================================================
 
@@ -59,7 +77,8 @@ const response =
 await fetch(
 `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
 {
-method: "POST",
+method:
+"POST",
 
 headers: {
 "Content-Type":
@@ -68,6 +87,7 @@ headers: {
 
 body:
 JSON.stringify(body),
+
 }
 );
 
@@ -94,13 +114,14 @@ return data.result;
 // =====================================================
 // MESAJ GÖNDER
 // =====================================================
+//
 // Normal mesaj:
 // sendMessage(chatId, text)
 //
 // Reply mesaj:
 // sendMessage(chatId, text, messageId)
 //
-// SADECE sonuç mesajlarında reply kullanılacak.
+// Sadece analiz sonucu reply yapılır.
 // =====================================================
 
 async function sendMessage(
@@ -165,6 +186,179 @@ body
 
 
 // =====================================================
+// INLINE BUTONLU BANKA SEÇİM MENÜSÜ
+// =====================================================
+//
+// Belge gönderildikten sonra gösterilir.
+//
+// Kullanıcı tekrar belge göndermez.
+// Butona basarak aynı belgeyi seçer.
+// =====================================================
+
+async function sendBankSelection(
+chatId
+) {
+
+return telegram(
+"sendMessage",
+{
+
+chat_id:
+chatId,
+
+text:
+
+` Belge alındı.
+
+ Bankayı seç:
+
+Belgeyi tekrar göndermene gerek yok.
+Aşağıdaki butonlardan birine bas.`,
+
+reply_markup:
+
+{
+
+inline_keyboard:
+
+[
+
+[
+{
+text:
+" Akbank",
+
+callback_data:
+"bank:akbank",
+},
+
+{
+text:
+" Garanti BBVA",
+
+callback_data:
+"bank:garanti",
+},
+
+],
+
+[
+{
+text:
+" Enpara",
+
+callback_data:
+"bank:enpara",
+},
+
+{
+text:
+" VakıfBank",
+
+callback_data:
+"bank:vakifbank",
+},
+
+],
+
+[
+{
+text:
+" İş Bankası",
+
+callback_data:
+"bank:isbankasi",
+},
+
+{
+text:
+" Ziraat",
+
+callback_data:
+"bank:ziraat",
+},
+
+],
+
+[
+{
+text:
+" Denizbank",
+
+callback_data:
+"bank:denizbank",
+},
+
+{
+text:
+" Halkbank",
+
+callback_data:
+"bank:halkbank",
+},
+
+],
+
+[
+{
+text:
+" Yapı Kredi",
+
+callback_data:
+"bank:yapikredi",
+},
+
+],
+
+[
+{
+text:
+" Hesap Özeti",
+
+callback_data:
+"mode:statement",
+},
+
+],
+
+},
+
+}
+);
+
+}
+
+
+// =====================================================
+// CALLBACK CEVAPLA
+// =====================================================
+
+async function answerCallbackQuery(
+callbackQueryId,
+text = ""
+) {
+
+return telegram(
+"answerCallbackQuery",
+{
+
+callback_query_id:
+callbackQueryId,
+
+text:
+
+text,
+
+show_alert:
+false,
+
+}
+);
+
+}
+
+
+// =====================================================
 // TELEGRAM DOSYASINI İNDİR
 // =====================================================
 
@@ -204,7 +398,7 @@ fileUrl
 if (!response.ok) {
 
 throw new Error(
-"Telegram dosyası indirilemedi."
+`Telegram dosyası indirilemedi. HTTP ${response.status}`
 );
 
 }
@@ -434,7 +628,11 @@ statementMode,
 }) {
 
 console.log(
-"VERIFYDOC'A GÖNDERİLİYOR:"
+"================================"
+);
+
+console.log(
+"VERIFYDOC'A GÖNDERİLİYOR"
 );
 
 console.log(
@@ -461,6 +659,10 @@ bank ||
 console.log(
 "STATEMENT MODE:",
 statementMode
+);
+
+console.log(
+"================================"
 );
 
 
@@ -503,8 +705,10 @@ form.append(
 // =================================================
 // BANKA
 // =================================================
+//
 // Hesap özetinde banka gönderilmez.
 // Böylece referans kullanılmaz.
+// =================================================
 
 if (
 bank
@@ -526,9 +730,11 @@ const blob =
 new Blob(
 [buffer],
 {
+
 type:
 mimeType ||
 "application/octet-stream",
+
 }
 );
 
@@ -572,18 +778,76 @@ const response =
 await fetch(
 ANALYZE_URL,
 {
+
 method:
 "POST",
 
 body:
 form,
+
 }
 );
 
 
-const result =
-await response.json();
+// =================================================
+// RESPONSE'U ÖNCE TEXT OLARAK AL
+// =================================================
+// Böylece API JSON yerine:
+// "Request Entity Too Large"
+// "Request En..."
+// veya başka bir hata döndürürse
+// JSON parse hatası oluşmaz.
+// =================================================
 
+const responseText =
+await response.text();
+
+
+console.log(
+"VERIFYDOC API HTTP STATUS:",
+response.status
+);
+
+
+console.log(
+"VERIFYDOC API RESPONSE:",
+responseText.slice(
+0,
+2000
+)
+);
+
+
+// =================================================
+// RESPONSE JSON PARSE
+// =================================================
+
+let result;
+
+
+try {
+
+result =
+JSON.parse(
+responseText
+);
+
+}
+
+catch {
+
+throw new Error(
+
+`VerifyDoc API geçerli JSON döndürmedi. HTTP ${response.status}. Cevap: ${responseText.slice(0,500)}`
+
+);
+
+}
+
+
+// =================================================
+// HTTP ERROR
+// =================================================
 
 if (
 !response.ok
@@ -591,7 +855,8 @@ if (
 
 throw new Error(
 result?.error ||
-"VerifyDoc analiz API hatası."
+result?.message ||
+`VerifyDoc analiz API hatası. HTTP ${response.status}`
 );
 
 }
@@ -604,10 +869,6 @@ return result;
 
 // =====================================================
 // ANALİZ SONUCUNU TELEGRAM'A GÖNDER
-// =====================================================
-// ÖNEMLİ:
-// replyToMessageId yalnızca burada kullanılıyor.
-// Böylece sadece sonuç mesajı belgeye reply olur.
 // =====================================================
 
 async function sendAnalysisResult(
@@ -692,16 +953,20 @@ const reasons =
 Array.isArray(
 videoAnalysis?.reasons
 )
-? videoAnalysis.reasons
-: [];
+?
+videoAnalysis.reasons
+:
+[];
 
 
 const observations =
 Array.isArray(
 videoAnalysis?.observations
 )
-? videoAnalysis.observations
-: [];
+?
+videoAnalysis.observations
+:
+[];
 
 
 const recommendation =
@@ -711,7 +976,7 @@ videoAnalysis?.recommendation ||
 
 let videoText =
 
-`🎥 VERIFYDOC VİDEO ANALİZ SONUCU
+` VERIFYDOC VİDEO ANALİZ SONUCU
 
 Sonuç:
 ${verdict}
@@ -774,10 +1039,6 @@ Bu sonuç yalnızca otomatik ön inceleme sonucudur.
 Kesin gerçeklik veya sahtecilik kararı değildir.`;
 
 
-// =================================================
-// SADECE SONUÇ MESAJI REPLY
-// =================================================
-
 await sendMessage(
 chatId,
 videoText,
@@ -799,7 +1060,7 @@ statementMode
 ) {
 
 let statementEmoji =
-"🟢";
+" ";
 
 
 if (
@@ -807,7 +1068,7 @@ score >= 71
 ) {
 
 statementEmoji =
-"🔴";
+" ";
 
 }
 
@@ -816,7 +1077,7 @@ score >= 46
 ) {
 
 statementEmoji =
-"🟠";
+" ";
 
 }
 
@@ -825,7 +1086,7 @@ score >= 21
 ) {
 
 statementEmoji =
-"🟡";
+" ";
 
 }
 
@@ -852,10 +1113,6 @@ Bu sonuç yalnızca otomatik ön inceleme sonucudur.
 Kesin gerçeklik veya sahtecilik kararı değildir.`;
 
 
-// =================================================
-// SADECE SONUÇ MESAJI REPLY
-// =================================================
-
 await sendMessage(
 chatId,
 statementText,
@@ -873,7 +1130,7 @@ return;
 // =================================================
 
 let emoji =
-"🟢";
+" ";
 
 
 if (
@@ -881,7 +1138,7 @@ score >= 71
 ) {
 
 emoji =
-"🔴";
+" ";
 
 }
 
@@ -890,7 +1147,7 @@ score >= 46
 ) {
 
 emoji =
-"🟠";
+" ";
 
 }
 
@@ -899,7 +1156,7 @@ score >= 21
 ) {
 
 emoji =
-"🟡";
+" ";
 
 }
 
@@ -926,10 +1183,6 @@ Bu sonuç yalnızca otomatik ön inceleme sonucudur.
 Kesin gerçeklik veya sahtecilik kararı değildir.`;
 
 
-// =================================================
-// SADECE SONUÇ MESAJI REPLY
-// =================================================
-
 await sendMessage(
 chatId,
 text,
@@ -952,14 +1205,16 @@ const mime =
 (
 mimeType ||
 ""
-).toLowerCase();
+)
+.toLowerCase();
 
 
 const name =
 (
 fileName ||
 ""
-).toLowerCase();
+)
+.toLowerCase();
 
 
 // =================================================
@@ -1145,16 +1400,377 @@ return bank;
 
 
 // =====================================================
-// GERÇEK ANALİZ İŞLEMİ
+// CALLBACK → BEKLEYEN BELGEYİ ANALİZ ET
 // =====================================================
 
-async function processTelegramUpdate(
-update
+async function processCallbackQuery(
+callbackQuery
 ) {
 
-const message =
-update?.message;
+const chatId =
+callbackQuery
+?.message
+?.chat
+?.id;
 
+
+const callbackId =
+callbackQuery
+?.id;
+
+
+const callbackData =
+callbackQuery
+?.data;
+
+
+if (
+!chatId ||
+!callbackId ||
+!callbackData
+) {
+
+return;
+
+}
+
+
+console.log(
+"================================"
+);
+
+console.log(
+"TELEGRAM CALLBACK"
+);
+
+console.log(
+"CHAT:",
+chatId
+);
+
+console.log(
+"DATA:",
+callbackData
+);
+
+console.log(
+"================================"
+);
+
+
+// =================================================
+// TELEGRAM BUTONUNA CEVAP
+// =================================================
+
+await answerCallbackQuery(
+callbackId,
+"Seçim alındı. Analiz başlatılıyor..."
+);
+
+
+// =================================================
+// BEKLEYEN DOSYA
+// =================================================
+
+const pending =
+pendingDocuments.get(
+chatId
+);
+
+
+if (
+!pending
+) {
+
+await sendMessage(
+chatId,
+
+` Bekleyen belge bulunamadı.
+
+Lütfen belgeyi tekrar gönder.`
+
+);
+
+return;
+
+}
+
+
+// =================================================
+// HESAP ÖZETİ
+// =================================================
+
+if (
+callbackData ===
+"mode:statement"
+) {
+
+console.log(
+"HESAP ÖZETİ BUTONUNA BASILDI"
+);
+
+
+// =================================================
+// HESAP ÖZETİ VİDEO KONTROLÜ
+// =================================================
+
+if (
+pending.type ===
+"video"
+) {
+
+await sendMessage(
+chatId,
+
+` Hesap özeti analizi için video desteklenmiyor.
+
+Lütfen PDF veya fotoğraf yükle.`
+
+);
+
+return;
+
+}
+
+
+await sendMessage(
+chatId,
+
+` Hesap Özeti seçildi.
+
+ Dosya:
+${pending.fileName}
+
+ VerifyDoc hesap özeti analizini başlatıyor...`
+);
+
+
+// =================================================
+// TELEGRAM'DAN DOSYAYI İNDİR
+// =================================================
+
+const downloaded =
+await downloadTelegramFile(
+pending.fileId
+);
+
+
+// =================================================
+// VERIFYDOC
+// =================================================
+
+const result =
+await analyzeFile({
+
+buffer:
+downloaded.buffer,
+
+fileName:
+pending.fileName,
+
+mimeType:
+pending.mimeType,
+
+type:
+"statement",
+
+bank:
+null,
+
+statementMode:
+true,
+
+});
+
+
+// =================================================
+// SONUÇ
+// =================================================
+
+await sendAnalysisResult(
+chatId,
+
+result,
+
+true,
+
+pending.messageId
+);
+
+
+// =================================================
+// TEMİZLE
+// =================================================
+
+pendingDocuments.delete(
+chatId
+);
+
+selectedBanks.delete(
+chatId
+);
+
+selectedModes.delete(
+chatId
+);
+
+
+console.log(
+"BEKLEYEN HESAP ÖZETİ TEMİZLENDİ:",
+chatId
+);
+
+
+return;
+
+}
+
+
+// =================================================
+// BANKA BUTONU
+// =================================================
+
+if (
+callbackData.startsWith(
+"bank:"
+)
+) {
+
+const selectedBank =
+callbackData.replace(
+"bank:",
+""
+);
+
+
+console.log(
+"SEÇİLEN BANKA:",
+selectedBank
+);
+
+
+// =================================================
+// SEÇİMİ KAYDET
+// =================================================
+
+selectedBanks.set(
+chatId,
+selectedBank
+);
+
+selectedModes.set(
+chatId,
+"normal"
+);
+
+
+// =================================================
+// KULLANICIYA BİLGİ
+// =================================================
+
+await sendMessage(
+chatId,
+
+` ${getBankDisplayName(selectedBank)} seçildi.
+
+ Dosya:
+${pending.fileName}
+
+ VerifyDoc analiz başlatıyor...`
+);
+
+
+// =================================================
+// TELEGRAM'DAN DOSYAYI İNDİR
+// =================================================
+
+const downloaded =
+await downloadTelegramFile(
+pending.fileId
+);
+
+
+// =================================================
+// VERIFYDOC
+// =================================================
+
+const result =
+await analyzeFile({
+
+buffer:
+downloaded.buffer,
+
+fileName:
+pending.fileName,
+
+mimeType:
+pending.mimeType,
+
+type:
+pending.type,
+
+bank:
+selectedBank,
+
+statementMode:
+false,
+
+});
+
+
+// =================================================
+// SONUÇ → İLK BELGEYE REPLY
+// =================================================
+
+await sendAnalysisResult(
+chatId,
+
+result,
+
+false,
+
+pending.messageId
+);
+
+
+// =================================================
+// TEMİZLE
+// =================================================
+
+pendingDocuments.delete(
+chatId
+);
+
+selectedBanks.delete(
+chatId
+);
+
+selectedModes.delete(
+chatId
+);
+
+
+console.log(
+"BEKLEYEN BELGE TEMİZLENDİ:",
+chatId
+);
+
+
+return;
+
+}
+
+
+}
+
+
+// =====================================================
+// GERÇEK MESAJ İŞLEMİ
+// =====================================================
+
+async function processTelegramMessage(
+message
+) {
 
 if (
 !message
@@ -1181,8 +1797,6 @@ return;
 // =================================================
 // ORİJİNAL TELEGRAM MESAJ ID
 // =================================================
-// Kullanıcının gönderdiği belge mesajının ID'si.
-// Analiz sonucu buna reply olarak gönderilecek.
 
 const messageId =
 message?.message_id;
@@ -1215,35 +1829,33 @@ message.text.startsWith(
 await sendMessage(
 chatId,
 
-`🤖 VerifyDoc'a hoş geldin.
+` VerifyDoc'a hoş geldin.
 
 Dekont, hesap özeti veya belge göndererek otomatik inceleme yaptırabilirsin.
 
-Banka seçimi:
+Artık belgeyi önce gönderebilirsin.
+Belgeyi gönderdikten sonra banka seçim butonları çıkacaktır.
 
-/akbank
-/garanti
-/enpara
-/vakifbank
-/isbankasi
-/ziraat
-/denizbank
-/halkbank
-/yapikredi
+Banka seç:
 
-Hesap özeti analizi:
+ Akbank
+ Garanti BBVA
+ Enpara
+ VakıfBank
+ İş Bankası
+ Ziraat
+ Denizbank
+ Halkbank
+ Yapı Kredi
 
-/hesapozeti
+Ayrıca:
 
-Hesap özeti seçildiğinde banka seçmene gerek yoktur.
+ Hesap Özeti
 
-Ardından belgeyi gönder.
+seçeneği bulunur.
 
-İstersen belge açıklamasına da banka adını yazabilirsin.
+Belgeyi tekrar yüklemen gerekmez.`
 
-Örneğin:
-
-İş Bankası dekontu`
 );
 
 return;
@@ -1252,7 +1864,11 @@ return;
 
 
 // =================================================
-// HESAP ÖZETİ
+// ESKİ KOMUTLAR
+// =================================================
+// İstersen hâlâ kullanılabilir.
+// Ancak yeni sistemde belge gönderildikten sonra
+// butonlarla seçim yapmak daha kolaydır.
 // =================================================
 
 if (
@@ -1266,8 +1882,6 @@ chatId,
 );
 
 
-// Önceden seçilmiş bankayı temizle.
-
 selectedBanks.delete(
 chatId
 );
@@ -1276,28 +1890,16 @@ chatId
 await sendMessage(
 chatId,
 
-`📊 HESAP ÖZETİ ANALİZİ SEÇİLDİ.
+` Hesap Özeti modu seçildi.
 
-Banka seçmene gerek yok.
+Şimdi PDF veya fotoğraf gönder.`
 
-Şimdi hesap özetini:
-
-• PDF
-• Fotoğraf
-
-olarak gönder.
-
-Referans dekont kullanılmadan analiz edilecek.`
 );
 
 return;
 
 }
 
-
-// =================================================
-// AKBANK
-// =================================================
 
 if (
 message?.text ===
@@ -1317,17 +1919,13 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 Akbank seçildi.\n\nŞimdi Akbank dekontunu gönder."
+" Akbank seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
 
 }
 
-
-// =================================================
-// GARANTİ
-// =================================================
 
 if (
 message?.text ===
@@ -1347,17 +1945,13 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 Garanti BBVA seçildi.\n\nŞimdi Garanti dekontunu gönder."
+" Garanti BBVA seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
 
 }
 
-
-// =================================================
-// ENPARA
-// =================================================
 
 if (
 message?.text ===
@@ -1377,17 +1971,13 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 Enpara seçildi.\n\nŞimdi Enpara dekontunu gönder."
+" Enpara seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
 
 }
 
-
-// =================================================
-// VAKIFBANK
-// =================================================
 
 if (
 message?.text ===
@@ -1407,17 +1997,13 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 VakıfBank seçildi.\n\nŞimdi VakıfBank dekontunu gönder."
+" VakıfBank seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
 
 }
 
-
-// =================================================
-// İŞ BANKASI
-// =================================================
 
 if (
 message?.text ===
@@ -1437,17 +2023,13 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 İş Bankası seçildi.\n\nŞimdi İş Bankası dekontunu gönder."
+" İş Bankası seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
 
 }
 
-
-// =================================================
-// ZİRAAT
-// =================================================
 
 if (
 message?.text ===
@@ -1467,17 +2049,13 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 Ziraat Bankası seçildi.\n\nŞimdi Ziraat Bankası dekontunu gönder."
+" Ziraat Bankası seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
 
 }
 
-
-// =================================================
-// DENİZBANK
-// =================================================
 
 if (
 message?.text ===
@@ -1497,17 +2075,13 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 Denizbank seçildi.\n\nŞimdi Denizbank dekontunu gönder."
+" Denizbank seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
 
 }
 
-
-// =================================================
-// HALKBANK
-// =================================================
 
 if (
 message?.text ===
@@ -1527,17 +2101,13 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 Halkbank seçildi.\n\nŞimdi Halkbank dekontunu gönder."
+" Halkbank seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
 
 }
 
-
-// =================================================
-// YAPI KREDİ
-// =================================================
 
 if (
 message?.text ===
@@ -1557,7 +2127,7 @@ chatId,
 
 await sendMessage(
 chatId,
-"🏦 Yapı Kredi seçildi.\n\nŞimdi Yapı Kredi dekontunu gönder."
+" Yapı Kredi seçildi.\n\nŞimdi dekontu gönder."
 );
 
 return;
@@ -1594,7 +2164,7 @@ if (
 await sendMessage(
 chatId,
 
-`📄 Lütfen analiz etmek istediğin belgeyi gönder.
+` Lütfen analiz etmek istediğin belgeyi gönder.
 
 Desteklenen:
 
@@ -1602,21 +2172,10 @@ Desteklenen:
 • Fotoğraf
 • Video
 
-Normal dekont için önce banka seç:
+Belgeyi gönderdikten sonra banka seçme butonları otomatik çıkacaktır.
 
-/akbank
-/garanti
-/enpara
-/vakifbank
-/isbankasi
-/ziraat
-/denizbank
-/halkbank
-/yapikredi
+ Hesap Özeti butonu da aynı menüde bulunur.`
 
-Hesap özeti için:
-
-/hesapozeti`
 );
 
 return;
@@ -1641,6 +2200,12 @@ selectedMode ===
 
 // =================================================
 // BANKA
+// =================================================
+//
+// Eski komut sistemi kullanıldıysa banka burada
+// alınabilir.
+//
+// Yeni sistemde normalde banka henüz yoktur.
 // =================================================
 
 let bank =
@@ -1692,53 +2257,20 @@ bank ||
 
 
 // =================================================
-// NORMAL MODDA BANKA YOKSA
-// =================================================
-
-if (
-!statementMode &&
-!bank
-) {
-
-await sendMessage(
-chatId,
-
-`🏦 Bankayı belirtmem gerekiyor.
-
-Önce bir banka seç:
-
-/akbank
-/garanti
-/enpara
-/vakifbank
-/isbankasi
-/ziraat
-/denizbank
-/halkbank
-/yapikredi
-
-ve ardından belgeyi gönder.
-
-İstersen belge açıklamasına da banka adını yazabilirsin.`
-);
-
-return;
-
-}
-
-
-// =================================================
 // DOSYA BİLGİLERİ
 // =================================================
 
 let fileId =
 null;
 
+
 let fileName =
 null;
 
+
 let mimeType =
 null;
+
 
 let type =
 null;
@@ -1764,8 +2296,10 @@ photo.file_id;
 
 fileName =
 statementMode
-? "telegram-hesap-ozeti.jpg"
-: "telegram-photo.jpg";
+?
+"telegram-hesap-ozeti.jpg"
+:
+"telegram-photo.jpg";
 
 
 mimeType =
@@ -1786,8 +2320,6 @@ else if (
 hasVideo
 ) {
 
-// Hesap özeti için video kabul etmiyoruz.
-
 if (
 statementMode
 ) {
@@ -1795,9 +2327,10 @@ statementMode
 await sendMessage(
 chatId,
 
-`❌ Hesap özeti analizi için video desteklenmiyor.
+` Hesap özeti analizi için video desteklenmiyor.
 
 Lütfen hesap özetini PDF veya fotoğraf olarak gönder.`
+
 );
 
 return;
@@ -1864,19 +2397,19 @@ throw new Error(
 }
 
 
-// Hesap özeti için yalnızca PDF veya görsel.
-
 if (
 statementMode &&
-type === "video"
+type ===
+"video"
 ) {
 
 await sendMessage(
 chatId,
 
-`❌ Hesap özeti analizi için video desteklenmiyor.
+` Hesap özeti analizi için video desteklenmiyor.
 
 Lütfen hesap özetini PDF veya fotoğraf olarak gönder.`
+
 );
 
 return;
@@ -1931,46 +2464,39 @@ console.log(
 
 
 // =================================================
-// ANALİZ BAŞLADI
+// ESKİDEN BANKA SEÇİLMİŞSE
 // =================================================
-// BU MESAJ REPLY DEĞİL.
-// Sadece sonuç mesajı reply olacak.
+//
+// /akbank gibi eski komut kullanılmışsa,
+// doğrudan analiz yapılabilir.
+//
+// Yeni sistemde banka seçilmemişse
+// aşağıdaki menü gösterilir.
+// =================================================
 
 if (
-statementMode
+!statementMode &&
+bank
 ) {
 
 await sendMessage(
 chatId,
 
-`📊 Hesap özeti alındı.
+` Belge alındı.
 
-📁 Dosya türü: ${type}
+ Banka:
+${getBankDisplayName(bank)}
 
-⏳ VerifyDoc hesap özeti analizini başlatıyor...`
+ Dosya türü:
+${type}
+
+ VerifyDoc analiz başlatıyor...`
+
 );
-
-}
-
-else {
-
-await sendMessage(
-chatId,
-
-`🔎 Belge alındı.
-
-🏦 Banka: ${getBankDisplayName(bank)}
-
-📁 Dosya türü: ${type}
-
-⏳ VerifyDoc analiz başlatıyor...`
-);
-
-}
 
 
 // =================================================
-// TELEGRAM'DAN İNDİR
+// DOSYAYI İNDİR
 // =================================================
 
 const downloaded =
@@ -1980,7 +2506,7 @@ fileId
 
 
 // =================================================
-// VERIFYDOC ANALİZİ
+// ANALİZ
 // =================================================
 
 const result =
@@ -1993,17 +2519,12 @@ fileName,
 
 mimeType,
 
-type:
-statementMode
-? "statement"
-: type,
+type,
 
-bank:
-statementMode
-? null
-: bank,
+bank,
 
-statementMode,
+statementMode:
+false,
 
 });
 
@@ -2011,26 +2532,20 @@ statementMode,
 // =================================================
 // SONUÇ
 // =================================================
-// ÇOK ÖNEMLİ:
-// Orijinal belge mesajının ID'si burada gönderiliyor.
-
-console.log(
-"ANALİZ SONUCU REPLY MESSAGE ID:",
-messageId
-);
-
 
 await sendAnalysisResult(
 chatId,
+
 result,
-statementMode,
+
+false,
+
 messageId
 );
 
 
 // =================================================
-// BAŞARILI ANALİZDEN SONRA
-// SEÇİMLERİ TEMİZLE
+// TEMİZLE
 // =================================================
 
 selectedBanks.delete(
@@ -2041,9 +2556,171 @@ selectedModes.delete(
 chatId
 );
 
+return;
+
+}
+
+
+// =================================================
+// HESAP ÖZETİ KOMUTU İLE GELDİYSE
+// =================================================
+
+if (
+statementMode
+) {
+
+await sendMessage(
+chatId,
+
+` Hesap özeti alındı.
+
+ Dosya türü:
+${type}
+
+ VerifyDoc hesap özeti analizini başlatıyor...`
+
+);
+
+
+const downloaded =
+await downloadTelegramFile(
+fileId
+);
+
+
+const result =
+await analyzeFile({
+
+buffer:
+downloaded.buffer,
+
+fileName,
+
+mimeType,
+
+type:
+"statement",
+
+bank:
+null,
+
+statementMode:
+true,
+
+});
+
+
+await sendAnalysisResult(
+chatId,
+
+result,
+
+true,
+
+messageId
+);
+
+
+selectedBanks.delete(
+chatId
+);
+
+selectedModes.delete(
+chatId
+);
+
+return;
+
+}
+
+
+// =====================================================
+// YENİ SİSTEM
+// =====================================================
+//
+// Buraya geldiysek:
+// belge geldi,
+// banka henüz seçilmedi.
+//
+// Belgeyi pending olarak sakla.
+// Sonra banka butonlarını göster.
+//
+// TEKRAR BELGE İSTENMEZ.
+// =====================================================
+
+pendingDocuments.set(
+chatId,
+
+{
+
+fileId,
+
+fileName,
+
+mimeType,
+
+type,
+
+messageId,
+
+createdAt:
+Date.now(),
+
+}
+);
+
 
 console.log(
-"SEÇİMLER TEMİZLENDİ:",
+"================================"
+);
+
+console.log(
+"BEKLEYEN BELGE KAYDEDİLDİ"
+);
+
+console.log(
+"CHAT:",
+chatId
+);
+
+console.log(
+"FILE:",
+fileName
+);
+
+console.log(
+"TYPE:",
+type
+);
+
+console.log(
+"MESSAGE ID:",
+messageId
+);
+
+console.log(
+"================================"
+);
+
+
+// =================================================
+// BANKA SEÇİM MENÜSÜ
+// =================================================
+
+await sendBankSelection(
+chatId
+);
+
+
+// =================================================
+// ÖNCEKİ SEÇİMLERİ TEMİZLE
+// =================================================
+
+selectedBanks.delete(
+chatId
+);
+
+selectedModes.delete(
 chatId
 );
 
@@ -2059,12 +2736,14 @@ req,
 res
 ) {
 
+
 // =================================================
 // GET
 // =================================================
 
 if (
-req.method !== "POST"
+req.method !==
+"POST"
 ) {
 
 return res
@@ -2133,11 +2812,13 @@ updateId
 return res
 .status(200)
 .json({
+
 ok:
 true,
 
 duplicate:
 true,
+
 });
 
 }
@@ -2148,8 +2829,9 @@ updateId
 );
 
 
-// Set'in sonsuza kadar büyümemesi için
-// yaklaşık 10 dakika sonra temizle.
+// =================================================
+// UPDATE ID TEMİZLE
+// =================================================
 
 setTimeout(
 () => {
@@ -2166,13 +2848,104 @@ updateId
 
 
 // =================================================
-// ANALİZİ ARKA PLANDA ÇALIŞTIR
+// CALLBACK QUERY Mİ?
+// =================================================
+//
+// Butona basıldığında Telegram update içinde
+// callback_query gelir.
 // =================================================
 
+if (
+update?.callback_query
+) {
+
 waitUntil(
-processTelegramUpdate(
-update
+
+processCallbackQuery(
+update.callback_query
 )
+
+.catch(
+async (error) => {
+
+console.error(
+"CALLBACK PROCESS ERROR:",
+error
+);
+
+
+try {
+
+const callbackChatId =
+update
+?.callback_query
+?.message
+?.chat
+?.id;
+
+
+if (
+callbackChatId
+) {
+
+await sendMessage(
+callbackChatId,
+
+` Analiz sırasında hata oluştu.
+
+Hata:
+${error?.message || "Bilinmeyen hata"}`
+
+);
+
+}
+
+}
+
+catch (
+telegramError
+) {
+
+console.error(
+"CALLBACK ERROR MESSAGE FAILED:",
+telegramError
+);
+
+}
+
+}
+
+)
+
+);
+
+
+return res
+.status(200)
+.json({
+
+ok:
+true,
+
+});
+
+}
+
+
+// =================================================
+// NORMAL MESAJ
+// =================================================
+
+if (
+update?.message
+) {
+
+waitUntil(
+
+processTelegramMessage(
+update.message
+)
+
 .catch(
 async (error) => {
 
@@ -2195,16 +2968,14 @@ if (
 chatId
 ) {
 
-// HATA MESAJI REPLY DEĞİL.
-// Yalnızca başarılı analiz sonucu reply edilir.
-
 await sendMessage(
 chatId,
 
-`❌ Analiz sırasında hata oluştu.
+` Analiz sırasında hata oluştu.
 
 Hata:
 ${error?.message || "Bilinmeyen hata"}`
+
 );
 
 }
@@ -2223,13 +2994,13 @@ telegramError
 }
 
 }
+
 )
+
 );
 
+}
 
-// =================================================
-// TELEGRAM'A HEMEN 200
-// =================================================
 
 return res
 .status(200)
@@ -2239,7 +3010,6 @@ ok:
 true,
 
 });
-
 
 }
 
