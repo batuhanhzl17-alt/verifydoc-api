@@ -394,6 +394,426 @@ false,
 
 
 // =====================================================
+// VERIFYDOC DETERMINISTIK RISK MOTORU
+// =====================================================
+
+const RISK_CATEGORY_WEIGHTS = {
+
+visualRisk: 0.15,
+
+textRisk: 0.15,
+
+layoutRisk: 0.15,
+
+financialDataRisk: 0.25,
+
+editingRisk: 0.30,
+
+};
+
+
+// -----------------------------------------------------
+// 25 KONTROLÜ KATEGORİLERE DAĞIT
+// -----------------------------------------------------
+
+const RISK_CHECK_MAP = {
+
+visualRisk: {
+
+compressionArtifacts: 1.0,
+
+aiGeneratedIndicators: 1.0,
+
+logoConsistency: 1.0,
+
+stampConsistency: 0.8,
+
+signatureConsistency: 0.8,
+
+imageQuality: 0.7,
+
+},
+
+textRisk: {
+
+ocrConsistency: 1.0,
+
+fontConsistency: 1.0,
+
+fontSizeConsistency: 0.9,
+
+characterSpacing: 0.8,
+
+lineSpacing: 0.7,
+
+textAlignment: 0.7,
+
+baselineConsistency: 0.8,
+
+dateConsistency: 0.8,
+
+currencyFormatting: 0.8,
+
+ibanFormatting: 0.8,
+
+swiftFormatting: 0.7,
+
+},
+
+layoutRisk: {
+
+textAlignment: 0.8,
+
+baselineConsistency: 0.7,
+
+logoConsistency: 0.8,
+
+qrBarcodeConsistency: 0.7,
+
+layoutIntegrity: 1.0,
+
+documentTypeConsistency: 0.9,
+
+},
+
+financialDataRisk: {
+
+dateConsistency: 0.8,
+
+amountConsistency: 1.0,
+
+currencyFormatting: 0.8,
+
+ibanFormatting: 0.8,
+
+swiftFormatting: 0.7,
+
+qrBarcodeConsistency: 0.5,
+
+suspiciousElements: 0.8,
+
+},
+
+editingRisk: {
+
+copyPasteRegions: 1.0,
+
+editingTraces: 1.0,
+
+photoshopArtifacts: 1.0,
+
+aiGeneratedIndicators: 0.8,
+
+suspiciousElements: 1.0,
+
+fontConsistency: 0.6,
+
+fontSizeConsistency: 0.5,
+
+characterSpacing: 0.5,
+
+baselineConsistency: 0.5,
+
+},
+
+};
+
+
+// =====================================================
+// KATEGORİ SKORU HESAPLA
+// =====================================================
+
+function calculateCategoryRisk(
+checks,
+mapping
+) {
+
+if (
+!checks ||
+typeof checks !== "object"
+) {
+
+return 0;
+
+}
+
+let weightedTotal = 0;
+
+let totalWeight = 0;
+
+for (
+const [
+checkName,
+weight
+]
+of Object.entries(mapping)
+) {
+
+const check =
+checks?.[checkName];
+
+if (
+!check ||
+typeof check !== "object"
+) {
+
+continue;
+
+}
+
+
+// UNKNOWN → RİSK EKLEME
+
+if (
+check.status === "unknown"
+) {
+
+continue;
+
+}
+
+
+const score =
+Number(check.score);
+
+
+if (
+!Number.isFinite(score)
+) {
+
+continue;
+
+}
+
+
+const safeScore =
+Math.max(
+0,
+Math.min(
+100,
+score
+)
+);
+
+
+weightedTotal +=
+safeScore * weight;
+
+totalWeight +=
+weight;
+
+}
+
+
+if (
+totalWeight === 0
+) {
+
+return 0;
+
+}
+
+
+return Math.round(
+weightedTotal /
+totalWeight
+);
+
+}
+
+
+// =====================================================
+// RİSK ETİKETİ
+// =====================================================
+
+function getRiskLabel(
+score
+) {
+
+if (
+score <= 20
+) {
+
+return "LOW RISK";
+
+}
+
+if (
+score <= 45
+) {
+
+return "MODERATE RISK";
+
+}
+
+if (
+score <= 70
+) {
+
+return "HIGH RISK";
+
+}
+
+return "VERY HIGH RISK";
+
+}
+
+
+// =====================================================
+// NİHAİ RİSK HESAPLA
+// =====================================================
+
+function calculateOverallRisk(
+result
+) {
+
+const checks =
+result?.checks ||
+{};
+
+
+// -----------------------------------------------------
+// KATEGORİLERİ 25 KONTROLDEN HESAPLA
+// -----------------------------------------------------
+
+const calculatedCategories = {
+
+visualRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.visualRisk
+),
+
+textRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.textRisk
+),
+
+layoutRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.layoutRisk
+),
+
+financialDataRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.financialDataRisk
+),
+
+editingRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.editingRisk
+),
+
+};
+
+
+// -----------------------------------------------------
+// AĞIRLIKLI ANA SKOR
+// -----------------------------------------------------
+
+let score =
+
+calculatedCategories.visualRisk *
+RISK_CATEGORY_WEIGHTS.visualRisk
+
++
+
+calculatedCategories.textRisk *
+RISK_CATEGORY_WEIGHTS.textRisk
+
++
+
+calculatedCategories.layoutRisk *
+RISK_CATEGORY_WEIGHTS.layoutRisk
+
++
+
+calculatedCategories.financialDataRisk *
+RISK_CATEGORY_WEIGHTS.financialDataRisk
+
++
+
+calculatedCategories.editingRisk *
+RISK_CATEGORY_WEIGHTS.editingRisk;
+
+
+// -----------------------------------------------------
+// MATEMATİKSEL TUTARSIZLIK BONUSU
+// -----------------------------------------------------
+//
+// Yeterli veri varsa ve matematik tutmuyorsa
+// finansal riski ayrıca artır.
+// -----------------------------------------------------
+
+const amountAnalysis =
+result?.amountAnalysis;
+
+
+if (
+amountAnalysis &&
+amountAnalysis.calculationConsistent === false &&
+amountAnalysis.calculatedTotal !== null &&
+amountAnalysis.totalAmount !== null
+) {
+
+const difference =
+Number(
+amountAnalysis.difference
+);
+
+if (
+Number.isFinite(difference) &&
+Math.abs(difference) > 0.01
+) {
+
+score += 10;
+
+}
+
+}
+
+
+// -----------------------------------------------------
+// SKORU 0-100 ARASINDA TUT
+// -----------------------------------------------------
+
+score =
+Math.round(
+Math.max(
+0,
+Math.min(
+100,
+score
+)
+)
+);
+
+
+// -----------------------------------------------------
+// YENİ KATEGORİLERİ DÖNDÜR
+// -----------------------------------------------------
+
+return {
+
+overallRisk:
+score,
+
+riskLabel:
+getRiskLabel(score),
+
+categories:
+calculatedCategories,
+
+};
+
+}
+
+
+// =====================================================
 // NORMAL DEKONT RESPONSE SCHEMA
 // =====================================================
 
@@ -3831,6 +4251,28 @@ parseAIResponse(
 response.output_text
 );
 
+
+// =====================================================
+// DETERMINISTIK RİSK MOTORU
+// =====================================================
+
+const calculatedRisk =
+calculateOverallRisk(
+result
+);
+
+
+// AI'ın overallRisk değerini kullanma.
+// Nihai skor JavaScript risk motorundan gelir.
+
+result.overallRisk =
+calculatedRisk.overallRisk;
+
+result.riskLabel =
+calculatedRisk.riskLabel;
+
+result.categories =
+calculatedRisk.categories;  
 
 // =====================================================
 // ANA SKOR
