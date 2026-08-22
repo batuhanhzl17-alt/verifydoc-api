@@ -706,9 +706,9 @@ function extractExpectedDetails(
  // ===================================================
 
  const ibanMatch =
- normalized.match(
- /\b([A-Z]{2}\s?\d{2}(?:\s?\d{4}){4,7})\b/i
- );
+normalized.match(
+/\b([A-Z]{2}\s?\d{2}(?:\s?\d{4}){5}\s?\d{2})\b/i
+);
 
  if (
  ibanMatch?.[1]
