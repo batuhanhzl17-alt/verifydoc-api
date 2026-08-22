@@ -4669,6 +4669,62 @@ Kurallar:
   karşılaştırılacaktır.
 - Bu karşılaştırma risk skoruna dahil edilmeyecektir.
 
+REFERANS ŞABLONUNU ALAN KONUMU İÇİN KULLAN:
+
+Referans dekont, analiz edilen dekonttaki alanların hangi bölümde
+ve hangi etiket altında bulunabileceğini belirlemek için kullanılır.
+
+ÖNEMLİ:
+Referans dekonttaki isim, IBAN, tutar, tarih veya diğer değerleri
+analiz edilen dekonta aktarma veya kopyalama.
+
+Referans sadece:
+- alanın konumunu
+- alanın etiketini
+- alanın bankaya özgü gösterim biçimini
+- alanların birbirleriyle olan ilişkisini
+belirlemek için kullanılmalıdır.
+
+Analiz edilen dekonttaki gerçek değerleri yalnızca analiz edilen
+dekont üzerinden çıkar.
+
+Özellikle aşağıdaki alanları bankanın referans şablonuna göre
+konumlandır ve doğru etikete bağla:
+
+- senderName
+- recipientName
+- iban
+- recipientIban
+- amount
+- currency
+- transactionDate
+- transactionNumber
+- referenceNumber
+
+Örneğin referans dekontta "Alıcı", "Alıcı Adı", "Alıcı Hesap",
+"Alacaklı" gibi bir alan bulunuyorsa, analiz edilen dekontta
+aynı bankanın aynı veya eşdeğer etiketinin bulunduğu bölgeyi
+öncelikli olarak değerlendir.
+
+Açıklama/metin içerisinde geçen bir isim, açıkça gönderen veya
+alıcı alanı olarak etiketlenmemişse senderName veya recipientName
+olarak kabul edilmemelidir.
+
+Bir değer birden fazla yerde görünüyorsa, bankanın referans
+şablonundaki alan konumuna ve etiketine en yakın olan değer
+öncelikli kabul edilmelidir.
+
+REFERANS VE GERÇEK DEKONT AYRIMI:
+
+1. Referans PDF = alanların yerini ve banka formatını öğrenmek için.
+2. Analiz edilen dekont = gerçek değerleri çıkarmak için.
+3. Kullanıcı tarafından verilen bilgiler = çıkarılan gerçek
+ değerlerle karşılaştırmak için.
+4. Bu üç kaynaktaki bilgiler birbirine karıştırılmamalıdır.
+
+Bir alan analiz edilen dekontta güvenilir şekilde bulunamıyorsa
+tahmin etme. null döndür.
+
 Filename:
 ${fileName}`,
 
