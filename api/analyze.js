@@ -3766,7 +3766,7 @@ provided.iban
 
 const actual =
 normalizeIBAN(
-document.iban
+document.recipientIban
 );
 
 matches.iban =
@@ -3779,7 +3779,7 @@ expected !== actual
 ) {
 
 warnings.push(
-`IBAN uyuşmuyor. Beklenen: "${provided.iban}", dekontta görülen: "${document.iban}".`
+`IBAN uyuşmuyor. Beklenen: "${provided.iban}", dekontta görülen: "${document.recipientIban}".`
 );
 
 }
