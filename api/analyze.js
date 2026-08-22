@@ -1990,6 +1990,10 @@ await openai.responses.create({
 model:
 "gpt-5-mini",
 
+reasoning: {
+  effort: "low",
+ }, 
+
 input: [
 
 {
