@@ -910,6 +910,11 @@ type:
 ["string", "null"],
 },
 
+recipientIban: {
+type:
+["string", "null"],
+},
+
 amount: {
 type:
 ["string", "null"],
