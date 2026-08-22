@@ -11,7 +11,7 @@ const execFileAsync = promisify(execFile);
 
 
 // =====================================================
-// REFERANS KLAS�R�
+// REFERANS KLASÖRÜ
 // =====================================================
 
 const REFERENCE_DIR =
@@ -19,7 +19,7 @@ path.join(process.cwd(), "references");
 
 
 // =====================================================
-// BANKA ? REFERANS PDF MAP
+// BANKA → REFERANS PDF MAP
 // =====================================================
 
 const REFERENCE_MAP = {
@@ -35,7 +35,7 @@ yapikredi: "yapikredi.pdf",
 
 
 // =====================================================
-// BANKA NORMAL?ZASYONU
+// BANKA NORMALİZASYONU
 // =====================================================
 
 function normalizeBank(bank) {
@@ -52,18 +52,18 @@ bank
 .toLowerCase()
 .trim()
 .replace(/\s+/g, "")
-.replace(/?/g, "i")
-.replace(/?/g, "i")
-.replace(/?/g, "s")
-.replace(/?/g, "s")
-.replace(/?/g, "g")
-.replace(/?/g, "g")
-.replace(/�/g, "u")
-.replace(/�/g, "u")
-.replace(/�/g, "o")
-.replace(/�/g, "o")
-.replace(/�/g, "c")
-.replace(/�/g, "c");
+.replace(/ı/g, "i")
+.replace(/İ/g, "i")
+.replace(/ş/g, "s")
+.replace(/Ş/g, "s")
+.replace(/ğ/g, "g")
+.replace(/Ğ/g, "g")
+.replace(/ü/g, "u")
+.replace(/Ü/g, "u")
+.replace(/ö/g, "o")
+.replace(/Ö/g, "o")
+.replace(/ç/g, "c")
+.replace(/Ç/g, "c");
 
 
 if (
@@ -214,7 +214,7 @@ if (
 ) {
 
 console.log(
-"REFERENCE DOSYASI BO?:",
+"REFERENCE DOSYASI BOŞ:",
 referencePath
 );
 
@@ -413,7 +413,7 @@ editingRisk: 0.30,
 
 
 // -----------------------------------------------------
-// 25 KONTROL� KATEGOR?LERE DA?IT
+// 25 KONTROLÜ KATEGORİLERE DAĞIT
 // -----------------------------------------------------
 
 const RISK_CHECK_MAP = {
@@ -520,7 +520,7 @@ baselineConsistency: 0.5,
 
 
 // =====================================================
-// KATEGOR? SKORU HESAPLA
+// KATEGORİ SKORU HESAPLA
 // =====================================================
 
 function calculateCategoryRisk(
@@ -562,7 +562,7 @@ continue;
 }
 
 
-// UNKNOWN ? R?SK EKLEME
+// UNKNOWN → RİSK EKLEME
 
 if (
 check.status === "unknown"
@@ -623,7 +623,7 @@ totalWeight
 
 
 // =====================================================
-// R?SK ET?KET?
+// RİSK ETİKETİ
 // =====================================================
 
 function getRiskLabel(
@@ -660,7 +660,7 @@ return "VERY HIGH RISK";
 
 
 // =====================================================
-// N?HA? R?SK HESAPLA
+// NİHAİ RİSK HESAPLA
 // =====================================================
 
 function calculateOverallRisk(
@@ -673,7 +673,7 @@ result?.checks ||
 
 
 // -----------------------------------------------------
-// KATEGOR?LER? 25 KONTROLDEN HESAPLA
+// KATEGORİLERİ 25 KONTROLDEN HESAPLA
 // -----------------------------------------------------
 
 const calculatedCategories = {
@@ -712,7 +712,7 @@ RISK_CHECK_MAP.editingRisk
 
 
 // -----------------------------------------------------
-// A?IRLIKLI ANA SKOR
+// AĞIRLIKLI ANA SKOR
 // -----------------------------------------------------
 
 let score =
@@ -742,11 +742,11 @@ RISK_CATEGORY_WEIGHTS.editingRisk;
 
 
 // -----------------------------------------------------
-// MATEMAT?KSEL TUTARSIZLIK BONUSU
+// MATEMATİKSEL TUTARSIZLIK BONUSU
 // -----------------------------------------------------
 //
 // Yeterli veri varsa ve matematik tutmuyorsa
-// finansal riski ayr?ca art?r.
+// finansal riski ayrıca artır.
 // -----------------------------------------------------
 
 const amountAnalysis =
@@ -794,7 +794,7 @@ score
 
 
 // -----------------------------------------------------
-// YEN? KATEGOR?LER? D�ND�R
+// YENİ KATEGORİLERİ DÖNDÜR
 // -----------------------------------------------------
 
 return {
@@ -812,305 +812,6 @@ calculatedCategories,
 
 }
 
-
-// =====================================================
-// KULLANICI TARAFINDAN VERİLEN DEKONT BİLGİLERİ
-// =====================================================
-
-function normalizeComparisonText(value) {
-
-if (
-value === null ||
-value === undefined
-) {
-return "";
-}
-
-return String(value)
-.toLocaleLowerCase("tr-TR")
-.trim()
-.replace(/\s+/g, " ");
-}
-
-function normalizeName(value) {
-
-return normalizeComparisonText(value)
-.replace(/[^\p{L}\p{N} ]/gu, "")
-.replace(/\s+/g, " ")
-.trim();
-}
-
-function normalizeIban(value) {
-
-return String(value || "")
-.toUpperCase()
-.replace(/[^A-Z0-9]/g, "");
-}
-
-function normalizeAmount(value) {
-
-if (
-value === null ||
-value === undefined ||
-value === ""
-) {
-return null;
-}
-
-const raw = String(value)
-.trim()
-.replace(/₺/g, "")
-.replace(/TL/gi, "")
-.replace(/TRY/gi, "")
-.replace(/\s/g, "");
-
-if (!raw) {
-return null;
-}
-
-let normalized = raw;
-
-// Türkçe sayı biçimi: 1.234,56
-if (
-normalized.includes(",") &&
-normalized.includes(".")
-) {
-normalized = normalized
-.replace(/\./g, "")
-.replace(",", ".");
-}
-else if (
-normalized.includes(",")
-) {
-normalized = normalized.replace(",", ".");
-}
-else if (
-/^\d{1,3}(\.\d{3})+$/.test(normalized)
-) {
-normalized = normalized.replace(/\./g, "");
-}
-
-const number = Number(normalized);
-
-return Number.isFinite(number)
-? number
-: null;
-}
-
-function parseUserProvidedInfo(value) {
-
-if (
-!value ||
-typeof value !== "string"
-) {
-return {
-senderName: null,
-recipientName: null,
-amount: null,
-iban: null,
-};
-}
-
-const result = {
-senderName: null,
-recipientName: null,
-amount: null,
-iban: null,
-};
-
-const lines = value
-.split(/\r?\n/)
-.map((line) => line.trim())
-.filter(Boolean);
-
-for (const line of lines) {
-
-const match = line.match(
-/^\s*(gönderen|gonderen|alıcı|alici|tutar|miktar|iban)\s*[:=-]\s*(.+?)\s*$/iu
-);
-
-if (!match) {
-continue;
-}
-
-const key = match[1]
-.toLocaleLowerCase("tr-TR");
-const val = match[2].trim();
-
-if (key === "gönderen" || key === "gonderen") {
-result.senderName = val;
-}
-else if (key === "alıcı" || key === "alici") {
-result.recipientName = val;
-}
-else if (key === "tutar" || key === "miktar") {
-result.amount = val;
-}
-else if (key === "iban") {
-result.iban = val;
-}
-}
-
-return result;
-}
-
-function compareProvidedInfoWithDocument(
-provided,
-documentInfo
-) {
-
-const warnings = [];
-
-const comparison = {
-
-available: false,
-
-sender: {
-provided: provided?.senderName || null,
-document: documentInfo?.senderName || null,
-status: "unknown",
-},
-
-recipient: {
-provided: provided?.recipientName || null,
-document: documentInfo?.recipientName || null,
-status: "unknown",
-},
-
-amount: {
-provided: provided?.amount || null,
-document: documentInfo?.amount || null,
-status: "unknown",
-},
-
-iban: {
-provided: provided?.iban || null,
-document: documentInfo?.iban || null,
-status: "unknown",
-},
-
-warnings,
-};
-
-const hasProvided =
-Boolean(
-provided?.senderName ||
-provided?.recipientName ||
-provided?.amount ||
-provided?.iban
-);
-
-comparison.available = hasProvided;
-
-if (!hasProvided) {
-return comparison;
-}
-
-if (provided?.senderName) {
-
-if (!documentInfo?.senderName) {
-comparison.sender.status = "unknown";
-warnings.push(
-`Gönderen bilgisi kullanıcı tarafından verildi (${provided.senderName}) ancak dekontta güvenilir şekilde okunamadı.`
-);
-}
-else if (
-normalizeName(provided.senderName) ===
-normalizeName(documentInfo.senderName)
-) {
-comparison.sender.status = "match";
-}
-else {
-comparison.sender.status = "mismatch";
-warnings.push(
-`Gönderen bilgisi uyuşmuyor: verilen "${provided.senderName}", dekontta görünen "${documentInfo.senderName}".`
-);
-}
-}
-
-if (provided?.recipientName) {
-
-if (!documentInfo?.recipientName) {
-comparison.recipient.status = "unknown";
-warnings.push(
-`Alıcı bilgisi kullanıcı tarafından verildi (${provided.recipientName}) ancak dekontta güvenilir şekilde okunamadı.`
-);
-}
-else if (
-normalizeName(provided.recipientName) ===
-normalizeName(documentInfo.recipientName)
-) {
-comparison.recipient.status = "match";
-}
-else {
-comparison.recipient.status = "mismatch";
-warnings.push(
-`Alıcı bilgisi uyuşmuyor: verilen "${provided.recipientName}", dekontta görünen "${documentInfo.recipientName}".`
-);
-}
-}
-
-if (provided?.amount) {
-
-const providedAmount = normalizeAmount(provided.amount);
-const documentAmount = normalizeAmount(documentInfo?.amount);
-
-if (
-providedAmount === null
-) {
-comparison.amount.status = "unknown";
-warnings.push(
-`Verilen tutar (${provided.amount}) güvenilir şekilde sayısal değere dönüştürülemedi.`
-);
-}
-else if (
- documentAmount === null
-) {
-comparison.amount.status = "unknown";
-warnings.push(
-`Tutar bilgisi kullanıcı tarafından verildi (${provided.amount}) ancak dekontta güvenilir şekilde okunamadı.`
-);
-}
-else if (
-Math.abs(providedAmount - documentAmount) < 0.01
-) {
-comparison.amount.status = "match";
-}
-else {
-comparison.amount.status = "mismatch";
-warnings.push(
-`Tutar bilgisi uyuşmuyor: verilen "${provided.amount}", dekontta görünen "${documentInfo.amount}".`
-);
-}
-}
-
-if (provided?.iban) {
-
-const providedIban = normalizeIban(provided.iban);
-const documentIban = normalizeIban(documentInfo?.iban);
-
-if (!providedIban) {
-comparison.iban.status = "unknown";
-}
-else if (!documentIban) {
-comparison.iban.status = "unknown";
-warnings.push(
-`IBAN bilgisi kullanıcı tarafından verildi ancak dekontta güvenilir şekilde okunamadı.`
-);
-}
-else if (providedIban === documentIban) {
-comparison.iban.status = "match";
-}
-else {
-comparison.iban.status = "mismatch";
-warnings.push(
-`IBAN bilgisi uyuşmuyor: verilen "${provided.iban}", dekontta görünen "${documentInfo.iban}".`
-);
-}
-}
-
-return comparison;
-}
 
 // =====================================================
 // NORMAL DEKONT RESPONSE SCHEMA
@@ -1169,6 +870,53 @@ summary: {
 
 type:
 "string",
+
+},
+
+documentData: {
+
+type:
+"object",
+
+properties: {
+
+senderName: {
+type:
+["string", "null"],
+},
+
+recipientName: {
+type:
+["string", "null"],
+},
+
+amount: {
+type:
+["string", "null"],
+},
+
+currency: {
+type:
+["string", "null"],
+},
+
+iban: {
+type:
+["string", "null"],
+},
+
+},
+
+required: [
+"senderName",
+"recipientName",
+"amount",
+"currency",
+"iban",
+],
+
+additionalProperties:
+false,
 
 },
 
@@ -1271,86 +1019,6 @@ CHECK_SCHEMA,
 
 required:
 CHECK_NAMES,
-
-additionalProperties:
-false,
-
-},
-
-transactionDetails: {
-
-type:
-"object",
-
-properties: {
-
-senderName: {
-type:
-["string", "null"],
-},
-
-recipientName: {
-type:
-["string", "null"],
-},
-
-iban: {
-type:
-["string", "null"],
-},
-
-amount: {
-type:
-["string", "null"],
-},
-
-currency: {
-type:
-["string", "null"],
-},
-
-},
-
-required: [
-"senderName",
-"recipientName",
-"iban",
-"amount",
-"currency",
-],
-
-additionalProperties:
-false,
-
-},
-
-verificationWarning: {
-
-type:
-"object",
-
-properties: {
-
-available: {
-type:
-"boolean",
-},
-
-warnings: {
-type:
-"array",
-items: {
-type:
-"string",
-},
-},
-
-},
-
-required: [
-"available",
-"warnings",
-],
 
 additionalProperties:
 false,
@@ -1480,10 +1148,9 @@ required: [
 "riskLabel",
 "confidence",
 "summary",
+"documentData",
 "categories",
 "checks",
-"transactionDetails",
-"verificationWarning",
 "limitations",
 "amountAnalysis",
 
@@ -1496,7 +1163,7 @@ false,
 
 
 // =====================================================
-// HESAP �ZET? RESPONSE SCHEMA
+// HESAP ÖZETİ RESPONSE SCHEMA
 // =====================================================
 
 const STATEMENT_RESPONSE_SCHEMA = {
@@ -1920,7 +1587,7 @@ files,
 
 
 // =====================================================
-// VIDEO ? FRAME �IKARMA
+// VIDEO → FRAME ÇIKARMA
 // =====================================================
 
 async function extractVideoFrames(
@@ -1994,7 +1661,7 @@ if (
 ) {
 
 throw new Error(
-"Videodan analiz edilecek kare �?kar?lamad?."
+"Videodan analiz edilecek kare çıkarılamadı."
 );
 
 }
@@ -2037,7 +1704,7 @@ return frames;
 
 
 // =====================================================
-// VIDEO FRAME ANAL?Z?
+// VIDEO FRAME ANALİZİ
 // REFERANS KULLANILMAZ
 // =====================================================
 
@@ -2051,7 +1718,7 @@ if (
 ) {
 
 throw new Error(
-"Analiz edilecek video karesi bulunamad?."
+"Analiz edilecek video karesi bulunamadı."
 );
 
 }
@@ -2085,167 +1752,167 @@ const videoPrompt = `
 ${PROMPT}
 
 =====================================================
-V?DEO ANAL?Z?
+VİDEO ANALİZİ
 =====================================================
 
-Bu belge bir video i�erisinden �?kar?lm??
-${frames.length} ayr? kare �zerinden analiz edilmektedir.
+Bu belge bir video içerisinden çıkarılmış
+${frames.length} ayrı kare üzerinden analiz edilmektedir.
 
-�OK �NEML?:
+ÇOK ÖNEMLİ:
 
 Bu video analizinde REFERANS DEKONT KULLANMA.
 
 Banka referans PDF'i,
-referans ?ablon,
+referans şablon,
 referans belge
-veya ba?ka bir referans dosya
+veya başka bir referans dosya
 video analizine dahil edilmemelidir.
 
-Yaln?zca video karelerinde ger�ekten g�r�lebilen
+Yalnızca video karelerinde gerçekten görülebilen
 bilgilere dayan.
 
-T�m video karelerini birlikte de?erlendir.
+Tüm video karelerini birlikte değerlendir.
 
 =====================================================
 KARELER ARASI TUTARLILIK
 =====================================================
 
-�zellikle kareler aras?nda ?u bilgilerin de?i?ip
-de?i?medi?ini kontrol et:
+Özellikle kareler arasında şu bilgilerin değişip
+değişmediğini kontrol et:
 
 - isim
 - soy isim
-- g�nderici
-- al?c?
+- gönderici
+- alıcı
 - IBAN
-- hesap numaras?
-- i?lem numaras?
-- referans numaras?
+- hesap numarası
+- işlem numarası
+- referans numarası
 - tarih
 - saat
 - tutar
 - para birimi
-- a�?klama
-- banka ad?
+- açıklama
+- banka adı
 - logo
 - QR kod
 - barkod
 - metin
 - rakamlar
 
-Ayr?ca:
+Ayrıca:
 
-- sonradan eklenmi? alan
-- sonradan silinmi? alan
-- yap??t?r?lm?? b�lge
+- sonradan eklenmiş alan
+- sonradan silinmiş alan
+- yapıştırılmış bölge
 - dijital montaj
-- farkl? font
-- farkl? karakter kalitesi
-- farkl? s?k??t?rma
-- farkl? keskinlik
-- farkl? g�r�nt� yap?s?
-- hareket s?ras?nda ortaya �?kan tutars?zl?k
-- ekran �zerinde sonradan de?i?tirilmi? alan
+- farklı font
+- farklı karakter kalitesi
+- farklı sıkıştırma
+- farklı keskinlik
+- farklı görüntü yapısı
+- hareket sırasında ortaya çıkan tutarsızlık
+- ekran üzerinde sonradan değiştirilmiş alan
 
-olup olmad???n? kontrol et.
+olup olmadığını kontrol et.
 
 =====================================================
-DO?AL V?DEO DE????KL?KLER?
+DOĞAL VİDEO DEĞİŞİKLİKLERİ
 =====================================================
 
-A?a??daki durumlar? tek ba??na sahtecilik kan?t?
-olarak de?erlendirme:
+Aşağıdaki durumları tek başına sahtecilik kanıtı
+olarak değerlendirme:
 
 - kamera hareketi
 - zoom
-- odak de?i?imi
-- ???k de?i?imi
-- perspektif de?i?imi
-- g�r�nt� titremesi
-- JPEG s?k??t?rmas?
-- video s?k??t?rmas?
-- hafif bulan?kl?k
-- farkl? karelerde farkl? parlakl?k
-- do?al g�lge de?i?imleri
+- odak değişimi
+- ışık değişimi
+- perspektif değişimi
+- görüntü titremesi
+- JPEG sıkıştırması
+- video sıkıştırması
+- hafif bulanıklık
+- farklı karelerde farklı parlaklık
+- doğal gölge değişimleri
 
-Bunlar tek ba??na risk skorunu y�kseltmemelidir.
+Bunlar tek başına risk skorunu yükseltmemelidir.
 
 =====================================================
-V?DEO MAN?P�LASYON KONTROL�
+VİDEO MANİPÜLASYON KONTROLÜ
 =====================================================
 
-Belgenin farkl? karelerinde ayn? alanlar? m�mk�n
-oldu?unca kar??la?t?r.
+Belgenin farklı karelerinde aynı alanları mümkün
+olduğunca karşılaştır.
 
-�rne?in:
+Örneğin:
 
 Bir karede tutar:
 
 "25.000 TL"
 
-iken ba?ka bir karede:
+iken başka bir karede:
 
 "35.000 TL"
 
-g�r�l�yorsa bunu �nemli bir tutars?zl?k olarak
-de?erlendir.
+görülüyorsa bunu önemli bir tutarsızlık olarak
+değerlendir.
 
-Ayn? ?ekilde:
+Aynı şekilde:
 
-IBAN de?i?iyorsa,
-isim de?i?iyorsa,
-tarih de?i?iyorsa,
-al?c? de?i?iyorsa,
-i?lem numaras? de?i?iyorsa
+IBAN değişiyorsa,
+isim değişiyorsa,
+tarih değişiyorsa,
+alıcı değişiyorsa,
+işlem numarası değişiyorsa
 
-bunu a�?k�a evidence alan?nda belirt.
+bunu açıkça evidence alanında belirt.
 
-Ancak g�r�nt� kalitesi nedeniyle bir bilginin
-okunamad??? durumda de?er tahmin etme.
+Ancak görüntü kalitesi nedeniyle bir bilginin
+okunamadığı durumda değer tahmin etme.
 
 =====================================================
-TUTAR KONTROL�
+TUTAR KONTROLÜ
 =====================================================
 
-Videoda g�r�nen finansal tutarlar? ayr?ca kontrol et.
+Videoda görünen finansal tutarları ayrıca kontrol et.
 
-Ana i?lem tutar?n?:
+Ana işlem tutarını:
 
 - IBAN
-- hesap numaras?
-- i?lem numaras?
-- referans numaras?
+- hesap numarası
+- işlem numarası
+- referans numarası
 - tarih
 - saat
 
-gibi di?er rakamlarla kar??t?rma.
+gibi diğer rakamlarla karıştırma.
 
-E?er ara toplam, vergi, �cret, komisyon veya
-toplam tutar g�r�n�yorsa matematiksel olarak
+Eğer ara toplam, vergi, ücret, komisyon veya
+toplam tutar görünüyorsa matematiksel olarak
 kontrol et.
 
-Yeterli veri yoksa de?erleri tahmin etme.
+Yeterli veri yoksa değerleri tahmin etme.
 
 =====================================================
-V?DEO KAL?TES?
+VİDEO KALİTESİ
 =====================================================
 
-Video kalitesi d�?�kse otomatik olarak sahtecilik
-karar? verme.
+Video kalitesi düşükse otomatik olarak sahtecilik
+kararı verme.
 
-E?er baz? karelerde belge okunam?yorsa bunu
-limitations alan?nda belirt.
+Eğer bazı karelerde belge okunamıyorsa bunu
+limitations alanında belirt.
 
-E?er kalite yeterliyse bunu a�?k�a belirt.
+Eğer kalite yeterliyse bunu açıkça belirt.
 
 =====================================================
-R?SK
+RİSK
 =====================================================
 
-Kareler aras?nda ger�ek ve anlaml? bir tutars?zl?k
-bulunmad?k�a risk skorunu gereksiz ?ekilde art?rma.
+Kareler arasında gerçek ve anlamlı bir tutarsızlık
+bulunmadıkça risk skorunu gereksiz şekilde artırma.
 
-Tek ba??na video kalitesinin d�?�k olmas?:
+Tek başına video kalitesinin düşük olması:
 
 HIGH RISK
 
@@ -2253,18 +1920,18 @@ veya
 
 VERY HIGH RISK
 
-anlam?na gelmez.
+anlamına gelmez.
 
-Belirsiz durumlarda confidence de?erini d�?�r.
+Belirsiz durumlarda confidence değerini düşür.
 
 =====================================================
-SONU�
+SONUÇ
 =====================================================
 
-Sonu� normal VerifyDoc analiz format?yla
-uyumlu olmal?d?r.
+Sonuç normal VerifyDoc analiz formatıyla
+uyumlu olmalıdır.
 
-?u alanlar?n tamam?n? doldur:
+Şu alanların tamamını doldur:
 
 overallRisk
 riskLabel
@@ -2275,13 +1942,13 @@ checks
 limitations
 amountAnalysis
 
-25 kontrol�n tamam?n? de?erlendir.
+25 kontrolün tamamını değerlendir.
 
-Kesin olarak "sahte" veya "ger�ek" deme.
+Kesin olarak "sahte" veya "gerçek" deme.
 
-Bu yaln?zca otomatik �n incelemedir.
+Bu yalnızca otomatik ön incelemedir.
 
-SONUCU SADECE JSON OLARAK D�ND�R.
+SONUCU SADECE JSON OLARAK DÖNDÜR.
 
 `;
 
@@ -2361,7 +2028,7 @@ if (
 ) {
 
 throw new Error(
-"OpenAI'dan video analiz sonucu al?namad?."
+"OpenAI'dan video analiz sonucu alınamadı."
 );
 
 }
@@ -2385,7 +2052,7 @@ typeof result !== "object"
 ) {
 
 throw new Error(
-"Video analiz sonucu ge�ersiz."
+"Video analiz sonucu geçersiz."
 );
 
 }
@@ -2415,7 +2082,7 @@ return result;
 
 
 // =====================================================
-// ARRAY'DEN ?LK DE?ER? AL
+// ARRAY'DEN İLK DEĞERİ AL
 // =====================================================
 
 function first(value) {
@@ -2485,7 +2152,7 @@ return null;
 
 
 // =====================================================
-// M?KRO KARAKTER / RAKAM TUTARLILIK ANAL?Z?
+// MİKRO KARAKTER / RAKAM TUTARLILIK ANALİZİ
 // =====================================================
 
 function analyzeTextCharacterConsistency(
@@ -2506,7 +2173,7 @@ suspicious:
 false,
 
 reason:
-"Analiz edilecek metin bulunamad?.",
+"Analiz edilecek metin bulunamadı.",
 
 };
 
@@ -2533,7 +2200,7 @@ suspicious:
 false,
 
 reason:
-"Kar??la?t?rma i�in yeterli rakam bulunamad?.",
+"Karşılaştırma için yeterli rakam bulunamadı.",
 
 };
 
@@ -2575,7 +2242,7 @@ suspicious:
 false,
 
 reason:
-"Ayn? rakam?n yeterli tekrar? bulunamad?.",
+"Aynı rakamın yeterli tekrarı bulunamadı.",
 
 };
 
@@ -2591,7 +2258,7 @@ suspicious:
 false,
 
 reason:
-"Rakam karakterleri mikro tutarl?l?k analizi i�in haz?r.",
+"Rakam karakterleri mikro tutarlılık analizi için hazır.",
 
 repeatedDigits:
 repeatedDigits.map(
@@ -2622,7 +2289,7 @@ typeof text !== "string"
 ) {
 
 throw new Error(
-"OpenAI bo? cevap d�nd�rd�."
+"OpenAI boş cevap döndürdü."
 );
 
 }
@@ -2677,7 +2344,7 @@ end + 1
 
 
 throw new Error(
-"OpenAI ge�erli JSON d�nd�rmedi."
+"OpenAI geçerli JSON döndürmedi."
 );
 
 }
@@ -2700,25 +2367,25 @@ MUST be written in TURKISH.
 
 Use proper Turkish characters whenever applicable:
 
-�, �
-?, ?
-?, I, ?
-�, �
-?, ?
-�, �
+ç, Ç
+ğ, Ğ
+ı, I, İ
+ö, Ö
+ş, Ş
+ü, Ü
 
 Do NOT replace Turkish characters with their ASCII equivalents when the
 correct Turkish spelling is known.
 
 For example:
 
-"�a?r?" is correct.
+"Çağrı" is correct.
 "Cagri" is not the preferred spelling when the Turkish character is visible.
 
-"?ahin" is correct.
+"Şahin" is correct.
 "Sahin" is not the preferred spelling when the Turkish character is visible.
 
-"?? Bankas?" is correct.
+"İş Bankası" is correct.
 "Is Bankasi" is not the preferred spelling when the Turkish characters
 are visible.
 
@@ -2747,7 +2414,7 @@ TURKISH TEXT AND CHARACTER ANALYSIS
 When Turkish text is visible in the document:
 
 1. Carefully inspect Turkish characters:
-�, ?, ?, ?, �, ?, �
+ç, ğ, ı, İ, ö, ş, ü
 
 2. Compare visually similar characters.
 
@@ -2770,7 +2437,7 @@ different from an ASCII character.
 supports that conclusion.
 
 7. If the image quality is insufficient to determine whether a character
-is "?" or "i", "?" or "I", "?" or "s", etc., use "unknown" or mention
+is "ı" or "i", "İ" or "I", "ş" or "s", etc., use "unknown" or mention
 the limitation.
 
 8. Never invent missing Turkish characters.
@@ -2787,16 +2454,16 @@ can be reliably read.
 
 Examples of Turkish characters that must be preserved:
 
-"�a?r?"
-"?ahin"
-"??lem"
-"�deme"
-"G�nderici"
-"Al?c?"
-"T�rk"
-"�cret"
-"�?k??"
-"?? Bankas?"
+"Çağrı"
+"Şahin"
+"İşlem"
+"Ödeme"
+"Gönderici"
+"Alıcı"
+"Türk"
+"Ücret"
+"Çıkış"
+"İş Bankası"
 
 Do not normalize these to ASCII unnecessarily.
 
@@ -2868,124 +2535,105 @@ Only increase suspicion when there is actual visible evidence of
 inconsistency or manipulation.
 
 =====================================================
-TUTAR / VERG? / MATEMAT?KSEL KONTROL
+TUTAR / VERGİ / MATEMATİKSEL KONTROL
 =====================================================
 
-Belgede g�r�nen finansal tutarlar? ayr?ca dikkatlice incele.
+Belgede görünen finansal tutarları ayrıca dikkatlice incele.
 
-�zellikle:
+Özellikle:
 
-- ana i?lem tutar?
+- ana işlem tutarı
 - ara toplam
-- mal/hizmet tutar?
+- mal/hizmet tutarı
 - KDV
-- di?er vergiler
+- diğer vergiler
 - komisyon
-- �cret
+- ücret
 - indirim
 - toplam tutar
 
-alanlar?n? tespit et.
+alanlarını tespit et.
 
-Ana i?lem tutar?n? IBAN, hesap numaras?, i?lem numaras?,
-referans numaras?, tarih veya ba?ka bir finansal rakamla kar??t?rma.
+Ana işlem tutarını IBAN, hesap numarası, işlem numarası,
+referans numarası, tarih veya başka bir finansal rakamla karıştırma.
 
-Varsa matematiksel ili?kiyi kontrol et.
+Varsa matematiksel ilişkiyi kontrol et.
 
-�rne?in:
+Örneğin:
 
-ara toplam + KDV + di?er vergiler + �cret + komisyon - indirim = toplam
+ara toplam + KDV + diğer vergiler + ücret + komisyon - indirim = toplam
 
-Belgede birden fazla vergi veya �cret varsa m�mk�n oldu?unca
-toplam?n? hesapla.
+Belgede birden fazla vergi veya ücret varsa mümkün olduğunca
+toplamını hesapla.
 
-G�r�nmeyen, okunamayan veya belirsiz rakamlar? tahmin etme.
+Görünmeyen, okunamayan veya belirsiz rakamları tahmin etme.
 
-Ara toplam g�r�lemiyorsa subtotal = null.
+Ara toplam görülemiyorsa subtotal = null.
 
-Vergi g�r�lemiyorsa taxAmount = null.
+Vergi görülemiyorsa taxAmount = null.
 
-Toplam g�r�lemiyorsa totalAmount = null.
+Toplam görülemiyorsa totalAmount = null.
 
-Hesaplanabilecek de?erler varsa:
+Hesaplanabilecek değerler varsa:
 
 calculatedTotal
 
-alan?nda matematiksel olarak hesaplanan toplam? belirt.
+alanında matematiksel olarak hesaplanan toplamı belirt.
 
-difference alan?nda:
+difference alanında:
 
-hesaplanan toplam - belgede g�r�nen toplam
+hesaplanan toplam - belgede görünen toplam
 
-fark?n? belirt.
+farkını belirt.
 
-Hesaplama i�in yeterli veri yoksa:
+Hesaplama için yeterli veri yoksa:
 
 calculatedTotal = null
 difference = null
 
 kullan.
 
-Yeterli veri yoksa calculationConsistent de?erini otomatik olarak
+Yeterli veri yoksa calculationConsistent değerini otomatik olarak
 true yapma.
 
-Hesaplama i�in yeterli veri bulunmad???nda calculationConsistent
-de?erini false olarak kullan ve nedenini evidence alan?nda a�?kla.
+Hesaplama için yeterli veri bulunmadığında calculationConsistent
+değerini false olarak kullan ve nedenini evidence alanında açıkla.
 
-�ok k���k yuvarlama farklar?n? tek ba??na ?�pheli olarak de?erlendirme.
+Çok küçük yuvarlama farklarını tek başına şüpheli olarak değerlendirme.
 
-Matematiksel tutars?zl?k varsa bunun nedenini amountAnalysis.evidence
-alan?nda a�?k�a belirt.
+Matematiksel tutarsızlık varsa bunun nedenini amountAnalysis.evidence
+alanında açıkça belirt.
 
 =====================================================
-ANA TUTAR KARAKTER / FONT KONTROL�
+ANA TUTAR KARAKTER / FONT KONTROLÜ
 =====================================================
 
-Ana i?lem tutar?n?n karakterlerini g�rsel olarak incele.
+Ana işlem tutarının karakterlerini görsel olarak incele.
 
-�zellikle:
+Özellikle:
 
-- karakter y�ksekli?i
-- karakter geni?li?i
-- font a??rl???
-- stroke kal?nl???
-- karakter aral???
+- karakter yüksekliği
+- karakter genişliği
+- font ağırlığı
+- stroke kalınlığı
+- karakter aralığı
 - baseline
 - hizalama
-- kenar yap?s?
+- kenar yapısı
 - anti-aliasing
-- genel render g�r�n�m�
+- genel render görünümü
 
-a�?s?ndan �evresindeki ayn? tip metinlerle tutarl?l???n? de?erlendir.
+açısından çevresindeki aynı tip metinlerle tutarlılığını değerlendir.
 
-Farkl? rakamlar?n do?al olarak farkl? ?ekillere sahip oldu?unu unutma.
+Farklı rakamların doğal olarak farklı şekillere sahip olduğunu unutma.
 
-Tek ba??na bir karakterin di?er rakamlardan farkl? g�r�nmesi
-?�pheli de?ildir.
+Tek başına bir karakterin diğer rakamlardan farklı görünmesi
+şüpheli değildir.
 
-Foto?raf a�?s?, perspektif, ???k, JPEG s?k??t?rmas? veya g�r�nt�
-kalitesi kaynakl? k���k farkl?l?klar? sahtecilik olarak de?erlendirme.
+Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması veya görüntü
+kalitesi kaynaklı küçük farklılıkları sahtecilik olarak değerlendirme.
 
-Yeterli g�rsel kan?t yoksa ?�pheli sonu� �retme.
-
-=====================================================
-İŞLEM BİLGİLERİNİ YAPISAL OLARAK ÇIKAR
-=====================================================
-
-Dekontta güvenilir şekilde görülebilen şu bilgileri ayrıca transactionDetails
-alanına çıkar:
-
-- senderName: gönderen adı/soyadı
-- recipientName: alıcı adı/soyadı
-- iban: dekontta görünen ilgili IBAN. Gönderici ve alıcı IBAN'ları birlikte
-  görünüyorsa işlemin ana karşı tarafına ait IBAN'ı mümkün olduğunca doğru
-  şekilde belirle; belirsizse null kullan.
-- amount: ana işlem tutarı. IBAN, hesap numarası, işlem numarası, tarih veya
-  saat gibi başka rakamları tutar olarak kullanma.
-- currency: para birimi
-
-Bilgi güvenilir şekilde okunamıyorsa null kullan.
-Tahmin etme.
+Yeterli görsel kanıt yoksa şüpheli sonuç üretme.
 
 =====================================================
 RISK CALCULATION
@@ -3097,12 +2745,12 @@ When quality is limited, explain specifically WHY it is limited.
 
 For example:
 
-"Belge PDF format?nda oldu?u i�in de?il, sayfa g�r�nt�s� d�?�k kaliteli
-oldu?u i�in baz? karakterler g�venilir ?ekilde do?rulanam?yor."
+"Belge PDF formatında olduğu için değil, sayfa görüntüsü düşük kaliteli
+olduğu için bazı karakterler güvenilir şekilde doğrulanamıyor."
 
 If the quality is sufficient, use wording similar to:
 
-"Belge kalitesi analiz i�in yeterli g�r�n�yor."
+"Belge kalitesi analiz için yeterli görünüyor."
 
 Never invent the PDF's internal structure if it cannot actually be determined.
 If the distinction between native digital PDF and image-based PDF cannot be
@@ -3168,12 +2816,12 @@ TURKISH CHARACTER ANALYSIS:
 
 Pay special attention to Turkish characters:
 
-� �
-? ?
-? I ? i
-� �
-? ?
-� �
+ç Ç
+ğ Ğ
+ı I İ i
+ö Ö
+ş Ş
+ü Ü
 
 Check whether Turkish characters appear visually consistent with the rest
 of the document.
@@ -3235,7 +2883,7 @@ Return ONLY the JSON object matching the supplied schema.
 
 
 // =====================================================
-// HESAP �ZET? PROMPT
+// HESAP ÖZETİ PROMPT
 // REFERANS KULLANILMAZ
 // =====================================================
 
@@ -3243,214 +2891,214 @@ const STATEMENT_PROMPT = `
 
 Sen VerifyDoc isimli AI destekli belge inceleme sistemisin.
 
-Bu belge bir banka hesap �zeti / hesap ekstresi olarak
+Bu belge bir banka hesap özeti / hesap ekstresi olarak
 incelenmektedir.
 
-�OK �NEML?:
+ÇOK ÖNEMLİ:
 
 Bu analizde banka referans PDF'i KULLANMA.
 
-Referans ?ablon kullanma.
+Referans şablon kullanma.
 
 Referans belge kullanma.
 
-Ba?ka banka belgesi ile kar??la?t?rma yapma.
+Başka banka belgesi ile karşılaştırma yapma.
 
-Yaln?zca g�nderilen hesap �zeti �zerinden analiz yap.
+Yalnızca gönderilen hesap özeti üzerinden analiz yap.
 
-Bu analiz kesin ger�eklik veya sahtecilik karar? de?ildir.
+Bu analiz kesin gerçeklik veya sahtecilik kararı değildir.
 
-Kesin olarak "ger�ek" deme.
+Kesin olarak "gerçek" deme.
 
 Kesin olarak "sahte" deme.
 
-Yaln?zca ger�ekten g�r�lebilen veya g�venilir ?ekilde
-hesaplanabilen bilgiler �zerinden de?erlendirme yap.
+Yalnızca gerçekten görülebilen veya güvenilir şekilde
+hesaplanabilen bilgiler üzerinden değerlendirme yap.
 
-G�r�lemeyen bilgileri tahmin etme.
+Görülemeyen bilgileri tahmin etme.
 
 =====================================================
-HESAP �ZET? TANIMLAMA
+HESAP ÖZETİ TANIMLAMA
 =====================================================
 
-Belgenin hesap �zeti / hesap ekstresi niteli?inde olup
-olmad???n? de?erlendir.
+Belgenin hesap özeti / hesap ekstresi niteliğinde olup
+olmadığını değerlendir.
 
-G�r�lebiliyorsa:
+Görülebiliyorsa:
 
 - banka
 - hesap sahibi
 - IBAN
-- hesap numaras?
-- hesap d�nemi
+- hesap numarası
+- hesap dönemi
 - para birimi
-- a�?l?? bakiyesi
-- kapan?? bakiyesi
+- açılış bakiyesi
+- kapanış bakiyesi
 
 bilgilerini incele.
 
-Banka ad? kesin olarak g�r�lemiyorsa banka ad? uydurma.
+Banka adı kesin olarak görülemiyorsa banka adı uydurma.
 
 =====================================================
-??LEM SATIRLARI
+İŞLEM SATIRLARI
 =====================================================
 
-G�r�nen i?lem sat?rlar?n? incele.
+Görünen işlem satırlarını incele.
 
-�zellikle:
+Özellikle:
 
-- i?lem tarihi
-- i?lem a�?klamas?
-- para giri?i
-- para �?k???
-- i?lem tutar?
-- i?lem sonras? bakiye
-- g�nderen
-- al?c?
-- i?lem/ref numaras?
+- işlem tarihi
+- işlem açıklaması
+- para girişi
+- para çıkışı
+- işlem tutarı
+- işlem sonrası bakiye
+- gönderen
+- alıcı
+- işlem/ref numarası
 
-alanlar?n? kontrol et.
+alanlarını kontrol et.
 
-Bir rakam?n ne oldu?u kesin de?ilse tahmin etme.
+Bir rakamın ne olduğu kesin değilse tahmin etme.
 
 =====================================================
-BAK?YE MATEMAT???
+BAKİYE MATEMATİĞİ
 =====================================================
 
 Yeterli veri varsa:
 
-�nceki bakiye
+önceki bakiye
 +
-para giri?leri
+para girişleri
 -
-para �?k??lar?
+para çıkışları
 =
 sonraki bakiye
 
-ili?kisini kontrol et.
+ilişkisini kontrol et.
 
-Birden fazla i?lem varsa m�mk�n oldu?unca ard???k
+Birden fazla işlem varsa mümkün olduğunca ardışık
 bakiyeleri kontrol et.
 
-�rne?in:
+Örneğin:
 
-Ba?lang?� bakiyesi: 10.000 TL
+Başlangıç bakiyesi: 10.000 TL
 
-Giri?: 2.000 TL
+Giriş: 2.000 TL
 
-�?k??: 500 TL
+Çıkış: 500 TL
 
 Beklenen bakiye: 11.500 TL
 
-Belgede farkl? bir bakiye g�r�n�yorsa bunu a�?k�a belirt.
+Belgede farklı bir bakiye görünüyorsa bunu açıkça belirt.
 
 Ancak:
 
-- �cret
+- ücret
 - komisyon
 - faiz
-- kur fark?
+- kur farkı
 - bloke
 - otomatik tahsilat
-- ba?ka finansal hareket
+- başka finansal hareket
 
-gibi g�r�n�r kalemleri de hesaba kat.
+gibi görünür kalemleri de hesaba kat.
 
-Yeterli veri yoksa matematiksel tutarl?l?k hakk?nda
-kesin sonu� verme.
+Yeterli veri yoksa matematiksel tutarlılık hakkında
+kesin sonuç verme.
 
 =====================================================
-TOPLAM G?R?? / �IKI?
+TOPLAM GİRİŞ / ÇIKIŞ
 =====================================================
 
-Belgede toplam giri? ve �?k?? tutarlar? g�r�n�yorsa
-i?lem sat?rlar?yla kar??la?t?r.
+Belgede toplam giriş ve çıkış tutarları görünüyorsa
+işlem satırlarıyla karşılaştır.
 
 Hesaplanabiliyorsa:
 
-- toplam giri?
-- toplam �?k??
+- toplam giriş
+- toplam çıkış
 - net hareket
-- hesaplanan kapan?? bakiyesi
+- hesaplanan kapanış bakiyesi
 
-de?erlerini hesapla.
+değerlerini hesapla.
 
 Eksik veri varsa tahmin etme.
 
 =====================================================
-TAR?H KONTROL�
+TARİH KONTROLÜ
 =====================================================
 
-??lem tarihlerini kontrol et.
+İşlem tarihlerini kontrol et.
 
-�zellikle:
+Özellikle:
 
-- hesap d�nemi
-- i?lem tarihleri
-- tarih s?ralamas?
-- d�nem d??? i?lem
-- imkans?z veya ?�pheli tarih
-- farkl? tarih formatlar?
+- hesap dönemi
+- işlem tarihleri
+- tarih sıralaması
+- dönem dışı işlem
+- imkansız veya şüpheli tarih
+- farklı tarih formatları
 
 incelenmelidir.
 
-Farkl? tarih format? tek ba??na sahtecilik kan?t? de?ildir.
+Farklı tarih formatı tek başına sahtecilik kanıtı değildir.
 
 =====================================================
-BAK?YE DEVAMLILI?I
+BAKİYE DEVAMLILIĞI
 =====================================================
 
-Bir i?lem sonras? bakiye ile sonraki i?lem �ncesi
-bakiye aras?nda tutarl?l?k varsa kontrol et.
+Bir işlem sonrası bakiye ile sonraki işlem öncesi
+bakiye arasında tutarlılık varsa kontrol et.
 
-Sayfalar aras?nda bakiye devaml?l??? varsa ayr?ca
+Sayfalar arasında bakiye devamlılığı varsa ayrıca
 kontrol et.
 
-Birinci sayfan?n son bakiyesi ile ikinci sayfan?n
-ba?lang?�/devam bakiyesi aras?nda tutars?zl?k varsa
-a�?k�a belirt.
+Birinci sayfanın son bakiyesi ile ikinci sayfanın
+başlangıç/devam bakiyesi arasında tutarsızlık varsa
+açıkça belirt.
 
 =====================================================
-TEKRARLAYAN ??LEMLER
+TEKRARLAYAN İŞLEMLER
 =====================================================
 
-Ayn?:
+Aynı:
 
 - tarih
 - tutar
-- a�?klama
-- g�nderen/al?c?
+- açıklama
+- gönderen/alıcı
 
-kombinasyonlar?n?n ola?and??? tekrar edip etmedi?ini
+kombinasyonlarının olağandışı tekrar edip etmediğini
 incele.
 
-Tekrar tek ba??na sahtecilik kan?t? de?ildir.
+Tekrar tek başına sahtecilik kanıtı değildir.
 
 =====================================================
-G�RSEL MAN?P�LASYON
+GÖRSEL MANİPÜLASYON
 =====================================================
 
-Hesap �zetinde:
+Hesap özetinde:
 
-- font farkl?l???
-- font boyutu farkl?l???
-- karakter aral???
+- font farklılığı
+- font boyutu farklılığı
+- karakter aralığı
 - baseline
 - hizalama
-- farkl? s?k??t?rma
-- kopyala-yap??t?r b�lgeleri
-- sonradan eklenmi? alan
-- sonradan silinmi? alan
-- farkl? keskinlik
-- farkl? render
+- farklı sıkıştırma
+- kopyala-yapıştır bölgeleri
+- sonradan eklenmiş alan
+- sonradan silinmiş alan
+- farklı keskinlik
+- farklı render
 - dijital montaj
-- Photoshop benzeri d�zenleme
-- yapay olarak de?i?tirilmi? rakamlar
-- sayfalar aras? g�rsel tutars?zl?k
+- Photoshop benzeri düzenleme
+- yapay olarak değiştirilmiş rakamlar
+- sayfalar arası görsel tutarsızlık
 
-olup olmad???n? incele.
+olup olmadığını incele.
 
-G�r�nt� kalitesinden kaynaklanan k���k farkl?l?klar?
+Görüntü kalitesinden kaynaklanan küçük farklılıkları
 otomatik olarak sahtecilik kabul etme.
 
 =====================================================
@@ -3461,49 +3109,49 @@ Birden fazla sayfa varsa:
 
 - hesap sahibi
 - IBAN
-- hesap numaras?
-- hesap d�nemi
+- hesap numarası
+- hesap dönemi
 - para birimi
-- i?lem s?ras?
-- bakiye devaml?l???
-- sayfa numaras?
+- işlem sırası
+- bakiye devamlılığı
+- sayfa numarası
 
-alanlar?n? kar??la?t?r.
+alanlarını karşılaştır.
 
-Farkl? sayfalarda ayn? bilgiler farkl? g�r�n�yorsa
+Farklı sayfalarda aynı bilgiler farklı görünüyorsa
 bunu incele.
 
-Ancak normal PDF olu?turma farkl?l?klar?n? otomatik
-olarak manip�lasyon olarak de?erlendirme.
+Ancak normal PDF oluşturma farklılıklarını otomatik
+olarak manipülasyon olarak değerlendirme.
 
 =====================================================
-PDF KAL?TES?
+PDF KALİTESİ
 =====================================================
 
-PDF olmas? tek ba??na d�?�k kalite de?ildir.
+PDF olması tek başına düşük kalite değildir.
 
-Belge okunabiliyorsa bunu olumlu kalite g�stergesi
-olarak de?erlendir.
+Belge okunabiliyorsa bunu olumlu kalite göstergesi
+olarak değerlendir.
 
-Yaln?zca ger�ekten:
+Yalnızca gerçekten:
 
-- bulan?kl?k
+- bulanıklık
 - pikselizasyon
 - okunamayan rakam
-- k?rp?lma
-- ciddi s?k??t?rma
-- tarama g�r�lt�s�
-- g�lge
+- kırpılma
+- ciddi sıkıştırma
+- tarama gürültüsü
+- gölge
 - parlama
-- perspektif bozulmas?
+- perspektif bozulması
 
 varsa limitation belirt.
 
 =====================================================
-R?SK HESAPLAMA
+RİSK HESAPLAMA
 =====================================================
 
-?unlar? hesapla:
+Şunları hesapla:
 
 visualRisk
 textRisk
@@ -3518,27 +3166,27 @@ overallRisk:
 46-70 HIGH RISK
 71-100 VERY HIGH RISK
 
-Confidence 0-100 aras?nda olmal?d?r.
+Confidence 0-100 arasında olmalıdır.
 
-Matematiksel bakiye tutars?zl??? varsa
-financialDataRisk'i art?r.
+Matematiksel bakiye tutarsızlığı varsa
+financialDataRisk'i artır.
 
-G�rsel manip�lasyon kan?t? varsa
-editingRisk'i art?r.
+Görsel manipülasyon kanıtı varsa
+editingRisk'i artır.
 
-Yaln?zca belirsizlik varsa confidence d�?�r.
+Yalnızca belirsizlik varsa confidence düşür.
 
-Belirsizli?i otomatik olarak HIGH RISK yapma.
+Belirsizliği otomatik olarak HIGH RISK yapma.
 
 =====================================================
-SONU�
+SONUÇ
 =====================================================
 
-Sonu� yaln?zca ge�erli JSON olmal?d?r.
+Sonuç yalnızca geçerli JSON olmalıdır.
 
-T�m a�?klamalar T�RK�E olmal?d?r.
+Tüm açıklamalar TÜRKÇE olmalıdır.
 
-?u alanlar?n tamam?n? d�nd�r:
+Şu alanların tamamını döndür:
 
 overallRisk
 riskLabel
@@ -3550,13 +3198,13 @@ transactionAnalysis
 limitations
 evidence
 
-Kesin ger�ek veya kesin sahte karar? verme.
+Kesin gerçek veya kesin sahte kararı verme.
 
 `;
 
 
 // =====================================================
-// HESAP �ZET? ANAL?Z FONKS?YONU
+// HESAP ÖZETİ ANALİZ FONKSİYONU
 // REFERANS KULLANILMAZ
 // =====================================================
 
@@ -3571,11 +3219,11 @@ console.log(
 );
 
 console.log(
-"HESAP �ZET? ANAL?Z? BA?LADI"
+"HESAP ÖZETİ ANALİZİ BAŞLADI"
 );
 
 console.log(
-"HESAP �ZET? REFERANS KULLANILMAYACAK"
+"HESAP ÖZETİ REFERANS KULLANILMAYACAK"
 );
 
 console.log(
@@ -3691,7 +3339,7 @@ STATEMENT_RESPONSE_SCHEMA,
 
 
 console.log(
-"HESAP �ZET? OPENAI RESPONSE RECEIVED"
+"HESAP ÖZETİ OPENAI RESPONSE RECEIVED"
 );
 
 
@@ -3704,14 +3352,14 @@ if (
 ) {
 
 throw new Error(
-"OpenAI'dan hesap �zeti analiz sonucu al?namad?."
+"OpenAI'dan hesap özeti analiz sonucu alınamadı."
 );
 
 }
 
 
 console.log(
-"HESAP �ZET? ANAL?Z SONUCU:",
+"HESAP ÖZETİ ANALİZ SONUCU:",
 output
 );
 
@@ -3728,13 +3376,471 @@ typeof result !== "object"
 ) {
 
 throw new Error(
-"Hesap �zeti analiz sonucu ge�ersiz."
+"Hesap özeti analiz sonucu geçersiz."
 );
 
 }
 
 
 return result;
+
+}
+
+
+// =====================================================
+// KULLANICININ VERDİĞİ DEKONT BİLGİLERİ
+// =====================================================
+//
+// Bu bilgiler RİSK SKORUNA DAHİL EDİLMEZ.
+// Yalnızca dekonttan çıkarılan bilgilerle karşılaştırılır.
+// =====================================================
+
+function normalizeComparisonText(value) {
+
+if (
+value === null ||
+value === undefined
+) {
+
+return "";
+
+}
+
+return String(value)
+.toLocaleLowerCase("tr-TR")
+.trim()
+.replace(/\s+/g, " ")
+.replace(/[.,;:()\-_/\\]+/g, " ")
+.replace(/\s+/g, " ")
+.trim();
+
+}
+
+
+function normalizeIBAN(value) {
+
+if (
+value === null ||
+value === undefined
+) {
+
+return "";
+
+}
+
+return String(value)
+.toUpperCase()
+.replace(/\s+/g, "")
+.replace(/[^A-Z0-9]/g, "");
+
+}
+
+
+function parseComparisonAmount(value) {
+
+if (
+value === null ||
+value === undefined
+) {
+
+return null;
+
+}
+
+if (
+typeof value === "number" &&
+Number.isFinite(value)
+) {
+
+return value;
+
+}
+
+let raw =
+String(value)
+.trim()
+.replace(/\s/g, "")
+.replace(/[₺]/g, "")
+.replace(/TL/gi, "")
+.replace(/TRY/gi, "");
+
+if (!raw) {
+
+return null;
+
+}
+
+if (
+raw.includes(",") &&
+raw.includes(".")
+) {
+
+raw =
+raw.replace(/\./g, "")
+.replace(",", ".");
+
+}
+
+else if (
+raw.includes(",")
+) {
+
+raw =
+raw.replace(",", ".");
+
+}
+
+else {
+
+const parts =
+raw.split(".");
+
+if (
+parts.length === 2 &&
+parts[1].length === 3
+) {
+
+raw =
+raw.replace(/\./g, "");
+
+}
+
+}
+
+const number =
+Number(raw);
+
+return Number.isFinite(number)
+? number
+: null;
+
+}
+
+
+function normalizeProvidedInfo(value) {
+
+if (
+!value ||
+typeof value !== "object"
+) {
+
+return null;
+
+}
+
+const normalized = {
+
+senderName:
+value.senderName ??
+value.sender ??
+null,
+
+recipientName:
+value.recipientName ??
+value.recipient ??
+null,
+
+amount:
+value.amount ??
+null,
+
+currency:
+value.currency ??
+null,
+
+iban:
+value.iban ??
+null,
+
+};
+
+const hasValue =
+Object.values(normalized)
+.some(
+item =>
+item !== null &&
+item !== undefined &&
+String(item).trim() !== ""
+);
+
+return hasValue
+? normalized
+: null;
+
+}
+
+
+function compareProvidedInfoWithDocument(
+providedInfo,
+documentData
+) {
+
+const provided =
+normalizeProvidedInfo(
+providedInfo
+);
+
+if (!provided) {
+
+return {
+
+enabled:
+false,
+
+matches:
+{},
+
+warnings:
+[],
+
+provided:
+null,
+
+document:
+documentData ||
+null,
+
+};
+
+}
+
+const document =
+documentData ||
+{};
+
+const matches = {};
+const warnings = [];
+
+
+if (
+provided.senderName
+) {
+
+if (
+!document.senderName
+) {
+
+matches.senderName =
+"unknown";
+
+warnings.push(
+"Gönderen adı kontrol edilemedi: dekonttan gönderen adı güvenilir şekilde okunamadı."
+);
+
+}
+
+else {
+
+const expected =
+normalizeComparisonText(
+provided.senderName
+);
+
+const actual =
+normalizeComparisonText(
+document.senderName
+);
+
+matches.senderName =
+expected === actual
+? "match"
+: "mismatch";
+
+if (
+expected !== actual
+) {
+
+warnings.push(
+`Gönderen adı uyuşmuyor. Beklenen: "${provided.senderName}", dekontta görülen: "${document.senderName}".`
+);
+
+}
+
+}
+
+}
+
+
+if (
+provided.recipientName
+) {
+
+if (
+!document.recipientName
+) {
+
+matches.recipientName =
+"unknown";
+
+warnings.push(
+"Alıcı adı kontrol edilemedi: dekonttan alıcı adı güvenilir şekilde okunamadı."
+);
+
+}
+
+else {
+
+const expected =
+normalizeComparisonText(
+provided.recipientName
+);
+
+const actual =
+normalizeComparisonText(
+document.recipientName
+);
+
+matches.recipientName =
+expected === actual
+? "match"
+: "mismatch";
+
+if (
+expected !== actual
+) {
+
+warnings.push(
+`Alıcı adı uyuşmuyor. Beklenen: "${provided.recipientName}", dekontta görülen: "${document.recipientName}".`
+);
+
+}
+
+}
+
+}
+
+
+if (
+provided.iban
+) {
+
+if (
+!document.iban
+) {
+
+matches.iban =
+"unknown";
+
+warnings.push(
+"IBAN kontrol edilemedi: dekonttan IBAN güvenilir şekilde okunamadı."
+);
+
+}
+
+else {
+
+const expected =
+normalizeIBAN(
+provided.iban
+);
+
+const actual =
+normalizeIBAN(
+document.iban
+);
+
+matches.iban =
+expected === actual
+? "match"
+: "mismatch";
+
+if (
+expected !== actual
+) {
+
+warnings.push(
+`IBAN uyuşmuyor. Beklenen: "${provided.iban}", dekontta görülen: "${document.iban}".`
+);
+
+}
+
+}
+
+}
+
+
+if (
+provided.amount !== null &&
+provided.amount !== undefined &&
+String(provided.amount).trim() !== ""
+) {
+
+const expected =
+parseComparisonAmount(
+provided.amount
+);
+
+const actual =
+parseComparisonAmount(
+document.amount
+);
+
+if (
+expected === null
+) {
+
+matches.amount =
+"unknown";
+
+warnings.push(
+"Tutar kontrolü yapılamadı: gönderilen beklenen tutar okunabilir bir sayıya dönüştürülemedi."
+);
+
+}
+
+else if (
+actual === null
+) {
+
+matches.amount =
+"unknown";
+
+warnings.push(
+"Tutar kontrol edilemedi: dekonttan ana işlem tutarı güvenilir şekilde okunamadı."
+);
+
+}
+
+else {
+
+const difference =
+Math.abs(
+expected - actual
+);
+
+matches.amount =
+difference <= 0.01
+? "match"
+: "mismatch";
+
+if (
+difference > 0.01
+) {
+
+warnings.push(
+`Tutar uyuşmuyor. Beklenen: "${provided.amount}", dekontta görülen: "${document.amount}".`
+);
+
+}
+
+}
+
+}
+
+return {
+
+enabled:
+true,
+
+matches,
+
+warnings,
+
+provided,
+
+document,
+
+};
 
 }
 
@@ -3828,7 +3934,7 @@ if (
 ) {
 
 throw new Error(
-"OPENAI_API_KEY Vercel Environment Variables i�inde bulunamad?."
+"OPENAI_API_KEY Vercel Environment Variables içinde bulunamadı."
 );
 
 }
@@ -3861,7 +3967,7 @@ if (
 ) {
 
 throw new Error(
-"Dosya al?namad?. image, file veya video alan? bulunamad?."
+"Dosya alınamadı. image, file veya video alanı bulunamadı."
 );
 
 }
@@ -3889,6 +3995,48 @@ fields?.fileName
 ) ||
 uploadedFile.originalFilename ||
 "document";
+
+
+// =================================================
+// KULLANICININ VERDİĞİ KARŞILAŞTIRMA BİLGİLERİ
+// =================================================
+
+let providedInfo =
+null;
+
+const rawProvidedInfo =
+first(
+fields?.providedInfo
+);
+
+if (
+rawProvidedInfo
+) {
+
+try {
+
+providedInfo =
+normalizeProvidedInfo(
+JSON.parse(
+rawProvidedInfo
+)
+);
+
+}
+
+catch (error) {
+
+console.warn(
+"providedInfo JSON okunamadı:",
+error
+);
+
+providedInfo =
+null;
+
+}
+
+}
 
 
 // =================================================
@@ -3965,7 +4113,7 @@ if (
 ) {
 
 throw new Error(
-"Y�klenen dosyan?n yolu bulunamad?."
+"Yüklenen dosyanın yolu bulunamadı."
 );
 
 }
@@ -3982,7 +4130,7 @@ if (
 ) {
 
 throw new Error(
-"Dosya bo?."
+"Dosya boş."
 );
 
 }
@@ -4129,21 +4277,21 @@ mime
 
 
 // =====================================================
-// HESAP �ZET?
+// HESAP ÖZETİ
 // =====================================================
 
-// �OK �NEML?:
+// ÇOK ÖNEMLİ:
 //
-// Hesap �zeti analizinde referans y�klenmez.
+// Hesap özeti analizinde referans yüklenmez.
 //
-// Bu b�l�m normal referans sisteminden tamamen ba??ms?zd?r.
+// Bu bölüm normal referans sisteminden tamamen bağımsızdır.
 
 if (
 type === "statement"
 ) {
 
 console.log(
-"HESAP �ZET? MODU"
+"HESAP ÖZETİ MODU"
 );
 
 console.log(
@@ -4180,19 +4328,19 @@ statementResult.evidence
 
 
 console.log(
-"HESAP �ZET? R?SK:",
+"HESAP ÖZETİ RİSK:",
 statementScore
 );
 
 
 console.log(
-"HESAP �ZET? ?�PHE:",
+"HESAP ÖZETİ ŞÜPHE:",
 statementSuspicious
 );
 
 
 console.log(
-"HESAP �ZET? ANAL?Z TAMAMLANDI"
+"HESAP ÖZETİ ANALİZ TAMAMLANDI"
 );
 
 
@@ -4235,10 +4383,10 @@ statementEvidence,
 // REFERANS DEKONT
 // =====================================================
 
-// Video analizinde kullan?lmayacak.
-// Hesap �zetinde de kullan?lmayacak.
+// Video analizinde kullanılmayacak.
+// Hesap özetinde de kullanılmayacak.
 //
-// Sadece normal image/pdf dekont analizlerinde kullan?l?r.
+// Sadece normal image/pdf dekont analizlerinde kullanılır.
 
 let reference =
 null;
@@ -4303,41 +4451,68 @@ text: `${PROMPT}
 REFERANS DEKONT
 =====================================================
 
-Bu analizde ayr?ca bir referans dekont sa?lanm??t?r.
+Bu analizde ayrıca bir referans dekont sağlanmıştır.
 
-Analiz edilen bankan?n sistem taraf?ndan belirlenen ad?:
+Analiz edilen bankanın sistem tarafından belirlenen adı:
 ${bank || "Banka belirtilmedi"}
 
 Referans:
-${reference?.fileName || "Referans bulunamad?"}
+${reference?.fileName || "Referans bulunamadı"}
 
 Referans dekontu, analiz edilen dekont ile:
 
-- belge ?ablonu
-- yerle?im
+- belge şablonu
+- yerleşim
 - tipografi
-- font g�r�n�m�
-- alan d�zeni
+- font görünümü
+- alan düzeni
 - logo
-- tarih bi�imi
-- tutar bi�imi
-- IBAN bi�imi
-- genel g�rsel yap?
+- tarih biçimi
+- tutar biçimi
+- IBAN biçimi
+- genel görsel yapı
 
-a�?s?ndan kar??la?t?r.
+açısından karşılaştır.
 
-Referans? belge ?ablonu, yerle?im, tipografi, alan d�zeni,
-logo, tarih, tutar, IBAN bi�imi ve genel g�rsel yap? a�?s?ndan
-kar??la?t?rma amac?yla kullan.
+Referansı belge şablonu, yerleşim, tipografi, alan düzeni,
+logo, tarih, tutar, IBAN biçimi ve genel görsel yapı açısından
+karşılaştırma amacıyla kullan.
 
-Referansla birebir ayn? olmamas?n? tek ba??na sahtecilik kan?t?
-olarak de?erlendirme.
+Referansla birebir aynı olmamasını tek başına sahtecilik kanıtı
+olarak değerlendirme.
 
-Birden fazla ba??ms?z ve anlaml? tutars?zl?k olmad?k�a risk
-art?rma.
+Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
+artırma.
 
 Referans dekontun kendisini analiz edilen dekontun
-ger�ekli?i i�in kesin kan?t olarak kabul etme.
+gerçekliği için kesin kanıt olarak kabul etme.
+
+=====================================================
+DEKONT BİLGİLERİNİ YAPILANDIRILMIŞ OLARAK ÇIKAR
+=====================================================
+
+Normal dekont analizinde aşağıdaki alanları mümkün olduğunca dekontun
+üzerinden doğrudan çıkar:
+
+documentData.senderName
+documentData.recipientName
+documentData.amount
+documentData.currency
+documentData.iban
+
+Kurallar:
+
+- Yalnızca gerçekten görülebilen bilgileri yaz.
+- Güvenilir şekilde okunamıyorsa null kullan.
+- IBAN'ı mümkünse standart biçimde yaz.
+- amount alanında dekontta görülen ana işlem tutarını kullan.
+- IBAN, hesap numarası, işlem numarası, referans numarası veya tarih
+  gibi diğer rakamları amount olarak kullanma.
+- Gönderen ve alıcıyı alan etiketlerine göre ayırt et.
+- Açıklama alanındaki isimleri gönderen/alıcı yerine kullanma.
+- Bu bilgiler daha sonra kullanıcı tarafından verilen bilgilerle
+  karşılaştırılacaktır.
+- Bu karşılaştırma risk skoruna dahil edilmeyecektir.
 
 Filename:
 ${fileName}`,
@@ -4387,45 +4562,72 @@ text: `${PROMPT}
 REFERANS DEKONT
 =====================================================
 
-Bu analizde ayr?ca bir referans dekont sa?lanm??t?r.
+Bu analizde ayrıca bir referans dekont sağlanmıştır.
 
-Analiz edilen bankan?n sistem taraf?ndan belirlenen ad?:
+Analiz edilen bankanın sistem tarafından belirlenen adı:
 ${bank || "Banka belirtilmedi"}
 
 Referans dosya:
-${reference?.fileName || "Referans bulunamad?"}
+${reference?.fileName || "Referans bulunamadı"}
 
 Referans dekontu, analiz edilen dekont ile:
 
-- belge ?ablonu
-- yerle?im
+- belge şablonu
+- yerleşim
 - tipografi
-- font g�r�n�m�
-- alan d�zeni
+- font görünümü
+- alan düzeni
 - logo
-- tarih bi�imi
-- tutar bi�imi
-- IBAN bi�imi
-- genel g�rsel yap?
+- tarih biçimi
+- tutar biçimi
+- IBAN biçimi
+- genel görsel yapı
 
-a�?s?ndan kar??la?t?r.
+açısından karşılaştır.
 
-�OK �NEML?:
+ÇOK ÖNEMLİ:
 
-Referans ile analiz edilen dekontun birebir ayn? olmas?
+Referans ile analiz edilen dekontun birebir aynı olması
 beklenmemektedir.
 
-Farkl? uygulama s�r�mleri, web/mobil bankac?l?k,
-i?lem t�rleri ve belge versiyonlar? olabilir.
+Farklı uygulama sürümleri, web/mobil bankacılık,
+işlem türleri ve belge versiyonları olabilir.
 
-Bu nedenle tek bir farkl?l??? sahtecilik kan?t? olarak
-de?erlendirme.
+Bu nedenle tek bir farklılığı sahtecilik kanıtı olarak
+değerlendirme.
 
-Birden fazla ba??ms?z ve anlaml? tutars?zl?k varsa
-risk de?erlendirmesine dahil et.
+Birden fazla bağımsız ve anlamlı tutarsızlık varsa
+risk değerlendirmesine dahil et.
 
 Referans dekontun kendisini analiz edilen dekontun
-ger�ekli?i i�in kesin kan?t olarak kabul etme.
+gerçekliği için kesin kanıt olarak kabul etme.
+
+=====================================================
+DEKONT BİLGİLERİNİ YAPILANDIRILMIŞ OLARAK ÇIKAR
+=====================================================
+
+Normal dekont analizinde aşağıdaki alanları mümkün olduğunca dekontun
+üzerinden doğrudan çıkar:
+
+documentData.senderName
+documentData.recipientName
+documentData.amount
+documentData.currency
+documentData.iban
+
+Kurallar:
+
+- Yalnızca gerçekten görülebilen bilgileri yaz.
+- Güvenilir şekilde okunamıyorsa null kullan.
+- IBAN'ı mümkünse standart biçimde yaz.
+- amount alanında dekontta görülen ana işlem tutarını kullan.
+- IBAN, hesap numarası, işlem numarası, referans numarası veya tarih
+  gibi diğer rakamları amount olarak kullanma.
+- Gönderen ve alıcıyı alan etiketlerine göre ayırt et.
+- Açıklama alanındaki isimleri gönderen/alıcı yerine kullanma.
+- Bu bilgiler daha sonra kullanıcı tarafından verilen bilgilerle
+  karşılaştırılacaktır.
+- Bu karşılaştırma risk skoruna dahil edilmeyecektir.
 
 Filename:
 ${fileName}`,
@@ -4528,7 +4730,7 @@ videoScore >= 46;
 const videoEvidence =
 videoResult?.amountAnalysis?.evidence ||
 videoResult?.summary ||
-"Video analizi tamamland?.";
+"Video analizi tamamlandı.";
 
 
 return res
@@ -4570,7 +4772,7 @@ videoEvidence,
 else {
 
 throw new Error(
-"Desteklenmeyen dosya t�r�."
+"Desteklenmeyen dosya türü."
 );
 
 }
@@ -4651,58 +4853,9 @@ parseAIResponse(
 response.output_text
 );
 
-// =====================================================
-// KULLANICI BİLGİLERİ İLE DEKONT KARŞILAŞTIRMASI
-// =====================================================
-// Bu karşılaştırma risk skoruna dahil edilmez.
-// Sadece ayrı bir uyarı olarak döndürülür.
-
-const providedInfoText =
-first(fields?.providedInfo) ||
-first(fields?.documentInfo) ||
-first(fields?.claim) ||
-"";
-
-const providedInfo =
-parseUserProvidedInfo(
-providedInfoText
-);
-
-const documentInfo =
-result?.transactionDetails || {};
-
-const verificationComparison =
-compareProvidedInfoWithDocument(
-providedInfo,
-documentInfo
-);
-
-result.verificationWarning = {
-available:
-verificationComparison.available,
-warnings:
-verificationComparison.warnings,
-};
-
-console.log(
-"PROVIDED INFO:",
-providedInfo
-);
-
-console.log(
-"DOCUMENT INFO:",
-documentInfo
-);
-
-console.log(
-"VERIFICATION WARNINGS:",
-verificationComparison.warnings
-);
-
-
 
 // =====================================================
-// DETERMINISTIK R?SK MOTORU
+// DETERMINISTIK RİSK MOTORU
 // =====================================================
 
 const calculatedRisk =
@@ -4711,7 +4864,7 @@ result
 );
 
 
-// AI'?n overallRisk de?erini kullanma.
+// AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
 
 result.overallRisk =
@@ -4721,7 +4874,24 @@ result.riskLabel =
 calculatedRisk.riskLabel;
 
 result.categories =
-calculatedRisk.categories;  
+calculatedRisk.categories;
+
+// =====================================================
+// KULLANICI BİLGİLERİ ↔ DEKONT KARŞILAŞTIRMASI
+// =====================================================
+//
+// ÖNEMLİ:
+// Bu kontrol risk skorunu değiştirmez.
+// Sadece ayrı bir uyarı olarak döndürülür.
+
+const informationCheck =
+compareProvidedInfoWithDocument(
+providedInfo,
+result?.documentData
+);
+
+result.informationCheck =
+informationCheck;
 
 // =====================================================
 // ANA SKOR
@@ -4740,7 +4910,7 @@ finalScore >= 46;
 const finalEvidence =
 result?.amountAnalysis?.evidence ||
 result?.summary ||
-"Analiz tamamland?.";
+"Analiz tamamlandı.";
 
 
 console.log(
@@ -4752,6 +4922,13 @@ finalScore
 console.log(
 "FINAL SUSPICIOUS:",
 finalSuspicious
+);
+
+console.log(
+"INFORMATION CHECK:",
+JSON.stringify(
+informationCheck
+)
 );
 
 
@@ -4801,10 +4978,6 @@ finalScore,
 suspicious:
 finalSuspicious,
 
-verificationWarning:
-result.verificationWarning,
-
-verificationComparison,
 evidence:
 finalEvidence,
 
