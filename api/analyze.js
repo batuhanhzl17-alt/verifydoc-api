@@ -3955,6 +3955,74 @@ console.log(
 "FORM PARSED"
 );
 
+// =================================================
+// KULLANICININ GİRDİĞİ BEKLENEN BİLGİLER
+// =================================================
+
+const expectedSenderName =
+first(
+fields?.expectedSenderName
+) || null;
+
+const expectedRecipientName =
+first(
+fields?.expectedRecipientName
+) || null;
+
+const expectedSenderIban =
+first(
+fields?.expectedSenderIban
+) || null;
+
+const expectedRecipientIban =
+first(
+fields?.expectedRecipientIban
+) || null;
+
+const expectedAmount =
+first(
+fields?.expectedAmount
+) || null;
+
+const expectedCurrency =
+first(
+fields?.expectedCurrency
+) || null;
+
+const expectedRawText =
+first(
+fields?.expectedRawText
+) || null;
+
+console.log(
+"EXPECTED SENDER NAME:",
+expectedSenderName
+);
+
+console.log(
+"EXPECTED RECIPIENT NAME:",
+expectedRecipientName
+);
+
+console.log(
+"EXPECTED SENDER IBAN:",
+expectedSenderIban
+);
+
+console.log(
+"EXPECTED RECIPIENT IBAN:",
+expectedRecipientIban
+);
+
+console.log(
+"EXPECTED AMOUNT:",
+expectedAmount
+);
+
+console.log(
+"EXPECTED CURRENCY:",
+expectedCurrency
+);
 
 const uploadedFile =
 findUploadedFile(
