@@ -4895,7 +4895,75 @@ const calculatedRisk =
 calculateOverallRisk(
 result
 );
+const calculatedRisk =
+calculateOverallRisk(result);
 
+// ==========================================
+// KRİTİK TUTAR TUTARSIZLIĞI
+// ==========================================
+
+const amountAnalysis = result?.amountAnalysis;
+
+const amountDifference = Number(
+amountAnalysis?.difference
+);
+
+const hasMajorAmountMismatch =
+Number.isFinite(amountDifference) &&
+Math.abs(amountDifference) >= 100;
+
+const hasSevereAmountMismatch =
+Number.isFinite(amountDifference) &&
+Math.abs(amountDifference) >= 1000;
+
+// Mevcut JavaScript risk motorunun sonucunu temel al
+let finalRiskScore =
+Number(calculatedRisk.overallRisk) || 0;
+
+// Tutar farkı varsa riski ciddi şekilde yükselt
+if (hasMajorAmountMismatch) {
+finalRiskScore = Math.max(
+finalRiskScore,
+60
+);
+}
+
+// Çok büyük fark varsa VERY HIGH seviyesine zorla
+if (hasSevereAmountMismatch) {
+finalRiskScore = Math.max(
+finalRiskScore,
+85
+);
+}
+
+// 0-100 arasında tut
+finalRiskScore = Math.round(
+Math.max(
+0,
+Math.min(100, finalRiskScore)
+)
+);
+
+let finalRiskLabel;
+
+if (finalRiskScore >= 85) {
+finalRiskLabel = "VERY HIGH RISK";
+} else if (finalRiskScore >= 60) {
+finalRiskLabel = "HIGH RISK";
+} else if (finalRiskScore >= 46) {
+finalRiskLabel = "MODERATE RISK";
+} else {
+finalRiskLabel = "LOW RISK";
+}
+
+result.overallRisk =
+finalRiskScore;
+
+result.riskLabel =
+finalRiskLabel;
+
+result.categories =
+calculatedRisk.categories;
 
 // AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
