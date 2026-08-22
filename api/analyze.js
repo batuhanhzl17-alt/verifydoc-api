@@ -775,27 +775,30 @@ result?.amountAnalysis;
 
 if (
 amountAnalysis &&
-amountAnalysis.calculationConsistent === false &&
-amountAnalysis.calculatedTotal !== null &&
-amountAnalysis.totalAmount !== null
+amountAnalysis.totalAmount !== null &&
+amountAnalysis.calculatedTotal !== null
 ) {
+const totalAmount = Number(
+amountAnalysis.totalAmount
+);
 
-const difference =
-Number(
-amountAnalysis.difference
+const calculatedTotal = Number(
+amountAnalysis.calculatedTotal
 );
 
 if (
-Number.isFinite(difference) &&
-Math.abs(difference) > 0.01
+Number.isFinite(totalAmount) &&
+Number.isFinite(calculatedTotal)
 ) {
+const difference = Math.abs(
+totalAmount - calculatedTotal
+);
 
+if (difference > 0.01) {
 score += 10;
-
 }
-
 }
-
+}
 
 // -----------------------------------------------------
 // SKORU 0-100 ARASINDA TUT
