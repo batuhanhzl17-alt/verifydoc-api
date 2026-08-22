@@ -572,29 +572,8 @@ async function downloadTelegramFile(
 // =====================================================
 // KULLANICI AÇIKLAMASINDAN BEKLENEN BİLGİLERİ ÇIKAR
 // =====================================================
-//
-// Örnek:
-//
-// Gönderen: Atıf Kale
-// 1000 TL
-// TR83 0013 4000 0266 0590 7001 01
-// Alıcı: Mehmet Uşak
-//
-// Açıklama yoksa bütün alanlar null kalır.
-//
-// ÖNEMLİ:
-// Önce para birimiyle birlikte yazılan tutar aranır.
-// Böylece:
-//
-// 12.45
-// 500 TL
-//
-// örneğinde 12.45 saat/tutar olarak yanlış alınmaz.
-// =====================================================
 
-function extractExpectedDetails(
- text
-) {
+function extractExpectedDetails(text) {
 
  const result = {
 
@@ -604,21 +583,22 @@ function extractExpectedDetails(
  recipientName:
  null,
 
+ senderIban:
+ null,
+
+ recipientIban:
+ null,
+
  amount:
  null,
 
  currency:
  null,
 
- iban:
- null,
-
  rawText:
- text ||
- "",
+ text || "",
 
  };
-
 
  if (
  !text ||
@@ -632,18 +612,8 @@ function extractExpectedDetails(
 
  const normalized =
  text
- .replace(
- /\r/g,
- ""
- )
+ .replace(/\r/g, "")
  .trim();
-
-
- if (!normalized) {
-
- return result;
-
- }
 
 
  const lines =
@@ -651,12 +621,7 @@ function extractExpectedDetails(
  .split("\n")
  .map(
  line =>
- line
- .trim()
- .replace(
- /\s+/g,
- " "
- )
+ line.trim()
  )
  .filter(Boolean);
 
@@ -694,62 +659,333 @@ function extractExpectedDetails(
  recipientMatch?.[1]
  ) {
 
- result.recipientName =
+ let recipientName =
  recipientMatch[1]
  .trim();
+
+ // "alıcı iban" gibi bir satır yanlışlıkla isim
+ // olarak okunmasın.
+ if (
+ !/^iban$/i.test(
+ recipientName
+ ) &&
+ !/iban/i.test(
+ recipientName
+ )
+ ) {
+
+ result.recipientName =
+ recipientName;
+
+ }
 
  }
 
 
  // ===================================================
- // IBAN
+ // IBAN NORMALİZASYONU
  // ===================================================
 
- const ibanMatch =
- normalized.match(
- /\b([A-Z]{2}\s?\d{2}(?:\s?\d{4}){4,7})\b/i
- );
-
- if (
- ibanMatch?.[1]
+ function normalizeIban(
+ value
  ) {
 
- result.iban =
- ibanMatch[1]
+ if (
+ !value ||
+ typeof value !== "string"
+ ) {
+
+ return null;
+
+ }
+
+ const cleaned =
+ value
  .replace(
- /\s+/g,
+ /[^A-Za-z0-9]/g,
  ""
  )
  .toUpperCase();
 
+ if (
+ /^TR\d{24}$/.test(
+ cleaned
+ )
+ ) {
+
+ return cleaned;
+
+ }
+
+ return null;
+
  }
 
 
  // ===================================================
- // TUTAR — ÖNCE PARA BİRİMİ İLE BİRLİKTE ARA
+ // IBAN BULMA
  // ===================================================
 
- const amountWithCurrencyMatch =
- normalized.match(
- /(?:^|\s)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(TL|TRY|₺|EUR|EURO|USD|\$)(?=\s|$)/i
+ function findIbanInText(
+ value
+ ) {
+
+ if (
+ !value
+ ) {
+
+ return null;
+
+ }
+
+ const match =
+ value.match(
+ /\bTR\s?\d{2}(?:\s?\d{4}){5}\b/i
  );
 
  if (
- amountWithCurrencyMatch?.[1]
+ !match
+ ) {
+
+ return null;
+
+ }
+
+ return normalizeIban(
+ match[0]
+ );
+
+ }
+
+
+ // ===================================================
+ // GÖNDEREN IBAN
+ // ===================================================
+
+ for (
+ let i = 0;
+ i < lines.length;
+ i++
+ ) {
+
+ const line =
+ lines[i];
+
+ if (
+ /(?:gönderen|gonderen|sender)/i.test(
+ line
+ ) &&
+ /iban/i.test(
+ line
+ )
+ ) {
+
+ const sameLineIban =
+ findIbanInText(
+ line
+ );
+
+ if (
+ sameLineIban
+ ) {
+
+ result.senderIban =
+ sameLineIban;
+
+ break;
+
+ }
+
+
+ if (
+ lines[i + 1]
+ ) {
+
+ const nextLineIban =
+ findIbanInText(
+ lines[i + 1]
+ );
+
+ if (
+ nextLineIban
+ ) {
+
+ result.senderIban =
+ nextLineIban;
+
+ break;
+
+ }
+
+ }
+
+ }
+
+ }
+
+
+ // ===================================================
+ // ALICI IBAN
+ // ===================================================
+
+ for (
+ let i = 0;
+ i < lines.length;
+ i++
+ ) {
+
+ const line =
+ lines[i];
+
+ if (
+ /(?:alıcı|alici|recipient)/i.test(
+ line
+ ) &&
+ /iban/i.test(
+ line
+ )
+ ) {
+
+ const sameLineIban =
+ findIbanInText(
+ line
+ );
+
+ if (
+ sameLineIban
+ ) {
+
+ result.recipientIban =
+ sameLineIban;
+
+ break;
+
+ }
+
+
+ if (
+ lines[i + 1]
+ ) {
+
+ const nextLineIban =
+ findIbanInText(
+ lines[i + 1]
+ );
+
+ if (
+ nextLineIban
+ ) {
+
+ result.recipientIban =
+ nextLineIban;
+
+ break;
+
+ }
+
+ }
+
+ }
+
+ }
+
+
+ // ===================================================
+ // EĞER "ALICI IBAN" YAZILMADAN SADECE IBAN VERİLDİYSE
+ // ===================================================
+ //
+ // Örneğin:
+ //
+ // Alıcı: MIRAÇ OKKAY
+ // TR46 0006 2001 1870 0006 8833 83
+ //
+ // Bu durumda alıcıdan sonraki IBAN'ı al.
+ // ===================================================
+
+ if (
+ !result.recipientIban
+ ) {
+
+ let recipientFound =
+ false;
+
+ for (
+ let i = 0;
+ i < lines.length;
+ i++
+ ) {
+
+ if (
+ /^(?:alıcı|alici|recipient)\b/i.test(
+ lines[i]
+ )
+ ) {
+
+ recipientFound =
+ true;
+
+ continue;
+
+ }
+
+ if (
+ recipientFound
+ ) {
+
+ const iban =
+ findIbanInText(
+ lines[i]
+ );
+
+ if (
+ iban
+ ) {
+
+ result.recipientIban =
+ iban;
+
+ break;
+
+ }
+
+ }
+
+ }
+
+ }
+
+
+ // ===================================================
+ // TUTAR
+ // ===================================================
+
+ const amountMatch =
+ normalized.match(
+ /(?:^|\s)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(TL|TRY|₺|EUR|EURO|USD|\$)?(?:\s|$)/i
+ );
+
+ if (
+ amountMatch?.[1]
  ) {
 
  result.amount =
- amountWithCurrencyMatch[1];
+ amountMatch[1];
+
+ if (
+ amountMatch?.[2]
+ ) {
 
  result.currency =
- amountWithCurrencyMatch[2]
+ amountMatch[2]
  .toUpperCase();
 
  }
 
+ }
+
 
  // ===================================================
- // TL / TRY KONTROLÜ
+ // TL / TRY
  // ===================================================
 
  if (
@@ -766,39 +1002,7 @@ function extractExpectedDetails(
 
 
  // ===================================================
- // ETİKETLİ TUTAR
- // ===================================================
-
- const labeledAmountMatch =
- normalized.match(
- /(?:tutar|miktar|amount)\s*[:\-]?\s*([0-9][0-9.,]*)\s*(TL|TRY|₺|EUR|EURO|USD|\$)?/i
- );
-
- if (
- labeledAmountMatch?.[1]
- ) {
-
- result.amount =
- labeledAmountMatch[1];
-
- if (
- labeledAmountMatch?.[2]
- ) {
-
- result.currency =
- labeledAmountMatch[2]
- .toUpperCase();
-
- }
-
- }
-
-
- // ===================================================
  // SADECE SAYI VERİLMİŞSE
- // ===================================================
- //
- // IBAN ve saat satırlarını tutar sanma.
  // ===================================================
 
  if (
@@ -819,31 +1023,9 @@ function extractExpectedDetails(
 
  }
 
- if (
- /\bTR\d{2}/i.test(
- line
- )
- ) {
-
- continue;
-
- }
-
- // 12.45 gibi değerleri saat kabul et.
-
- if (
- /^\d{1,2}[.:]\d{2}$/.test(
- line
- )
- ) {
-
- continue;
-
- }
-
  const match =
  line.match(
- /^(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)$/
+ /^(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(TL|TRY|₺|EUR|EURO|USD|\$)?$/i
  );
 
  if (
@@ -853,6 +1035,16 @@ function extractExpectedDetails(
  result.amount =
  match[1];
 
+ if (
+ match[2]
+ ) {
+
+ result.currency =
+ match[2]
+ .toUpperCase();
+
+ }
+
  break;
 
  }
@@ -860,6 +1052,18 @@ function extractExpectedDetails(
  }
 
  }
+
+
+ console.log(
+ "EXPECTED DETAILS:",
+ result
+ );
+
+
+ return result;
+
+}
+
 
 
  // ===================================================
