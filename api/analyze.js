@@ -873,6 +873,53 @@ type:
 
 },
 
+documentData: {
+
+type:
+"object",
+
+properties: {
+
+senderName: {
+type:
+["string", "null"],
+},
+
+recipientName: {
+type:
+["string", "null"],
+},
+
+amount: {
+type:
+["string", "null"],
+},
+
+currency: {
+type:
+["string", "null"],
+},
+
+iban: {
+type:
+["string", "null"],
+},
+
+},
+
+required: [
+"senderName",
+"recipientName",
+"amount",
+"currency",
+"iban",
+],
+
+additionalProperties:
+false,
+
+},
+
 categories: {
 
 type:
@@ -1101,6 +1148,7 @@ required: [
 "riskLabel",
 "confidence",
 "summary",
+"documentData",
 "categories",
 "checks",
 "limitations",
@@ -3340,6 +3388,464 @@ return result;
 
 
 // =====================================================
+// KULLANICININ VERDİĞİ DEKONT BİLGİLERİ
+// =====================================================
+//
+// Bu bilgiler RİSK SKORUNA DAHİL EDİLMEZ.
+// Yalnızca dekonttan çıkarılan bilgilerle karşılaştırılır.
+// =====================================================
+
+function normalizeComparisonText(value) {
+
+if (
+value === null ||
+value === undefined
+) {
+
+return "";
+
+}
+
+return String(value)
+.toLocaleLowerCase("tr-TR")
+.trim()
+.replace(/\s+/g, " ")
+.replace(/[.,;:()\-_/\\]+/g, " ")
+.replace(/\s+/g, " ")
+.trim();
+
+}
+
+
+function normalizeIBAN(value) {
+
+if (
+value === null ||
+value === undefined
+) {
+
+return "";
+
+}
+
+return String(value)
+.toUpperCase()
+.replace(/\s+/g, "")
+.replace(/[^A-Z0-9]/g, "");
+
+}
+
+
+function parseComparisonAmount(value) {
+
+if (
+value === null ||
+value === undefined
+) {
+
+return null;
+
+}
+
+if (
+typeof value === "number" &&
+Number.isFinite(value)
+) {
+
+return value;
+
+}
+
+let raw =
+String(value)
+.trim()
+.replace(/\s/g, "")
+.replace(/[₺]/g, "")
+.replace(/TL/gi, "")
+.replace(/TRY/gi, "");
+
+if (!raw) {
+
+return null;
+
+}
+
+if (
+raw.includes(",") &&
+raw.includes(".")
+) {
+
+raw =
+raw.replace(/\./g, "")
+.replace(",", ".");
+
+}
+
+else if (
+raw.includes(",")
+) {
+
+raw =
+raw.replace(",", ".");
+
+}
+
+else {
+
+const parts =
+raw.split(".");
+
+if (
+parts.length === 2 &&
+parts[1].length === 3
+) {
+
+raw =
+raw.replace(/\./g, "");
+
+}
+
+}
+
+const number =
+Number(raw);
+
+return Number.isFinite(number)
+? number
+: null;
+
+}
+
+
+function normalizeProvidedInfo(value) {
+
+if (
+!value ||
+typeof value !== "object"
+) {
+
+return null;
+
+}
+
+const normalized = {
+
+senderName:
+value.senderName ??
+value.sender ??
+null,
+
+recipientName:
+value.recipientName ??
+value.recipient ??
+null,
+
+amount:
+value.amount ??
+null,
+
+currency:
+value.currency ??
+null,
+
+iban:
+value.iban ??
+null,
+
+};
+
+const hasValue =
+Object.values(normalized)
+.some(
+item =>
+item !== null &&
+item !== undefined &&
+String(item).trim() !== ""
+);
+
+return hasValue
+? normalized
+: null;
+
+}
+
+
+function compareProvidedInfoWithDocument(
+providedInfo,
+documentData
+) {
+
+const provided =
+normalizeProvidedInfo(
+providedInfo
+);
+
+if (!provided) {
+
+return {
+
+enabled:
+false,
+
+matches:
+{},
+
+warnings:
+[],
+
+provided:
+null,
+
+document:
+documentData ||
+null,
+
+};
+
+}
+
+const document =
+documentData ||
+{};
+
+const matches = {};
+const warnings = [];
+
+
+if (
+provided.senderName
+) {
+
+if (
+!document.senderName
+) {
+
+matches.senderName =
+"unknown";
+
+warnings.push(
+"Gönderen adı kontrol edilemedi: dekonttan gönderen adı güvenilir şekilde okunamadı."
+);
+
+}
+
+else {
+
+const expected =
+normalizeComparisonText(
+provided.senderName
+);
+
+const actual =
+normalizeComparisonText(
+document.senderName
+);
+
+matches.senderName =
+expected === actual
+? "match"
+: "mismatch";
+
+if (
+expected !== actual
+) {
+
+warnings.push(
+`Gönderen adı uyuşmuyor. Beklenen: "${provided.senderName}", dekontta görülen: "${document.senderName}".`
+);
+
+}
+
+}
+
+}
+
+
+if (
+provided.recipientName
+) {
+
+if (
+!document.recipientName
+) {
+
+matches.recipientName =
+"unknown";
+
+warnings.push(
+"Alıcı adı kontrol edilemedi: dekonttan alıcı adı güvenilir şekilde okunamadı."
+);
+
+}
+
+else {
+
+const expected =
+normalizeComparisonText(
+provided.recipientName
+);
+
+const actual =
+normalizeComparisonText(
+document.recipientName
+);
+
+matches.recipientName =
+expected === actual
+? "match"
+: "mismatch";
+
+if (
+expected !== actual
+) {
+
+warnings.push(
+`Alıcı adı uyuşmuyor. Beklenen: "${provided.recipientName}", dekontta görülen: "${document.recipientName}".`
+);
+
+}
+
+}
+
+}
+
+
+if (
+provided.iban
+) {
+
+if (
+!document.iban
+) {
+
+matches.iban =
+"unknown";
+
+warnings.push(
+"IBAN kontrol edilemedi: dekonttan IBAN güvenilir şekilde okunamadı."
+);
+
+}
+
+else {
+
+const expected =
+normalizeIBAN(
+provided.iban
+);
+
+const actual =
+normalizeIBAN(
+document.iban
+);
+
+matches.iban =
+expected === actual
+? "match"
+: "mismatch";
+
+if (
+expected !== actual
+) {
+
+warnings.push(
+`IBAN uyuşmuyor. Beklenen: "${provided.iban}", dekontta görülen: "${document.iban}".`
+);
+
+}
+
+}
+
+}
+
+
+if (
+provided.amount !== null &&
+provided.amount !== undefined &&
+String(provided.amount).trim() !== ""
+) {
+
+const expected =
+parseComparisonAmount(
+provided.amount
+);
+
+const actual =
+parseComparisonAmount(
+document.amount
+);
+
+if (
+expected === null
+) {
+
+matches.amount =
+"unknown";
+
+warnings.push(
+"Tutar kontrolü yapılamadı: gönderilen beklenen tutar okunabilir bir sayıya dönüştürülemedi."
+);
+
+}
+
+else if (
+actual === null
+) {
+
+matches.amount =
+"unknown";
+
+warnings.push(
+"Tutar kontrol edilemedi: dekonttan ana işlem tutarı güvenilir şekilde okunamadı."
+);
+
+}
+
+else {
+
+const difference =
+Math.abs(
+expected - actual
+);
+
+matches.amount =
+difference <= 0.01
+? "match"
+: "mismatch";
+
+if (
+difference > 0.01
+) {
+
+warnings.push(
+`Tutar uyuşmuyor. Beklenen: "${provided.amount}", dekontta görülen: "${document.amount}".`
+);
+
+}
+
+}
+
+}
+
+return {
+
+enabled:
+true,
+
+matches,
+
+warnings,
+
+provided,
+
+document,
+
+};
+
+}
+
+
+// =====================================================
 // API
 // =====================================================
 
@@ -3489,6 +3995,48 @@ fields?.fileName
 ) ||
 uploadedFile.originalFilename ||
 "document";
+
+
+// =================================================
+// KULLANICININ VERDİĞİ KARŞILAŞTIRMA BİLGİLERİ
+// =================================================
+
+let providedInfo =
+null;
+
+const rawProvidedInfo =
+first(
+fields?.providedInfo
+);
+
+if (
+rawProvidedInfo
+) {
+
+try {
+
+providedInfo =
+normalizeProvidedInfo(
+JSON.parse(
+rawProvidedInfo
+)
+);
+
+}
+
+catch (error) {
+
+console.warn(
+"providedInfo JSON okunamadı:",
+error
+);
+
+providedInfo =
+null;
+
+}
+
+}
 
 
 // =================================================
@@ -3939,6 +4487,33 @@ artırma.
 Referans dekontun kendisini analiz edilen dekontun
 gerçekliği için kesin kanıt olarak kabul etme.
 
+=====================================================
+DEKONT BİLGİLERİNİ YAPILANDIRILMIŞ OLARAK ÇIKAR
+=====================================================
+
+Normal dekont analizinde aşağıdaki alanları mümkün olduğunca dekontun
+üzerinden doğrudan çıkar:
+
+documentData.senderName
+documentData.recipientName
+documentData.amount
+documentData.currency
+documentData.iban
+
+Kurallar:
+
+- Yalnızca gerçekten görülebilen bilgileri yaz.
+- Güvenilir şekilde okunamıyorsa null kullan.
+- IBAN'ı mümkünse standart biçimde yaz.
+- amount alanında dekontta görülen ana işlem tutarını kullan.
+- IBAN, hesap numarası, işlem numarası, referans numarası veya tarih
+  gibi diğer rakamları amount olarak kullanma.
+- Gönderen ve alıcıyı alan etiketlerine göre ayırt et.
+- Açıklama alanındaki isimleri gönderen/alıcı yerine kullanma.
+- Bu bilgiler daha sonra kullanıcı tarafından verilen bilgilerle
+  karşılaştırılacaktır.
+- Bu karşılaştırma risk skoruna dahil edilmeyecektir.
+
 Filename:
 ${fileName}`,
 
@@ -4026,6 +4601,33 @@ risk değerlendirmesine dahil et.
 
 Referans dekontun kendisini analiz edilen dekontun
 gerçekliği için kesin kanıt olarak kabul etme.
+
+=====================================================
+DEKONT BİLGİLERİNİ YAPILANDIRILMIŞ OLARAK ÇIKAR
+=====================================================
+
+Normal dekont analizinde aşağıdaki alanları mümkün olduğunca dekontun
+üzerinden doğrudan çıkar:
+
+documentData.senderName
+documentData.recipientName
+documentData.amount
+documentData.currency
+documentData.iban
+
+Kurallar:
+
+- Yalnızca gerçekten görülebilen bilgileri yaz.
+- Güvenilir şekilde okunamıyorsa null kullan.
+- IBAN'ı mümkünse standart biçimde yaz.
+- amount alanında dekontta görülen ana işlem tutarını kullan.
+- IBAN, hesap numarası, işlem numarası, referans numarası veya tarih
+  gibi diğer rakamları amount olarak kullanma.
+- Gönderen ve alıcıyı alan etiketlerine göre ayırt et.
+- Açıklama alanındaki isimleri gönderen/alıcı yerine kullanma.
+- Bu bilgiler daha sonra kullanıcı tarafından verilen bilgilerle
+  karşılaştırılacaktır.
+- Bu karşılaştırma risk skoruna dahil edilmeyecektir.
 
 Filename:
 ${fileName}`,
@@ -4272,7 +4874,24 @@ result.riskLabel =
 calculatedRisk.riskLabel;
 
 result.categories =
-calculatedRisk.categories;  
+calculatedRisk.categories;
+
+// =====================================================
+// KULLANICI BİLGİLERİ ↔ DEKONT KARŞILAŞTIRMASI
+// =====================================================
+//
+// ÖNEMLİ:
+// Bu kontrol risk skorunu değiştirmez.
+// Sadece ayrı bir uyarı olarak döndürülür.
+
+const informationCheck =
+compareProvidedInfoWithDocument(
+providedInfo,
+result?.documentData
+);
+
+result.informationCheck =
+informationCheck;
 
 // =====================================================
 // ANA SKOR
@@ -4303,6 +4922,13 @@ finalScore
 console.log(
 "FINAL SUSPICIOUS:",
 finalSuspicious
+);
+
+console.log(
+"INFORMATION CHECK:",
+JSON.stringify(
+informationCheck
+)
 );
 
 
