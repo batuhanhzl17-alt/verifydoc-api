@@ -935,6 +935,7 @@ type:
 required: [
 "senderName",
 "recipientName",
+"recipientIban",
 "amount",
 "currency",
 "iban",
@@ -4640,6 +4641,7 @@ Normal dekont analizinde aşağıdaki alanları mümkün olduğunca dekontun
 
 documentData.senderName
 documentData.recipientName
+documentData.recipientIban
 documentData.amount
 documentData.currency
 documentData.iban
@@ -4649,6 +4651,8 @@ Kurallar:
 - Yalnızca gerçekten görülebilen bilgileri yaz.
 - Güvenilir şekilde okunamıyorsa null kullan.
 - IBAN'ı mümkünse standart biçimde yaz.
+- Dekontta "ALICI IBAN", "ALICI HESAP", "Alıcı Hesap" veya  bir etiketle görülen IBAN/h hesap bilgisini recipientIban alanına yaz.
+- "Gönderen IBAN" veya "Gönderen IBAN"  olarak etiketlenen IBAN'ı recipientIban alanına yazma;  onu iban alanına tut.
 - amount alanında dekontta görülen ana işlem tutarını kullan.
 - IBAN, hesap numarası, işlem numarası, referans numarası veya tarih
   gibi diğer rakamları amount olarak kullanma.
