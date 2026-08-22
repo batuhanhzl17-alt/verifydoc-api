@@ -90,10 +90,6 @@ async function sendMessage(
 
  };
 
- // ===================================================
- // REPLY
- // ===================================================
-
  if (
  replyToMessageId !== null &&
  replyToMessageId !== undefined
@@ -112,10 +108,6 @@ async function sendMessage(
  };
 
  }
-
- // ===================================================
- // INLINE KEYBOARD
- // ===================================================
 
  if (
  replyMarkup
@@ -313,7 +305,7 @@ function getBankKeyboard() {
  [
  {
  text:
- "🏦 Akbank",
+ " Akbank",
 
  callback_data:
  "bank:akbank",
@@ -321,7 +313,7 @@ function getBankKeyboard() {
 
  {
  text:
- "🏦 Garanti BBVA",
+ " Garanti BBVA",
 
  callback_data:
  "bank:garanti",
@@ -331,7 +323,7 @@ function getBankKeyboard() {
  [
  {
  text:
- "🏦 Enpara",
+ " Enpara",
 
  callback_data:
  "bank:enpara",
@@ -339,7 +331,7 @@ function getBankKeyboard() {
 
  {
  text:
- "🏦 VakıfBank",
+ " VakıfBank",
 
  callback_data:
  "bank:vakifbank",
@@ -349,7 +341,7 @@ function getBankKeyboard() {
  [
  {
  text:
- "🏦 İş Bankası",
+ " İş Bankası",
 
  callback_data:
  "bank:isbankasi",
@@ -357,7 +349,7 @@ function getBankKeyboard() {
 
  {
  text:
- "🏦 Ziraat",
+ " Ziraat",
 
  callback_data:
  "bank:ziraat",
@@ -367,7 +359,7 @@ function getBankKeyboard() {
  [
  {
  text:
- "🏦 Denizbank",
+ " Denizbank",
 
  callback_data:
  "bank:denizbank",
@@ -375,7 +367,7 @@ function getBankKeyboard() {
 
  {
  text:
- "🏦 Halkbank",
+ " Halkbank",
 
  callback_data:
  "bank:halkbank",
@@ -385,7 +377,7 @@ function getBankKeyboard() {
  [
  {
  text:
- "🏦 Yapı Kredi",
+ " Yapı Kredi",
 
  callback_data:
  "bank:yapikredi",
@@ -395,7 +387,7 @@ function getBankKeyboard() {
  [
  {
  text:
- "📊 Hesap Özeti",
+ " Hesap Özeti",
 
  callback_data:
  "mode:statement",
@@ -581,7 +573,7 @@ async function downloadTelegramFile(
 // KULLANICI AÇIKLAMASINDAN BEKLENEN BİLGİLERİ ÇIKAR
 // =====================================================
 //
-// ÖRNEK:
+// Örnek:
 //
 // Gönderen: Atıf Kale
 // 1000 TL
@@ -589,11 +581,19 @@ async function downloadTelegramFile(
 // Alıcı: Mehmet Uşak
 //
 // Açıklama yoksa bütün alanlar null kalır.
-// Bu durumda analiz NORMAL şekilde devam eder.
+//
+// ÖNEMLİ:
+// Önce para birimiyle birlikte yazılan tutar aranır.
+// Böylece:
+//
+// 12.45
+// 500 TL
+//
+// örneğinde 12.45 saat/tutar olarak yanlış alınmaz.
 // =====================================================
 
 function extractExpectedDetails(
-text
+ text
 ) {
 
  const result = {
@@ -619,6 +619,7 @@ text
 
  };
 
+
  if (
  !text ||
  typeof text !== "string"
@@ -636,6 +637,28 @@ text
  ""
  )
  .trim();
+
+
+ if (!normalized) {
+
+ return result;
+
+ }
+
+
+ const lines =
+ normalized
+ .split("\n")
+ .map(
+ line =>
+ line
+ .trim()
+ .replace(
+ /\s+/g,
+ " "
+ )
+ )
+ .filter(Boolean);
 
 
  // ===================================================
@@ -703,30 +726,24 @@ text
 
 
  // ===================================================
- // TUTAR
+ // TUTAR — ÖNCE PARA BİRİMİ İLE BİRLİKTE ARA
  // ===================================================
 
- const amountMatch =
+ const amountWithCurrencyMatch =
  normalized.match(
- /(?:^|\s)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(TL|TRY|₺|EUR|EURO|USD|\$)?(?:\s|$)/i
+ /(?:^|\s)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(TL|TRY|₺|EUR|EURO|USD|\$)(?=\s|$)/i
  );
 
  if (
- amountMatch?.[1]
+ amountWithCurrencyMatch?.[1]
  ) {
 
  result.amount =
- amountMatch[1];
-
- if (
- amountMatch?.[2]
- ) {
+ amountWithCurrencyMatch[1];
 
  result.currency =
- amountMatch[2]
+ amountWithCurrencyMatch[2]
  .toUpperCase();
-
- }
 
  }
 
@@ -749,33 +766,44 @@ text
 
 
  // ===================================================
+ // ETİKETLİ TUTAR
+ // ===================================================
+
+ const labeledAmountMatch =
+ normalized.match(
+ /(?:tutar|miktar|amount)\s*[:\-]?\s*([0-9][0-9.,]*)\s*(TL|TRY|₺|EUR|EURO|USD|\$)?/i
+ );
+
+ if (
+ labeledAmountMatch?.[1]
+ ) {
+
+ result.amount =
+ labeledAmountMatch[1];
+
+ if (
+ labeledAmountMatch?.[2]
+ ) {
+
+ result.currency =
+ labeledAmountMatch[2]
+ .toUpperCase();
+
+ }
+
+ }
+
+
+ // ===================================================
  // SADECE SAYI VERİLMİŞSE
  // ===================================================
  //
- // Örneğin:
- //
- // Gönderen: Atıf Kale
- // 1000
- // IBAN...
- //
- // IBAN rakamlarını tutar sanmamak için
- // IBAN satırını hariç tutuyoruz.
+ // IBAN ve saat satırlarını tutar sanma.
  // ===================================================
 
  if (
  !result.amount
  ) {
-
- const lines =
- normalized
- .split("\n")
- .map(
- line => line.trim()
- )
- .filter(
- Boolean
- );
-
 
  for (
  const line of lines
@@ -791,9 +819,31 @@ text
 
  }
 
+ if (
+ /\bTR\d{2}/i.test(
+ line
+ )
+ ) {
+
+ continue;
+
+ }
+
+ // 12.45 gibi değerleri saat kabul et.
+
+ if (
+ /^\d{1,2}[.:]\d{2}$/.test(
+ line
+ )
+ ) {
+
+ continue;
+
+ }
+
  const match =
  line.match(
- /^(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(TL|TRY|₺|EUR|EURO|USD|\$)?$/i
+ /^(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)$/
  );
 
  if (
@@ -802,16 +852,6 @@ text
 
  result.amount =
  match[1];
-
- if (
- match[2]
- ) {
-
- result.currency =
- match[2]
- .toUpperCase();
-
- }
 
  break;
 
@@ -822,9 +862,296 @@ text
  }
 
 
+ // ===================================================
+ // YAPISIZ METİN İÇİN YARDIMCI ANALİZ
+ // ===================================================
+
+ const bankRegex =
+ /\b(akbank|garanti(?:\s+bbva)?|garanti\s+bankası|enpara|vakıfbank|iş\s+bankası|isbankası|ziraat(?:\s+bankası)?|denizbank|halkbank|yapı\s+kredi)\b/i;
+
+
+ const timeRegex =
+ /^\d{1,2}[.:]\d{2}$/;
+
+
+ const amountLineRegex =
+ /^\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:TL|TRY|₺|EUR|EURO|USD|\$)$/i;
+
+
+ const cleanLines =
+ lines.filter(
+ line => {
+
+ if (
+ /iban/i.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ /\bTR\d{2}/i.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ bankRegex.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ timeRegex.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ amountLineRegex.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ /^\d{5,}$/.test(
+ line.replace(
+ /\s/g,
+ ""
+ )
+ )
+ ) {
+
+ return false;
+
+ }
+
+ return true;
+
+ }
+ );
+
+
+ // ===================================================
+ // YAPISIZ GÖNDEREN / ALICI
+ // ===================================================
+
+ if (
+ !result.senderName &&
+ !result.recipientName &&
+ cleanLines.length
+ ) {
+
+ const bankIndex =
+ lines.findIndex(
+ line =>
+ bankRegex.test(
+ line
+ )
+ );
+
+
+ const amountIndex =
+ lines.findIndex(
+ line =>
+ amountLineRegex.test(
+ line
+ )
+ );
+
+
+ // ---------------------------------------------------
+ // BANKADAN ÖNCEKİ İSİM
+ // ---------------------------------------------------
+
+ if (
+ bankIndex > 0
+ ) {
+
+ const beforeBank =
+ lines
+ .slice(
+ 0,
+ bankIndex
+ )
+ .filter(
+ line => {
+
+ if (
+ /^\d{5,}$/.test(
+ line.replace(
+ /\s/g,
+ ""
+ )
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ timeRegex.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ return true;
+
+ }
+ );
+
+
+ if (
+ beforeBank.length
+ ) {
+
+ result.senderName =
+ beforeBank
+ .join(" ")
+ .trim();
+
+ }
+
+ }
+
+
+ // ---------------------------------------------------
+ // TUTARDAN SONRAKİ İSİM
+ // ---------------------------------------------------
+
+ if (
+ amountIndex >= 0
+ ) {
+
+ const afterAmount =
+ lines
+ .slice(
+ amountIndex + 1
+ )
+ .filter(
+ line => {
+
+ if (
+ /iban/i.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ /\bTR\d{2}/i.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ bankRegex.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ if (
+ timeRegex.test(
+ line
+ )
+ ) {
+
+ return false;
+
+ }
+
+ return true;
+
+ }
+ );
+
+
+ if (
+ afterAmount.length
+ ) {
+
+ result.recipientName =
+ afterAmount
+ .join(" ")
+ .trim();
+
+ }
+
+ }
+
+ }
+
+
+ // ===================================================
+ // SON ÇARE
+ // ===================================================
+
+ if (
+ !result.senderName &&
+ cleanLines.length >= 2
+ ) {
+
+ result.senderName =
+ cleanLines[0];
+
+ }
+
+
+ if (
+ !result.recipientName &&
+ cleanLines.length >= 2
+ ) {
+
+ result.recipientName =
+ cleanLines[
+ cleanLines.length - 1
+ ];
+
+ }
+
+
  console.log(
  "EXPECTED DETAILS:",
- result
+ JSON.stringify(
+ result,
+ null,
+ 2
+ )
  );
 
 
@@ -1058,12 +1385,60 @@ expectedDetails,
  // KULLANICININ VERDİĞİ BEKLENEN BİLGİLER
  // ===================================================
  //
- // Açıklama yoksa bunlar gönderilmez.
+ // YENİ:
+ // providedInfo JSON olarak API'ye gönderiliyor.
+ //
+ // Geriye dönük uyumluluk için eski alanlar da
+ // gönderiliyor.
  // ===================================================
 
  if (
  expectedDetails
  ) {
+
+ const hasExpectedDetails =
+ Object.values(
+ expectedDetails
+ )
+ .some(
+ value =>
+ value !== null &&
+ value !== undefined &&
+ String(value).trim() !== ""
+ );
+
+
+ if (
+ hasExpectedDetails
+ ) {
+
+ form.append(
+ "providedInfo",
+ JSON.stringify({
+
+ senderName:
+ expectedDetails.senderName ||
+ null,
+
+ recipientName:
+ expectedDetails.recipientName ||
+ null,
+
+ amount:
+ expectedDetails.amount ||
+ null,
+
+ currency:
+ expectedDetails.currency ||
+ null,
+
+ iban:
+ expectedDetails.iban ||
+ null,
+
+ })
+ );
+
 
  if (
  expectedDetails.senderName
@@ -1076,6 +1451,7 @@ expectedDetails,
 
  }
 
+
  if (
  expectedDetails.recipientName
  ) {
@@ -1086,6 +1462,7 @@ expectedDetails,
  );
 
  }
+
 
  if (
  expectedDetails.amount
@@ -1098,6 +1475,7 @@ expectedDetails,
 
  }
 
+
  if (
  expectedDetails.currency
  ) {
@@ -1108,6 +1486,7 @@ expectedDetails,
  );
 
  }
+
 
  if (
  expectedDetails.iban
@@ -1120,6 +1499,7 @@ expectedDetails,
 
  }
 
+
  if (
  expectedDetails.rawText
  ) {
@@ -1128,6 +1508,8 @@ expectedDetails,
  "expectedRawText",
  expectedDetails.rawText
  );
+
+ }
 
  }
 
@@ -1259,18 +1641,21 @@ expectedDetails,
 // KULLANICI BİLGİSİ KARŞILAŞTIRMA SONUCUNU FORMATLA
 // =====================================================
 //
-// Bu bölüm risk skorunu değiştirmez.
-// Sadece ayrı bir UYARI oluşturur.
+// API'den öncelikle:
 //
-// Şimdilik API'den gelecek:
+// informationCheck
+//
+// beklenir.
+//
+// Eski yapı için:
 //
 // comparison
 //
-// alanını bekler.
+// da desteklenir.
 // =====================================================
 
 function formatComparisonWarning(
-comparison
+ comparison
 ) {
 
  if (
@@ -1283,8 +1668,15 @@ comparison
  }
 
 
+ const provided =
+ comparison?.provided ||
+ null;
+
+
  const hasExpected =
- comparison?.hasExpectedDetails === true;
+ comparison?.enabled === true ||
+ comparison?.hasExpectedDetails === true ||
+ !!provided;
 
 
  if (
@@ -1297,7 +1689,8 @@ comparison
 
 
  const matches =
- comparison?.matches === true;
+ comparison?.matches ||
+ {};
 
 
  const warnings =
@@ -1308,36 +1701,95 @@ comparison
  : [];
 
 
+ // ===================================================
+ // MATCHES YAPISI
+ // ===================================================
+
+ const mismatchCount =
+ Object.values(
+ matches
+ )
+ .filter(
+ value =>
+ value === "mismatch" ||
+ value === false
+ )
+ .length;
+
+
+ const unknownCount =
+ Object.values(
+ matches
+ )
+ .filter(
+ value =>
+ value === "unknown" ||
+ value === null
+ )
+ .length;
+
+
+ // ===================================================
+ // HER ŞEY UYUMLU
+ // ===================================================
+
  if (
- matches &&
- !warnings.length
+ mismatchCount === 0 &&
+ unknownCount === 0 &&
+ warnings.length === 0
  ) {
 
  return `
 
 ━━━━━━━━━━━━━━
-📋 KULLANICI BİLGİSİ KONTROLÜ
+ KULLANICI BİLGİSİ KONTROLÜ
 
-🟢 Girilen bilgiler dekontta görünen bilgilerle uyumlu görünüyor.
+ Girilen bilgiler dekontta görünen bilgilerle uyumlu görünüyor.
 
 Bu kontrol risk skoruna dahil edilmemiştir.`;
 
  }
 
 
+ // ===================================================
+ // UYARI
+ // ===================================================
+
  let text = `
 
 ━━━━━━━━━━━━━━
-📋 KULLANICI BİLGİSİ KONTROLÜ
+ KULLANICI BİLGİSİ KONTROLÜ`;
 
-🟠 Girilen bilgiler ile dekont arasında farklılık bulundu.`;
 
+ if (
+ mismatchCount > 0
+ ) {
+
+ text += `
+
+ UYARI: Girilen bilgiler ile dekont arasında farklılık bulundu.`;
+
+ }
+
+ else {
+
+ text += `
+
+ Girilen bilgilerin bazıları dekont üzerinden güvenilir şekilde doğrulanamadı.`;
+
+ }
+
+
+ // ===================================================
+ // API WARNINGS
+ // ===================================================
 
  if (
  warnings.length
  ) {
 
  text +=
+
  `
 
 ${warnings
@@ -1348,6 +1800,53 @@ ${warnings
  .join(
  "\n"
  )}`;
+
+ }
+
+
+ // ===================================================
+ // MATCHES'TEN OTOMATİK UYARI ÜRET
+ // ===================================================
+
+ const fieldNames = {
+
+ senderName:
+ "Gönderen adı",
+
+ recipientName:
+ "Alıcı adı",
+
+ amount:
+ "Tutar",
+
+ currency:
+ "Para birimi",
+
+ iban:
+ "IBAN",
+
+ };
+
+
+ for (
+ const [
+ field,
+ value
+ ]
+ of Object.entries(
+ matches
+ )
+ ) {
+
+ if (
+ value === "mismatch" ||
+ value === false
+ ) {
+
+ text +=
+ `\n• ${fieldNames[field] || field}: Uyuşmuyor.`;
+
+ }
 
  }
 
@@ -1400,7 +1899,7 @@ async function sendAnalysisResult(
  // ===================================================
 
  let emoji =
- "🟢";
+ " ";
 
 
  if (
@@ -1408,7 +1907,7 @@ async function sendAnalysisResult(
  ) {
 
  emoji =
- "🔴";
+ " ";
 
  }
 
@@ -1417,7 +1916,7 @@ async function sendAnalysisResult(
  ) {
 
  emoji =
- "🟠";
+ " ";
 
  }
 
@@ -1426,7 +1925,7 @@ async function sendAnalysisResult(
  ) {
 
  emoji =
- "🟡";
+ " ";
 
  }
 
@@ -1434,9 +1933,19 @@ async function sendAnalysisResult(
  // ===================================================
  // KULLANICI BİLGİSİ UYARISI
  // ===================================================
+ //
+ // YENİ API:
+ // informationCheck
+ //
+ // ESKİ API:
+ // comparison
+ //
+ // İkisini de destekliyoruz.
+ // ===================================================
 
  const comparisonWarning =
  formatComparisonWarning(
+ result?.informationCheck ||
  result?.comparison
  );
 
@@ -1538,12 +2047,12 @@ async function sendDocumentMenu(
 
  const text =
 
-`📄 Belge alındı.
+` Belge alındı.
 
 Şimdi hangi analiz yapılacağını seç:
 
-🏦 Normal dekont için bankayı seç.
-📊 Hesap özeti için "Hesap Özeti" seçeneğine bas.
+ Normal dekont için bankayı seç.
+ Hesap özeti için "Hesap Özeti" seçeneğine bas.
 
 Seçtiğinde aynı gönderdiğin belge otomatik olarak analiz edilecek.
 Tekrar yüklemen gerekmeyecek.`;
@@ -1623,7 +2132,7 @@ async function processCallbackQuery(
  await sendMessage(
  chatId,
 
- `❌ Orijinal belge mesajı bulunamadı.
+` Orijinal belge mesajı bulunamadı.
 
 Lütfen belgeyi tekrar gönder.`
  );
@@ -1650,7 +2159,7 @@ Lütfen belgeyi tekrar gönder.`
  await sendMessage(
  chatId,
 
- `❌ Belge dosyası okunamadı.
+` Belge dosyası okunamadı.
 
 Lütfen belgeyi tekrar gönder.`
  );
@@ -1662,12 +2171,6 @@ Lütfen belgeyi tekrar gönder.`
 
  // ===================================================
  // KULLANICININ AÇIKLAMASINI OKU
- // ===================================================
- //
- // Açıklama yoksa:
- // expectedDetails boş kalır.
- //
- // Analiz yine başlar.
  // ===================================================
 
  const originalText =
@@ -1684,7 +2187,11 @@ Lütfen belgeyi tekrar gönder.`
 
  console.log(
  "CALLBACK EXPECTED DETAILS:",
- expectedDetails
+ JSON.stringify(
+ expectedDetails,
+ null,
+ 2
+ )
  );
 
 
@@ -1732,7 +2239,7 @@ Lütfen belgeyi tekrar gönder.`
  await sendMessage(
  chatId,
 
- "❌ Geçersiz analiz seçimi."
+ " Geçersiz analiz seçimi."
  );
 
  return;
@@ -1753,7 +2260,7 @@ Lütfen belgeyi tekrar gönder.`
  await sendMessage(
  chatId,
 
- `❌ Hesap özeti analizi için video desteklenmiyor.
+` Hesap özeti analizi için video desteklenmiyor.
 
 Lütfen hesap özetini PDF veya fotoğraf olarak gönder.`,
  originalMessage.message_id
@@ -1787,11 +2294,11 @@ Lütfen hesap özetini PDF veya fotoğraf olarak gönder.`,
 
  startText =
 
-`📊 Hesap özeti seçildi.
+` Hesap özeti seçildi.
 
-📁 ${fileInfo.fileName}
+ ${fileInfo.fileName}
 
-⏳ VerifyDoc hesap özetini analiz ediyor...
+ VerifyDoc hesap özetini analiz ediyor...
 
 Dosyayı tekrar göndermene gerek yok.`;
 
@@ -1801,11 +2308,11 @@ Dosyayı tekrar göndermene gerek yok.`;
 
  startText =
 
-`🏦 ${getBankDisplayName(bank)} seçildi.
+` ${getBankDisplayName(bank)} seçildi.
 
-📁 ${fileInfo.fileName}
+ ${fileInfo.fileName}
 
-⏳ VerifyDoc analiz ediyor...
+ VerifyDoc analiz ediyor...
 
 Dosyayı tekrar göndermene gerek yok.`;
 
@@ -1888,7 +2395,7 @@ Dosyayı tekrar göndermene gerek yok.`;
  await sendMessage(
  chatId,
 
-`❌ Analiz sırasında hata oluştu.
+` Analiz sırasında hata oluştu.
 
 Hata:
 ${error?.message || "Bilinmeyen hata"}`,
@@ -1956,15 +2463,15 @@ async function processNormalMessage(
  await sendMessage(
  chatId,
 
-`🤖 VerifyDoc'a hoş geldin.
+` VerifyDoc'a hoş geldin.
 
-📄 Dekont, hesap özeti veya belge gönder.
+ Dekont, hesap özeti veya belge gönder.
 
 Belgeyi gönderdikten sonra banka seçimleri otomatik olarak çıkacak.
 
-🏦 Bankalardan birine basarsan normal dekont analizi yapılır.
+ Bankalardan birine basarsan normal dekont analizi yapılır.
 
-📊 "Hesap Özeti" butonuna basarsan hesap özeti analizi yapılır.
+ "Hesap Özeti" butonuna basarsan hesap özeti analizi yapılır.
 
 Dosyayı tekrar yüklemen gerekmez.
 
@@ -2001,20 +2508,20 @@ Açıklama yazmazsan da analiz normal şekilde devam eder.`
  await sendMessage(
  chatId,
 
-`📄 Önce analiz etmek istediğin belgeyi gönder.
+` Önce analiz etmek istediğin belgeyi gönder.
 
 Belgeyi gönderdikten sonra:
 
-🏦 Akbank
-🏦 Garanti BBVA
-🏦 Enpara
-🏦 VakıfBank
-🏦 İş Bankası
-🏦 Ziraat
-🏦 Denizbank
-🏦 Halkbank
-🏦 Yapı Kredi
-📊 Hesap Özeti
+ Akbank
+ Garanti BBVA
+ Enpara
+ VakıfBank
+ İş Bankası
+ Ziraat
+ Denizbank
+ Halkbank
+ Yapı Kredi
+ Hesap Özeti
 
 butonları otomatik çıkacak.
 
@@ -2055,7 +2562,7 @@ Açıklama yazmak zorunlu değildir.`
  await sendMessage(
  chatId,
 
-`📄 Lütfen analiz etmek istediğin belgeyi gönder.
+` Lütfen analiz etmek istediğin belgeyi gönder.
 
 Desteklenen:
 
@@ -2090,7 +2597,7 @@ Açıklama yazmak zorunlu değildir.`
  await sendMessage(
  chatId,
 
-`❌ Bu dosya türü desteklenmiyor.
+` Bu dosya türü desteklenmiyor.
 
 Lütfen PDF, fotoğraf veya video gönder.`
  );
@@ -2310,7 +2817,7 @@ export default async function handler(
  await sendMessage(
  chatId,
 
-`❌ VerifyDoc işlem hatası.
+` VerifyDoc işlem hatası.
 
 ${error?.message || "Bilinmeyen hata"}`
  );
