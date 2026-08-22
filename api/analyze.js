@@ -3655,12 +3655,14 @@ const expected =
 normalizeTurkishText(
 normalizeComparisonText(
 provided.senderName
+)
 );
 
 const actual =
 normalizeTurkishText(
 normalizeComparisonText(
 document.senderName
+)
 );
 
 matches.senderName =
