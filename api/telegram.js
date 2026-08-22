@@ -1692,16 +1692,36 @@ expectedDetails,
  }
 
 
- if (
- expectedDetails.iban
- ) {
+// ===================================================
+// GÖNDEREN IBAN
+// ===================================================
+
+if (
+ expectedDetails.senderIban
+) {
 
  form.append(
- "expectedIban",
- expectedDetails.iban
+ "expectedSenderIban",
+ expectedDetails.senderIban
  );
 
- }
+}
+
+
+// ===================================================
+// ALICI IBAN
+// ===================================================
+
+if (
+ expectedDetails.recipientIban
+) {
+
+ form.append(
+ "expectedRecipientIban",
+ expectedDetails.recipientIban
+ );
+
+}
 
 
  if (
