@@ -4903,9 +4903,19 @@ result
 
 const amountAnalysis = result?.amountAnalysis;
 
-const amountDifference = Number(
-amountAnalysis?.difference
+const totalAmount = Number(
+amountAnalysis?.totalAmount
 );
+
+const calculatedTotal = Number(
+amountAnalysis?.calculatedTotal
+);
+
+const amountDifference =
+Number.isFinite(totalAmount) &&
+Number.isFinite(calculatedTotal)
+? Math.abs(totalAmount - calculatedTotal)
+: Number(amountAnalysis?.difference);
 
 const hasMajorAmountMismatch =
 Number.isFinite(amountDifference) &&
