@@ -4588,189 +4588,113 @@ const pdfDataUrl =
 
 content = [
 
-{
+ // =================================================
+ // PROMPT
+ // =================================================
 
-type:
-"input_text",
+ {
+ type: "input_text",
 
-text: `${PROMPT}
+ text: `${PROMPT}`
+ },
 
-=====================================================
-REFERANS DEKONT
-=====================================================
 
-Bu analizde ayrıca bir referans dekont sağlanmıştır.
+ // =================================================
+ // GERÇEK DEKONT
+ // =================================================
 
-Analiz edilen bankanın sistem tarafından belirlenen adı:
-${bank || "Banka belirtilmedi"}
+ {
+ type: "input_text",
 
-Referans dosya:
-${reference?.fileName || "Referans bulunamadı"}
+ text: `
+==================================================
+GERÇEK DEKONT — ANALİZ EDİLECEK DOSYA
+==================================================
 
-Referans dekontu, analiz edilen dekont ile:
+Aşağıdaki PDF, kullanıcının yüklediği GERÇEK DEKONT'tur.
 
-- belge şablonu
-- yerleşim
-- tipografi
-- font görünümü
-- alan düzeni
-- logo
-- tarih biçimi
-- tutar biçimi
-- IBAN biçimi
-- genel görsel yapı
+ÇIKARILACAK GERÇEK DEĞERLER YALNIZCA BU PDF'DEN
+ALINMALIDIR.
 
-açısından karşılaştır.
+Gönderen adı, alıcı adı, IBAN, tutar, tarih, işlem numarası
+ve diğer belge değerlerini bu PDF üzerinde göründüğü
+şekilde belirle.
 
-ÇOK ÖNEMLİ:
+REFERANS PDF'deki hiçbir değer gerçek dekontun değeri
+olarak kullanılmamalıdır.
 
-Referans ile analiz edilen dekontun birebir aynı olması
-beklenmemektedir.
+Dosya adı:
+${fileName}
+`
+ },
 
-Farklı uygulama sürümleri, web/mobil bankacılık,
-işlem türleri ve belge versiyonları olabilir.
+ {
+ type: "input_file",
+ filename: fileName,
+ file_data: pdfDataUrl,
+ },
 
-Bu nedenle tek bir farklılığı sahtecilik kanıtı olarak
-değerlendirme.
 
-Birden fazla bağımsız ve anlamlı tutarsızlık varsa
-risk değerlendirmesine dahil et.
+ // =================================================
+ // REFERANS BANKA ŞABLONU
+ // =================================================
 
-Referans dekontun kendisini analiz edilen dekontun
-gerçekliği için kesin kanıt olarak kabul etme.
+ ...(
+ reference?.base64
+ ? [
 
-=====================================================
-DEKONT BİLGİLERİNİ YAPILANDIRILMIŞ OLARAK ÇIKAR
-=====================================================
+ {
+ type: "input_text",
 
-Normal dekont analizinde aşağıdaki alanları mümkün olduğunca dekontun
-üzerinden doğrudan çıkar:
+ text: `
+==================================================
+REFERANS DEKONT — SADECE ŞABLON / KONUM BİLGİSİ
+==================================================
 
-documentData.senderName
-documentData.recipientName
-documentData.recipientIban
-documentData.amount
-documentData.currency
-documentData.iban
+Aşağıdaki PDF, ${bank || "seçilen bankanın"} REFERANS
+DEKONT ŞABLONUDUR.
 
-Kurallar:
+BU DOSYADAN GERÇEK İŞLEM DEĞERİ ALMA.
 
-- Yalnızca gerçekten görülebilen bilgileri yaz.
-- Güvenilir şekilde okunamıyorsa null kullan.
-- IBAN'ı mümkünse standart biçimde yaz.
-- Dekontta "ALICI IBAN", "ALICI HESAP", "Alıcı Hesap" veya  bir etiketle görülen IBAN/h hesap bilgisini recipientIban alanına yaz.
-- "Gönderen IBAN" veya "Gönderen IBAN"  olarak etiketlenen IBAN'ı recipientIban alanına yazma;  onu iban alanına tut.
-- amount alanında dekontta görülen ana işlem tutarını kullan.
-- IBAN, hesap numarası, işlem numarası, referans numarası veya tarih
-  gibi diğer rakamları amount olarak kullanma.
-- Gönderen ve alıcıyı alan etiketlerine göre ayırt et.
-- Açıklama alanındaki isimleri gönderen/alıcı yerine kullanma.
-- Bu bilgiler daha sonra kullanıcı tarafından verilen bilgilerle
-  karşılaştırılacaktır.
-- Bu karşılaştırma risk skoruna dahil edilmeyecektir.
+Bu PDF'yi yalnızca:
 
-REFERANS ŞABLONUNU ALAN KONUMU İÇİN KULLAN:
+- alanların nerede bulunduğunu,
+- alanların hangi etiketlerle gösterildiğini,
+- gönderen alanının konumunu,
+- alıcı alanının konumunu,
+- IBAN alanının konumunu,
+- tutar alanının konumunu,
+- tarih alanının konumunu,
+- işlem/reference numarası alanlarının konumunu,
+- bankaya özgü belge düzenini
 
-Referans dekont, analiz edilen dekonttaki alanların hangi bölümde
-ve hangi etiket altında bulunabileceğini belirlemek için kullanılır.
+anlamak için kullan.
 
 ÖNEMLİ:
-Referans dekonttaki isim, IBAN, tutar, tarih veya diğer değerleri
-analiz edilen dekonta aktarma veya kopyalama.
 
-Referans sadece:
-- alanın konumunu
-- alanın etiketini
-- alanın bankaya özgü gösterim biçimini
-- alanların birbirleriyle olan ilişkisini
-belirlemek için kullanılmalıdır.
+Referans PDF'deki isimleri, IBAN'ları, tutarları,
+tarihleri veya işlem numaralarını analiz edilen dekonta
+AKTARMA.
 
-Analiz edilen dekonttaki gerçek değerleri yalnızca analiz edilen
-dekont üzerinden çıkar.
+Gerçek değerlerin tamamı GERÇEK DEKONT PDF'sinden
+çıkarılmalıdır.
 
-Özellikle aşağıdaki alanları bankanın referans şablonuna göre
-konumlandır ve doğru etikete bağla:
+Referans dosya adı:
+${reference.fileName}
+`
+ },
 
-- senderName
-- recipientName
-- iban
-- recipientIban
-- amount
-- currency
-- transactionDate
-- transactionNumber
-- referenceNumber
+ {
+ type: "input_file",
+ filename: reference.fileName,
+ file_data: `data:application/pdf;base64,${reference.base64}`,
+ },
 
-Örneğin referans dekontta "Alıcı", "Alıcı Adı", "Alıcı Hesap",
-"Alacaklı" gibi bir alan bulunuyorsa, analiz edilen dekontta
-aynı bankanın aynı veya eşdeğer etiketinin bulunduğu bölgeyi
-öncelikli olarak değerlendir.
-
-Açıklama/metin içerisinde geçen bir isim, açıkça gönderen veya
-alıcı alanı olarak etiketlenmemişse senderName veya recipientName
-olarak kabul edilmemelidir.
-
-Bir değer birden fazla yerde görünüyorsa, bankanın referans
-şablonundaki alan konumuna ve etiketine en yakın olan değer
-öncelikli kabul edilmelidir.
-
-REFERANS VE GERÇEK DEKONT AYRIMI:
-
-1. Referans PDF = alanların yerini ve banka formatını öğrenmek için.
-2. Analiz edilen dekont = gerçek değerleri çıkarmak için.
-3. Kullanıcı tarafından verilen bilgiler = çıkarılan gerçek
- değerlerle karşılaştırmak için.
-4. Bu üç kaynaktaki bilgiler birbirine karıştırılmamalıdır.
-
-Bir alan analiz edilen dekontta güvenilir şekilde bulunamıyorsa
-tahmin etme. null döndür.
-
-Filename:
-${fileName}`,
-
-},
-
-{
-
-type:
-"input_file",
-
-filename:
-fileName,
-
-file_data:
-pdfDataUrl,
-
-},
-
-...(
-reference?.base64
-
-? [
-
-{
-
-type:
-"input_file",
-
-filename:
-reference.fileName,
-
-file_data:
-`data:application/pdf;base64,${reference.base64}`,
-
-},
-
-]
-
-: []
-),
+ ]
+ : []
+ ),
 
 ];
-
-}
-
-
 // =================================================
 // VIDEO
 // =================================================
