@@ -4895,8 +4895,7 @@ const calculatedRisk =
 calculateOverallRisk(
 result
 );
-const calculatedRisk =
-calculateOverallRisk(result);
+
 
 // ==========================================
 // KRİTİK TUTAR TUTARSIZLIĞI
@@ -4968,14 +4967,7 @@ calculatedRisk.categories;
 // AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
 
-result.overallRisk =
-calculatedRisk.overallRisk;
 
-result.riskLabel =
-calculatedRisk.riskLabel;
-
-result.categories =
-calculatedRisk.categories;
 
 // =====================================================
 // KULLANICI BİLGİLERİ ↔ DEKONT KARŞILAŞTIRMASI
