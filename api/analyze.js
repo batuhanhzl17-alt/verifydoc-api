@@ -33,6 +33,26 @@ halkbank: "halkbank.pdf",
 yapikredi: "yapikredi.pdf",
 };
 
+function normalizeTurkishText(value) {
+
+if (
+!value ||
+typeof value !== "string"
+) {
+
+return "";
+
+}
+
+return value
+.toLocaleLowerCase("tr-TR")
+.replace(/\s+/g, " ")
+.trim()
+.replace(/ı/g, "i")
+.replace(/İ/g, "i");
+
+}
+
 
 // =====================================================
 // BANKA NORMALİZASYONU
@@ -3632,11 +3652,13 @@ warnings.push(
 else {
 
 const expected =
+normalizeTurkishText(
 normalizeComparisonText(
 provided.senderName
 );
 
 const actual =
+normalizeTurkishText(
 normalizeComparisonText(
 document.senderName
 );
