@@ -7,6 +7,17 @@ import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
 import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
+import { createRequire } from "module";
+import { pathToFileURL } from "url";
+
+const require = createRequire(import.meta.url);
+
+const pdfWorkerPath = require.resolve(
+"pdfjs-dist/build/pdf.worker.mjs"
+);
+
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+pathToFileURL(pdfWorkerPath).href;
 
 
 
