@@ -4145,6 +4145,8 @@ uploadedFile.size
 const filePath =
 uploadedFile.filepath;
 
+const mime =
+ uploadedFile.mimetype || "";
 
 if (
 !filePath
@@ -4226,8 +4228,6 @@ buffer.toString(
 );
 
 
-let mime =
-uploadedFile.mimetype;
 
 
 // =================================================
