@@ -8,6 +8,7 @@ import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
 import * as pdfjslib from "pdfjs-dist/legacy/build/pdf.mjs";
 
+
 const execFileAsync = promisify(execFile);
 
 
@@ -4187,6 +4188,7 @@ path.extname(filePath).toLowerCase() === ".pdf"
 try {
 const pdf = await pdfjsLib.getDocument({
 data: new Uint8Array(buffer),
+disableWorker: true
 }).promise;
 
 const pages = [];
