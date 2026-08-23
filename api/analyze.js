@@ -6,6 +6,8 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
+import { PDFParse } from "pdf-parse";
+import * as pdfjslib from "pdfjs-dist/legacy/build/pdf.msj";
 
 const execFileAsync = promisify(execFile);
 
@@ -4171,7 +4173,49 @@ throw new Error(
 );
 
 }
+// =================================================
+// PDF METİN ÇIKARMA — YEREL
+// =================================================
 
+let extractedPdfText = "";
+
+if (
+mime === "application/pdf" ||
+path.extname(filePath).toLowerCase() === ".pdf"
+) {
+try {
+const pdf = await pdfjsLib.getDocument({
+data: new Uint8Array(buffer),
+}).promise;
+
+const pages = [];
+
+for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+const page = await pdf.getPage(pageNumber);
+const textContent = await page.getTextContent();
+
+const pageText = textContent.items
+.map(item => item.str || "")
+.join(" ");
+
+pages.push(pageText);
+}
+
+extractedPdfText = pages.join("\n");
+
+console.log(
+"PDF METİN ÇIKARILDI:",
+extractedPdfText.length,
+"karakter"
+);
+
+} catch (error) {
+console.error(
+"PDF METİN ÇIKARMA HATASI:",
+error
+);
+}
+}
 
 // =================================================
 // BASE64
