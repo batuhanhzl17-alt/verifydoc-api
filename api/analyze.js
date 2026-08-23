@@ -6,13 +6,9 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
-import * as pdfjslib from "pdfjs-dist/legacy/build/pdf.mjs";
+import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-new URL(
-"pdfjs-dist/legacy/build/pdf.worker.min.mjs",
-import.meta.url
-).toString();
+
 
 
 const execFileAsync = promisify(execFile);
