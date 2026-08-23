@@ -6,7 +6,7 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
-import * as pdfjslib from "pdfjs-dist/legacy/build/pdf.msj";
+import * as pdfjslib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 const execFileAsync = promisify(execFile);
 
