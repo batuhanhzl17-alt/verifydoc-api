@@ -4144,6 +4144,7 @@ uploadedFile.size
 
 const filePath =
 uploadedFile.filepath;
+const mime = uploadFile.mimetype  || "";
 
 
 if (
