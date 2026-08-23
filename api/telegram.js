@@ -2722,6 +2722,11 @@ export default async function handler(
  );
 
  console.log(
+"CALLBACK DATA:",
+update?.callback_query?.data || "YOK"
+);
+
+ console.log(
  "================================"
  );
 
