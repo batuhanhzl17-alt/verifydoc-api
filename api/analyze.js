@@ -4599,7 +4599,13 @@ Kurallar:
 - Yalnızca gerçekten görülebilen bilgileri yaz.
 - Güvenilir şekilde okunamıyorsa null kullan.
 - IBAN'ı mümkünse standart biçimde yaz.
-- amount alanında dekontta görülen ana işlem tutarını kullan.
+- amount alanında dekontta GERÇEKTEN GÖRÜLEN ana işlem tutarını aynen çıkar.
+- Tutarı tahmin etme, yuvarlama, düzeltme veya matematiksel olarak yeniden oluşturma.
+- Dekontta "9000", "9.000", "9.000,00", "9000.00" gibi kaç hane görünüyorsa o haneleri KORU.
+- Özellikle sondaki sıfırları kesinlikle silme. Örneğin "9000" değerini "900" olarak değiştirme.
+- Türkçe sayı biçiminde nokta binlik ayırıcı, virgül ondalık ayırıcı olabilir. Görünen biçimi bozma.
+- Bir tutarın okunması kesin değilse tahmin etmek yerine null kullan.
+- IBAN, hesap numarası, işlem numarası, referans numarası, tarih veya başka rakamları amount olarak kullanma.
 - IBAN, hesap numarası, işlem numarası, referans numarası veya tarih
   gibi diğer rakamları amount olarak kullanma.
 - Gönderen ve alıcıyı alan etiketlerine göre ayırt et.
@@ -4932,6 +4938,26 @@ result =
 parseAIResponse(
 response.output_text
 );
+
+function preserveAmount(value) {
+if (value === null || value === undefined) {
+return null;
+}
+
+const text = String(value).trim();
+
+if (!text) {
+return null;
+}
+
+// Tutarı değiştirme:
+// - sondaki sıfırları koru
+// - nokta/virgülü koru
+// - yuvarlama yapma
+return text;
+}
+
+result.amount = preserveAmount(result.amount);
 
 
 // =====================================================
