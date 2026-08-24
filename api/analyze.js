@@ -2550,6 +2550,7 @@ Check these 25 areas:
 23. Missing or suspicious elements
 24. Document type consistency
 25. Image quality limitations
+26.Check if the amount sent matches the amount written as "... TL has been sent".
 
 For each check:
 
@@ -3039,6 +3040,7 @@ Giriş: 2.000 TL
 Beklenen bakiye: 11.500 TL
 
 Belgede farklı bir bakiye görünüyorsa bunu açıkça belirt.
+Belgede tüm sütunlarda giriş çıkışlarda rakamlar tutmuyorsa bunu belirt.
 
 Ancak:
 
