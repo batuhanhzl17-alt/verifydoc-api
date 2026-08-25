@@ -2684,19 +2684,44 @@ kalitesi kaynaklı küçük farklılıkları sahtecilik olarak değerlendirme.
 
 Yeterli görsel kanıt yoksa şüpheli sonuç üretme.
 
-=====================================================
+==================================================
 RISK CALCULATION
-=====================================================
+==================================================
 
-Calculate:
+DO NOT calculate any risk score.
 
-visualRisk
-textRisk
-layoutRisk
-financialDataRisk
-editingRisk
+DO NOT calculate:
+- visualRisk
+- textRisk
+- layoutRisk
+- financialDataRisk
+- editingRisk
+- overallRisk
+- confidence
 
-Calculate overallRisk from 0 to 100.
+Your job is ONLY to inspect the document and report
+observable evidence.
+
+For every check, return a deterministic finding:
+
+- "pass" = no visible problem found
+- "fail" = visible evidence of a problem exists
+- "unknown" = the check cannot be reliably determined
+
+IMPORTANT:
+
+Do not use intuition, probability, suspicion, or guesswork.
+
+Do not assign a numeric score.
+
+Do not decide LOW / MODERATE / HIGH / VERY HIGH risk.
+
+Do not compensate one finding with another.
+
+Only report what is actually visible in the document.
+
+If evidence is insufficient, return "unknown".
+
 
 Risk labels:
 
