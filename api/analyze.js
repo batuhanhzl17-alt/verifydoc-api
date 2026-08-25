@@ -432,19 +432,15 @@ false,
 // VERIFYDOC DETERMINISTIK RISK MOTORU
 // =====================================================
 
-const RISK_CATEGORY_WEIGHTS = {
+const RISK_CATEGORY_WEIGHTS = Object.freeze({
+visualRisk: 15,
+textRisk: 15,
+layoutRisk: 15,
+financialDataRisk: 25,
+editingRisk: 30,
+});
 
-visualRisk: 0.15,
-
-textRisk: 0.15,
-
-layoutRisk: 0.15,
-
-financialDataRisk: 0.25,
-
-editingRisk: 0.30,
-
-};
+const MAX_RISK_SCORE = 100;
 
 
 // -----------------------------------------------------
