@@ -2626,6 +2626,21 @@ Lütfen PDF, fotoğraf veya video gönder.`
 async function processTelegramUpdate(
  update
 ) {
+const incomingChatId =
+ update?.message?.chat?.id ||
+ update?.callback_query?.message?.chat?.id;
+
+ const incomingChatType =
+ update?.message?.chat?.type ||
+ update?.callback_query?.message?.chat?.type;
+
+ // SADECE GRUPLARDA ÇALIŞ
+ if (
+ incomingChatType !== "group" &&
+ incomingChatType !== "supergroup"
+ ) {
+ return;
+ }
 
  // ===================================================
  // CALLBACK QUERY
