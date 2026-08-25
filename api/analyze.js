@@ -2061,6 +2061,7 @@ RESPONSE_SCHEMA,
 
 });
 
+console.log("KULLANILAN OPENAI MODEL:", response.model);
 
 console.log(
 "OPENAI VIDEO RESPONSE RECEIVED"
@@ -3388,6 +3389,7 @@ STATEMENT_RESPONSE_SCHEMA,
 
 });
 
+console.log("KULLANILAN OPENAI MODEL:", response.model);
 
 console.log(
 "HESAP ÖZETİ OPENAI RESPONSE RECEIVED"
@@ -4917,6 +4919,7 @@ RESPONSE_SCHEMA,
 
 });
 
+console.log("KULLANILAN OPENAI MODEL:", response.model);
 
 console.log(
 "OPENAI RESPONSE RECEIVED"
