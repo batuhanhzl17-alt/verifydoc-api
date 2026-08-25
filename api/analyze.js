@@ -2690,14 +2690,23 @@ RISK CALCULATION
 
 DO NOT calculate any risk score.
 
-DO NOT calculate:
+Do NOT calculate:
 - visualRisk
 - textRisk
 - layoutRisk
 - financialDataRisk
 - editingRisk
 - overallRisk
-- confidence
+
+
+You MAY provide confidence as a 0-100 value
+representing how confident you are that your
+observable findings are reliable.
+
+Confidence is NOT a risk score.
+
+Do not use confidence to calculate any risk score.
+
 
 Your job is ONLY to inspect the document and report
 observable evidence.
