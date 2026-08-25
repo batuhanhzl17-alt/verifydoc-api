@@ -809,6 +809,12 @@ const difference = Math.abs(
 totalAmount - calculatedTotal
 );
 
+console.log("===== TUTAR DEBUG =====");
+console.log("totalAmount:", totalAmount);
+console.log("calculatedTotal:", calculatedTotal);
+console.log("difference:", difference);
+console.log("=======================");  
+
 if (difference > 0.01) {
 score += 10;
 }
