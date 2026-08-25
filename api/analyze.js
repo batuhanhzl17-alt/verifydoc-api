@@ -3335,6 +3335,8 @@ detail:
 const response =
 await openai.responses.create({
 
+console.log("KULLANILAN OPENAI MODEL:",response.model);
+
 model:
 "gpt-5.6-terra",
 
