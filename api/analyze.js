@@ -2006,7 +2006,7 @@ const response =
 await openai.responses.create({
 
 model:
-"gpt-5-mini",
+"gpt-5.6-terra",
 
 reasoning: {
   effort: "medium",
@@ -3336,7 +3336,7 @@ const response =
 await openai.responses.create({
 
 model:
-"gpt-5-mini",
+"gpt-5.6-terra",
 
 input: [
 
