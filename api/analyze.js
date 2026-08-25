@@ -604,27 +604,24 @@ continue;
 }
 
 
-const score =
-Number(check.score);
+const status =
+String(check.status || "")
+.trim()
+.toLowerCase();
 
+const STATUS_SCORE = {
+pass: 0,
+review: 50,
+suspicious: 100
+};
 
-if (
-!Number.isFinite(score)
-) {
-
+if (!(status in STATUS_SCORE)) {
 continue;
-
 }
 
-
 const safeScore =
-Math.max(
-0,
-Math.min(
-100,
-score
-)
-);
+STATUS_SCORE[status];
+
 
 
 weightedTotal +=
