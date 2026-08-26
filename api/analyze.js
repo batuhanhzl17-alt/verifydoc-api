@@ -698,11 +698,6 @@ result
 const checks =
 result?.checks ||
 {};
-function calculateOverallRisk(
-result
-) {
-
-const checks = result?.checks || {};
 
 let risk = 0;
 
