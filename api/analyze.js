@@ -611,8 +611,7 @@ String(check.status || "")
 
 const STATUS_SCORE = {
 pass: 0,
-review: 50,
-suspicious: 100
+fail: 100
 };
 
 if (!(status in STATUS_SCORE)) {
