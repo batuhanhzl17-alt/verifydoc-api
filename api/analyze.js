@@ -693,82 +693,78 @@ return "VERY HIGH RISK";
 
 function calculateOverallRisk(result) {
 
- const checks = result?.checks || {};
+const checks = result?.checks || {};
 
- let failedWeight = 0;
- let totalWeight = 0;
+let failedWeight = 0;
+let totalWeight = 0;
 
- for (const [checkName, check] of Object.entries(checks)) {
+for (const [checkName, check] of Object.entries(checks)) {
 
- if (!check || typeof check !== "object") {
- continue;
- }
-
- const status = check.status;
-
- // Sadece belirlenebilir kontroller hesaba katılır
- if (
- status !== "pass" &&
- status !== "fail"
- ) {
- continue;
- }
-
- const name = String(checkName).toLowerCase();
-
- let weight = 1;
-
- // Kritik kontroller
- if (
- name.includes("amount") ||
- name.includes("total") ||
- name.includes("calculation") ||
- name.includes("financial")
- ) {
- weight = 3;
- }
-
- // Düzenleme/manipülasyon kontrolleri
- else if (
- name.includes("editing") ||
- name.includes("manipulation") ||
- name.includes("tamper") ||
- name.includes("alter")
- ) {
- weight = 3;
- }
-
- // Görsel / metin / layout
- else if (
- name.includes("visual") ||
- name.includes("text") ||
- name.includes("layout")
- ) {
- weight = 1;
- }
-
- totalWeight += weight;
-
- if (status === "fail") {
- failedWeight += weight;
- }
- }
-
- // Hiçbir kontrol değerlendirilemediyse
- if (totalWeight === 0) {
- return 0;
- }
-
- // Başarısız kontrollerin ağırlıklı yüzdesi
- const risk = Math.round(
- (failedWeight / totalWeight) * 100
- );
-
- return Math.max(
- 0,
- Math.min(100, risk)
- );
+if (!check || typeof check !== "object") {
+continue;
 }
+
+const status = check.status;
+
+if (
+status !== "pass" &&
+status !== "fail"
+) {
+continue;
+}
+
+const name = String(checkName).toLowerCase();
+
+let weight = 1;
+
+if (
+name.includes("amount") ||
+name.includes("total") ||
+name.includes("calculation") ||
+name.includes("financial")
+) {
+weight = 3;
+}
+
+else if (
+name.includes("editing") ||
+name.includes("manipulation") ||
+name.includes("tamper") ||
+name.includes("alter")
+) {
+weight = 3;
+}
+
+else if (
+name.includes("visual") ||
+name.includes("text") ||
+name.includes("layout")
+) {
+weight = 1;
+}
+
+totalWeight += weight;
+
+if (status === "fail") {
+failedWeight += weight;
+}
+}
+
+if (totalWeight === 0) {
+return 0;
+}
+
+const risk = Math.round(
+(failedWeight / totalWeight) * 100
+);
+
+return Math.max(
+0,
+Math.min(100, risk)
+);
+}
+
+
 // -----------------------------------------------------
 // KATEGORİLERİ 25 KONTROLDEN HESAPLA
 // -----------------------------------------------------
