@@ -698,7 +698,84 @@ result
 const checks =
 result?.checks ||
 {};
+function calculateOverallRisk(
+result
+) {
 
+const checks = result?.checks || {};
+
+let risk = 0;
+
+for (const [checkName, check] of Object.entries(checks)) {
+
+if (!check || typeof check !== "object") {
+continue;
+}
+
+// PASS = risk yok
+if (check.status === "pass") {
+continue;
+}
+
+// UNKNOWN = yeterli kanıt yok, risk ekleme
+if (check.status === "unknown") {
+continue;
+}
+
+// Sadece gerçek FAIL bulguları risk oluşturur
+if (check.status !== "fail") {
+continue;
+}
+
+const name = String(checkName).toLowerCase();
+
+// Kritik bulgular
+if (
+name.includes("amount") ||
+name.includes("total") ||
+name.includes("calculation") ||
+name.includes("financial")
+) {
+risk += 25;
+continue;
+}
+
+// Açık düzenleme / değiştirme bulguları
+if (
+name.includes("editing") ||
+name.includes("manipulation") ||
+name.includes("tamper") ||
+name.includes("alter")
+) {
+risk += 30;
+continue;
+}
+
+// Görsel / metin / düzen problemleri
+if (
+name.includes("visual") ||
+name.includes("text") ||
+name.includes("layout")
+) {
+risk += 10;
+continue;
+}
+
+// Diğer FAIL'ler
+risk += 8;
+}
+
+// 0–100 arasında tut
+risk = Math.max(
+0,
+Math.min(
+100,
+Math.round(risk)
+)
+);
+
+return risk;
+}
 
 // -----------------------------------------------------
 // KATEGORİLERİ 25 KONTROLDEN HESAPLA
