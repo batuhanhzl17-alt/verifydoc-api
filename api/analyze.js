@@ -46,6 +46,7 @@ ziraat: "ziraat.pdf",
 denizbank: "denizbank.pdf",
 halkbank: "halkbank.pdf",
 yapikredi: "yapikredi.pdf",
+garanti: "garanti.pdf",
 };
 
 function normalizeTurkishText(value) {
