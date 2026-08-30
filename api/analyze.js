@@ -5025,7 +5025,17 @@ try {
 const geminiParts =
 convertOpenAIContentToGemini(content);
 
-const geminiResponse =
+let geminiResponse;
+
+// =====================================================
+// GEMINI 3.7 FLASH
+// =====================================================
+
+try {
+
+console.log("GEMINI 3.7 FLASH START");
+
+geminiResponse =
 await gemini.models.generateContent({
 model: "gemini-3.7-flash",
 
@@ -5038,13 +5048,55 @@ parts: geminiParts,
 
 config: {
 systemInstruction:
-"You are a second independent document verification system. Analyze the supplied document carefully for authenticity inconsistencies, OCR inconsistencies, layout anomalies, amount inconsistencies, IBAN inconsistencies, dates, names and suspicious alterations. Return a concise factual analysis.",
+"You are a second independent document verification system. Analyze the supplied document carefully for authenticity, consistency and anomalies.",
 
 temperature: 0,
 },
 });
 
-geminiResult = geminiResponse.text || "";
+console.log("GEMINI 3.7 FLASH SUCCESS");
+
+} catch (firstError) {
+
+console.error(
+"GEMINI 3.7 FLASH FAILED:",
+firstError?.message || firstError
+);
+
+// ===================================================
+// FALLBACK → GEMINI 3.1 FLASH-LITE
+// ===================================================
+
+console.log(
+"GEMINI FALLBACK → 3.1 FLASH-LITE"
+);
+
+geminiResponse =
+await gemini.models.generateContent({
+model: "gemini-3.1-flash-lite",
+
+contents: [
+{
+role: "user",
+parts: geminiParts,
+},
+],
+
+config: {
+systemInstruction:
+"You are a second independent document verification system. Analyze the supplied document carefully for authenticity, consistency and anomalies.",
+
+temperature: 0,
+},
+});
+
+console.log(
+"GEMINI 3.1 FLASH-LITE SUCCESS"
+);
+}
+
+geminiResult =
+geminiResponse.text || "";
 
 console.log(
 "GEMINI RESULT:",
@@ -5058,8 +5110,8 @@ console.error(
 error?.message || error
 );
 
+geminiResult = null;
 }
-
 // -------------------------------------------------
 // PARSE
 // -------------------------------------------------
