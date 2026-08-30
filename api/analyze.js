@@ -5033,42 +5033,38 @@ let geminiResponse;
 
 try {
 
-console.log("GEMINI 3.7 FLASH START");
+ console.log("GEMINI 3.7 FLASH START");
 
-geminiResponse =
-await gemini.models.generateContent({
-model: "gemini-3.7-flash",
+ geminiResponse =
+ await gemini.models.generateContent({
+ model: "gemini-3.7-flash",
 
-contents: [
-{
-role: "user",
-parts: geminiParts,
-},
-],
+ contents: [
+ {
+ role: "user",
+ parts: geminiParts,
+ },
+ ],
 
-config: {
-systemInstruction:
-"You are a second independent document verification system. Analyze the supplied document carefully for authenticity, consistency and anomalies.",
+ config: {
+ temperature: 0,
+ },
+ });
 
-temperature: 0,
-},
-});
-
-console.log("GEMINI 3.7 FLASH SUCCESS");
+ console.log("GEMINI 3.7 FLASH SUCCESS");
 
 } catch (firstError) {
 
-
-console.error(
+ console.error(
  "GEMINI 3.7 FLASH FAILED:",
  firstError?.message || firstError
-);
+ );
 
-throw new Error(
+ throw new Error(
  `Gemini 3.7 Flash analiz hatası: ${
  firstError?.message || "Bilinmeyen Gemini hatası"
  }`
-);
+ );
 }
   
 // -------------------------------------------------
