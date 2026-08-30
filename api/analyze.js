@@ -5034,21 +5034,33 @@ try {
 
  console.log("GEMINI 3.7 FLASH START");
 
- geminiResponse =
- await gemini.models.generateContent({
- model: "gemini-3.7-flash",
+ geminiResponse = await Promise.race([
+gemini.models.generateContent({
+model: "gemini-3.7-flash",
 
- contents: [
- {
- role: "user",
- parts: geminiParts,
- },
- ],
+contents: [
+{
+role: "user",
+parts: geminiParts,
+},
+],
 
- config: {
- temperature: 0,
- },
- });
+config: {
+temperature: 0,
+
+thinkingConfig: {
+thinkingLevel: "low",
+},
+},
+}),
+
+new Promise((_, reject) =>
+setTimeout(
+() => reject(new Error("Gemini API timeout: 60 saniye")),
+60000
+)
+),
+]);
 
  console.log("GEMINI 3.7 FLASH SUCCESS");
 
