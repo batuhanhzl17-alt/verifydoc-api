@@ -25,6 +25,47 @@ pathToFileURL(pdfWorkerPath).href;
 
 const execFileAsync = promisify(execFile);
 
+function convertOpenAIContentToGemini(content) {
+const parts = [];
+
+for (const item of content || []) {
+
+// Metin
+if (
+item?.type === "input_text" &&
+typeof item.text === "string"
+) {
+parts.push({
+text: item.text,
+});
+
+continue;
+}
+
+// Görsel
+if (
+item?.type === "input_image" &&
+typeof item.image_url === "string"
+) {
+const match =
+item.image_url.match(
+/^data:(image\/[^;]+);base64,(.+)$/
+);
+
+if (match) {
+parts.push({
+inlineData: {
+mimeType: match[1],
+data: match[2],
+},
+});
+}
+}
+}
+
+return parts;
+}
+
 
 // =====================================================
 // REFERANS KLASÖRÜ
@@ -315,7 +356,10 @@ new OpenAI({
 
 apiKey:
 process.env.OPENAI_API_KEY,
-
+});
+const gemini =
+new GoogleGenAI({
+apiKey: process.env.GEMINI_API_KEY,
 });
 
 
@@ -4967,6 +5011,54 @@ console.log(
 "seconds"
 );
 
+
+// =====================================================
+// GEMINI SECOND OPINION
+// =====================================================
+
+console.log("GEMINI REQUEST START");
+
+let geminiResult = null;
+
+try {
+
+const geminiParts =
+convertOpenAIContentToGemini(content);
+
+const geminiResponse =
+await gemini.models.generateContent({
+model: "gemini-3.7-flash",
+
+contents: [
+{
+role: "user",
+parts: geminiParts,
+},
+],
+
+config: {
+systemInstruction:
+"You are a second independent document verification system. Analyze the supplied document carefully for authenticity inconsistencies, OCR inconsistencies, layout anomalies, amount inconsistencies, IBAN inconsistencies, dates, names and suspicious alterations. Return a concise factual analysis.",
+
+temperature: 0,
+},
+});
+
+geminiResult = geminiResponse.text || "";
+
+console.log(
+"GEMINI RESULT:",
+geminiResult
+);
+
+} catch (error) {
+
+console.error(
+"GEMINI ERROR:",
+error?.message || error
+);
+
+}
 
 // -------------------------------------------------
 // PARSE
