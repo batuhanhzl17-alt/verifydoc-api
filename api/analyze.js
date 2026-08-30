@@ -3913,6 +3913,12 @@ document.recipientIban
 if (actual) {
 const ibanMod97 = validateIBANMod97(actual);
 
+console.log("===== IBAN MOD-97 =====");
+console.log("IBAN:", actual);
+console.log("MOD-97 VALID:", ibanMod97.valid);
+console.log("MOD-97 REMAINDER:", ibanMod97.remainder);
+console.log("========================");
+
 if (!ibanMod97.valid) {
 warnings.push(
 `Dekonttaki alıcı IBAN'ı MOD-97 kontrolünden geçmedi. Kalan: ${
