@@ -5020,7 +5020,6 @@ console.log("GEMINI REQUEST START");
 
 let geminiResult = null;
 
-try {
 
 const geminiParts =
 convertOpenAIContentToGemini(content);
