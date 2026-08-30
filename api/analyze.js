@@ -5045,6 +5045,8 @@ thinkingLevel: "low",
 },
 });
 
+  console.log("GEMINI 3.7 FLASH SUCCESS");
+  
  console.error(
  "GEMINI 3.7 FLASH FAILED:",
  firstError?.message || firstError
