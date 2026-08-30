@@ -5031,22 +5031,20 @@ let geminiResponse;
 // =====================================================
 
 try {
-
  console.log("GEMINI 3.7 FLASH START");
 
+ geminiResponse = await gemini.models.generateContent({
+ model: "gemini-3.7-flash",
+ contents: "Reply with exactly: GEMINI TEST OK",
+ config: {
+ thinkingConfig: {
+ thinkingLevel: "low",
+ },
+ },
+ });
 
-geminiResponse = await gemini.models.generateContent({
-model: "gemini-3.7-flash",
-contents: "Reply with exactly: GEMINI TEST OK",
-config: {
-thinkingConfig: {
-thinkingLevel: "low",
-},
-},
-});
-
-  console.log("GEMINI 3.7 FLASH SUCCESS");
-  
+ console.log("GEMINI 3.7 FLASH SUCCESS");
+} catch (firstError) {
  console.error(
  "GEMINI 3.7 FLASH FAILED:",
  firstError?.message || firstError
