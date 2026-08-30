@@ -3910,14 +3910,17 @@ normalizeIBAN(
 document.recipientIban
 );
 
+if (actual) {
 const ibanMod97 = validateIBANMod97(actual);
 
-if (ibanMod97.valid === false) {
- warnings.push(
- `Dekonttaki alıcı IBAN'ı MOD-97 kontrolünden geçmedi. Kalan: ${ibanMod97.remainder ?? "bilinmiyor"}.`
- );
+if (!ibanMod97.valid) {
+warnings.push(
+`Dekonttaki alıcı IBAN'ı MOD-97 kontrolünden geçmedi. Kalan: ${
+ibanMod97.remainder ?? "bilinmiyor"
+}.`
+);
 }
-
+}
 matches.iban =
 expected === actual
 ? "match"
