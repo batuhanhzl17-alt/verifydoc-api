@@ -5058,7 +5058,6 @@ console.log("GEMINI 3.7 FLASH SUCCESS");
 
 } catch (firstError) {
 
-} catch (firstError) {
 
 console.error(
  "GEMINI 3.7 FLASH FAILED:",
