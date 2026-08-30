@@ -5034,9 +5034,6 @@ try {
 
  console.log("GEMINI 3.7 FLASH START");
 
- geminiResponse = await Promise.race([
-gemini.models.generateContent({
-model: "gemini-3.7-flash",
 
 geminiResponse = await gemini.models.generateContent({
 model: "gemini-3.7-flash",
