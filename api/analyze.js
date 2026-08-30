@@ -3564,6 +3564,44 @@ return String(value)
 
 }
 
+function validateIBANMod97(value) {
+const iban = normalizeIBAN(value);
+
+if (!iban) {
+return {
+valid: false,
+reason: "IBAN okunamadı"
+};
+}
+
+if (!/^[A-Z]{2}[0-9]{2}[A-Z0-9]+$/.test(iban)) {
+return {
+valid: false,
+reason: "IBAN formatı geçersiz"
+};
+}
+
+const rearranged = iban.slice(4) + iban.slice(0, 4);
+
+let remainder = 0;
+
+for (const char of rearranged) {
+const value = /[A-Z]/.test(char)
+? char.charCodeAt(0) - 55
+: Number(char);
+
+const digits = String(value);
+
+for (const digit of digits) {
+remainder = (remainder * 10 + Number(digit)) % 97;
+}
+}
+
+return {
+valid: remainder === 1,
+remainder
+};
+}
 
 function parseComparisonAmount(value) {
 
