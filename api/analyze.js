@@ -4610,64 +4610,94 @@ let content;
 // =================================================
 
 if (
-type === "image"
+ type === "image"
 ) {
 
-content = [
+ content = [
 
-{
+ // -------------------------------------------------
+ // ANALİZ PROMPTU
+ // -------------------------------------------------
 
-type:
-"input_text",
+ {
+ type:
+ "input_text",
 
-text: `${PROMPT}
+ text: `${PROMPT}
 
 =====================================================
-REFERANS DEKONT
+REFERANS DEKONT KARŞILAŞTIRMASI
 =====================================================
 
-Bu analizde ayrıca bir referans dekont sağlanmıştır.
+Bu analizde ayrıca banka tarafından belirlenen
+referans dekont sağlanmıştır.
 
 Analiz edilen bankanın sistem tarafından belirlenen adı:
 ${bank || "Banka belirtilmedi"}
 
-Referans:
+Referans dosya:
 ${reference?.fileName || "Referans bulunamadı"}
 
-Referans dekontu, analiz edilen dekont ile:
+ÇOK ÖNEMLİ:
+
+Referans dekontu yalnızca görsel ve yapısal
+karşılaştırma amacıyla kullan.
+
+Analiz edilen JPG dekont ile referans dekontu:
 
 - belge şablonu
-- yerleşim
+- sayfa/alan yerleşimi
+- logo
+- başlık yapısı
 - tipografi
 - font görünümü
-- alan düzeni
-- logo
+- font boyutu
+- karakter aralıkları
+- satır aralıkları
+- alan hizalamaları
 - tarih biçimi
+- saat biçimi
 - tutar biçimi
+- para birimi
 - IBAN biçimi
+- gönderen/alıcı alanları
+- işlem bilgileri
 - genel görsel yapı
 
 açısından karşılaştır.
 
-Referansı belge şablonu, yerleşim, tipografi, alan düzeni,
-logo, tarih, tutar, IBAN biçimi ve genel görsel yapı açısından
-karşılaştırma amacıyla kullan.
+Referans dekont ile birebir aynı olmamasını
+tek başına sahtecilik kanıtı olarak değerlendirme.
 
-Referansla birebir aynı olmamasını tek başına sahtecilik kanıtı
-olarak değerlendirme.
+Web/mobil bankacılık, uygulama sürümü,
+işlem türü veya belge versiyonu nedeniyle oluşabilecek
+normal farklılıkları dikkate al.
 
-Birden fazla bağımsız ve anlamlı tutarsızlık olmadıkça risk
-artırma.
+Birden fazla bağımsız ve anlamlı tutarsızlık
+olmadıkça risk artırma.
 
-Referans dekontun kendisini analiz edilen dekontun
+Referans dekontun kendisini analiz edilen belgenin
 gerçekliği için kesin kanıt olarak kabul etme.
 
 =====================================================
-DEKONT BİLGİLERİNİ YAPILANDIRILMIŞ OLARAK ÇIKAR
+REFERANS DOSYASI KULLANIMI
 =====================================================
 
-Normal dekont analizinde aşağıdaki alanları mümkün olduğunca dekontun
-üzerinden doğrudan çıkar:
+Aşağıdaki ek dosya gerçek banka referans dekontudur.
+
+Bu dosyayı görsel olarak incele ve yukarıdaki
+karşılaştırmayı gerçekten bu dosyanın görüntüsü
+üzerinden gerçekleştir.
+
+Referans dosyanın yalnızca dosya adına bakarak
+şablon hakkında çıkarım yapma.
+
+=====================================================
+DEKONT BİLGİLERİNİ ÇIKAR
+=====================================================
+
+Normal dekont analizinde aşağıdaki alanları mümkün
+olduğunca doğrudan analiz edilen dekonttan çıkar:
 
 documentData.senderName
 documentData.recipientName
@@ -4680,41 +4710,54 @@ Kurallar:
 - Yalnızca gerçekten görülebilen bilgileri yaz.
 - Güvenilir şekilde okunamıyorsa null kullan.
 - IBAN'ı mümkünse standart biçimde yaz.
-- amount alanında dekontta GERÇEKTEN GÖRÜLEN ana işlem tutarını aynen çıkar.
-- Tutarı tahmin etme, yuvarlama, düzeltme veya matematiksel olarak yeniden oluşturma.
-- Dekontta "9000", "9.000", "9.000,00", "9000.00" gibi kaç hane görünüyorsa o haneleri KORU.
-- Özellikle sondaki sıfırları kesinlikle silme. Örneğin "9000" değerini "900" olarak değiştirme.
-- Türkçe sayı biçiminde nokta binlik ayırıcı, virgül ondalık ayırıcı olabilir. Görünen biçimi bozma.
-- Bir tutarın okunması kesin değilse tahmin etmek yerine null kullan.
-- IBAN, hesap numarası, işlem numarası, referans numarası, tarih veya başka rakamları amount olarak kullanma.
-- IBAN, hesap numarası, işlem numarası, referans numarası veya tarih
-  gibi diğer rakamları amount olarak kullanma.
+- amount alanında dekontta görülen ana işlem tutarını kullan.
+- IBAN, hesap numarası, işlem numarası, referans numarası
+ veya tarih gibi diğer rakamları amount olarak kullanma.
 - Gönderen ve alıcıyı alan etiketlerine göre ayırt et.
 - Açıklama alanındaki isimleri gönderen/alıcı yerine kullanma.
-- Bu bilgiler daha sonra kullanıcı tarafından verilen bilgilerle
-  karşılaştırılacaktır.
 - Bu karşılaştırma risk skoruna dahil edilmeyecektir.
 
 Filename:
 ${fileName}`,
+ },
 
-},
+ // -------------------------------------------------
+ // ANALİZ EDİLEN JPG
+ // -------------------------------------------------
 
-{
+ {
+ type:
+ "input_image",
 
-type:
-"input_image",
+ image_url:
+ imageDataUrl,
 
-image_url:
-imageDataUrl,
+ detail:
+ "high",
+ },
 
-detail:
-"auto",
+ // -------------------------------------------------
+ // BANKA REFERANS PDF
+ // -------------------------------------------------
 
-},
+ ...(
+ reference?.base64
+ ? [
+ {
+ type:
+ "input_file",
 
-];
+ filename:
+ reference.fileName,
 
+ file_data:
+ `data:application/pdf;base64,${reference.base64}`,
+ },
+ ]
+ : []
+ ),
+
+ ];
 }
 
 
