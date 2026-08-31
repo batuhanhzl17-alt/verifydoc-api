@@ -17,11 +17,6 @@ import {
   ImageData,
 } from "@napi-rs/canvas";
 
-// =====================================================
-// PADDLEOCR
-// =====================================================
-
-import { PaddleOCRClient, Model } from "@paddleocr/api-sdk";
 
 const require = createRequire(import.meta.url);
  
