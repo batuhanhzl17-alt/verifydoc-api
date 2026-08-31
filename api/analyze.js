@@ -2962,6 +2962,168 @@ familiar.
 
 If there is insufficient evidence to determine whether a particular
 institutional style is normal, use "unknown" or "review".
+============================================================
+TRANSACTION DATA CONSISTENCY — HIGH PRIORITY
+============================================================
+
+For EVERY document analysis, whether the uploaded document is a JPG/PNG
+image or a PDF, perform a dedicated transaction-data consistency check.
+
+This check has HIGHER PRIORITY than general visual/template observations.
+
+Pay particular attention to these fields:
+
+1. RECIPIENT NAME
+2. RECIPIENT IBAN
+3. TRANSACTION DATE AND TIME
+4. TRANSACTION AMOUNT
+5. WRITTEN AMOUNT / AMOUNT IN WORDS
+6. TOTAL / FEE / EXPENSE INFORMATION
+7. DESCRIPTION / TRANSACTION TEXT
+
+For each field:
+
+- Read the value directly from the analyzed document.
+- Do not invent, complete, or infer unreadable values.
+- If a value cannot be read reliably, use null or state that it is unreadable.
+- Compare repeated occurrences of the same information within the document.
+- Check whether the recipient name and recipient IBAN appear internally consistent.
+- Check whether the transaction date/time is internally consistent.
+- Check whether the numeric transaction amount is internally consistent.
+- If an amount is written both numerically and in words, compare the two.
+- Check whether fees, expenses, commissions, or additional charges mathematically
+agree with the displayed total.
+- Check whether the amount mentioned in the description agrees with the actual
+transaction amount.
+- Pay special attention to decimal separators, thousands separators, TRY/EUR/USD
+notation, and possible OCR digit substitutions.
+- Do not treat a formatting difference alone as evidence of fraud.
+
+IMPORTANT AMOUNT CHECK:
+
+If the document contains multiple monetary values, determine what each value
+represents before comparing them.
+
+Do NOT automatically assume that every monetary number is the transaction amount.
+
+For example, distinguish between:
+
+- main transaction amount
+- fee
+- commission
+- expense
+- total amount
+- remaining balance
+- previous balance
+- reference number
+- account number
+- IBAN
+- date/time
+
+Perform arithmetic checks whenever the visible information allows it.
+
+If:
+
+transaction amount + fee + other applicable charges != displayed total
+
+report the exact visible values and the mathematical discrepancy.
+
+If a written amount and numeric amount disagree, treat this as an important
+consistency finding and explicitly report both values.
+
+RECIPIENT PRIORITY:
+
+Recipient name and recipient IBAN are especially important.
+
+Check whether:
+
+- the recipient name is clearly visible,
+- the recipient IBAN is clearly visible,
+- the same recipient information appears consistently,
+- there are suspicious inconsistencies between recipient fields,
+- a recipient name appears to have been inserted or altered,
+- the IBAN format contains unusual or inconsistent characters.
+
+DATE/TIME PRIORITY:
+
+Check:
+
+- transaction date,
+- transaction time,
+- repeated date/time values,
+- chronological consistency,
+- unusual formatting or visible inconsistencies.
+
+DO NOT invent a discrepancy.
+
+Only report a discrepancy when it is supported by information actually visible
+in the analyzed document.
+
+If a field is unreadable, explicitly say that it could not be reliably verified.
+
+------------------------------------------------------------
+ANALYSIS ORDER
+------------------------------------------------------------
+
+Always analyze the actual uploaded document first.
+
+For an image document:
+- analyze the actual image,
+- extract the visible transaction information,
+- perform the transaction consistency checks above,
+- then perform visual/template analysis.
+
+For a PDF document:
+- analyze the actual PDF,
+- extract the visible transaction information from the PDF,
+- perform the SAME transaction consistency checks above,
+- then perform visual/template analysis.
+
+The same transaction-consistency rules apply to BOTH image and PDF analysis.
+
+Do not redirect image analysis to the PDF analysis path.
+Do not redirect PDF analysis to the image analysis path.
+
+When a reference document is supplied, use it only according to the existing
+reference-document rules. Never copy transaction values from a reference document
+into the analyzed document.
+
+------------------------------------------------------------
+RESULT EXPLANATION
+------------------------------------------------------------
+
+The final explanation should be similar to a forensic consistency summary.
+
+Prioritize concrete findings over generic statements.
+
+When a meaningful inconsistency is found, explain:
+
+- WHAT was found,
+- WHERE it was found,
+- WHAT the expected relationship was,
+- WHY the values are inconsistent,
+- and, when applicable, the exact arithmetic difference.
+
+Example style:
+
+"The document shows a transaction amount of 3090.00 TRY, while the description
+states that 3090.40 TRY was deducted. The displayed fee is 6.40 TRY, so the
+amounts do not reconcile as presented. This is a financial-data inconsistency
+and should increase the risk assessment."
+
+Do not state that a document is definitely fake solely because of one
+inconsistency.
+
+Instead distinguish between:
+
+- consistent,
+- minor inconsistency,
+- significant inconsistency,
+- suspicious visual/data inconsistency,
+- insufficient evidence.
+
+The final summary should mention the most important transaction-data findings
+before less important template/style observations.
 
 IMPORTANT:
 
