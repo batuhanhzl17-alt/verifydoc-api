@@ -4698,59 +4698,86 @@ if (
 
  text: `${PROMPT}
 
-=====================================================
-REFERANS DEKONT KARŞILAŞTIRMASI
-=====================================================
+// =====================================================
+// REFERANS DEKONT KARŞILAŞTIRMASI
+// =====================================================
 
-Bu analizde ayrıca banka tarafından belirlenen
-referans dekont sağlanmıştır.
+REFERANS DEKONT KULLANIMI:
 
-Analiz edilen bankanın sistem tarafından belirlenen adı:
-${bank || "Banka belirtilmedi"}
+Aşağıdaki ek dosya banka tarafından sağlanan GERÇEK REFERANS
+DEKONTUDUR.
 
-Referans dosya:
-${reference?.fileName || "Referans bulunamadı"}
+Bu referans dekont SADECE:
+- belge şablonunu,
+- sayfa ve alan yerleşimini,
+- banka logosunu,
+- başlık yapısını,
+- tipografiyi,
+- font görünümünü,
+- font boyutunu,
+- karakter aralıklarını,
+- satır aralıklarını,
+- alan hizalamalarını,
+- tarih/saat biçimini,
+- tutar biçimini,
+- para birimi biçimini,
+- IBAN biçimini,
+- gönderen/alıcı alanlarının yapısını,
+- işlem bilgilerinin yerleşimini
+
+görsel ve yapısal olarak karşılaştırmak amacıyla kullanılacaktır.
 
 ÇOK ÖNEMLİ:
 
-Referans dekontu yalnızca görsel ve yapısal
-karşılaştırma amacıyla kullan.
+ANALİZ EDİLEN BELGENİN BİLGİ KAYNAĞI YALNIZCA
+"input_image" OLARAK GÖNDERİLEN JPG DEKONTTUR.
 
-Analiz edilen JPG dekont ile referans dekontu:
+JPG DEKONTTAN ÇIKARILACAK:
+- gönderen adı,
+- alıcı adı,
+- tutar,
+- para birimi,
+- IBAN,
+- hesap bilgileri,
+- tarih,
+- saat,
+- işlem numarası,
+- referans numarası,
+- açıklama,
+- diğer dekont bilgileri
 
-- belge şablonu
-- sayfa/alan yerleşimi
-- logo
-- başlık yapısı
-- tipografi
-- font görünümü
-- font boyutu
-- karakter aralıkları
-- satır aralıkları
-- alan hizalamaları
-- tarih biçimi
-- saat biçimi
-- tutar biçimi
-- para birimi
-- IBAN biçimi
-- gönderen/alıcı alanları
-- işlem bilgileri
-- genel görsel yapı
+YALNIZCA ANALİZ EDİLEN JPG ÜZERİNDEN BELİRLENMELİDİR.
 
-açısından karşılaştır.
+REFERANS PDF'DEKİ HİÇBİR BİLGİYİ ANALİZ EDİLEN JPG'YE
+AKTARMA.
 
-Referans dekont ile birebir aynı olmamasını
-tek başına sahtecilik kanıtı olarak değerlendirme.
+REFERANS PDF'DEKİ İSİM, IBAN, TUTAR, TARİH, SAAT,
+HESAP NUMARASI, İŞLEM NUMARASI VEYA BAŞKA BİR BİLGİYİ
+JPG'DE YOKSA JPG VARMIŞ GİBİ KULLANMA.
 
-Web/mobil bankacılık, uygulama sürümü,
-işlem türü veya belge versiyonu nedeniyle oluşabilecek
-normal farklılıkları dikkate al.
+JPG'DE BİR BİLGİ OKUNAMIYORSA:
+- referans PDF'den tamamlamaya çalışma,
+- tahmin etme,
+- başka bir belgeden kopyalama,
+- null döndür.
 
-Birden fazla bağımsız ve anlamlı tutarsızlık
-olmadıkça risk artırma.
+JPG ile referans PDF'deki bilgiler farklı olabilir.
+Bu durumda HER ZAMAN JPG'DE GERÇEKTEN GÖRÜLEN BİLGİYİ
+ESAS AL.
 
-Referans dekontun kendisini analiz edilen belgenin
-gerçekliği için kesin kanıt olarak kabul etme.
+REFERANS PDF'NİN İÇERİĞİNİ "ANALİZ EDİLEN DEKONT" OLARAK
+KABUL ETME.
+
+REFERANS PDF'DEKİ GERÇEK İŞLEM BİLGİLERİ SADECE REFERANS
+BELGESİNE AİTTİR.
+
+ÖNCE input_image OLAN JPG'Yİ BAŞTAN SONA ANALİZ ET.
+JPG'DEKİ BİLGİLERİ ÇIKAR.
+DAHA SONRA REFERANS PDF İLE SADECE GÖRSEL/ŞABLON
+KARŞILAŞTIRMASI YAP.
+
+REFERANS DEKONTUN KENDİSİNİ ANALİZ EDİLEN BELGENİN
+GERÇEKLİĞİ İÇİN KESİN KANIT OLARAK KABUL ETME.
 
 =====================================================
 REFERANS DOSYASI KULLANIMI
