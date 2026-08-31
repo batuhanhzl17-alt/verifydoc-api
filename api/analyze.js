@@ -16,7 +16,13 @@ import {
   createCanvas,
   ImageData,
 } from "@napi-rs/canvas";
- 
+
+// =====================================================
+// PADDLEOCR
+// =====================================================
+
+import { PaddleOCRClient, Model } from "@paddleocr/api-sdk";
+
 const require = createRequire(import.meta.url);
  
 const pdfWorkerPath = require.resolve(
@@ -30,6 +36,350 @@ pathToFileURL(pdfWorkerPath).href;
  
  
 const execFileAsync = promisify(execFile);
+
+// =====================================================
+// PADDLEOCR CLIENT
+// =====================================================
+
+let paddleOCRClient = null;
+
+function getPaddleOCRClient() {
+
+if (
+!process.env.PADDLEOCR_ACCESS_TOKEN
+) {
+
+console.warn(
+"PADDLEOCR_ACCESS_TOKEN bulunamadı."
+);
+
+return null;
+
+}
+
+if (
+!paddleOCRClient
+) {
+
+paddleOCRClient =
+new PaddleOCRClient({
+
+token:
+process.env.PADDLEOCR_ACCESS_TOKEN,
+
+requestTimeout:
+300000,
+
+pollTimeout:
+600000,
+
+});
+
+}
+
+return paddleOCRClient;
+
+}
+
+
+// =====================================================
+// PADDLEOCR OCR
+// =====================================================
+//
+// Yerel dosyayı PaddleOCR resmi API'ye gönderir.
+// Token Vercel Environment Variables üzerinden gelir.
+//
+// PADDLEOCR_ACCESS_TOKEN
+//
+// PP-OCRv6 kullanılır.
+// =====================================================
+
+async function runPaddleOCR(
+filePath
+) {
+
+if (
+!filePath
+) {
+
+console.warn(
+"PADDLEOCR: filePath bulunamadı."
+);
+
+return {
+
+text:
+"",
+
+confidence:
+0,
+
+success:
+false,
+
+};
+
+}
+
+
+const client =
+getPaddleOCRClient();
+
+
+if (
+!client
+) {
+
+return {
+
+text:
+"",
+
+confidence:
+0,
+
+success:
+false,
+
+};
+
+}
+
+
+try {
+
+console.log(
+"================================================"
+);
+
+console.log(
+"PADDLEOCR BAŞLADI"
+);
+
+console.log(
+"DOSYA:",
+filePath
+);
+
+console.log(
+"MODEL: PP-OCRv6"
+);
+
+console.log(
+"================================================"
+);
+
+
+const result =
+await client.ocr({
+
+filePath:
+
+filePath,
+
+model:
+
+Model.PPOCRv6,
+
+});
+
+
+const pages =
+Array.isArray(
+result?.pages
+)
+?
+result.pages
+:
+[];
+
+
+const allTexts = [];
+
+const allScores = [];
+
+
+for (
+const page
+of pages
+) {
+
+const pruned =
+page?.prunedResult ||
+page?.pruned_result ||
+{};
+
+
+const texts =
+Array.isArray(
+pruned?.rec_texts
+)
+?
+pruned.rec_texts
+:
+[];
+
+
+const scores =
+Array.isArray(
+pruned?.rec_scores
+)
+?
+pruned.rec_scores
+:
+[];
+
+
+for (
+const text
+of texts
+) {
+
+if (
+text !== null &&
+text !== undefined &&
+String(text).trim()
+) {
+
+allTexts.push(
+String(text).trim()
+);
+
+}
+
+}
+
+
+for (
+const score
+of scores
+) {
+
+const numericScore =
+Number(score);
+
+if (
+Number.isFinite(
+numericScore
+)
+) {
+
+allScores.push(
+numericScore
+);
+
+}
+
+}
+
+}
+
+
+const text =
+allTexts.join(
+"\n"
+);
+
+
+const confidence =
+allScores.length
+?
+Math.round(
+(
+allScores.reduce(
+(
+sum,
+value
+) =>
+sum + value,
+0
+) /
+allScores.length
+) *
+100
+)
+:
+0;
+
+
+console.log(
+"PADDLEOCR TAMAMLANDI"
+);
+
+console.log(
+"PADDLEOCR SAYFA:",
+pages.length
+);
+
+console.log(
+"PADDLEOCR METİN:",
+text.length,
+"karakter"
+);
+
+console.log(
+"PADDLEOCR CONFIDENCE:",
+confidence
+);
+
+
+return {
+
+text,
+
+confidence,
+
+success:
+true,
+
+pages:
+pages.length,
+
+};
+
+}
+
+catch (
+error
+) {
+
+console.error(
+"================================================"
+);
+
+console.error(
+"PADDLEOCR HATASI:"
+);
+
+console.error(
+error
+);
+
+console.error(
+"================================================"
+);
+
+
+return {
+
+text:
+"",
+
+confidence:
+0,
+
+success:
+false,
+
+error:
+error?.message ||
+"Unknown PaddleOCR error",
+
+};
+
+}
+
+}
  
 let ocrWorker = null;
  
@@ -4996,7 +5346,58 @@ error
 );
 }
 }
- 
+
+// =====================================================
+// PADDLEOCR FALLBACK
+// =====================================================
+
+if (
+extractedPdfText.trim().length < 100
+) {
+
+console.log(
+"PDF metni yetersiz, PaddleOCR başlatılıyor..."
+);
+
+
+const paddleResult =
+await runPaddleOCR(
+filePath
+);
+
+
+if (
+paddleResult.success &&
+paddleResult.text?.trim()
+) {
+
+extractedPdfText =
+paddleResult.text;
+
+console.log(
+"PADDLEOCR PDF METNİ ALINDI:",
+extractedPdfText.length,
+"karakter"
+);
+
+console.log(
+"PADDLEOCR CONFIDENCE:",
+paddleResult.confidence
+);
+
+}
+
+else {
+
+console.log(
+"PaddleOCR kullanılabilir sonuç vermedi."
+);
+
+}
+
+}
+
+  
 // =================================================
 // BASE64
 // =================================================
@@ -5006,7 +5407,44 @@ buffer.toString(
 "base64"
 );
  
- 
+// =====================================================
+// PADDLEOCR IMAGE OCR
+// =====================================================
+
+let paddleImageOCR = null;
+
+if (
+type === "image" ||
+type === "statement"
+) {
+
+console.log(
+"PADDLEOCR IMAGE ANALİZİ BAŞLIYOR..."
+);
+
+
+paddleImageOCR =
+await runPaddleOCR(
+filePath
+);
+
+
+if (
+paddleImageOCR.success
+) {
+
+console.log(
+"PADDLEOCR IMAGE OCR BAŞARILI"
+);
+
+console.log(
+"PADDLEOCR IMAGE CONFIDENCE:",
+paddleImageOCR.confidence
+);
+
+}
+
+} 
  
  
 // =================================================
@@ -5308,6 +5746,31 @@ type:
 "input_text",
  
 text: `${PROMPT}
+
+=====================================================
+PADDLEOCR EK OCR SONUCU
+=====================================================
+
+PaddleOCR tarafından ayrıca çıkarılmış OCR metni
+aşağıdadır.
+
+Bu metin yalnızca OCR yardımcı verisidir.
+
+ASLINDA GÖRÜNEN BELGE HER ZAMAN ÖNCELİKLİDİR.
+
+PaddleOCR metni görüntüyle çelişirse görüntüyü esas al.
+
+OCR tarafından tahmin edilmiş veya yanlış okunmuş
+değerleri belge üzerinde gerçekmiş gibi kullanma.
+
+PaddleOCR OCR metni:
+
+${paddleImageOCR?.text || "PaddleOCR sonucu alınamadı."}
+
+PaddleOCR confidence:
+
+${paddleImageOCR?.confidence ?? 0}
+
  
 =====================================================
 JPG / JPEG — ANALİZ EDİLECEK ASIL BELGE
