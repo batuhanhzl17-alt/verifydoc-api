@@ -11,6 +11,7 @@ import { createWorker } from "tesseract.js";
 import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
+import "@napi-rs/canvas";
 
 const require = createRequire(import.meta.url);
 
