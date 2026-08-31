@@ -397,39 +397,6 @@ confidence: Number(data.confidence) || 0,
 }
  
  
-// =====================================================
-// PADDLEOCR — OFFICIAL API OCR
-// =====================================================
- 
-let paddleOCRClient = null;
- 
-function getPaddleOCRClient() {
- 
-if (!process.env.PADDLEOCR_ACCESS_TOKEN) {
- 
-return null;
- 
-}
- 
-if (!paddleOCRClient) {
- 
-paddleOCRClient = new PaddleOCRClient({
- 
-token:
-process.env.PADDLEOCR_ACCESS_TOKEN,
- 
-requestTimeout:
-300000,
- 
-pollTimeout:
-600000,
- 
-});
- 
-}
- 
-return paddleOCRClient;
-}
  
  
 function extractPaddleOCRText(result) {
