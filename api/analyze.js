@@ -495,32 +495,7 @@ pages.length,
 }
  
  
-async function runPaddleOCR(filePath) {
- 
-const client = getPaddleOCRClient();
- 
-if (!client) {
- 
-console.warn(
-"PADDLEOCR_ACCESS_TOKEN bulunamadı. PaddleOCR atlanıyor."
-);
- 
-return {
- 
-available:
-false,
- 
-text:
-"",
- 
-confidence:
-0,
- 
-pages:
-0,
- 
-};
-}
+
  
 try {
  
