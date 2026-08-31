@@ -4679,125 +4679,120 @@ let content;
 
 
 // =================================================
-// IMAGE
+// IMAGE / JPEG
 // =================================================
 
 if (
- type === "image"
+type === "image"
 ) {
 
- content = [
+content = [
 
- // -------------------------------------------------
- // ANALİZ PROMPTU
- // -------------------------------------------------
+// =================================================
+// SADECE JPEG ANALİZ TALİMATI
+// =================================================
 
- {
- type:
- "input_text",
+{
+type:
+"input_text",
 
- text: `${PROMPT}
+text: `${PROMPT}
 
-// =====================================================
-// REFERANS DEKONT KARŞILAŞTIRMASI
-// =====================================================
-
-REFERANS DEKONT KULLANIMI:
-
-Aşağıdaki ek dosya banka tarafından sağlanan GERÇEK REFERANS
-DEKONTUDUR.
-
-Bu referans dekont SADECE:
-- belge şablonunu,
-- sayfa ve alan yerleşimini,
-- banka logosunu,
-- başlık yapısını,
-- tipografiyi,
-- font görünümünü,
-- font boyutunu,
-- karakter aralıklarını,
-- satır aralıklarını,
-- alan hizalamalarını,
-- tarih/saat biçimini,
-- tutar biçimini,
-- para birimi biçimini,
-- IBAN biçimini,
-- gönderen/alıcı alanlarının yapısını,
-- işlem bilgilerinin yerleşimini
-
-görsel ve yapısal olarak karşılaştırmak amacıyla kullanılacaktır.
+=====================================================
+JPG / JPEG — ANALİZ EDİLECEK ASIL BELGE
+=====================================================
 
 ÇOK ÖNEMLİ:
 
-ANALİZ EDİLEN BELGENİN BİLGİ KAYNAĞI YALNIZCA
-"input_image" OLARAK GÖNDERİLEN JPG DEKONTTUR.
+Bu analizde ASIL ANALİZ EDİLECEK BELGE,
+aşağıda gönderilen input_image olarak verilen
+JPG / JPEG dosyasıdır.
 
-JPG DEKONTTAN ÇIKARILACAK:
-- gönderen adı,
-- alıcı adı,
-- tutar,
-- para birimi,
-- IBAN,
-- hesap bilgileri,
-- tarih,
-- saat,
-- işlem numarası,
-- referans numarası,
-- açıklama,
-- diğer dekont bilgileri
+TÜM GERÇEK DEKONT BİLGİLERİNİ YALNIZCA
+JPG / JPEG GÖRÜNTÜSÜNDEN ÇIKAR.
 
-YALNIZCA ANALİZ EDİLEN JPG ÜZERİNDEN BELİRLENMELİDİR.
+JPG / JPEG üzerinde gerçekten görünmeyen hiçbir
+bilgiyi yazma.
 
-REFERANS PDF'DEKİ HİÇBİR BİLGİYİ ANALİZ EDİLEN JPG'YE
-AKTARMA.
+JPG / JPEG üzerinde bir bilgi okunamıyorsa:
+null kullan.
 
-REFERANS PDF'DEKİ İSİM, IBAN, TUTAR, TARİH, SAAT,
-HESAP NUMARASI, İŞLEM NUMARASI VEYA BAŞKA BİR BİLGİYİ
-JPG'DE YOKSA JPG VARMIŞ GİBİ KULLANMA.
+=====================================================
+REFERANS PDF — SADECE GÖRSEL / ŞABLON REFERANSI
+=====================================================
 
-JPG'DE BİR BİLGİ OKUNAMIYORSA:
-- referans PDF'den tamamlamaya çalışma,
-- tahmin etme,
-- başka bir belgeden kopyalama,
-- null döndür.
+Aşağıda ayrıca bir banka referans PDF'i verilebilir.
 
-JPG ile referans PDF'deki bilgiler farklı olabilir.
-Bu durumda HER ZAMAN JPG'DE GERÇEKTEN GÖRÜLEN BİLGİYİ
-ESAS AL.
+REFERANS PDF:
 
-REFERANS PDF'NİN İÇERİĞİNİ "ANALİZ EDİLEN DEKONT" OLARAK
+SADECE şu amaçlarla kullanılabilir:
+
+- belge şablonu
+- sayfa düzeni
+- alanların konumu
+- banka logosu
+- başlık yapısı
+- tipografi
+- font görünümü
+- font boyutu
+- karakter aralıkları
+- satır aralıkları
+- hizalama
+- tarih biçiminin görsel yapısı
+- tutar biçiminin görsel yapısı
+- IBAN alanının görsel yapısı
+- gönderen/alıcı alanlarının görsel yerleşimi
+- genel görsel yapı
+- belge üzerindeki olası düzenleme izlerinin karşılaştırılması
+
+=====================================================
+KESİN KURAL — VERİ AKTARMA YASAK
+=====================================================
+
+REFERANS PDF'DEKİ HİÇBİR GERÇEK İŞLEM BİLGİSİNİ
+JPG / JPEG'E AKTARMA.
+
+Özellikle REFERANS PDF'den:
+
+- isim
+- soyisim
+- gönderen adı
+- alıcı adı
+- IBAN
+- hesap numarası
+- tutar
+- para birimi
+- tarih
+- saat
+- işlem numarası
+- referans numarası
+- açıklama
+- vergi numarası
+- müşteri numarası
+- diğer herhangi bir rakam veya metin
+
+ALMA.
+
+JPG / JPEG'DE YOKSA BU BİLGİLERİ
+REFERANS PDF'DEN TAMAMLAMA.
+
+JPG / JPEG'DEKİ BİR ALAN REFERANS PDF'DEKİ
+DEĞERDEN FARKLIYSA REFERANS PDF'Yİ DOĞRU
 KABUL ETME.
 
-REFERANS PDF'DEKİ GERÇEK İŞLEM BİLGİLERİ SADECE REFERANS
-BELGESİNE AİTTİR.
+GERÇEK DEĞER HER ZAMAN JPG / JPEG ÜZERİNDE
+GERÇEKTEN GÖRÜLEN DEĞERDİR.
 
-ÖNCE input_image OLAN JPG'Yİ BAŞTAN SONA ANALİZ ET.
-JPG'DEKİ BİLGİLERİ ÇIKAR.
-DAHA SONRA REFERANS PDF İLE SADECE GÖRSEL/ŞABLON
-KARŞILAŞTIRMASI YAP.
-
-REFERANS DEKONTUN KENDİSİNİ ANALİZ EDİLEN BELGENİN
-GERÇEKLİĞİ İÇİN KESİN KANIT OLARAK KABUL ETME.
+JPG / JPEG'DE OKUNAMAYAN BİR DEĞER İÇİN
+TAHMİN YAPMA VE REFERANS PDF'DEN DEĞER
+KOPYALAMA.
 
 =====================================================
-REFERANS DOSYASI KULLANIMI
+DOCUMENT DATA
 =====================================================
 
-Aşağıdaki ek dosya gerçek banka referans dekontudur.
-
-Bu dosyayı görsel olarak incele ve yukarıdaki
-karşılaştırmayı gerçekten bu dosyanın görüntüsü
-üzerinden gerçekleştir.
-
-Referans dosyanın yalnızca dosya adına bakarak
-şablon hakkında çıkarım yapma.
-
-=====================================================
-DEKONT BİLGİLERİNİ ÇIKAR
-=====================================================
-
-Normal dekont analizinde aşağıdaki alanları mümkün
-olduğunca doğrudan analiz edilen dekonttan çıkar:
+Aşağıdaki alanları YALNIZCA JPG / JPEG
+görüntüsünden çıkar:
 
 documentData.senderName
 documentData.recipientName
@@ -4807,35 +4802,77 @@ documentData.iban
 
 Kurallar:
 
-- Yalnızca gerçekten görülebilen bilgileri yaz.
+- Yalnızca JPG / JPEG üzerinde gerçekten görülen bilgileri yaz.
 - Güvenilir şekilde okunamıyorsa null kullan.
 - IBAN'ı mümkünse standart biçimde yaz.
-- amount alanında dekontta görülen ana işlem tutarını kullan.
-- IBAN, hesap numarası, işlem numarası, referans numarası
- veya tarih gibi diğer rakamları amount olarak kullanma.
-- Gönderen ve alıcıyı alan etiketlerine göre ayırt et.
-- Açıklama alanındaki isimleri gönderen/alıcı yerine kullanma.
-- Bu karşılaştırma risk skoruna dahil edilmeyecektir.
+- amount alanına yalnızca JPG / JPEG üzerinde görülen
+ana işlem tutarını yaz.
+- IBAN, hesap numarası, işlem numarası,
+referans numarası veya tarih gibi rakamları
+amount olarak kullanma.
+- Gönderen ve alıcıyı JPG / JPEG üzerindeki
+alan etiketlerine göre ayırt et.
+- Açıklama alanındaki isimleri gönderen/alıcı
+yerine kullanma.
+- REFERANS PDF'dEKİ DEĞERLERİ documentData'YA
+KOPYALAMA.
+- JPG / JPEG'de yoksa null döndür.
 
-Filename:
+=====================================================
+ANALİZ SIRASI
+=====================================================
+
+1. Önce JPG / JPEG görüntüsünü baştan sona analiz et.
+2. JPG / JPEG'de görülen tüm bilgileri belirle.
+3. documentData alanlarını yalnızca JPG / JPEG'den doldur.
+4. Daha sonra referans PDF'yi yalnızca görsel/şablon
+karşılaştırması için kullan.
+5. Referans PDF'deki gerçek işlem bilgilerini
+analiz edilen JPG / JPEG'in bilgileri olarak kullanma.
+
+Dosya adı:
 ${fileName}`,
- },
+},
 
- // -------------------------------------------------
- // ANALİZ EDİLEN JPG
- // -------------------------------------------------
+// =================================================
+// ASIL ANALİZ EDİLECEK JPEG
+// =================================================
 
- {
- type:
- "input_image",
+{
+type:
+"input_image",
 
- image_url:
- imageDataUrl,
+image_url:
+imageDataUrl,
 
- detail:
- "high",
- },
+detail:
+"high",
+},
+
+// =================================================
+// REFERANS PDF
+// SADECE GÖRSEL / ŞABLON KARŞILAŞTIRMASI
+// =================================================
+
+...(
+reference?.base64
+? [
+{
+type:
+"input_file",
+
+filename:
+reference.fileName,
+
+file_data:
+`data:application/pdf;base64,${reference.base64}`,
+},
+]
+: []
+),
+
 ];
+
 }
 
 
