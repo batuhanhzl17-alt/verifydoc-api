@@ -10,7 +10,10 @@ import { createWorker } from "tesseract.js";
 import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
-import "@napi-rs/canvas";
+import{ 
+createCanvas,
+ImageData,
+ } from "@napi-rs/canvas";
 
 const require = createRequire(import.meta.url);
 
@@ -44,6 +47,101 @@ return {
 text: data.text || "",
 confidence: Number(data.confidence) || 0,
 };
+}
+
+// =====================================================
+// PDF → IMAGE — OCR FALLBACK
+// =====================================================
+
+async function pdfToImg(buffer, options = {}) {
+
+const scale =
+options.scale || 2;
+
+const pdf =
+await pdfjsLib.getDocument({
+data:
+new Uint8Array(buffer),
+}).promise;
+
+const images = [];
+
+
+for (
+let pageNumber = 1;
+pageNumber <= pdf.numPages;
+pageNumber++
+) {
+
+const page =
+await pdf.getPage(
+pageNumber
+);
+
+const viewport =
+page.getViewport({
+scale,
+});
+
+
+const canvas =
+createCanvas(
+Math.ceil(viewport.width),
+Math.ceil(viewport.height)
+);
+
+
+const context =
+canvas.getContext(
+"2d"
+);
+
+
+await page.render({
+
+canvasContext:
+context,
+
+viewport,
+
+}).promise;
+
+
+images.push(
+canvas.toBuffer(
+"image/png"
+)
+);
+
+}
+
+
+return {
+
+async *[
+Symbol.asyncIterator
+]() {
+
+for (
+const image
+of images
+) {
+
+yield image;
+
+}
+
+},
+
+
+async destroy() {
+
+images.length = 0;
+
+},
+
+};
+
 }
 
 // =====================================================
