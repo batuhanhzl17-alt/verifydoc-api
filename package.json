@@ -11,7 +11,8 @@
   "pdfjs-dist": "4.7.76",
   "@vercel/functions": "^3.8.0",
   "@google/genai": "^2.19.0",
-  "@napi-rs/canvas": "^0.1.100"
+  "@napi-rs/canvas": "^0.1.100",
+  "@paddleocr/api-sdk": "latest"
   
  }
 }
