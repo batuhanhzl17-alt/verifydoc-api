@@ -1,5 +1,4 @@
 import OpenAI from "openai";
-import { GoogleGenAI } from "@google/genai";
 import formidable from "formidable";
 import fs from "fs/promises";
 import path from "path";
@@ -357,10 +356,7 @@ new OpenAI({
 apiKey:
 process.env.OPENAI_API_KEY,
 });
-const gemini =
-new GoogleGenAI({
-apiKey: process.env.GEMINI_API_KEY,
-});
+
 
 
 // =====================================================
@@ -5114,50 +5110,7 @@ console.log(
 );
 
 
-// =====================================================
-// GEMINI SECOND OPINION
-// =====================================================
 
-console.log("GEMINI REQUEST START");
-
-let geminiResult = null;
-
-
-const geminiParts =
-convertOpenAIContentToGemini(content);
-
-let geminiResponse;
-
-// =====================================================
-// GEMINI 3.7 FLASH
-// =====================================================
-
-try {
- console.log("GEMINI 3.7 FLASH START");
-
- geminiResponse = await gemini.models.generateContent({
- model: "gemini-3.6-flash",
- contents: "Reply with exactly: GEMINI TEST OK",
- config: {
- thinkingConfig: {
- thinkingLevel: "low",
- },
- },
- });
-
- console.log("GEMINI 3.7 FLASH SUCCESS");
-} catch (firstError) {
- console.error(
- "GEMINI 3.7 FLASH FAILED:",
- firstError?.message || firstError
- );
-
- throw new Error(
- `Gemini 3.7 Flash analiz hatası: ${
- firstError?.message || "Bilinmeyen Gemini hatası"
- }`
- );
-}
   
 // -------------------------------------------------
 // PARSE
