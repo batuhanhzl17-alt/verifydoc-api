@@ -24,46 +24,7 @@ pathToFileURL(pdfWorkerPath).href;
 
 const execFileAsync = promisify(execFile);
 
-function convertOpenAIContentToGemini(content) {
-const parts = [];
 
-for (const item of content || []) {
-
-// Metin
-if (
-item?.type === "input_text" &&
-typeof item.text === "string"
-) {
-parts.push({
-text: item.text,
-});
-
-continue;
-}
-
-// Görsel
-if (
-item?.type === "input_image" &&
-typeof item.image_url === "string"
-) {
-const match =
-item.image_url.match(
-/^data:(image\/[^;]+);base64,(.+)$/
-);
-
-if (match) {
-parts.push({
-inlineData: {
-mimeType: match[1],
-data: match[2],
-},
-});
-}
-}
-}
-
-return parts;
-}
 
 
 // =====================================================
