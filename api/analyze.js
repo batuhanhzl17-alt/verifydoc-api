@@ -6,7 +6,6 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
-import { pdf as pdfToImg } from "pdf-to-img";
 import { createWorker } from "tesseract.js";
 import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
 import { createRequire } from "module";
