@@ -6,6 +6,7 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
+import { pdf as pdfToImg } from "pdf-to-img";
 import { createWorker } from "tesseract.js";
 import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
 import { createRequire } from "module";
@@ -4338,6 +4339,44 @@ console.log(
 extractedPdfText.length,
 "karakter"
 );
+
+// =====================================================
+// OCR FALLBACK - TARAMA PDF
+// =====================================================
+
+if (extractedPdfText.trim().length < 100) {
+ console.log("PDF metni yetersiz, Tesseract OCR başlatılıyor...");
+
+ const ocrWorker = await createWorker("tur+eng");
+
+ try {
+ const ocrDocument = await pdfToImg(buffer, {
+ scale: 2
+ });
+
+ const ocrPages = [];
+
+ for await (const image of ocrDocument) {
+ const { data } = await ocrWorker.recognize(image);
+
+ if (data.text?.trim()) {
+ ocrPages.push(data.text.trim());
+ }
+ }
+
+ extractedPdfText = ocrPages.join("\n");
+
+ console.log(
+ "TESSERACT OCR TAMAMLANDI:",
+ extractedPdfText.length,
+ "karakter"
+ );
+
+ await ocrDocument.destroy();
+ } finally {
+ await ocrWorker.terminate();
+ }
+}
 
 } catch (error) {
 console.error(
