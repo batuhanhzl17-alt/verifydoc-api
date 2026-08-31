@@ -4836,29 +4836,6 @@ ${fileName}`,
  "high",
  },
 
- // -------------------------------------------------
- // BANKA REFERANS PDF
- // -------------------------------------------------
-
- ...(
- reference?.base64
- ? [
- {
- type:
- "input_file",
-
- filename:
- reference.fileName,
-
- file_data:
- `data:application/pdf;base64,${reference.base64}`,
- },
- ]
- : []
- ),
-
- ];
-}
 
 
 // =================================================
