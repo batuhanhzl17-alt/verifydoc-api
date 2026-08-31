@@ -6,6 +6,7 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
+import { createWorker } from "tesseract.js";
 import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
@@ -24,8 +25,25 @@ pathToFileURL(pdfWorkerPath).href;
 
 const execFileAsync = promisify(execFile);
 
+let ocrWorker = null;
 
+async function getOCRWorker() {
+if (!ocrWorker) {
+ocrWorker = await createWorker("tur+eng");
+}
 
+return ocrWorker;
+}
+async function runOCR(imagePath) {
+const worker = await getOCRWorker();
+
+const { data } = await worker.recognize(imagePath);
+
+return {
+text: data.text || "",
+confidence: Number(data.confidence) || 0,
+};
+}
 
 // =====================================================
 // REFERANS KLASÖRÜ
