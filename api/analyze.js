@@ -3142,6 +3142,121 @@ If the issuer cannot be reliably identified, do not invent a bank or
 institution name.
 
 Return ONLY the JSON object matching the supplied schema.
+============================================================
+SABİT ANALİZ SONUCU FORMATI
+============================================================
+
+ANALİZ SONUCUNU HER ZAMAN AŞAĞIDAKİ 5 BAŞLIKLA VE TAM OLARAK BU SIRAYLA VER.
+
+JPEG VE PDF İÇİN AYNI FORMAT KULLANILACAKTIR.
+DOSYA TÜRÜNE GÖRE BAŞLIK, SIRA VE YAPI DEĞİŞTİRME.
+
+1. TUTAR KONTROLÜ
+- İşlem tutarının doğru görünüp görünmediğini kontrol et.
+- Tutar alanında görünür bir oynama veya sonradan eklenmiş/değiştirilmiş görünüm var mı kontrol et.
+- Tutarın fontu, karakter yapısı, boyutu, hizası ve çevresindeki metinle görsel tutarlılığını kontrol et.
+- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
+
+2. ALICI BİLGİLERİ
+- Alıcı adını kontrol et.
+- Alıcı IBAN'ını kontrol et.
+- Alıcı adı ve IBAN'ın dekont içindeki diğer bilgilerle tutarlı olup olmadığını kontrol et.
+- Bu alanlarda font, karakter, hizalama veya görsel oynama belirtisi olup olmadığını kontrol et.
+- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
+
+3. TOPLAM / YAZILI TUTAR UYUMU
+ÖZELLİKLE KONTROL ET:
+- "Yalnız ..." şeklinde yazıyla belirtilen tutar
+- "Hesabınızdan ..." şeklinde belirtilen işlem tutarı
+- Dekonttaki rakamsal ana işlem tutarı
+- Toplam tutar / masraf / işlem tutarı ilişkisi
+
+Bu değerlerin matematiksel ve metinsel olarak birbiriyle uyumlu olup olmadığını kontrol et.
+
+Birbirleriyle uyuşmayan tutarlar varsa bunu açıkça belirt ve hangi tutarların uyuşmadığını yaz.
+
+4. OYNAMA / KIRPMA / KESME KONTROLÜ
+- Görsel olarak tespit edilebilen kesme
+- kırpma
+- silme
+- ekleme
+- birleştirme
+- font değişikliği
+- farklı bölgenin sonradan yerleştirilmiş görünmesi
+- hizalama veya karakter yapısında belirgin anormallik
+
+var mı kontrol et.
+
+SADECE GÖRSEL OLARAK DESTEKLENEN BULGULARI RAPORLA.
+Görünmeyen veya kanıtlanamayan bir düzenleme olduğunu iddia etme.
+
+5. TARİH / SAAT KONTROLÜ
+- Tarih formatını kontrol et.
+- Saat formatını kontrol et.
+- Tarih ve saatin dekontun diğer görünen bilgileriyle tutarlı olup olmadığını kontrol et.
+- Tarih/saat alanında font, karakter, hizalama veya görsel farklılık olup olmadığını kontrol et.
+- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
+
+
+============================================================
+CEVAP YAZIM KURALI
+============================================================
+
+Yukarıdaki 5 başlığı HER ANALİZDE MUTLAKA KULLAN.
+
+Başlıkları değiştirme.
+Başlıkların sırasını değiştirme.
+Yeni ana başlık ekleme.
+Bu 5 kontrolü birleştirme.
+Aynı bulguyu farklı başlıklarda tekrar tekrar anlatma.
+
+Cevap kısa, net ve dekont üzerinde görülen kanıtlara dayalı olsun.
+
+Her başlık altında en fazla 1-2 kısa cümle kullan.
+
+FORMAT:
+
+1. TUTAR KONTROLÜ:
+[bulgu]
+
+2. ALICI BİLGİLERİ:
+[bulgu]
+
+3. TOPLAM / YAZILI TUTAR UYUMU:
+[bulgu]
+
+4. OYNAMA / KIRPMA / KESME KONTROLÜ:
+[bulgu]
+
+5. TARİH / SAAT KONTROLÜ:
+[bulgu]
+
+
+============================================================
+KANIT KURALI
+============================================================
+
+"Şüpheli", "uyumsuz", "oynama var", "değiştirilmiş" veya benzeri bir sonuç
+SADECE gözlemlenebilir ve açıklanabilir kanıt varsa kullanılmalıdır.
+
+Tek başına:
+- farklı font görünümü,
+- fotoğraf açısı,
+- JPEG sıkıştırması,
+- görüntü kalitesi,
+- tarama kalitesi,
+- normal karakter farklılığı
+
+sahtecilik kanıtı olarak kabul edilmemelidir.
+
+Bir kontrol güvenilir şekilde yapılamıyorsa:
+"Belirlenemedi — yeterli görsel kanıt yok."
+
+şeklinde cevap ver.
+
+Özellikle tutar, alıcı adı, alıcı IBAN, yazıyla belirtilen tutar,
+"Hesabınızdan..." tutarı, tarih ve saat üzerinde görülen somut
+uyumsuzluklara öncelik ver.
 
 `;
 
