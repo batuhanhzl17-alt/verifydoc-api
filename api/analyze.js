@@ -192,6 +192,7 @@ result.pages
 const allTexts = [];
 
 const allScores = [];
+const allBoxes : [];
 
 
 for (
@@ -224,22 +225,34 @@ pruned.rec_scores
 :
 [];
 
+const boxes =
+Array.isArray(pruned?.rec_boxes)
+? pruned.rec_boxes
+: Array.isArray(pruned?.dt_polys)
+? pruned.dt_polys
+: [];
 
-for (
-const text
-of texts
-) {
 
-if (
-text !== null &&
-text !== undefined &&
-String(text).trim()
-) {
+for (let i = 0; i < texts.length; i++) {
 
-allTexts.push(
-String(text).trim()
-);
+const cleanText =
+String(texts[i] ?? "").trim();
 
+if (!cleanText) {
+continue;
+}
+
+allTexts.push(cleanText);
+
+const box = boxes[i];
+
+if (box) {
+allBoxes.push({
+text: cleanText,
+box,
+score:
+Number(scores[i]) || 0,
+});
 }
 
 }
@@ -324,11 +337,14 @@ text,
 
 confidence,
 
+
 success:
 true,
 
 pages:
 pages.length,
+
+boxes: allBoxes,
 
 };
 
@@ -1759,6 +1775,7 @@ required: [
 "darknessDifference",
 "renderingDifference",
 "evidence",
+"amountForensics",
 ],
 
 additionalProperties: false,
@@ -3834,7 +3851,107 @@ Ana işlem tutarı yalnızca "okunuyor mu?" diye kontrol edilmemelidir.
 tutarın görsel olarak değiştirilmediğini kanıtlamaz.
 
 Okunabilirlik ve görsel bütünlük iki ayrı kontroldür.
- 
+
+
+=====================================================
+AMOUNT FORENSICS — ZORUNLU GÖRSEL KARŞILAŞTIRMA
+=====================================================
+
+amountForensics alanı yalnızca ana işlem tutarının
+görsel bütünlüğünü değerlendirmek içindir.
+
+Bu alan OCR sonucundan üretilemez.
+
+ASIL KAYNAK yalnızca belge görüntüsüdür.
+
+Ana işlem tutarı okunabiliyorsa, tutarın içindeki
+karakterleri birbirleriyle ve belgede bulunan aynı
+veya benzer karakterlerle karşılaştır.
+
+Özellikle tutarın farklı bölümleri arasında:
+
+- koyuluk
+- stroke kalınlığı
+- karakter yoğunluğu
+- kenar keskinliği
+- anti-aliasing
+- piksel yoğunluğu
+- render kalitesi
+
+farkı olup olmadığını incele.
+
+ÖRNEK:
+
+1.700,00 TL
+
+ifadesinde:
+
+"1.700"
+
+ile
+
+",00"
+
+bölümlerinin görsel üretim özelliklerini karşılaştır.
+
+Eğer ",00" bölümü "1.700" bölümünden belirgin şekilde
+daha koyu veya kalın görünüyorsa bunu yalnızca
+"okunabilirlik farkı" olarak geçme.
+
+Önce bunun:
+
+1. ışık,
+2. odak,
+3. perspektif,
+4. JPEG sıkıştırması
+
+gibi tüm belgeyi etkileyen doğal bir neden olup
+olmadığını değerlendir.
+
+Fark yalnızca tutarın belirli karakterlerinde veya
+belirli bir bölümünde lokalizeyse bunu özellikle belirt.
+
+Aynı tutar içerisinde aynı karakterlerden birinin
+diğerlerinden belirgin şekilde farklı görünmesi
+özellikle önemlidir.
+
+Örneğin:
+
+1.700,00
+
+içindeki "0" karakterlerinden biri diğerlerinden
+belirgin şekilde daha koyu, kalın, keskin veya farklı
+render edilmiş görünüyorsa bunu evidence alanında
+açıkça belirt.
+
+Küçük veya belirsiz farklılıkları FAIL yapma.
+
+Fark açık, lokalize ve birden fazla görsel özellikle
+destekleniyorsa:
+
+status = "fail"
+
+kullan.
+
+Yeterli çözünürlük olmadığı için güvenilir karar
+verilemiyorsa:
+
+status = "unknown"
+
+kullan.
+
+Hiçbir anlamlı görsel tutarsızlık yoksa:
+
+status = "pass"
+
+kullan.
+
+ÖNEMLİ:
+
+Tutarın okunabilmesi amountForensics = pass anlamına
+gelmez.
+
+Okunabilirlik ve görsel bütünlük ayrı kontrollerdir.
 ==================================================
 RISK CALCULATION
 ==================================================
