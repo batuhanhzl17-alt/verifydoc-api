@@ -2181,10 +2181,10 @@ ffmpegPath,
 videoPath,
  
 "-vf",
-"fps=2,scale=1280:-2",
+"fps=1,scale=1280:-2",
  
 "-frames:v",
-"8",
+"4",
  
 "-q:v",
 "5",
@@ -2299,51 +2299,41 @@ console.log(
  "VIDEO PADDLEOCR BAŞLIYOR"
 );
 
-const videoOCRResults = [];
+const videoOCRResults = await Promise.all(
+frames.map(async (frame, index) => {
 
-for (let i = 0; i < frames.length; i++) {
+try {
 
- const frame = frames[i];
+const ocrResult =
+await runPaddleOCR(frame.framePath);
 
- console.log(
- `VIDEO FRAME ${i + 1}/${frames.length} PADDLEOCR`
- );
+return {
+frame: index + 1,
+file: frame.file,
+text: ocrResult?.text || "",
+confidence:
+Number(ocrResult?.confidence) || 0,
+success:
+Boolean(ocrResult?.success),
+};
 
- try {
+} catch (error) {
 
- // ÖNEMLİ:
- // MP4 gönderme.
- // PaddleOCR'a yalnızca JPG frame gönder.
- const ocrResult =
- await runPaddleOCR(
- frame.framePath
- );
+return {
+frame: index + 1,
+file: frame.file,
+text: "",
+confidence: 0,
+success: false,
+error:
+error?.message ||
+"PaddleOCR başarısız.",
+};
 
- videoOCRResults.push({
- frame: i + 1,
- file: frame.file,
- text: ocrResult?.text || "",
- confidence:
- Number(
- ocrResult?.confidence
- ) || 0,
- success:
- Boolean(
- ocrResult?.success
- ),
- });
+}
 
- console.log(
- `FRAME ${i + 1} OCR CONFIDENCE:`,
- ocrResult?.confidence || 0
- );
-
- console.log(
- `FRAME ${i + 1} OCR TEXT:`,
- ocrResult?.text || ""
- );
-
- }
+})
+);
 
  catch (error) {
 
