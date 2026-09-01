@@ -3158,10 +3158,9 @@ Only report this when both values are actually visible and readable.
 For each check:
  
 status:
-- pass
-- review
-- suspicious
-- unknown
+- pass = sorun görülmedi
+- fail = somut bir sorun veya tutarsızlık görüldü
+- unknown = güvenilir şekilde değerlendirilemedi
  
 score:
 0 = no suspicious evidence detected
@@ -3730,91 +3729,157 @@ Return ONLY the JSON object matching the supplied schema.
 SABİT ANALİZ SONUCU FORMATI
 ============================================================
  
-ANALİZ SONUCUNU HER ZAMAN AŞAĞIDAKİ 5 BAŞLIKLA VE TAM OLARAK BU SIRAYLA VER.
+
  
 JPEG VE PDF İÇİN AYNI FORMAT KULLANILACAKTIR.
 DOSYA TÜRÜNE GÖRE BAŞLIK, SIRA VE YAPI DEĞİŞTİRME.
  
+=====================================================
+YORUM / SUMMARY FORMATI
+=====================================================
+
+summary alanı kullanıcıya gösterilecek ana yorumdur.
+
+ÇOK ÖNEMLİ:
+
+summary yalnızca gerçekten tespit edilen önemli bulguları
+içermelidir.
+
+TEMİZ / SORUNSUZ KONTROLLERİ TEK TEK YAZMA.
+
+Örneğin:
+
+Tutar sorunsuzsa:
+"1. TUTAR KONTROLÜ: Sorun tespit edilmedi."
+
+şeklinde ayrı ayrı yazma.
+
+Bunun yerine yalnızca önemli bir sorun varsa belirt.
+
+=====================================================
+KULLANILACAK KONTROL SIRASI
+=====================================================
+
+Analiz mantıksal olarak aşağıdaki 5 alanı kontrol etmelidir:
+
 1. TUTAR KONTROLÜ
-- İşlem tutarının doğru görünüp görünmediğini kontrol et.
-- Tutar alanında görünür bir oynama veya sonradan eklenmiş/değiştirilmiş görünüm var mı kontrol et.
-- Tutarın fontu, karakter yapısı, boyutu, hizası ve çevresindeki metinle görsel tutarlılığını kontrol et.
-- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
- 
 2. ALICI BİLGİLERİ
-- Alıcı adını kontrol et.
-- Alıcı IBAN'ını kontrol et.
-- Alıcı adı ve IBAN'ın dekont içindeki diğer bilgilerle tutarlı olup olmadığını kontrol et.
-- Bu alanlarda font, karakter, hizalama veya görsel oynama belirtisi olup olmadığını kontrol et.
-- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
- 
 3. TOPLAM / YAZILI TUTAR UYUMU
-ÖZELLİKLE KONTROL ET:
-- "Yalnız ..." şeklinde yazıyla belirtilen tutar
-- "Hesabınızdan ..." şeklinde belirtilen işlem tutarı
-- Dekonttaki rakamsal ana işlem tutarı
-- Toplam tutar / masraf / işlem tutarı ilişkisi
- 
-Bu değerlerin matematiksel ve metinsel olarak birbiriyle uyumlu olup olmadığını kontrol et.
- 
-Birbirleriyle uyuşmayan tutarlar varsa bunu açıkça belirt ve hangi tutarların uyuşmadığını yaz.
- 
 4. OYNAMA / KIRPMA / KESME KONTROLÜ
-- Görsel olarak tespit edilebilen kesme
-- kırpma
-- silme
-- ekleme
-- birleştirme
-- font değişikliği
-- farklı bölgenin sonradan yerleştirilmiş görünmesi
-- hizalama veya karakter yapısında belirgin anormallik
- 
-var mı kontrol et.
- 
-SADECE GÖRSEL OLARAK DESTEKLENEN BULGULARI RAPORLA.
-Görünmeyen veya kanıtlanamayan bir düzenleme olduğunu iddia etme.
- 
 5. TARİH / SAAT KONTROLÜ
-- Tarih formatını kontrol et.
-- Saat formatını kontrol et.
-- Tarih ve saatin dekontun diğer görünen bilgileriyle tutarlı olup olmadığını kontrol et.
-- Tarih/saat alanında font, karakter, hizalama veya görsel farklılık olup olmadığını kontrol et.
-- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
- 
- 
-============================================================
-CEVAP YAZIM KURALI
-============================================================
- 
-Yukarıdaki 5 başlığı HER ANALİZDE MUTLAKA KULLAN.
- 
-Başlıkları değiştirme.
-Başlıkların sırasını değiştirme.
-Yeni ana başlık ekleme.
-Bu 5 kontrolü birleştirme.
-Aynı bulguyu farklı başlıklarda tekrar tekrar anlatma.
- 
-Cevap kısa, net ve dekont üzerinde görülen kanıtlara dayalı olsun.
- 
-Her başlık altında en fazla 1-2 kısa cümle kullan.
- 
-FORMAT:
- 
-1. TUTAR KONTROLÜ:
-[bulgu]
- 
-2. ALICI BİLGİLERİ:
-[bulgu]
- 
-3. TOPLAM / YAZILI TUTAR UYUMU:
-[bulgu]
- 
-4. OYNAMA / KIRPMA / KESME KONTROLÜ:
-[bulgu]
- 
-5. TARİH / SAAT KONTROLÜ:
-[bulgu]
- 
+
+Ancak summary içerisinde yalnızca sorun veya dikkat edilmesi
+gereken somut bir bulgu bulunan alanları göster.
+
+Sorunsuz alanları tekrar tekrar yazma.
+
+=====================================================
+YORUM YAZIM KURALI
+=====================================================
+
+Eğer önemli bir sorun / tutarsızlık / görsel anormallik varsa:
+
+summary içerisinde kısa maddeler halinde belirt.
+
+Örnek:
+
+"• İşlem tutarı ile yazılı tutar arasında uyumsuzluk tespit edildi.
+• Alıcı IBAN'ında belge içerisindeki diğer bilgilerle tutarsızlık görüldü."
+
+Her madde en fazla 1 kısa cümle olsun.
+
+Gereksiz açıklama yapma.
+
+Kare kare anlatma.
+
+OCR sürecini anlatma.
+
+Teknik analiz sürecini anlatma.
+
+Model veya algoritmadan bahsetme.
+
+=====================================================
+SORUN YOKSA
+=====================================================
+
+Eğer anlamlı hiçbir tutarsızlık veya manipülasyon göstergesi
+tespit edilmemişse summary yalnızca şu anlama gelen kısa bir
+cümle olmalıdır:
+
+"Belgede belirgin bir tutarsızlık veya manipülasyon göstergesi
+tespit edilmedi."
+
+Bu cümleyi gereksiz şekilde uzatma.
+
+=====================================================
+BELİRSİZ DURUMLAR
+=====================================================
+
+Bir alan okunamıyorsa veya güvenilir şekilde değerlendirilemiyorsa
+bunu yalnızca gerçekten önemliyse belirt.
+
+Örneğin:
+
+"• Görüntü kalitesi nedeniyle alıcı IBAN'ının tamamı güvenilir
+şekilde doğrulanamadı."
+
+Belirsizliği sahtecilik olarak değerlendirme.
+
+=====================================================
+ÖNCELİK
+=====================================================
+
+Bulgu varsa öncelik sırası:
+
+1. Tutar uyumsuzluğu
+2. Yazılı tutar / rakamsal tutar uyumsuzluğu
+3. Alıcı adı / IBAN uyumsuzluğu
+4. Tarih / saat tutarsızlığı
+5. Görsel oynama / ekleme / silme / kesme
+6. Diğer önemli finansal tutarsızlıklar
+
+Önemsiz veya normal görsel farklılıkları summary'ye yazma.
+
+=====================================================
+KANIT KURALI
+=====================================================
+
+"Şüpheli",
+"uyumsuz",
+"oynama var",
+"değiştirilmiş",
+"manipüle edilmiş"
+
+gibi ifadeleri yalnızca gözlemlenebilir ve açıklanabilir
+kanıt varsa kullan.
+
+Tek başına:
+
+- farklı font görünümü
+- fotoğraf açısı
+- JPEG sıkıştırması
+- görüntü kalitesi
+- tarama kalitesi
+- normal karakter farklılığı
+
+sahtecilik kanıtı değildir.
+
+Görsel veya veri kanıtı yoksa sorun üretme.
+
+=====================================================
+SUMMARY ÇIKTI KURALI
+=====================================================
+
+summary:
+
+- Türkçe olmalıdır.
+- Kısa olmalıdır.
+- Yalnızca önemli bulguları içermelidir.
+- Temiz kontrolleri tek tek listelememelidir.
+- En fazla 3-5 kısa madde kullanılmalıdır.
+- Sorun yoksa tek kısa cümle kullanılmalıdır.
+- Aynı bulguyu tekrar etmemelidir.
+- Kesin "sahte" veya "gerçek" sonucu vermemelidir.
  
 ============================================================
 KANIT KURALI
