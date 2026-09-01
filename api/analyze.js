@@ -853,8 +853,201 @@ apiKey:
 process.env.OPENAI_API_KEY,
 });
  
- 
- 
+async function analyzeAmountRegion(
+imagePath,
+box
+) {
+
+if (
+!imagePath ||
+!Array.isArray(box) ||
+box.length < 4
+) {
+
+return {
+available: false,
+reason: "Tutar bölgesi belirlenemedi.",
+};
+
+}
+
+try {
+
+const xs =
+box.map(point => Number(point[0]));
+
+const ys =
+box.map(point => Number(point[1]));
+
+const left =
+Math.max(0, Math.floor(Math.min(...xs)));
+
+const top =
+Math.max(0, Math.floor(Math.min(...ys)));
+
+const right =
+Math.ceil(Math.max(...xs));
+
+const bottom =
+Math.ceil(Math.max(...ys));
+
+const width =
+right - left;
+
+const height =
+bottom - top;
+
+if (
+width <= 0 ||
+height <= 0
+) {
+
+return {
+available: false,
+reason: "Geçerli tutar bölgesi bulunamadı.",
+};
+
+}
+
+const { data, info } =
+await sharp(imagePath)
+.extract({
+left,
+top,
+width,
+height,
+})
+.grayscale()
+.raw()
+.toBuffer({
+resolveWithObject: true,
+});
+
+let darkPixels = 0;
+let totalIntensity = 0;
+
+for (
+let i = 0;
+i < data.length;
+i++
+) {
+
+const value =
+Number(data[i]);
+
+totalIntensity += value;
+
+if (value < 150) {
+darkPixels++;
+}
+
+}
+
+const pixelCount =
+data.length;
+
+const averageIntensity =
+pixelCount
+? totalIntensity / pixelCount
+: null;
+
+const darkRatio =
+pixelCount
+? darkPixels / pixelCount
+: null;
+
+return {
+
+available: true,
+
+left,
+top,
+width,
+height,
+
+averageIntensity,
+
+darkRatio,
+
+};
+
+}
+catch (error) {
+
+console.error(
+"AMOUNT REGION ANALYSIS ERROR:",
+error
+);
+
+return {
+
+available: false,
+
+reason:
+error?.message ||
+"Tutar bölgesi analiz edilemedi.",
+
+};
+
+}
+
+} 
+
+// =====================================================
+// OCR SONUÇLARINDAN TUTAR KUTUSUNU BUL
+// =====================================================
+
+function findAmountBoxFromOCR(paddleResult) {
+
+const boxes =
+Array.isArray(paddleResult?.boxes)
+? paddleResult.boxes
+: [];
+
+if (!boxes.length) {
+return null;
+}
+
+// Para/tutar görünümünü yakalamaya çalış
+const amountRegex =
+/(?:₺|TL|TRY|EUR|USD|\$|€)?\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*(?:₺|TL|TRY|EUR|USD|\$|€)?/i;
+
+const candidates = [];
+
+for (const item of boxes) {
+
+const text =
+String(item?.text || "").trim();
+
+if (!text) {
+continue;
+}
+
+if (amountRegex.test(text)) {
+
+candidates.push({
+text,
+box: item.box,
+score:
+Number(item.score) || 0,
+});
+
+}
+
+}
+
+if (!candidates.length) {
+return null;
+}
+
+// En yüksek OCR confidence olan adayı seç
+candidates.sort(
+(a, b) =>
+b.score - a.score
+);
+
+return candidates[0];
+}
 // =====================================================
 // CHECKLER
 // =====================================================
@@ -1775,7 +1968,6 @@ required: [
 "darknessDifference",
 "renderingDifference",
 "evidence",
-"amountForensics",
 ],
 
 additionalProperties: false,
@@ -6070,44 +6262,109 @@ buffer.toString(
 "base64"
 );
  
-// =====================================================
+// =================================================
 // PADDLEOCR IMAGE OCR
-// =====================================================
+// =================================================
 
 let paddleImageOCR = null;
 
-if (
-type === "image" ||
-type === "statement"
-) {
-
-console.log(
-"PADDLEOCR IMAGE ANALİZİ BAŞLIYOR..."
-);
-
-
-paddleImageOCR =
-await runPaddleOCR(
-filePath
-);
-
+let amountRegionAnalysis = null;
 
 if (
-paddleImageOCR.success
+ type === "image" ||
+ type === "statement"
 ) {
 
-console.log(
-"PADDLEOCR IMAGE OCR BAŞARILI"
-);
+ console.log(
+ "PADDLEOCR IMAGE ANALİZİ BAŞLIYOR..."
+ );
 
-console.log(
-"PADDLEOCR IMAGE CONFIDENCE:",
-paddleImageOCR.confidence
-);
+ paddleImageOCR =
+ await runPaddleOCR(
+ filePath
+ );
+
+ if (
+ paddleImageOCR.success
+ ) {
+
+ console.log(
+ "PADDLEOCR IMAGE OCR BAŞARILI"
+ );
+
+ console.log(
+ "PADDLEOCR IMAGE CONFIDENCE:",
+ paddleImageOCR.confidence
+ );
+
+ // =================================================
+ // ANA TUTAR KUTUSUNU BUL
+ // =================================================
+
+ const amountCandidate =
+ findAmountBoxFromOCR(
+ paddleImageOCR
+ );
+
+ if (
+ amountCandidate
+ ) {
+
+ console.log(
+ "===== AMOUNT REGION BULUNDU ====="
+ );
+
+ console.log(
+ "AMOUNT OCR TEXT:",
+ amountCandidate.text
+ );
+
+ console.log(
+ "AMOUNT OCR SCORE:",
+ amountCandidate.score
+ );
+
+ console.log(
+ "AMOUNT BOX:",
+ JSON.stringify(
+ amountCandidate.box
+ )
+ );
+
+ // =================================================
+ // GÖRSEL TUTAR ANALİZİ
+ // =================================================
+
+ amountRegionAnalysis =
+ await analyzeAmountRegion(
+ filePath,
+ amountCandidate.box
+ );
+
+ console.log(
+ "===== AMOUNT REGION ANALYSIS ====="
+ );
+
+ console.log(
+ JSON.stringify(
+ amountRegionAnalysis,
+ null,
+ 2
+ )
+ );
+
+ }
+ else {
+
+ console.log(
+ "AMOUNT REGION BULUNAMADI"
+ );
+
+ }
+
+ }
 
 }
-
-} 
  
  
 // =================================================
@@ -6377,7 +6634,67 @@ console.log(
 reference?.fileName ||
 "YOK"
 );
- 
+
+// =====================================================
+// AMOUNT FORENSICS CONTEXT
+// =====================================================
+
+let amountForensicsContext = "";
+
+if (
+amountRegionAnalysis?.available
+) {
+
+amountForensicsContext = `
+
+=====================================================
+OTOMATİK LOKAL TUTAR BÖLGESİ ÖLÇÜMÜ
+=====================================================
+
+Bu ölçüm gerçek belge görüntüsünden çıkarılmıştır.
+
+OCR tarafından bulunan tutar bölgesi:
+
+${findAmountBoxFromOCR(paddleImageOCR)?.text || "Bilinmiyor"}
+
+Bölge koordinatları:
+
+left:
+${amountRegionAnalysis.left}
+
+top:
+${amountRegionAnalysis.top}
+
+width:
+${amountRegionAnalysis.width}
+
+height:
+${amountRegionAnalysis.height}
+
+Ortalama piksel yoğunluğu:
+
+${amountRegionAnalysis.averageIntensity}
+
+Koyu piksel oranı:
+
+${amountRegionAnalysis.darkRatio}
+
+ÇOK ÖNEMLİ:
+
+Bu ölçüm tek başına manipülasyon kanıtı değildir.
+
+Kamera, ışık, perspektif, JPEG sıkıştırması,
+ekran fotoğrafı ve odak farklılıklarını dikkate al.
+
+Bu veriyi yalnızca görüntüdeki tutar bölgesini
+değerlendirirken yardımcı kanıt olarak kullan.
+
+ASIL KAYNAK BELGE GÖRÜNTÜSÜDÜR.
+
+=====================================================
+`;
+
+}
  
 // -------------------------------------------------
 // OPENAI INPUT
@@ -6409,6 +6726,8 @@ type:
 "input_text",
  
 text: `${PROMPT}
+
+${amountForensicsContext}
 
 =====================================================
 PADDLEOCR EK OCR SONUCU
@@ -6636,7 +6955,8 @@ content = [
  
  text: `${PROMPT}`
  },
- 
+
+${amountForensicsContext}
  
  // =================================================
  // GERÇEK DEKONT
