@@ -2309,208 +2309,170 @@ detail:
  
  
 const videoPrompt = `
- 
-${PROMPT}
- 
-=====================================================
-VİDEO ANALİZİ
-=====================================================
- 
+
+Sen VerifyDoc video analiz sistemisin.
+
+TÜM ANALİZ TÜRKÇE OLMALIDIR.
+
 Bu belge bir video içerisinden çıkarılmış
 ${frames.length} ayrı kare üzerinden analiz edilmektedir.
- 
-ÇOK ÖNEMLİ:
- 
-Bu video analizinde REFERANS DEKONT KULLANMA.
- 
-Banka referans PDF'i,
-referans şablon,
-referans belge
-veya başka bir referans dosya
-video analizine dahil edilmemelidir.
- 
-Yalnızca video karelerinde gerçekten görülebilen
-bilgilere dayan.
- 
-Tüm video karelerini birlikte değerlendir.
- 
+
+Tüm kareleri birlikte değerlendir.
+
+Bu analiz yalnızca otomatik ön incelemedir.
+Belgenin kesin olarak gerçek veya sahte olduğunu söyleme.
+
 =====================================================
-KARELER ARASI TUTARLILIK
+ANA AMAÇ
 =====================================================
- 
-Özellikle kareler arasında şu bilgilerin değişip
-değişmediğini kontrol et:
- 
-- isim
-- soy isim
-- gönderici
+
+Videodaki belgeyi genel olarak analiz et.
+
+Kareler arasındaki tutarlılığı kontrol et.
+
+Özellikle:
+
+- gönderen
 - alıcı
 - IBAN
-- hesap numarası
-- işlem numarası
-- referans numarası
+- işlem tutarı
+- para birimi
 - tarih
 - saat
-- tutar
-- para birimi
+- işlem numarası
 - açıklama
-- banka adı
+- banka
 - logo
-- QR kod
+- QR
 - barkod
-- metin
-- rakamlar
- 
-Ayrıca:
- 
-- sonradan eklenmiş alan
-- sonradan silinmiş alan
-- yapıştırılmış bölge
+- belge üzerindeki metin ve rakamlar
+
+üzerinde değişiklik olup olmadığını incele.
+
+=====================================================
+VİDEO HAREKETLERİ
+=====================================================
+
+Kamera hareketi, zoom, odak değişimi, perspektif,
+ışık değişimi, titreme, JPEG/video sıkıştırması veya
+hafif bulanıklığı tek başına manipülasyon olarak
+değerlendirme.
+
+=====================================================
+MANİPÜLASYON
+=====================================================
+
+Aşağıdakileri yalnızca gerçekten görünüyorsa değerlendir:
+
+- sonradan ekleme
+- sonradan silme
+- kesme
+- kırpma
+- yapıştırma
 - dijital montaj
 - farklı font
-- farklı karakter kalitesi
-- farklı sıkıştırma
-- farklı keskinlik
-- farklı görüntü yapısı
-- hareket sırasında ortaya çıkan tutarsızlık
-- ekran üzerinde sonradan değiştirilmiş alan
- 
-olup olmadığını kontrol et.
- 
+- farklı karakter yapısı
+- farklı görüntü kalitesi
+- kareler arasında değişen belge alanı
+
+Somut kanıt yoksa şüpheli sonuç üretme.
+
 =====================================================
-DOĞAL VİDEO DEĞİŞİKLİKLERİ
+TUTAR
 =====================================================
- 
-Aşağıdaki durumları tek başına sahtecilik kanıtı
-olarak değerlendirme:
- 
-- kamera hareketi
-- zoom
-- odak değişimi
-- ışık değişimi
-- perspektif değişimi
-- görüntü titremesi
-- JPEG sıkıştırması
-- video sıkıştırması
-- hafif bulanıklık
-- farklı karelerde farklı parlaklık
-- doğal gölge değişimleri
- 
-Bunlar tek başına risk skorunu yükseltmemelidir.
- 
+
+Videoda görünen ana işlem tutarını belirle.
+
+Farklı karelerde tutarın değişip değişmediğini kontrol et.
+
+IBAN, hesap numarası, işlem numarası, tarih veya saat
+gibi rakamları işlem tutarıyla karıştırma.
+
+Yeterli veri yoksa tahmin etme.
+
 =====================================================
-VİDEO MANİPÜLASYON KONTROLÜ
+ALICI VE IBAN
 =====================================================
- 
-Belgenin farklı karelerinde aynı alanları mümkün
-olduğunca karşılaştır.
- 
-Örneğin:
- 
-Bir karede tutar:
- 
-"25.000 TL"
- 
-iken başka bir karede:
- 
-"35.000 TL"
- 
-görülüyorsa bunu önemli bir tutarsızlık olarak
-değerlendir.
- 
-Aynı şekilde:
- 
-IBAN değişiyorsa,
-isim değişiyorsa,
-tarih değişiyorsa,
-alıcı değişiyorsa,
-işlem numarası değişiyorsa
- 
-bunu açıkça evidence alanında belirt.
- 
-Ancak görüntü kalitesi nedeniyle bir bilginin
-okunamadığı durumda değer tahmin etme.
- 
+
+Alıcı adı ve IBAN'ı kareler arasında karşılaştır.
+
+Değişiklik varsa açıkça belirt.
+
+Okunamıyorsa tahmin etme.
+
 =====================================================
-TUTAR KONTROLÜ
+TARİH / SAAT
 =====================================================
- 
-Videoda görünen finansal tutarları ayrıca kontrol et.
- 
-Ana işlem tutarını:
- 
-- IBAN
-- hesap numarası
-- işlem numarası
-- referans numarası
-- tarih
-- saat
- 
-gibi diğer rakamlarla karıştırma.
- 
-Eğer ara toplam, vergi, ücret, komisyon veya
-toplam tutar görünüyorsa matematiksel olarak
-kontrol et.
- 
-Yeterli veri yoksa değerleri tahmin etme.
- 
+
+Görünen tarih ve saat bilgilerini kareler arasında
+karşılaştır.
+
+Gerçek bir değişiklik görülmüyorsa değişiklik varmış
+gibi yorumlama.
+
 =====================================================
-VİDEO KALİTESİ
+GENEL SUMMARY
 =====================================================
- 
-Video kalitesi düşükse otomatik olarak sahtecilik
-kararı verme.
- 
-Eğer bazı karelerde belge okunamıyorsa bunu
-limitations alanında belirt.
- 
-Eğer kalite yeterliyse bunu açıkça belirt.
- 
+
+summary alanı kullanıcıya gösterilecek ana sonuçtur.
+
+summary:
+
+- TEK BİR PARAGRAF olmalıdır.
+- Türkçe olmalıdır.
+- Doğal bir analiz dili kullanılmalıdır.
+- Kare kare anlatım yapılmamalıdır.
+- "Tutar:", "Alıcı:", "IBAN:", "Oynama:" gibi ayrı
+başlıklar kullanılmamalıdır.
+- Önemli bulgular tek bir genel analiz içerisinde
+birleştirilmelidir.
+
+Örneğin belge tutarlıysa:
+
+"Belge, video içerisinden alınan farklı kareler üzerinden
+incelenmiştir. Kareler arasında işlem tutarı, alıcı bilgileri,
+IBAN ve tarih/saat açısından belirgin bir tutarsızlık
+görülmemiştir. Görüntü hareketleri doğal video koşullarıyla
+uyumlu değerlendirilmiş ve belirgin bir sonradan ekleme,
+silme veya montaj belirtisi tespit edilmemiştir."
+
+Bu yalnızca örnektir.
+
+Gerçek summary yalnızca videoda görülen kanıtlara göre
+oluşturulmalıdır.
+
+Eğer önemli bir tutarsızlık varsa bunu aynı paragraf
+içerisinde açıkça anlat.
+
 =====================================================
-RİSK
+DİĞER ALANLAR
 =====================================================
- 
-Kareler arasında gerçek ve anlamlı bir tutarsızlık
-bulunmadıkça risk skorunu gereksiz şekilde artırma.
- 
-Tek başına video kalitesinin düşük olması:
- 
-HIGH RISK
- 
-veya
- 
-VERY HIGH RISK
- 
-anlamına gelmez.
- 
-Belirsiz durumlarda confidence değerini düşür.
- 
-=====================================================
-SONUÇ
-=====================================================
- 
-Sonuç normal VerifyDoc analiz formatıyla
-uyumlu olmalıdır.
- 
-Şu alanların tamamını doldur:
- 
-overallRisk
-riskLabel
-confidence
-summary
-categories
-checks
-limitations
-amountAnalysis
- 
-25 kontrolün tamamını değerlendir.
- 
-Kesin olarak "sahte" veya "gerçek" deme.
- 
-Bu yalnızca otomatik ön incelemedir.
- 
+
+documentData alanlarını yalnızca videoda gerçekten
+okunabilen bilgilerle doldur.
+
+Okunamayan değerleri null yap.
+
+amountAnalysis alanında yeterli veri yoksa null kullan.
+
+limitations alanında video nedeniyle gerçekten
+oluşan sınırlamaları belirt.
+
+checks alanındaki 25 kontrolü:
+
+pass = sorun görülmedi
+fail = somut sorun/tutarsızlık görüldü
+unknown = güvenilir şekilde değerlendirilemedi
+
+olarak doldur.
+
+Risk skorunu kendin hesaplama.
+
+overallRisk, riskLabel ve categories değerleri
+backend tarafından deterministik risk motoruyla
+hesaplanacaktır.
+
 SONUCU SADECE JSON OLARAK DÖNDÜR.
- 
 `;
  
  
@@ -6007,7 +5969,6 @@ videoScore >= 46;
  
  
 const videoEvidence =
-videoResult?.amountAnalysis?.evidence ||
 videoResult?.summary ||
 "Video analizi tamamlandı.";
  
