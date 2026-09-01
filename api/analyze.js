@@ -3152,6 +3152,26 @@ As part of the amountConsistency check, also verify whether
 the main transaction amount matches any written statement such as
 "... TL has been sent".
 
+PaddleOCR ana işlem tutarını farklı bir değer olarak
+okuyorsa bunu otomatik olarak gerçek kabul etme.
+
+Görüntüdeki rakamları doğrudan kontrol et.
+
+OCR ve görüntü arasında tutar farkı varsa bunu
+amountConsistency incelemesinde dikkate al.
+
+Özellikle OCR'ın:
+
+- 1 / 7
+- 0 / 6 / 8
+- 1 / I
+- 0 / O
+- , / .
+- rakam atlama
+- fazla rakam
+
+hataları yapabileceğini unutma.
+
 If the visible numeric amount and the written transaction amount
 do not match, report this as a fail under amountConsistency.
 Only report this when both values are actually visible and readable.
@@ -3169,6 +3189,186 @@ score:
 Evidence must be concise and written in Turkish.
  
 Do not invent evidence.
+
+=====================================================
+CRITICAL — ANA İŞLEM TUTARI FORENSİK İNCELEMESİ
+=====================================================
+
+ANA İŞLEM TUTARI, BELGENİN EN YÜKSEK ÖNCELİKLİ
+ALANLARINDAN BİRİDİR.
+
+Tutarın yalnızca doğru okunup okunmadığını kontrol etme.
+
+Tutarın GÖRSEL OLARAK BELGENİN DOĞAL BİR PARÇASI OLUP
+OLMADIĞINI ayrıca incele.
+
+Özellikle ana işlem tutarındaki HER RAKAMI ayrı ayrı incele.
+
+Örneğin:
+
+1.700,00 TL
+
+gibi bir tutar görülüyorsa:
+
+1
+7
+0
+0
+0
+0
+
+rakamlarının her birini çevredeki aynı veya benzer
+rakamlarla görsel olarak karşılaştır.
+
+ŞUNLARI KONTROL ET:
+
+- rakam yüksekliği
+- rakam genişliği
+- stroke kalınlığı
+- font ağırlığı
+- karakter aralığı
+- baseline
+- üst/alt hizalama
+- kenar keskinliği
+- anti-aliasing
+- piksel yapısı
+- JPEG sıkıştırma davranışı
+- rakamın arka planla birleşimi
+- rakamın çevresindeki lokal görüntü kalitesi
+- rakamın diğer metinlerle aynı render yapısına sahip olup olmadığı
+
+=====================================================
+AYNI RAKAMLARI KARŞILAŞTIR
+=====================================================
+
+Belgenin başka bölgelerinde aynı rakamlar bulunuyorsa,
+ana işlem tutarındaki rakamlarla karşılaştır.
+
+Örneğin ana tutarda "1", "7" veya "0" bulunuyorsa,
+belgenin diğer alanlarında görülen aynı karakterlerle:
+
+- şekil
+- genişlik
+- yükseklik
+- kalınlık
+- kenar yapısı
+- baseline
+- render kalitesi
+
+açısından karşılaştır.
+
+Aynı belge içerisinde aynı yazı stilindeki karakterler
+belirgin şekilde farklı görünüyorsa bunu dikkate al.
+
+=====================================================
+LOKAL MANİPÜLASYON KONTROLÜ
+=====================================================
+
+Ana işlem tutarının çevresinde özellikle şunları ara:
+
+- silme izi
+- beyazlatılmış veya kapatılmış alan
+- farklı arka plan dokusu
+- dikdörtgen maskeleme
+- farklı JPEG sıkıştırması
+- farklı keskinlik
+- farklı noise yapısı
+- karakter çevresinde halo
+- yapıştırılmış gibi duran karakter
+- diğer metinden farklı anti-aliasing
+- karakterlerin doğal olmayan hizalanması
+- karakterler arasında anormal boşluk
+- yalnızca tutar bölgesinde görülen görüntü bozulması
+
+Bunlardan biri açıkça görülüyorsa:
+
+amountConsistency = fail
+
+veya
+
+editingTraces = fail
+
+olarak değerlendir.
+
+Ancak yalnızca küçük görüntü kalitesi farklılıkları
+veya JPEG sıkıştırması nedeniyle FAIL verme.
+
+=====================================================
+TUTARIN OKUNMASI ≠ TUTARIN DOĞALLIĞI
+=====================================================
+
+ÇOK ÖNEMLİ:
+
+Bir tutarın net şekilde okunabiliyor olması,
+tutarın değiştirilmediğini göstermez.
+
+Örneğin:
+
+"1.700,00 TL"
+
+net şekilde okunuyor olsa bile, rakamların sonradan
+eklenmiş veya değiştirilmiş olup olmadığı ayrıca
+incelenmelidir.
+
+Bu nedenle:
+
+"tutar okunuyor"
+
+tek başına amountConsistency = pass sebebi değildir.
+
+Hem:
+
+1. TUTARIN NE OLDUĞUNU OKU
+
+hem:
+
+2. TUTARIN GÖRSEL OLARAK BELGEYLE UYUMLU OLUP
+ OLMADIĞINI İNCELE.
+
+=====================================================
+KARŞILAŞTIRMA ÖNCELİĞİ
+=====================================================
+
+Ana tutar ile ilgili birden fazla bilgi varsa aşağıdaki
+öncelik sırasını kullan:
+
+1. Belgede görünen rakamsal ana işlem tutarı
+2. "Yalnız ...", "..." TL gönderildi vb. yazılı tutar
+3. "Hesabınızdan ...", "İşlem tutarı ..." gibi tekrar eden tutarlar
+4. Toplam / masraf / komisyon ilişkisi
+5. Kullanıcı tarafından ayrıca verilen beklenen tutar
+6. Yardımcı OCR sonuçları
+
+Birbirleriyle uyuşmayan iki açık ve okunabilir tutar
+varsa bunu amountConsistency altında açıkça belirt.
+
+OCR ile görüntü çelişirse GÖRÜNTÜYÜ esas al.
+
+=====================================================
+KULLANICI TARAFINDAN BEKLENEN TUTAR VERİLDİYSE
+=====================================================
+
+Backend tarafından kullanıcıya ait beklenen işlem tutarı
+sağlanmışsa, bunu ayrıca karşılaştır.
+
+Beklenen tutar ile belgede görünen ana işlem tutarı
+arasında fark varsa:
+
+amountConsistency = fail
+
+olarak değerlendir.
+
+Farkı açıkça evidence alanında belirt.
+
+Örneğin:
+
+"Beklenen işlem tutarı ile dekont üzerinde görünen ana
+işlem tutarı uyuşmamaktadır."
+
+Ancak kullanıcı tarafından beklenen tutar verilmemişse
+tahmin yapma.
+
+Belgede görünmeyen bir gerçek tutarı varsayma.
  
 =====================================================
 TURKISH CHARACTER RISK
@@ -3285,6 +3485,84 @@ Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması veya görüntü
 kalitesi kaynaklı küçük farklılıkları sahtecilik olarak değerlendirme.
  
 Yeterli görsel kanıt yoksa şüpheli sonuç üretme.
+
+=====================================================
+ANA TUTAR — MİKRO GÖRSEL FORENSİK KONTROL
+=====================================================
+
+İşlem tutarı belgenin en kritik alanlarından biridir.
+
+Ana işlem tutarını yalnızca okunabilir bir metin olarak değerlendirme.
+
+Tutar alanını ayrıca görsel olarak incele.
+
+Özellikle:
+
+- rakamların karakter yüksekliği
+- karakter genişliği
+- stroke / çizgi kalınlığı
+- font ağırlığı
+- rakamların iç boşlukları
+- rakamların kenar keskinliği
+- anti-aliasing yapısı
+- piksel / raster yapısı
+- karakterler arası boşluk
+- baseline
+- üst ve alt hizalama
+- virgül ve nokta karakterlerinin yapısı
+- TL sembolü veya TL yazısının yapısı
+- aynı belgede bulunan benzer rakamlarla görsel uyum
+
+kontrol edilmelidir.
+
+Özellikle ana işlem tutarındaki rakamları,
+belgenin başka bölgelerinde bulunan aynı veya benzer
+rakam karakterleriyle karşılaştır.
+
+Örneğin belgede başka bir "1", "7", "0", "0" veya
+benzer fontta rakam bulunuyorsa bunların:
+
+- şekli
+- genişliği
+- kalınlığı
+- kenar yapısı
+- render kalitesi
+
+açısından tutar alanıyla uyumlu olup olmadığını incele.
+
+Tutar alanının çevresindeki arka plan ile rakamların
+kenarlarını ayrıca incele.
+
+Şunlardan biri gerçekten görülüyorsa amountConsistency
+ve/veya editingTraces kontrolünde FAIL ver:
+
+- rakam çevresinde belirgin silme izi
+- farklı keskinlikte rakam
+- farklı sıkıştırma / raster yapısı
+- rakamın çevresinde dikdörtgen veya maskeleme izi
+- karakterin arka planla birleşiminde anormallik
+- diğer aynı font karakterlerinden belirgin farklı render
+- baseline veya hizalama anomalisi
+- sonradan yerleştirilmiş gibi görünen karakter
+- karakterler arasında doğal olmayan spacing
+- tutar alanında lokal görüntü kalitesi değişikliği
+
+Ancak yalnızca görüntü kalitesi, perspektif,
+JPEG sıkıştırması veya fotoğraf çekim koşulları nedeniyle
+oluşan küçük farklılıkları manipülasyon kabul etme.
+
+Somut görsel kanıt yoksa FAIL verme.
+
+Yeterli çözünürlük yoksa UNKNOWN kullan.
+
+ÖNEMLİ:
+
+Ana işlem tutarı yalnızca "okunuyor mu?" diye kontrol edilmemelidir.
+
+"Tutar 1.700,00 TL olarak okunuyor" demek,
+tutarın görsel olarak değiştirilmediğini kanıtlamaz.
+
+Okunabilirlik ve görsel bütünlük iki ayrı kontroldür.
  
 ==================================================
 RISK CALCULATION
