@@ -2302,6 +2302,10 @@ console.log(
 const videoOCRResults = await Promise.all(
 frames.map(async (frame, index) => {
 
+console.log(
+`VIDEO FRAME ${index + 1}/${frames.length} PADDLEOCR`
+);
+
 try {
 
 const ocrResult =
@@ -2319,6 +2323,11 @@ Boolean(ocrResult?.success),
 
 } catch (error) {
 
+console.error(
+`FRAME ${index + 1} PADDLEOCR HATASI:`,
+error
+);
+
 return {
 frame: index + 1,
 file: frame.file,
@@ -2335,6 +2344,10 @@ error?.message ||
 })
 );
 
+console.log(
+"VIDEO PADDLEOCR TAMAMLANDI"
+);
+  
  catch (error) {
 
  console.error(
