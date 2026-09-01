@@ -2295,9 +2295,7 @@ frames.length
 // VIDEO FRAME PADDLEOCR
 // =====================================================
 
-console.log(
- "VIDEO PADDLEOCR BAŞLIYOR"
-);
+
 
 const videoOCRResults = await Promise.all(
 frames.map(async (frame, index) => {
@@ -2348,27 +2346,8 @@ console.log(
 "VIDEO PADDLEOCR TAMAMLANDI"
 );
   
-} catch (error) {
 
- console.error(
- `FRAME ${i + 1} PADDLEOCR HATASI:`,
- error
- );
 
- videoOCRResults.push({
- frame: i + 1,
- file: frame.file,
- text: "",
- confidence: 0,
- success: false,
- error:
- error?.message ||
- "PaddleOCR frame analizi başarısız.",
- });
-
- }
-
-}
 
 console.log(
  "VIDEO PADDLEOCR TAMAMLANDI"
