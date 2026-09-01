@@ -6952,7 +6952,7 @@ content = [
  {
  type: "input_text",
  
- text: `${PROMPT}`
+ text: `${PROMPT}
 
 
 ${amountForensicsContext}`
