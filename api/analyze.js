@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
 import { createWorker } from "tesseract.js";
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk";
-import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
+import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
 import {
@@ -6723,13 +6723,11 @@ content = [
 // =================================================
  
 {
-type:
-"input_text",
- 
-text: `${PROMPT}
+ type: "input_text",
 
-${amountForensicsContext}`
-}, 
+ text: `${PROMPT}
+
+${amountForensicsContext}
 
 =====================================================
 PADDLEOCR EK OCR SONUCU
@@ -6755,36 +6753,35 @@ PaddleOCR confidence:
 
 ${paddleImageOCR?.confidence ?? 0}
 
- 
 =====================================================
 JPG / JPEG — ANALİZ EDİLECEK ASIL BELGE
 =====================================================
- 
+
 ÇOK ÖNEMLİ:
- 
+
 Bu analizde ASIL ANALİZ EDİLECEK BELGE,
 aşağıda gönderilen input_image olarak verilen
 JPG / JPEG dosyasıdır.
- 
+
 TÜM GERÇEK DEKONT BİLGİLERİNİ YALNIZCA
 JPG / JPEG GÖRÜNTÜSÜNDEN ÇIKAR.
- 
+
 JPG / JPEG üzerinde gerçekten görünmeyen hiçbir
 bilgiyi yazma.
- 
+
 JPG / JPEG üzerinde bir bilgi okunamıyorsa:
 null kullan.
- 
+
 =====================================================
 REFERANS PDF — SADECE GÖRSEL / ŞABLON REFERANSI
 =====================================================
- 
+
 Aşağıda ayrıca bir banka referans PDF'i verilebilir.
- 
+
 REFERANS PDF:
- 
+
 SADECE şu amaçlarla kullanılabilir:
- 
+
 - belge şablonu
 - sayfa düzeni
 - alanların konumu
@@ -6802,16 +6799,16 @@ SADECE şu amaçlarla kullanılabilir:
 - gönderen/alıcı alanlarının görsel yerleşimi
 - genel görsel yapı
 - belge üzerindeki olası düzenleme izlerinin karşılaştırılması
- 
+
 =====================================================
 KESİN KURAL — VERİ AKTARMA YASAK
 =====================================================
- 
+
 REFERANS PDF'DEKİ HİÇBİR GERÇEK İŞLEM BİLGİSİNİ
 JPG / JPEG'E AKTARMA.
- 
+
 Özellikle REFERANS PDF'den:
- 
+
 - isim
 - soyisim
 - gönderen adı
@@ -6828,38 +6825,38 @@ JPG / JPEG'E AKTARMA.
 - vergi numarası
 - müşteri numarası
 - diğer herhangi bir rakam veya metin
- 
+
 ALMA.
- 
+
 JPG / JPEG'DE YOKSA BU BİLGİLERİ
 REFERANS PDF'DEN TAMAMLAMA.
- 
+
 JPG / JPEG'DEKİ BİR ALAN REFERANS PDF'DEKİ
 DEĞERDEN FARKLIYSA REFERANS PDF'Yİ DOĞRU
 KABUL ETME.
- 
+
 GERÇEK DEĞER HER ZAMAN JPG / JPEG ÜZERİNDE
 GERÇEKTEN GÖRÜLEN DEĞERDİR.
- 
+
 JPG / JPEG'DE OKUNAMAYAN BİR DEĞER İÇİN
 TAHMİN YAPMA VE REFERANS PDF'DEN DEĞER
 KOPYALAMA.
- 
+
 =====================================================
 DOCUMENT DATA
 =====================================================
- 
+
 Aşağıdaki alanları YALNIZCA JPG / JPEG
 görüntüsünden çıkar:
- 
+
 documentData.senderName
 documentData.recipientName
 documentData.amount
 documentData.currency
 documentData.iban
- 
+
 Kurallar:
- 
+
 - Yalnızca JPG / JPEG üzerinde gerçekten görülen bilgileri yaz.
 - Güvenilir şekilde okunamıyorsa null kullan.
 - IBAN'ı mümkünse standart biçimde yaz.
@@ -6875,11 +6872,11 @@ yerine kullanma.
 - REFERANS PDF'dEKİ DEĞERLERİ documentData'YA
 KOPYALAMA.
 - JPG / JPEG'de yoksa null döndür.
- 
+
 =====================================================
 ANALİZ SIRASI
 =====================================================
- 
+
 1. Önce JPG / JPEG görüntüsünü baştan sona analiz et.
 2. JPG / JPEG'de görülen tüm bilgileri belirle.
 3. documentData alanlarını yalnızca JPG / JPEG'den doldur.
@@ -6887,9 +6884,9 @@ ANALİZ SIRASI
 karşılaştırması için kullan.
 5. Referans PDF'deki gerçek işlem bilgilerini
 analiz edilen JPG / JPEG'in bilgileri olarak kullanma.
- 
+
 Dosya adı:
-${fileName}`,
+${fileName}`
 },
  
 // =================================================
@@ -6956,9 +6953,10 @@ content = [
  type: "input_text",
  
  text: `${PROMPT}`
- },
 
-${amountForensicsContext}
+
+${amountForensicsContext}`
+ },
   
  
  // =================================================
