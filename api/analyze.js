@@ -1910,7 +1910,7 @@ false,
  
 },
  
-},
+
 amountForensics: {
 type: "object",
 properties: {
@@ -1985,6 +1985,7 @@ required: [
 "checks",
 "limitations",
 "amountAnalysis",
+"amountForensics",
  
 ],
  
