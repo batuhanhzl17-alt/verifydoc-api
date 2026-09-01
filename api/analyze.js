@@ -6727,7 +6727,7 @@ content = [
 
  text: `${PROMPT}
 
-${amountForensicsContext}`
+${amountForensicsContext}
 
 =====================================================
 PADDLEOCR EK OCR SONUCU
@@ -6955,9 +6955,9 @@ content = [
  text: `${PROMPT}
 
 
-${amountForensicsContext}`
+${amountForensicsContext}`,
  
-  
+},  
  
  // =================================================
  // GERÇEK DEKONT
