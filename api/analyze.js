@@ -1702,7 +1702,69 @@ false,
 },
  
 },
- 
+amountForensics: {
+type: "object",
+properties: {
+
+status: {
+type: "string",
+enum: [
+"pass",
+"fail",
+"unknown"
+],
+},
+
+amountText: {
+type: ["string", "null"],
+},
+
+visualConsistency: {
+type: "string",
+enum: [
+"consistent",
+"inconsistent",
+"uncertain"
+],
+},
+
+localizedDifference: {
+type: "boolean",
+},
+
+strokeDifference: {
+type: "boolean",
+},
+
+darknessDifference: {
+type: "boolean",
+},
+
+renderingDifference: {
+type: "boolean",
+},
+
+evidence: {
+type: "string",
+},
+
+},
+
+required: [
+"status",
+"amountText",
+"visualConsistency",
+"localizedDifference",
+"strokeDifference",
+"darknessDifference",
+"renderingDifference",
+"evidence",
+],
+
+additionalProperties: false,
+},
+
+  
 required: [
  
 "overallRisk",
