@@ -3456,36 +3456,245 @@ Matematiksel tutarsızlık varsa bunun nedenini amountAnalysis.evidence
 alanında açıkça belirt.
  
 =====================================================
-ANA TUTAR KARAKTER / FONT KONTROLÜ
+ANA TUTAR KARAKTER / FONT / STROKE KONTROLÜ
 =====================================================
- 
-Ana işlem tutarının karakterlerini görsel olarak incele.
- 
-Özellikle:
- 
+
+Ana işlem tutarı üzerinde özel ve ayrıntılı görsel inceleme yap.
+
+Bu kontrol yalnızca tutarın doğru okunmasına değil,
+tutarın gerçekten aynı görsel/metinsel üretimden çıkmış
+olup olmadığına yönelik görsel tutarlılığa odaklanmalıdır.
+
+Özellikle ana işlem tutarındaki HER RAKAMI ayrı ayrı incele.
+
+Kontrol et:
+
 - karakter yüksekliği
 - karakter genişliği
+- font görünümü
+- font ağırlığı
+- stroke / çizgi kalınlığı
+- rakamların koyuluk seviyesi
+- piksel yoğunluğu
+- kenar keskinliği
+- anti-aliasing
+- karakter içi doluluk
+- karakter aralıkları
+- baseline
+- dikey hizalama
+- yatay hizalama
+- rakamların çevresindeki boşluk
+- rakamların diğer aynı tür metinlerle görsel uyumu
+
+=====================================================
+AYNI TUTAR İÇİN RAKAM-RİCAM KARŞILAŞTIRMASI
+=====================================================
+
+Ana işlem tutarı birden fazla rakam içeriyorsa,
+rakamları yalnızca bütün olarak değil, tek tek karşılaştır.
+
+Örneğin:
+
+1.700,00 TL
+
+ifadesinde:
+
+1
+.
+7
+0
+0
+,
+0
+0
+
+karakterlerinin görsel özelliklerini ayrı ayrı incele.
+
+Özellikle aynı tutar içerisindeki aynı karakterlerin
+birbirleriyle tutarlı olup olmadığını kontrol et.
+
+Örneğin:
+
+1.700,00
+
+ifadesindeki "0" karakterlerinden biri diğerlerinden
+belirgin şekilde daha koyu, daha kalın, daha keskin,
+daha büyük veya farklı render edilmiş görünüyorsa
+bunu ayrıca belirt.
+
+Ancak küçük ve kamera/sıkıştırma kaynaklı farklılıkları
+tek başına manipülasyon olarak değerlendirme.
+
+=====================================================
+KOYULUK / STROKE FARKI
+=====================================================
+
+ÖZELLİKLE kontrol et:
+
+Ana işlem tutarının bir bölümü diğer bölümüne göre
+belirgin şekilde daha koyu veya daha kalın mı?
+
+Örneğin:
+
+"1.700" bölümü daha silik,
+",00" bölümü daha koyu/kalın
+
+gibi bir fark varsa bunu tespit et.
+
+Benzer şekilde:
+
+- ilk rakamların daha silik olması
+- son rakamların daha koyu olması
+- belirli bir rakamın daha kalın olması
+- belirli bir rakamın daha keskin olması
+- bir grup rakamın farklı piksel yoğunluğuna sahip olması
+- aynı tutar içerisinde farklı render kalitesi bulunması
+
+gibi durumları incele.
+
+Belirgin ve lokalize bir fark varsa bunu
+amountConsistency ve fontConsistency kontrollerinde
+kanıt olarak değerlendir.
+
+=====================================================
+LOKAL BÖLGE ANALİZİ
+=====================================================
+
+Tutar alanındaki farklılık tüm belgeye yayılmış mı,
+yoksa yalnızca belirli rakamlarda mı görülüyor
+bunu ayırt et.
+
+Tüm belge genelinde aynı koyuluk/kalınlık değişimi
+varsa bunu öncelikle:
+
+- fotoğraf ışığı
+- perspektif
+- kamera odağı
+- JPEG sıkıştırması
+- ekran görüntüsü
+- tarama koşulları
+
+gibi doğal görüntüleme koşullarıyla açıklamaya çalış.
+
+Buna karşılık fark yalnızca ana işlem tutarının
+belirli rakamlarında veya belirli bir bölümünde
+lokalize ise daha dikkatli incele.
+
+Özellikle:
+
+- tutarın ilk kısmı
+- tutarın son kısmı
+- ondalık kısmı
+- binlik kısmı
+
+arasında belirgin render farkı olup olmadığını kontrol et.
+
+=====================================================
+FONT FARKI İLE GÖRÜNTÜ KALİTESİNİ AYIR
+=====================================================
+
+Bir rakamın daha silik görünmesi tek başına
+farklı font anlamına gelmez.
+
+Aşağıdakileri birbirinden ayır:
+
+1. doğal fotoğraf/sıkıştırma farkı
+2. odak veya ışık farkı
+3. ekran fotoğrafı kaynaklı görüntü farkı
+4. tarama/render farkı
+5. gerçek font/stroke farkı
+6. olası sonradan ekleme veya değiştirme
+
+Bir farkın kaynağı güvenilir şekilde belirlenemiyorsa
+"Belirlenemedi — yeterli görsel kanıt yok."
+ifadesini kullan.
+
+=====================================================
+TUTARDA SONRADAN EKLENMİŞ GÖRÜNÜM
+=====================================================
+
+Ana işlem tutarındaki belirli rakamlar çevresindeki
+metinden farklı görünüyorsa şu özellikleri birlikte
+değerlendir:
+
 - font ağırlığı
 - stroke kalınlığı
-- karakter aralığı
+- karakter genişliği
+- karakter yüksekliği
 - baseline
-- hizalama
-- kenar yapısı
+- spacing
+- kenar keskinliği
 - anti-aliasing
-- genel render görünümü
- 
-açısından çevresindeki aynı tip metinlerle tutarlılığını değerlendir.
- 
-Farklı rakamların doğal olarak farklı şekillere sahip olduğunu unutma.
- 
-Tek başına bir karakterin diğer rakamlardan farklı görünmesi
-şüpheli değildir.
- 
-Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması veya görüntü
-kalitesi kaynaklı küçük farklılıkları sahtecilik olarak değerlendirme.
- 
-Yeterli görsel kanıt yoksa şüpheli sonuç üretme.
+- piksel yoğunluğu
+- çevredeki arka planla birleşme şekli
 
+Birden fazla bağımsız görsel farklılık aynı bölgede
+birlikte görülüyorsa bunu önemli bir görsel tutarsızlık
+olarak raporla.
+
+Tek bir küçük farklılığı kesin manipülasyon olarak
+yorumlama.
+
+=====================================================
+TUTAR KONTROLÜ SONUCU
+=====================================================
+
+Tutar görsel olarak okunabiliyorsa tutarın kendisini
+açıkça belirt.
+
+Örneğin:
+
+"Görüntüde ana işlem tutarı 1.700,00 TL olarak
+okunmaktadır. Ancak tutarın '1.700' bölümü ile
+',00' bölümü arasında belirgin koyuluk ve stroke
+kalınlığı farkı görülmektedir. Fark lokalize olduğu
+için olası sonradan düzenleme açısından inceleme
+gerektiren bir görsel tutarsızlık olarak
+değerlendirilmiştir."
+
+Ancak fark yeterince belirgin değilse:
+
+"1.700,00 TL tutarı okunabilmektedir. Rakamlar
+arasında küçük görsel yoğunluk farklılıkları
+bulunmakla birlikte bunların manipülasyon olduğunu
+gösterecek yeterli görsel kanıt bulunmamaktadır."
+
+şeklinde değerlendir.
+
+=====================================================
+KRİTİK KURAL
+=====================================================
+
+Ana işlem tutarını değerlendirirken:
+
+OCR sonucu ≠ otomatik gerçek
+
+OCR sonucu yalnızca yardımcı veridir.
+
+GERÇEK GÖRÜNTÜ ÖNCELİKLİDİR.
+
+Görüntüdeki rakamlar ile OCR sonucu çelişirse
+görüntüyü tekrar incele.
+
+OCR'ın yanlış okumasını gerçek belge değeri olarak
+kabul etme.
+
+Özellikle:
+
+1 ↔ 7
+0 ↔ 6
+0 ↔ 8
+1 ↔ I
+0 ↔ O
+, ↔ .
+eksik rakam
+fazla rakam
+binlik ayırıcı
+ondalık ayırıcı
+
+hatalarına dikkat et.
+
+=====================================================
 =====================================================
 ANA TUTAR — MİKRO GÖRSEL FORENSİK KONTROL
 =====================================================
