@@ -2248,6 +2248,7 @@ framePath
 frames.push({
  
 file,
+framePath,
  
 base64:
 buffer.toString(
@@ -2289,8 +2290,104 @@ console.log(
 "VIDEO FRAME SAYISI:",
 frames.length
 );
- 
- 
+
+// =====================================================
+// VIDEO FRAME PADDLEOCR
+// =====================================================
+
+console.log(
+ "VIDEO PADDLEOCR BAŞLIYOR"
+);
+
+const videoOCRResults = [];
+
+for (let i = 0; i < frames.length; i++) {
+
+ const frame = frames[i];
+
+ console.log(
+ `VIDEO FRAME ${i + 1}/${frames.length} PADDLEOCR`
+ );
+
+ try {
+
+ // ÖNEMLİ:
+ // MP4 gönderme.
+ // PaddleOCR'a yalnızca JPG frame gönder.
+ const ocrResult =
+ await runPaddleOCR(
+ frame.framePath
+ );
+
+ videoOCRResults.push({
+ frame: i + 1,
+ file: frame.file,
+ text: ocrResult?.text || "",
+ confidence:
+ Number(
+ ocrResult?.confidence
+ ) || 0,
+ success:
+ Boolean(
+ ocrResult?.success
+ ),
+ });
+
+ console.log(
+ `FRAME ${i + 1} OCR CONFIDENCE:`,
+ ocrResult?.confidence || 0
+ );
+
+ console.log(
+ `FRAME ${i + 1} OCR TEXT:`,
+ ocrResult?.text || ""
+ );
+
+ }
+
+ catch (error) {
+
+ console.error(
+ `FRAME ${i + 1} PADDLEOCR HATASI:`,
+ error
+ );
+
+ videoOCRResults.push({
+ frame: i + 1,
+ file: frame.file,
+ text: "",
+ confidence: 0,
+ success: false,
+ error:
+ error?.message ||
+ "PaddleOCR frame analizi başarısız.",
+ });
+
+ }
+
+}
+
+console.log(
+ "VIDEO PADDLEOCR TAMAMLANDI"
+);
+
+const videoOCRText =
+videoOCRResults
+.map((item) => {
+
+return `
+KARE ${item.frame}
+DOSYA: ${item.file}
+OCR BAŞARILI: ${item.success}
+OCR CONFIDENCE: ${item.confidence}/100
+
+OCR METNİ:
+${item.text || "Metin okunamadı."}
+`;
+
+})
+.join("\n");
+  
 const imageMessages =
 frames.map(
 (frame) => ({
@@ -2473,6 +2570,43 @@ backend tarafından deterministik risk motoruyla
 hesaplanacaktır.
 
 SONUCU SADECE JSON OLARAK DÖNDÜR.
+
+=====================================================
+PADDLEOCR VİDEO KARE SONUÇLARI
+=====================================================
+
+Aşağıdaki OCR sonuçları videodan çıkarılan JPG
+karelerinin her biri üzerinde ayrı ayrı çalıştırılmıştır.
+
+ÇOK ÖNEMLİ:
+
+OCR yalnızca yardımcı veridir.
+
+ASIL KAYNAK:
+video karelerinin gerçek görüntüsüdür.
+
+OCR sonucu görüntüyle çelişirse görüntüyü esas al.
+
+OCR tarafından tahmin edilmiş veya yanlış okunmuş
+değerleri gerçek belge bilgisi olarak kabul etme.
+
+KARELER ARASI OCR KARŞILAŞTIRMASI YAP.
+
+Özellikle:
+
+- alıcı adı
+- IBAN
+- tutar
+- tarih
+- saat
+- işlem numarası
+- açıklama
+
+alanlarının kareler arasında değişip değişmediğini kontrol et.
+
+${videoOCRText}
+
+=====================================================
 `;
  
  
