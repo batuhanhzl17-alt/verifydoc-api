@@ -192,7 +192,7 @@ result.pages
 const allTexts = [];
 
 const allScores = [];
-const allBoxes : [];
+const allBoxes = [];
 
 
 for (
