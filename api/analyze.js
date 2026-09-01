@@ -901,8 +901,7 @@ type:
 enum: [
  
 "pass",
-"review",
-"suspicious",
+"fail",
 "unknown",
  
 ],
@@ -3069,8 +3068,15 @@ Check these 25 areas:
 23. Missing or suspicious elements
 24. Document type consistency
 25. Image quality limitations
-26.Check if the amount sent matches the amount written as "... TL has been sent".
- 
+
+IMPORTANT AMOUNT CONSISTENCY:
+As part of the amountConsistency check, also verify whether
+the main transaction amount matches any written statement such as
+"... TL has been sent".
+
+If the visible numeric amount and the written transaction amount
+do not match, report this as a fail under amountConsistency.
+Only report this when both values are actually visible and readable.
 For each check:
  
 status:
@@ -5962,7 +5968,33 @@ console.log(
 "VIDEO RESULT:",
 videoResult
 );
- 
+// =====================================================
+ // DETERMINISTIK VIDEO RISK MOTORU
+ // =====================================================
+
+ const videoRisk =
+ calculateOverallRisk(
+ videoResult
+ );
+
+
+ // =====================================================
+ // AI RISK SKORU KULLANILMAZ
+ // =====================================================
+
+ videoResult.overallRisk =
+ videoRisk.overallRisk;
+
+ videoResult.riskLabel =
+ videoRisk.riskLabel;
+
+ videoResult.categories =
+ videoRisk.categories;
+
+
+ // =====================================================
+ // FINAL VIDEO SCORE
+ // =====================================================
  
 const videoScore =
 Number(
