@@ -2348,7 +2348,7 @@ console.log(
 "VIDEO PADDLEOCR TAMAMLANDI"
 );
   
- catch (error) {
+} catch (error) {
 
  console.error(
  `FRAME ${i + 1} PADDLEOCR HATASI:`,
