@@ -3734,6 +3734,89 @@ function directAmountLabelEvidence(group) {
   return best;
 }
 
+
+// =====================================================
+// ROBUST TUTAR ETİKETİ RECONSTRUCTION
+// =====================================================
+// OCR, "GİDEN FAST TUTARI" gibi bir etiketi tek kutu yerine
+// "GİDEN" + "FAST" + "TUTARI" şeklinde bölebilir. Bu durumda
+// tek-kutu regex'i hiçbir şey bulamaz. Aynı satırdaki OCR kutularını
+// soldan sağa birleştirip etiketi tekrar kuruyoruz ve hemen sağındaki
+// sayıyı deterministik tutar adayı yapıyoruz.
+function reconstructedAmountLabelEvidence(group) {
+  if (!group?.region) return { score: 0, label: null, distance: Infinity, hard: false };
+
+  const gr = group.region;
+  const gx1 = Number(gr.x1) || 0;
+  const gy1 = Number(gr.y1) || 0;
+  const gx2 = Number(gr.x2) || 0;
+  const gy2 = Number(gr.y2) || 0;
+  const gh = Math.max(8, gy2 - gy1);
+  const gcy = (gy1 + gy2) / 2;
+
+  const items = ocrResult.regions
+    .filter((item) => item?.text && validRegion(item.region))
+    .map((item) => ({
+      text: cleanAmountText(item.text),
+      x1: Number(item.region.x1) || 0,
+      y1: Number(item.region.y1) || 0,
+      x2: Number(item.region.x2) || 0,
+      y2: Number(item.region.y2) || 0,
+    }))
+    .filter((item) => item.text);
+
+  const left = items
+    .filter((item) => {
+      const cy = (item.y1 + item.y2) / 2;
+      return item.x2 <= gx1 + 10 &&
+        Math.abs(cy - gcy) <= Math.max(18, gh * 1.8) &&
+        gx1 - item.x2 <= Math.max(500, gh * 20);
+    })
+    .sort((a, b) => a.x1 - b.x1);
+
+  if (!left.length) return { score: 0, label: null, distance: Infinity, hard: false };
+
+  // Son kutudan geriye doğru birkaç kutu al. Böylece hem tek kutu
+  // hem de parçalanmış "GİDEN FAST TUTARI" etiketleri yakalanır.
+  const start = Math.max(0, left.length - 10);
+  const tail = left.slice(start);
+
+  for (let i = 0; i < tail.length; i++) {
+    let combined = "";
+    let first = null;
+    let last = null;
+
+    for (let j = i; j < tail.length && j < i + 8; j++) {
+      const item = tail[j];
+      if (first && item.x1 - last.x2 > Math.max(100, gh * 5)) break;
+      combined = `${combined} ${item.text}`.trim();
+      first = first || item;
+      last = item;
+
+      const normalized = combined
+        .toLocaleLowerCase("tr-TR")
+        .replace(/[^a-zçğıöşü0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      const strong = /giden fast tutar|gönderilen fast tutar|giden tutar|gönderim tutar/.test(normalized);
+      const medium = /işlem tutar|transfer tutar|ana tutar|tutar/.test(normalized);
+      if (!strong && !medium) continue;
+
+      const gap = gx1 - last.x2;
+      const score = (strong ? 300 : 220) + Math.max(0, 90 - Math.min(90, gap / Math.max(1, gh) * 5));
+      return {
+        score,
+        label: combined,
+        distance: gap,
+        hard: strong,
+      };
+    }
+  }
+
+  return { score: 0, label: null, distance: Infinity, hard: false };
+}
+
 const allRankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
 const context = nearbyContextScore(group);
@@ -3742,6 +3825,7 @@ const templateScore = templatePositionScore(group);
 const labelEvidence = amountLabelEvidence(group);
 const referencePositionScore = referenceAmountPositionScore(group);
 const directLabelEvidence = directAmountLabelEvidence(group);
+const reconstructedLabelEvidence = reconstructedAmountLabelEvidence(group);
 return {
 ...group,
 amountCandidateScore:
@@ -3758,6 +3842,7 @@ templateScore,
 labelEvidence,
 referencePositionScore,
 directLabelEvidence,
+reconstructedLabelEvidence,
 };
 });
 
@@ -3779,52 +3864,40 @@ if (referenceAmountField) {
   const directLabelMatched = allRankedCandidates.filter((item) =>
     Number(item.directLabelEvidence?.score || 0) >= 150
   );
+  const reconstructedLabelMatched = allRankedCandidates.filter((item) =>
+    Number(item.reconstructedLabelEvidence?.score || 0) >= 220
+  );
   const labelMatched = allRankedCandidates.filter((item) =>
     Number(item.labelEvidence?.score || 0) >= 150
   );
 
-  // En güçlü kapı: referans ROI + gerçek JPG'deki kesin tutar etiketi.
+  // En güçlü seçim: referans ROI + gerçek dekontta açık tutar etiketi.
   const bothMatched = referenceMatched.filter((item) =>
-    Number(item.directLabelEvidence?.score || 0) >= 150
+    Number(item.directLabelEvidence?.score || 0) >= 150 ||
+    Number(item.reconstructedLabelEvidence?.score || 0) >= 220
   );
 
   if (bothMatched.length) {
     candidatePool = bothMatched;
     selectionMethod = "reference-roi-and-direct-label";
-  } else if (directLabelMatched.length) {
-    // Gerçek JPG'de "GİDEN FAST TUTARI" gibi açık bir etiket varsa,
-    // etiketin hemen sağındaki sayıyı önceliklendir.
-    candidatePool = directLabelMatched;
-    selectionMethod = "direct-amount-label-roi";
   } else if (referenceMatched.length) {
     candidatePool = referenceMatched;
     selectionMethod = "reference-roi";
+  } else if (reconstructedLabelMatched.length) {
+    // OCR etiketi parçaladıysa bile "GİDEN FAST TUTARI" yeniden kurulur.
+    candidatePool = reconstructedLabelMatched;
+    selectionMethod = "reconstructed-amount-label";
+  } else if (directLabelMatched.length) {
+    candidatePool = directLabelMatched;
+    selectionMethod = "direct-amount-label-roi";
   } else if (labelMatched.length) {
     candidatePool = labelMatched;
     selectionMethod = "amount-label";
   } else {
-    // Referansla hiç eşleşme yoksa eski serbest seçim yöntemine dönme.
-    // Yalnızca referansın yakınında pozitif skor alan aday varsa onu kullan.
-    // Hiçbiri yoksa sonucu açıkça reference-unmatched olarak işaretle.
-    const nearest = [...allRankedCandidates].sort((a, b) => {
-      const ra = Number(a.referencePositionScore || 0);
-      const rb = Number(b.referencePositionScore || 0);
-      if (rb !== ra) return rb - ra;
-
-      const da = Number(a.directLabelEvidence?.score || 0);
-      const db = Number(b.directLabelEvidence?.score || 0);
-      if (db !== da) return db - da;
-
-      return (b.amountCandidateScore || 0) - (a.amountCandidateScore || 0);
-    });
-
-    if (nearest.length && Number(nearest[0].referencePositionScore || 0) > 0) {
-      candidatePool = [nearest[0]];
-      selectionMethod = "reference-nearest";
-    } else {
-      candidatePool = allRankedCandidates;
-      selectionMethod = "reference-unmatched";
-    }
+    // KRİTİK: Referans mevcutken referansla ilgisiz bir sayıya FALLBACK YOK.
+    // Aksi halde müşteri no / sorgu no tekrar tutar seçilebilir.
+    candidatePool = [];
+    selectionMethod = "reference-unmatched";
   }
 }
 
@@ -3844,6 +3917,36 @@ return String(a.text).localeCompare(String(b.text));
 });
 
 const candidate = rankedCandidates[0];
+
+if (!candidate) {
+  console.warn(
+    "REFERENCE GUIDED AMOUNT: GÜVENİLİR TUTAR ADAYI BULUNAMADI",
+    JSON.stringify({
+      referenceAmountField,
+      selectionMethod,
+      candidateCount: allRankedCandidates.length,
+    })
+  );
+
+  return {
+    available: true,
+    status: "unknown",
+    severity: "none",
+    score: 0,
+    fileFingerprint: fileFingerprint || currentFileFingerprint,
+    amountText: null,
+    region: null,
+    characterCount: 0,
+    metrics: {},
+    referenceGuided: Boolean(referenceAmountField),
+    referenceGuidedSelection: selectionMethod,
+    selectedAmountText: null,
+    evidence: referenceAmountField
+      ? "Referans tutar alanı mevcut ancak gerçek dekontta referans bölgesi veya açık tutar etiketiyle doğrulanmış aday bulunamadı. İlgisiz müşteri/ref numarası tutar olarak seçilmedi."
+      : "Güvenilir tutar adayı bulunamadı.",
+  };
+}
+
 const rawRegion = candidate.region;
 
 console.log(
@@ -3858,6 +3961,8 @@ amountLabelScore: item.labelEvidence?.score || 0,
 amountLabel: item.labelEvidence?.positive || [],
 directAmountLabelScore: item.directLabelEvidence?.score || 0,
 directAmountLabel: item.directLabelEvidence?.label || null,
+reconstructedAmountLabelScore: item.reconstructedLabelEvidence?.score || 0,
+reconstructedAmountLabel: item.reconstructedLabelEvidence?.label || null,
 anchorContext: item.anchor?.anchors || [],
 positiveContext: item.context?.positive || [],
 negativeContext: [...(item.context?.negative || []), ...(item.labelEvidence?.negative || [])],
@@ -7677,7 +7782,7 @@ preserveAmount(result.documentData.amount);
 // Eksi işareti dekontta çıkış yönünü gösterir; documentData.amount
 // tutarın büyüklüğünü korur.
 if (
-  ["reference-roi-and-direct-label", "direct-amount-label-roi", "reference-roi", "reference-position-and-label", "reference-position", "reference-nearest", "amount-label"].includes(amountForensics?.selectionMethod) &&
+  ["reference-roi-and-direct-label", "direct-amount-label-roi", "reference-roi", "reference-position-and-label", "reference-position", "reference-nearest", "amount-label", "reconstructed-amount-label"].includes(amountForensics?.selectionMethod) &&
   amountForensics?.selectedAmountText
 ) {
   const selected = String(amountForensics.selectedAmountText)
