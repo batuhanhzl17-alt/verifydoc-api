@@ -3614,7 +3614,7 @@ function referenceAmountPositionScore(group) {
   return 0;
 }
 
-const rankedCandidates = groups.map((group) => {
+const allRankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
 const context = nearbyContextScore(group);
 const anchor = anchorContextScore(group);
@@ -3630,8 +3630,65 @@ templateScore,
 labelEvidence,
 referencePositionScore,
 };
-}).sort((a, b) => {
+});
+
+// =====================================================
+// REFERANS TUTAR ALANI = HARD GATE
+// =====================================================
+// Referans profili mevcutsa, genel OCR sıralamasının sayfa üzerindeki
+// herhangi bir numarayı tutar seçmesine izin verme. Önce referansın
+// beklenen tutar bölgesine düşen adayları ve/veya gerçek tutar etiketini
+// taşıyan adayları ayır. Böylece MÜŞTERİ NO / SORGU NO / İŞLEM REF gibi
+// rakamlar, sırf OCR puanı yüksek diye tutarın önüne geçemez.
+let candidatePool = allRankedCandidates;
+let selectionMethod = "legacy-scoring";
+
+if (referenceAmountField) {
+  const referenceMatched = allRankedCandidates.filter((item) =>
+    Number(item.referencePositionScore || 0) > 0
+  );
+  const labelMatched = allRankedCandidates.filter((item) =>
+    Number(item.labelEvidence?.score || 0) >= 150
+  );
+
+  // Öncelik: hem referans bölgesinde hem de tutar etiketiyle desteklenen aday.
+  const bothMatched = referenceMatched.filter((item) =>
+    Number(item.labelEvidence?.score || 0) >= 150
+  );
+
+  if (bothMatched.length) {
+    candidatePool = bothMatched;
+    selectionMethod = "reference-position-and-label";
+  } else if (referenceMatched.length) {
+    candidatePool = referenceMatched;
+    selectionMethod = "reference-position";
+  } else if (labelMatched.length) {
+    candidatePool = labelMatched;
+    selectionMethod = "amount-label";
+  } else {
+    // Referans var ama OCR ölçeği/konumu nedeniyle hiçbir aday eşleşmedi.
+    // Bu durumda legacy sıralamaya dönmek yerine, en azından en yakın
+    // referans adayını seç. Böylece uzak bir müşteri/ref numarası kazanamaz.
+    const nearest = [...allRankedCandidates].sort((a, b) => {
+      const ra = Number(a.referencePositionScore || 0);
+      const rb = Number(b.referencePositionScore || 0);
+      if (rb !== ra) return rb - ra;
+      return (b.amountCandidateScore || 0) - (a.amountCandidateScore || 0);
+    });
+    if (nearest.length && Number(nearest[0].referencePositionScore || 0) > 0) {
+      candidatePool = [nearest[0]];
+      selectionMethod = "reference-nearest";
+    } else {
+      candidatePool = allRankedCandidates;
+      selectionMethod = "reference-unmatched-legacy";
+    }
+  }
+}
+
+const rankedCandidates = candidatePool.sort((a, b) => {
 if (b.amountCandidateScore !== a.amountCandidateScore) return b.amountCandidateScore - a.amountCandidateScore;
+if ((b.referencePositionScore || 0) !== (a.referencePositionScore || 0)) return (b.referencePositionScore || 0) - (a.referencePositionScore || 0);
+if ((b.labelEvidence?.score || 0) !== (a.labelEvidence?.score || 0)) return (b.labelEvidence?.score || 0) - (a.labelEvidence?.score || 0);
 if ((b.signal || 0) !== (a.signal || 0)) return (b.signal || 0) - (a.signal || 0);
 if ((b.score || 0) !== (a.score || 0)) return (b.score || 0) - (a.score || 0);
 const ay = Number(a.region?.y1) || 0;
@@ -3667,7 +3724,7 @@ console.log(
 JSON.stringify({
 referenceAmountField,
 selectedText: candidate.text,
-selectionMethod: referenceAmountField ? "reference-position-plus-label" : "legacy-scoring"
+selectionMethod
 })
 );
 
@@ -4264,12 +4321,12 @@ templateBank: referenceAnchor?.bank || null,
 templateAmountText: referenceAnchor?.amountText || null,
 templatePositionScore: Number(candidate.templateScore || 0),
 referenceGuided: Boolean(referenceAmountField),
-referenceGuidedSelection: referenceAmountField ? "reference-position-plus-label" : "legacy-scoring",
+referenceGuidedSelection: selectionMethod,
 referenceAmountPositionScore: Number(candidate.referencePositionScore || 0),
 amountLabelScore: Number(candidate.labelEvidence?.score || 0),
 amountLabelEvidence: candidate.labelEvidence?.positive || [],
 },
-selectionMethod: referenceAmountField ? "reference-position-plus-label" : "legacy-scoring",
+selectionMethod,
 selectedAmountText: candidate.text,
 referenceAmountText: referenceAmountField?.label || null,
 segmentFeatures: features.map((feature, index) => ({
@@ -7473,7 +7530,7 @@ preserveAmount(result.documentData.amount);
 // Eksi işareti dekontta çıkış yönünü gösterir; documentData.amount
 // tutarın büyüklüğünü korur.
 if (
-  amountForensics?.selectionMethod === "reference-position-plus-label" &&
+  ["reference-position-and-label", "reference-position", "reference-nearest", "amount-label"].includes(amountForensics?.selectionMethod) &&
   amountForensics?.selectedAmountText
 ) {
   const selected = String(amountForensics.selectedAmountText)
