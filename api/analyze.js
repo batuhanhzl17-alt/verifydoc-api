@@ -3228,6 +3228,202 @@ const medEdge = median(edgeValues);
 const medWidth = median(widthValues);
 const medHeight = median(heightValues);
 
+// =====================================================
+// AYNI KARAKTER KARŞILAŞTIRMASI
+// =====================================================
+// Genel medyan karşılaştırması 1, 7 ve 0 gibi doğal olarak farklı
+// glyph'leri birbirleriyle kıyasladığı için tek başına yeterli değildir.
+// Özellikle aynı tutar içindeki 0-0, 1-1 gibi tekrar eden karakterleri
+// ayrıca karşılaştırıyoruz. Bu, örneğin "1.700,00" içindeki son iki
+// 0'ın önceki 0'lardan belirgin biçimde farklı render edilmesini yakalar.
+function extractConnectedCharacterComponents(gray, width, height) {
+const visited = new Uint8Array(width * height);
+const components = [];
+const threshold = 200;
+
+for (let sy = 0; sy < height; sy++) {
+for (let sx = 0; sx < width; sx++) {
+const startIndex = sy * width + sx;
+if (visited[startIndex] || gray[startIndex] >= threshold) continue;
+
+const queueX = [sx];
+const queueY = [sy];
+visited[startIndex] = 1;
+let qi = 0;
+let minX = sx;
+let maxX = sx;
+let minY = sy;
+let maxY = sy;
+let area = 0;
+
+while (qi < queueX.length) {
+const x = queueX[qi];
+const y = queueY[qi];
+qi++;
+area++;
+minX = Math.min(minX, x);
+maxX = Math.max(maxX, x);
+minY = Math.min(minY, y);
+maxY = Math.max(maxY, y);
+
+for (let dy = -1; dy <= 1; dy++) {
+for (let dx = -1; dx <= 1; dx++) {
+if (dx === 0 && dy === 0) continue;
+const nx = x + dx;
+const ny = y + dy;
+if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+const ni = ny * width + nx;
+if (visited[ni] || gray[ni] >= threshold) continue;
+visited[ni] = 1;
+queueX.push(nx);
+queueY.push(ny);
+}
+}
+}
+
+const cw = maxX - minX + 1;
+const ch = maxY - minY + 1;
+if (area >= 3 && cw <= Math.max(2, Math.floor(width * 0.40)) && ch >= 2) {
+components.push({ minX, maxX, minY, maxY, width: cw, height: ch, area });
+}
+}
+}
+
+return components.sort((a, b) => a.minX - b.minX);
+}
+
+function characterComponentFeatures(component) {
+const x0 = component.minX;
+const y0 = component.minY;
+const x1 = component.maxX + 1;
+const y1 = component.maxY + 1;
+const cw = Math.max(1, x1 - x0);
+const ch = Math.max(1, y1 - y0);
+
+let ink220 = 0;
+let ink180 = 0;
+let darkSum = 0;
+let darkCount = 0;
+let edgeSum = 0;
+let pixels = 0;
+
+for (let y = y0; y < y1; y++) {
+for (let x = x0; x < x1; x++) {
+const value = data[y * w + x];
+pixels++;
+if (value < 220) ink220++;
+if (value < 180) ink180++;
+if (value < 185) {
+darkSum += 255 - value;
+darkCount++;
+}
+if (x > x0) {
+edgeSum += Math.abs(value - data[y * w + (x - 1)]);
+}
+if (y > y0) {
+edgeSum += Math.abs(value - data[(y - 1) * w + x]);
+}
+}
+}
+
+return {
+width: cw,
+height: ch,
+inkRatio: pixels ? ink220 / pixels : 0,
+inkRatio180: pixels ? ink180 / pixels : 0,
+darkness: darkCount ? darkSum / darkCount : 0,
+edgeDensity: pixels ? edgeSum / (pixels * 2) : 0,
+};
+}
+
+function relativeDifference(a, b) {
+const denom = Math.max(0.0001, (Math.abs(a) + Math.abs(b)) / 2);
+return Math.abs(a - b) / denom;
+}
+
+let repeatedCharacterAnalysis = {
+available: false,
+strongGroups: [],
+maxDifference: 0,
+};
+
+try {
+const normalizedAmount = cleanAmountText(candidate.text)
+.replace(/(?:TL|TRY|EUR|USD|GBP|₺|€|\$|£)/gi, "")
+.replace(/\s+/g, "");
+
+const expectedCharacters = [...normalizedAmount].filter((char) => /[0-9.,]/.test(char));
+const components = extractConnectedCharacterComponents(data, w, h);
+
+// İlk karakterler soldan sağa tutar karakterlerine karşılık gelir.
+// Currency metni varsa sayısal karakterlerden sonra gelir ve dışarıda bırakılır.
+if (expectedCharacters.length >= 4 && components.length >= expectedCharacters.length) {
+const charPairs = expectedCharacters.map((char, index) => ({
+char,
+component: components[index],
+features: characterComponentFeatures(components[index]),
+index,
+}));
+
+const groupsByChar = {};
+for (const item of charPairs) {
+if (!groupsByChar[item.char]) groupsByChar[item.char] = [];
+groupsByChar[item.char].push(item);
+}
+
+for (const [char, items] of Object.entries(groupsByChar)) {
+if (!/[0-9]/.test(char) || items.length < 2) continue;
+
+const medianInkChar = median(items.map((x) => x.features.inkRatio));
+const medianInk180Char = median(items.map((x) => x.features.inkRatio180));
+const medianDarkChar = median(items.map((x) => x.features.darkness));
+const medianEdgeChar = median(items.map((x) => x.features.edgeDensity));
+const medianWidthChar = median(items.map((x) => x.features.width));
+const medianHeightChar = median(items.map((x) => x.features.height));
+
+for (const item of items) {
+const differences = {
+ink: relativeDifference(item.features.inkRatio, medianInkChar),
+ink180: relativeDifference(item.features.inkRatio180, medianInk180Char),
+dark: relativeDifference(item.features.darkness, medianDarkChar),
+edge: relativeDifference(item.features.edgeDensity, medianEdgeChar),
+width: relativeDifference(item.features.width, medianWidthChar),
+height: relativeDifference(item.features.height, medianHeightChar),
+};
+
+const votes = [
+differences.ink >= 0.08,
+differences.ink180 >= 0.08,
+differences.dark >= 0.08,
+differences.edge >= 0.10,
+differences.width >= 0.10,
+differences.height >= 0.08,
+].filter(Boolean).length;
+
+const maxDifference = Math.max(...Object.values(differences));
+repeatedCharacterAnalysis.maxDifference = Math.max(
+repeatedCharacterAnalysis.maxDifference,
+maxDifference
+);
+
+if (votes >= 2 && maxDifference >= 0.08) {
+repeatedCharacterAnalysis.strongGroups.push({
+char,
+position: item.index,
+votes,
+differences,
+features: item.features,
+});
+}
+}
+}
+
+repeatedCharacterAnalysis.available = repeatedCharacterAnalysis.strongGroups.length > 0;
+}
+} catch (error) {
+console.warn("AYNI KARAKTER ANALİZİ HATASI:", error?.message || error);
+}
+
 const anomalyScores = features.map((feature) => {
 const inkDiff = relativeOutlier(feature.inkRatio, medInk);
 const ink200Diff = relativeOutlier(feature.inkRatio200, medInk200);
@@ -3289,11 +3485,42 @@ const localized =
 maxScore >= 3 &&
 anomalyRatio <= 0.35;
 
+const repeatedStrong =
+repeatedCharacterAnalysis.strongGroups.length >= 1;
+
+const repeatedVeryStrong =
+repeatedCharacterAnalysis.strongGroups.some((group) =>
+(group.votes >= 3 &&
+Math.max(
+Number(group.differences.ink) || 0,
+Number(group.differences.ink180) || 0,
+Number(group.differences.dark) || 0
+) >= 0.12)
+);
+
 let status = "pass";
 let severity = "none";
 let score = 0;
 
+// Aynı rakamın (özellikle 0'ın) bir kopyası diğerlerinden belirgin
+// biçimde farklıysa, genel medyan testi güçlü çıkmasa bile bunu yakala.
 if (
+repeatedVeryStrong ||
+(
+repeatedStrong &&
+(
+maxInkDifference >= 0.18 ||
+maxStrokeProxyDifference >= 0.18 ||
+maxDarkDifference >= 0.18
+)
+)
+) {
+status = "warning";
+severity = "strong";
+score = 85;
+}
+else if (
+(
 localized &&
 maxScore >= 4 &&
 (
@@ -3302,20 +3529,8 @@ maxStrokeProxyDifference >= 0.28 ||
 maxEdgeDifference >= 0.32 ||
 maxDarkDifference >= 0.30
 )
-) {
-status = "warning";
-severity = "strong";
-score = 85;
-}
-else if (
-localized &&
-maxScore >= 3 &&
-(
-maxInkDifference >= 0.20 ||
-maxStrokeProxyDifference >= 0.20 ||
-maxEdgeDifference >= 0.22 ||
-maxDarkDifference >= 0.22
-)
+) ||
+repeatedStrong
 ) {
 status = "warning";
 severity = "moderate";
@@ -3327,8 +3542,11 @@ maxIndex >= 0 ? features[maxIndex] : null;
 
 let evidence;
 if (status === "warning") {
+const repeatedText = repeatedCharacterAnalysis.strongGroups.length
+? ` Aynı rakam tekrarları içinde ${repeatedCharacterAnalysis.strongGroups.length} lokal farklılık da tespit edildi.`
+: "";
 evidence =
-`Tutar alanında ${features.length} karakter bölgesi karşılaştırıldı. ${maxScore} ayrı mikro-görsel özellik aynı karakter bölgesinde diğer karakterlerden ayrıştı. En belirgin fark; ink/stroke yoğunluğu, kenar yapısı veya karakter geometrisinde lokalize bir tutarsızlık olarak ölçüldü. Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
+`Tutar alanında ${features.length} karakter bölgesi karşılaştırıldı. ${maxScore} ayrı mikro-görsel özellik aynı karakter bölgesinde diğer karakterlerden ayrıştı.${repeatedText} En belirgin fark; ink/stroke yoğunluğu, kenar yapısı veya karakter geometrisinde lokalize bir tutarsızlık olarak ölçüldü. Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
 } else {
 evidence =
 `Tutar alanında ${features.length} karakter bölgesi mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
@@ -3345,6 +3563,7 @@ maxStrokeProxyDifference,
 maxEdgeDifference,
 maxDarkDifference,
 anomalyRatio,
+repeatedCharacterAnalysis,
 outlierFeature,
 })
 );
@@ -3373,6 +3592,9 @@ maxStrokeProxyDifference: Number(maxStrokeProxyDifference.toFixed(3)),
 maxEdgeDensityDifference: Number(maxEdgeDifference.toFixed(3)),
 maxDarknessDifference: Number(maxDarkDifference.toFixed(3)),
 localAnomalyRatio: Number(anomalyRatio.toFixed(3)),
+repeatedCharacterAvailable: repeatedCharacterAnalysis.available,
+repeatedCharacterMaxDifference: Number((repeatedCharacterAnalysis.maxDifference || 0).toFixed(3)),
+repeatedCharacterGroups: repeatedCharacterAnalysis.strongGroups.slice(0, 8),
 maxFeatureVotes: maxScore,
 },
 segmentFeatures: features.map((feature, index) => ({
