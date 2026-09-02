@@ -31,6 +31,7 @@ pathToFileURL(pdfWorkerPath).href;
 const execFileAsync = promisify(execFile);
 let currentFileFingerprint = null;
 const amountForensicsStrongCache = new Map();
+const referenceAmountAnchorCache = new Map();
 
 // =====================================================
 // PADDLEOCR CLIENT
@@ -832,6 +833,9 @@ fileName:
 path.basename(
 referencePath
 ),
+
+path:
+referencePath,
 
 base64:
 buffer.toString(
@@ -2707,7 +2711,66 @@ count,
 }
 
 // =====================================================
-// TUTAR FORENSICS V2 — MİKRO GÖRSEL KARAKTER KONTROLÜ
+// BANKA ŞABLONU — TUTAR ALANI KALİBRASYONU
+// Referans PDF, yalnızca OpenAI bağlamı olarak değil, bankaya özgü tutar
+// konumunu belirlemek için de kullanılır. Sabit piksel yerine normalize konum kullanılır.
+async function getReferenceAmountAnchor(bank) {
+const normalizedBank = normalizeBank(bank);
+if (!normalizedBank) return null;
+if (referenceAmountAnchorCache.has(normalizedBank)) return referenceAmountAnchorCache.get(normalizedBank);
+const referencePath = getReferenceFile(normalizedBank);
+if (!referencePath) return null;
+try {
+const buffer = await fs.readFile(referencePath);
+if (!buffer?.length) return null;
+const pdf = await pdfjsLib.getDocument({data: new Uint8Array(buffer)}).promise;
+const labelRegex = /(?:işlem\s*tutarı|islem\s*tutari|ana\s*tutar|\btutar\b|amount)/i;
+const moneyRegex = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
+const decimalRegex = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
+for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 3); pageNumber++) {
+const page = await pdf.getPage(pageNumber);
+const viewport = page.getViewport({scale: 1});
+const textContent = await page.getTextContent();
+const items = textContent.items.map((item) => {
+const tr = Array.isArray(item?.transform) ? item.transform : [];
+return {str: String(item?.str || '').trim(), x: Number(tr[4]), y: Number(tr[5]), width: Number(item?.width) || 0, height: Math.abs(Number(tr[3])) || Number(item?.height) || 0};
+}).filter((x) => x.str && Number.isFinite(x.x) && Number.isFinite(x.y));
+const labels = items.filter((x) => labelRegex.test(x.str));
+const amounts = items.filter((x) => (moneyRegex.test(x.str) || decimalRegex.test(x.str)) && /\d/.test(x.str));
+for (const label of labels) {
+let best = null;
+let bestDistance = Infinity;
+for (const amount of amounts) {
+const labelY = viewport.height - label.y;
+const amountY = viewport.height - amount.y;
+const verticalDistance = Math.abs(labelY - amountY);
+const horizontalDistance = amount.x >= label.x ? amount.x - (label.x + label.width) : Infinity;
+if (verticalDistance > Math.max(40, label.height * 3)) continue;
+if (horizontalDistance < 0 || horizontalDistance > Math.max(700, label.width * 12)) continue;
+const distance = verticalDistance * 5 + horizontalDistance;
+if (distance < bestDistance) { bestDistance = distance; best = amount; }
+}
+if (best) {
+const anchor = {bank: normalizedBank, pageNumber, xNorm: viewport.width ? (best.x + best.width / 2) / viewport.width : null, yNorm: viewport.height ? (viewport.height - best.y - best.height / 2) / viewport.height : null, widthNorm: viewport.width ? best.width / viewport.width : null, heightNorm: viewport.height ? best.height / viewport.height : null, label: label.str, amountText: best.str};
+referenceAmountAnchorCache.set(normalizedBank, anchor);
+console.log('REFERENCE AMOUNT ANCHOR:', JSON.stringify(anchor));
+return anchor;
+}
+}
+}
+referenceAmountAnchorCache.set(normalizedBank, null);
+return null;
+} catch (error) {
+console.warn('REFERENCE AMOUNT ANCHOR HATASI:', normalizedBank, error?.message || error);
+referenceAmountAnchorCache.set(normalizedBank, null);
+return null;
+}
+}
+
+// =====================================================
+// TUTAR FORENSICS V4 — ŞABLON + ETİKET + PİKSEL KONTROLÜ
+// =====================================================
+
 // =====================================================
 // PaddleOCR kutularını ve gerçek piksel verisini birlikte kullanır.
 // Amaç: tutarın içindeki tek/az sayıdaki karakterin diğerlerinden
@@ -2715,7 +2778,8 @@ count,
 async function analyzeAmountForensics(
 filePath,
 ocrResult,
-fileFingerprint = currentFileFingerprint
+fileFingerprint = currentFileFingerprint,
+bank = null
 ) {
 
 if (
@@ -2762,8 +2826,12 @@ return String(value || "")
 function numericSignal(text) {
 const value = cleanAmountText(text);
 if (!value) return 0;
-if (moneyPattern.test(value)) return 5;
-if (numericOnlyPattern.test(value) && /\d/.test(value)) return 3;
+const anchoredMoneyPattern = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?$/i;
+const anchoredDecimalPattern = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
+if (anchoredDecimalPattern.test(value)) return 9;
+if (anchoredMoneyPattern.test(value) && /[,\.]\d{1,2}/.test(value)) return 8;
+if (anchoredMoneyPattern.test(value) && /\d/.test(value)) return 5;
+if (numericOnlyPattern.test(value)) return 3;
 return 0;
 }
 
@@ -3012,15 +3080,43 @@ negative.push(text);
 return {score, positive, negative};
 }
 
+let image;
+try {
+const meta = await sharp(filePath).metadata();
+if (!meta?.width || !meta?.height) throw new Error("Görüntü boyutu alınamadı.");
+image = {width: meta.width, height: meta.height};
+} catch (error) {
+return {available: false, status: "unknown", severity: "none", score: 0, amountText: null, region: null, characterCount: 0, metrics: {}, evidence: "Görüntü boyutu alınamadı."};
+}
+
+const referenceAnchor = await getReferenceAmountAnchor(bank);
+console.log("AMOUNT TEMPLATE ANCHOR:", JSON.stringify(referenceAnchor));
+
+function templatePositionScore(group) {
+if (!referenceAnchor || !image?.width || !image?.height) return 0;
+const cx = (Number(group.region.x1) + Number(group.region.x2)) / 2;
+const cy = (Number(group.region.y1) + Number(group.region.y2)) / 2;
+const dx = Math.abs(cx / image.width - Number(referenceAnchor.xNorm || 0));
+const dy = Math.abs(cy / image.height - Number(referenceAnchor.yNorm || 0));
+const d = Math.sqrt(dx * dx + dy * dy);
+if (d <= 0.025) return 35;
+if (d <= 0.05) return 25;
+if (d <= 0.09) return 14;
+if (d <= 0.15) return 5;
+return 0;
+}
+
 const rankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
 const context = nearbyContextScore(group);
 const anchor = anchorContextScore(group);
+const templateScore = templatePositionScore(group);
 return {
 ...group,
-amountCandidateScore: baseScore + context.score + anchor.score,
+amountCandidateScore: baseScore + context.score + anchor.score + templateScore,
 context,
 anchor,
+templateScore,
 };
 }).sort((a, b) => {
 if (b.amountCandidateScore !== a.amountCandidateScore) return b.amountCandidateScore - a.amountCandidateScore;
@@ -3044,30 +3140,12 @@ JSON.stringify(rankedCandidates.slice(0, 8).map((item) => ({
 text: item.text,
 signal: item.signal,
 amountCandidateScore: item.amountCandidateScore,
+templateScore: item.templateScore || 0,
 anchorContext: item.anchor?.anchors || [],
 positiveContext: item.context?.positive || [],
 negativeContext: item.context?.negative || [],
 })))
 );
-
-let image;
-try {
-const meta = await sharp(filePath).metadata();
-if (!meta?.width || !meta?.height) throw new Error("Görüntü boyutu alınamadı.");
-image = {width: meta.width, height: meta.height};
-} catch (error) {
-return {
-available: false,
-status: "unknown",
-severity: "none",
-score: 0,
-amountText: candidate.text,
-region: rawRegion,
-characterCount: 0,
-metrics: {},
-evidence: "Tutar alanı bulundu ancak görüntü boyut bilgisi alınamadı.",
-};
-}
 
 const rawWidth = Math.max(1, Number(rawRegion.x2) - Number(rawRegion.x1));
 const rawHeight = Math.max(1, Number(rawRegion.y2) - Number(rawRegion.y1));
@@ -3614,6 +3692,9 @@ console.log(
 JSON.stringify({
 fileFingerprint: fileFingerprint || currentFileFingerprint,
 amountText: candidate.text,
+templateBank: referenceAnchor?.bank || null,
+templateAmountText: referenceAnchor?.amountText || null,
+templatePositionScore: candidate.templateScore || 0,
 characterCount: features.length,
 maxScore,
 maxInkDifference,
@@ -3655,6 +3736,9 @@ repeatedCharacterAvailable: repeatedCharacterAnalysis.available,
 repeatedCharacterMaxDifference: Number((repeatedCharacterAnalysis.maxDifference || 0).toFixed(3)),
 repeatedCharacterGroups: repeatedCharacterAnalysis.strongGroups.slice(0, 8),
 maxFeatureVotes: maxScore,
+templateBank: referenceAnchor?.bank || null,
+templateAmountText: referenceAnchor?.amountText || null,
+templatePositionScore: Number(candidate.templateScore || 0),
 },
 segmentFeatures: features.map((feature, index) => ({
 index,
@@ -5928,7 +6012,8 @@ amountForensics =
 await analyzeAmountForensics(
 filePath,
 paddleImageOCR,
-currentFileFingerprint
+currentFileFingerprint,
+bank
 );
 
 console.log(
@@ -6645,7 +6730,8 @@ amountForensics =
 await analyzeAmountForensics(
 filePath,
 paddleResult,
-currentFileFingerprint
+currentFileFingerprint,
+bank
 );
 }
 
