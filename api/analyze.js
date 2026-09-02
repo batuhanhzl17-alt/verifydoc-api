@@ -6284,6 +6284,22 @@ JSON.stringify(amountForensics)
 }
 
 // =====================================================
+// REFERANS DEKONTU ÖNCE YÜKLE
+// =====================================================
+// reference değişkeni, referans şablon kalibrasyonu kullanılmadan
+// ÖNCE tanımlanmalı. Aksi halde JavaScript TDZ nedeniyle:
+// ReferenceError: Cannot access 'reference' before initialization
+// hatası oluşur.
+let reference = null;
+
+if (type !== "video" && type !== "statement") {
+  reference = await loadReferenceFile(bank);
+}
+
+console.log("BANK:", bank || "YOK");
+console.log("REFERENCE:", reference?.fileName || "YOK");
+
+// =====================================================
 // REFERANS ŞABLON KALİBRASYONU
 // =====================================================
 if (
@@ -6515,42 +6531,6 @@ statementEvidence,
 
 }
 
-
-// =====================================================
-// REFERANS DEKONT
-// =====================================================
-
-// Video analizinde kullanılmayacak.
-// Hesap özetinde de kullanılmayacak.
-//
-// Sadece normal image/pdf dekont analizlerinde kullanılır.
-let reference =
-null;
-
-if (
-type !== "video" &&
-type !== "statement"
-) {
-
-reference =
-await loadReferenceFile(
-bank
-);
-
-}
-
-
-console.log(
-"BANK:",
-bank ||
-"YOK"
-);
-
-console.log(
-"REFERENCE:",
-reference?.fileName ||
-"YOK"
-);
 
 // -------------------------------------------------
 // OPENAI INPUT
