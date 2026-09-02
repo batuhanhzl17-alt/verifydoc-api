@@ -3,7 +3,7 @@ import path from 'path';
 import sharp from 'sharp';
 
 // =====================================================
-// VERIFYDOC VISUAL FORENSICS HELPER v1
+// VERIFYDOC VISUAL FORENSICS HELPER v2 - PDFJS RENDER + DIAGNOSTIC LOGS
 // =====================================================
 // Amaç: Güvenilen referans GÖRSELLERİ ile yeni JPG/PNG'yi
 // bütün sayfa seviyesinde karşılaştırmak.
@@ -19,29 +19,138 @@ const PDF_EXT = '.pdf';
 
 function clamp(v, lo=0, hi=1){ return Math.max(lo, Math.min(hi, v)); }
 
+async function renderPdfWithCanvas(pdfPath, outPath) {
+  console.log('PDF RENDER PDFJS BAŞLADI:', path.basename(pdfPath));
+
+  try {
+    const canvasMod = await import('@napi-rs/canvas');
+    const createCanvas =
+      canvasMod.createCanvas ||
+      canvasMod.default?.createCanvas;
+
+    if (typeof createCanvas !== 'function') {
+      throw new Error('@napi-rs/canvas createCanvas bulunamadı');
+    }
+
+    const pdfjs = await import('pdfjs-dist/build/pdf.mjs');
+    const buffer = await fs.readFile(pdfPath);
+
+    const pdf = await pdfjs.getDocument({
+      data: new Uint8Array(buffer),
+      useWorkerFetch: false,
+      isEvalSupported: false
+    }).promise;
+
+    const page = await pdf.getPage(1);
+    const baseViewport = page.getViewport({ scale: 1 });
+
+    const scale = Math.min(
+      1200 / baseViewport.width,
+      1600 / baseViewport.height
+    );
+
+    const viewport = page.getViewport({ scale });
+    const canvas = createCanvas(
+      Math.ceil(viewport.width),
+      Math.ceil(viewport.height)
+    );
+
+    const ctx = canvas.getContext('2d');
+
+    await page.render({
+      canvasContext: ctx,
+      viewport
+    }).promise;
+
+    const png = canvas.toBuffer('image/png');
+    await fs.writeFile(outPath, png);
+    await fs.access(outPath);
+
+    console.log('PDF RENDER PDFJS BAŞARILI:', JSON.stringify({
+      file: path.basename(pdfPath),
+      method: 'pdfjs-napi-canvas',
+      width: Math.ceil(viewport.width),
+      height: Math.ceil(viewport.height)
+    }));
+
+    return outPath;
+  } catch (e) {
+    console.warn('PDF RENDER PDFJS HATASI:', JSON.stringify({
+      file: path.basename(pdfPath),
+      error: e?.message || String(e),
+      name: e?.name || null,
+      stack: e?.stack ? String(e.stack).split('\n').slice(0, 4).join('\n') : null
+    }));
+    return null;
+  }
+}
+
 async function renderReferencePdfToPng(pdfPath, workDir) {
-  const base = path.basename(pdfPath, path.extname(pdfPath)).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const base = path.basename(pdfPath, path.extname(pdfPath))
+    .replace(/[^a-zA-Z0-9_-]/g, '_');
+
   const outPrefix = path.join(workDir, `__vf_${base}`);
   const outPng = `${outPrefix}-1.png`;
 
+  // 1) Vercel uyumlu PDF.js + @napi-rs/canvas
+  const canvasRendered = await renderPdfWithCanvas(pdfPath, outPng);
+  if (canvasRendered) return canvasRendered;
+
+  // 2) pdftoppm fallback
   try {
     const { execFile } = await import('child_process');
     const { promisify } = await import('util');
     const execFileAsync = promisify(execFile);
-    await execFileAsync('pdftoppm', ['-f','1','-singlefile','-png','-r','110',pdfPath,outPrefix], { timeout: 20000 });
-    await fs.access(outPng);
-    return outPng;
-  } catch {}
 
+    console.log('PDF RENDER PDftoppm BAŞLADI:', path.basename(pdfPath));
+
+    await execFileAsync(
+      'pdftoppm',
+      ['-f', '1', '-singlefile', '-png', '-r', '110', pdfPath, outPrefix],
+      { timeout: 20000 }
+    );
+
+    await fs.access(outPng);
+
+    console.log('PDF RENDER PDftoppm BAŞARILI:', path.basename(pdfPath));
+    return outPng;
+  } catch (e) {
+    console.warn('PDF RENDER PDftoppm HATASI:', JSON.stringify({
+      file: path.basename(pdfPath),
+      error: e?.message || String(e),
+      code: e?.code || null,
+      stderr: e?.stderr ? String(e.stderr).slice(0, 1000) : null
+    }));
+  }
+
+  // 3) ImageMagick fallback
   try {
     const { execFile } = await import('child_process');
     const { promisify } = await import('util');
     const execFileAsync = promisify(execFile);
-    await execFileAsync('magick', ['-density','110',`${pdfPath}[0]`,outPng], { timeout: 20000 });
-    await fs.access(outPng);
-    return outPng;
-  } catch {}
 
+    console.log('PDF RENDER MAGICK BAŞLADI:', path.basename(pdfPath));
+
+    await execFileAsync(
+      'magick',
+      ['-density', '110', `${pdfPath}[0]`, outPng],
+      { timeout: 20000 }
+    );
+
+    await fs.access(outPng);
+
+    console.log('PDF RENDER MAGICK BAŞARILI:', path.basename(pdfPath));
+    return outPng;
+  } catch (e) {
+    console.warn('PDF RENDER MAGICK HATASI:', JSON.stringify({
+      file: path.basename(pdfPath),
+      error: e?.message || String(e),
+      code: e?.code || null,
+      stderr: e?.stderr ? String(e.stderr).slice(0, 1000) : null
+    }));
+  }
+
+  console.warn('PDF RENDER TAMAMEN BAŞARISIZ:', path.basename(pdfPath));
   return null;
 }
 
