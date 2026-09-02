@@ -3537,17 +3537,98 @@ if (d <= 0.15) return 5;
 return 0;
 }
 
+// =====================================================
+// REFERANS ODAKLI TUTAR SEÇİMİ
+// =====================================================
+// Referansın "amount" alanı varsa, gerçek JPG'deki tutarı yalnızca
+// genel OCR puanına bırakma. Önce referansın normalize konumuna,
+// ardından aynı satırdaki tutar etiketine bak. Bu sayede müşteri no,
+// sorgu no, işlem ref gibi rakamlar tutarın önüne geçemez.
+let referenceAmountField = null;
+try {
+  const referenceProfile = await buildReferenceTemplateProfile(bank);
+  referenceAmountField = referenceProfile?.fields?.amount || null;
+} catch (error) {
+  console.warn("REFERENCE GUIDED AMOUNT PROFILE HATASI:", error?.message || error);
+}
+
+function amountLabelEvidence(group) {
+  const gx1 = Number(group.region.x1) || 0;
+  const gy1 = Number(group.region.y1) || 0;
+  const gx2 = Number(group.region.x2) || 0;
+  const gy2 = Number(group.region.y2) || 0;
+  const gh = Math.max(8, gy2 - gy1);
+  let score = 0;
+  const positive = [];
+  const negative = [];
+
+  for (const item of ocrResult.regions) {
+    if (!item?.text || !validRegion(item.region)) continue;
+    const text = cleanAmountText(item.text);
+    if (!text) continue;
+
+    const ix1 = Number(item.region.x1) || 0;
+    const iy1 = Number(item.region.y1) || 0;
+    const ix2 = Number(item.region.x2) || 0;
+    const iy2 = Number(item.region.y2) || 0;
+    const ih = Math.max(8, iy2 - iy1);
+    const sameLine = Math.abs(((iy1 + iy2) / 2) - ((gy1 + gy2) / 2)) <= Math.max(14, Math.min(gh, ih) * 0.9);
+    const leftOfAmount = ix2 <= gx1 + 8;
+    const close = gx1 - ix2 <= Math.max(360, gh * 14);
+    const aboveClose = iy2 <= gy1 + 8 && gy1 - iy2 <= Math.max(55, gh * 4);
+
+    if (sameLine && leftOfAmount && close && /giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar/i.test(text)) {
+      score += 260;
+      positive.push(text);
+    } else if (sameLine && leftOfAmount && close && /(?:tutar|amount|para\s*cinsi)/i.test(text)) {
+      score += 150;
+      positive.push(text);
+    }
+
+    if (sameLine && leftOfAmount && close && /(?:müşteri\s*no|musteri\s*no|işlem\s*ref|işlem\s*no|islem\s*no|fiş\s*no|fis\s*no|referans|sorgu\s*no|seri\s*no|sıra\s*no|sira\s*no|hesap\s*no|iban|tckn|vergi\s*no)/i.test(text)) {
+      score -= 140;
+      negative.push(text);
+    }
+
+    if (aboveClose && /(?:giden\s*fast\s*tutar|tutar|amount)/i.test(text)) {
+      score += 70;
+      positive.push(text);
+    }
+  }
+
+  return { score, positive, negative };
+}
+
+function referenceAmountPositionScore(group) {
+  if (!referenceAmountField || !image?.width || !image?.height) return 0;
+  const cx = (Number(group.region.x1) + Number(group.region.x2)) / 2 / image.width;
+  const cy = (Number(group.region.y1) + Number(group.region.y2)) / 2 / image.height;
+  const refCx = Number(referenceAmountField.xNorm || 0) + Number(referenceAmountField.widthNorm || 0) / 2;
+  const refCy = Number(referenceAmountField.yNorm || 0) + Number(referenceAmountField.heightNorm || 0) / 2;
+  const d = Math.sqrt(Math.pow(cx - refCx, 2) + Math.pow(cy - refCy, 2));
+  if (d <= 0.018) return 260;
+  if (d <= 0.035) return 210;
+  if (d <= 0.055) return 150;
+  if (d <= 0.080) return 85;
+  if (d <= 0.120) return 30;
+  return 0;
+}
+
 const rankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
 const context = nearbyContextScore(group);
 const anchor = anchorContextScore(group);
 const templateScore = templatePositionScore(group);
+const labelEvidence = amountLabelEvidence(group);
+const referencePositionScore = referenceAmountPositionScore(group);
 return {
 ...group,
-amountCandidateScore: baseScore + context.score + anchor.score + templateScore,
+amountCandidateScore: baseScore + context.score + anchor.score + templateScore + labelEvidence.score + referencePositionScore,
 context,
 anchor,
 templateScore,
+labelEvidence,
+referencePositionScore,
 };
 }).sort((a, b) => {
 if (b.amountCandidateScore !== a.amountCandidateScore) return b.amountCandidateScore - a.amountCandidateScore;
@@ -3567,15 +3648,27 @@ const rawRegion = candidate.region;
 
 console.log(
 "AMOUNT CANDIDATE RANKING:",
-JSON.stringify(rankedCandidates.slice(0, 8).map((item) => ({
+JSON.stringify(rankedCandidates.slice(0, 10).map((item) => ({
 text: item.text,
 signal: item.signal,
 amountCandidateScore: item.amountCandidateScore,
 templateScore: item.templateScore || 0,
+referencePositionScore: item.referencePositionScore || 0,
+amountLabelScore: item.labelEvidence?.score || 0,
+amountLabel: item.labelEvidence?.positive || [],
 anchorContext: item.anchor?.anchors || [],
 positiveContext: item.context?.positive || [],
-negativeContext: item.context?.negative || [],
+negativeContext: [...(item.context?.negative || []), ...(item.labelEvidence?.negative || [])],
 })))
+);
+
+console.log(
+"REFERENCE GUIDED AMOUNT:",
+JSON.stringify({
+referenceAmountField,
+selectedText: candidate.text,
+selectionMethod: referenceAmountField ? "reference-position-plus-label" : "legacy-scoring"
+})
 );
 
 const rawWidth = Math.max(1, Number(rawRegion.x2) - Number(rawRegion.x1));
@@ -4170,7 +4263,15 @@ maxFeatureVotes: maxScore,
 templateBank: referenceAnchor?.bank || null,
 templateAmountText: referenceAnchor?.amountText || null,
 templatePositionScore: Number(candidate.templateScore || 0),
+referenceGuided: Boolean(referenceAmountField),
+referenceGuidedSelection: referenceAmountField ? "reference-position-plus-label" : "legacy-scoring",
+referenceAmountPositionScore: Number(candidate.referencePositionScore || 0),
+amountLabelScore: Number(candidate.labelEvidence?.score || 0),
+amountLabelEvidence: candidate.labelEvidence?.positive || [],
 },
+selectionMethod: referenceAmountField ? "reference-position-plus-label" : "legacy-scoring",
+selectedAmountText: candidate.text,
+referenceAmountText: referenceAmountField?.label || null,
 segmentFeatures: features.map((feature, index) => ({
 index,
 width: Number(feature.width.toFixed(2)),
@@ -7366,6 +7467,25 @@ return text;
 if (result?.documentData) {
 result.documentData.amount =
 preserveAmount(result.documentData.amount);
+
+// Referans + güçlü tutar etiketi birlikte doğrulanmışsa AI'ın seçtiği
+// başka bir sayının tekrar tutar olarak kullanılmasına izin verme.
+// Eksi işareti dekontta çıkış yönünü gösterir; documentData.amount
+// tutarın büyüklüğünü korur.
+if (
+  amountForensics?.selectionMethod === "reference-position-plus-label" &&
+  amountForensics?.selectedAmountText
+) {
+  const selected = String(amountForensics.selectedAmountText)
+    .trim()
+    .replace(/^[+\-(]+/, "")
+    .replace(/[)]+$/, "")
+    .trim();
+  if (selected) {
+    result.documentData.amount = selected;
+    console.log("REFERENCE GUIDED DOCUMENT AMOUNT:", selected);
+  }
+}
 }
 
 if (amountForensics) {
