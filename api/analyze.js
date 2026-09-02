@@ -1,4 +1,3 @@
-// VERIFYDOC ANALYZE 8 - syntax-safe amount selection patch
 import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
@@ -2801,10 +2800,10 @@ return JSON.parse(JSON.stringify(cached));
 }
 
 const moneyPattern =
-/^(?:[+()-]?\s*(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?|[+()-]?\s*(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?)$/i;
+/(?:₺|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?|(?:₺|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})?(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?/i;
 
 const numericOnlyPattern =
-/^[-+()]?[₺€$£]?\s*[0-9][0-9.,\s]*\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?$/i;
+/^[₺€$£]?\s*[0-9][0-9.,\s]*\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
 
 function validRegion(region) {
 return !!(
@@ -2827,112 +2826,13 @@ return String(value || "")
 function numericSignal(text) {
 const value = cleanAmountText(text);
 if (!value) return 0;
-
-const anchoredMoneyPattern =
-/^[-+()]?(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*\)?$/i;
-
-const anchoredDecimalPattern =
-/^[-+()]?(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*\)?$/i;
-
+const anchoredMoneyPattern = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?$/i;
+const anchoredDecimalPattern = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
 if (anchoredDecimalPattern.test(value)) return 9;
 if (anchoredMoneyPattern.test(value) && /[,\.]\d{1,2}/.test(value)) return 8;
 if (anchoredMoneyPattern.test(value) && /\d/.test(value)) return 5;
 if (numericOnlyPattern.test(value)) return 3;
 return 0;
-}
-
-// =====================================================
-// ETİKET BAZLI ANA TUTAR TESPİTİ
-// =====================================================
-// OCR'ın "MÜŞTERİ NO", "İŞLEM REF", IBAN vb. sayıları tutar
-// sanmasını engellemek için önce tutar etiketini bul.
-// Özellikle Yapı Kredi FAST dekontlarında:
-//   GİDEN FAST TUTARI : -1000
-// satırı, ana işlem tutarı için birincil kaynaktır.
-const AMOUNT_LABEL_RULES = [
-{ pattern: /giden\s+fast\s+tutar[ıi]/i, score: 220 },
-{ pattern: /gönderilen\s+(?:fast\s+)?tutar[ıi]/i, score: 210 },
-{ pattern: /transfer\s+tutar[ıi]/i, score: 200 },
-{ pattern: /işlem\s+tutar[ıi]/i, score: 190 },
-{ pattern: /islem\s+tutar[ıi]/i, score: 190 },
-{ pattern: /ana\s+tutar/i, score: 180 },
-{ pattern: /gönderim\s+tutar[ıi]/i, score: 175 },
-{ pattern: /giden\s+tutar[ıi]/i, score: 175 },
-{ pattern: /\btutar[ıi]\b/i, score: 120 },
-];
-
-const NON_AMOUNT_LABEL_RULE =
-/müşteri\s*no|customer\s*no|işlem\s*ref|islem\s*ref|işlem\s*no|islem\s*no|fiş\s*no|fis\s*no|sorgu\s*no|sorgu|referans|seri\s*no|sıra\s*no|sira\s*no|belge\s*(?:no|numarası|numarasi)|iban|hesap\s*no|hesap\s*numarası|hesap\s*numarasi|tckn|vergi\s*no/i;
-
-function amountLabelContext(group) {
-const gx1 = Number(group?.region?.x1) || 0;
-const gy1 = Number(group?.region?.y1) || 0;
-const gx2 = Number(group?.region?.x2) || 0;
-const gy2 = Number(group?.region?.y2) || 0;
-const gh = Math.max(8, gy2 - gy1);
-
-const items = ocrResult.regions
-.filter((item) => item?.text && validRegion(item?.region))
-.map((item) => ({
-text: cleanAmountText(item.text),
-x1: Number(item.region.x1),
-y1: Number(item.region.y1),
-x2: Number(item.region.x2),
-y2: Number(item.region.y2),
-}))
-.filter((item) => item.x2 <= gx1 + Math.max(20, gh * 0.8))
-.filter((item) => {
-const overlap = Math.min(gy2, item.y2) - Math.max(gy1, item.y1);
-return overlap >= -Math.max(10, gh * 0.8);
-})
-.filter((item) => {
-const gap = gx1 - item.x2;
-return gap >= -5 && gap <= Math.max(520, gh * 16);
-})
-.sort((a, b) => a.x1 - b.x1);
-
-let best = { score: 0, label: null };
-
-for (const item of items) {
-for (const rule of AMOUNT_LABEL_RULES) {
-if (rule.pattern.test(item.text)) {
-let score = rule.score;
-if (/toplam\s+işlem\s+tutar[ıi]|toplam\s+islem\s+tutar[ıi]/i.test(item.text)) {
-score -= 90;
-}
-if (score > best.score) {
-best = { score, label: item.text };
-}
-}
-}
-}
-
-// OCR etiketi birkaç kutuya bölmüşse, aynı satırdaki sol metinleri
-// birleştirerek tekrar dene.
-for (let i = 0; i < items.length; i++) {
-let combined = "";
-for (let j = i; j < items.length; j++) {
-if (j > i && items[j].x1 - items[j - 1].x2 > Math.max(45, gh * 2.8)) break;
-combined = `${combined} ${items[j].text}`.trim();
-
-for (const rule of AMOUNT_LABEL_RULES) {
-if (rule.pattern.test(combined)) {
-let score = rule.score - 5;
-if (/toplam\s+işlem\s+tutar[ıi]|toplam\s+islem\s+tutar[ıi]/i.test(combined)) {
-score -= 90;
-}
-if (score > best.score) {
-best = { score, label: combined };
-}
-}
-}
-}
-
-if (NON_AMOUNT_LABEL_RULE.test(items.map((x) => x.text).join(" "))) {
-best.score -= 10;
-}
-
-return best;
 }
 
 const rawCandidates =
@@ -3210,23 +3110,12 @@ const rankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
 const context = nearbyContextScore(group);
 const anchor = anchorContextScore(group);
-const labelContext = amountLabelContext(group);
 const templateScore = templatePositionScore(group);
-
-// Etiket bulunduğunda bu sinyal diğer tüm genel OCR sinyallerinden
-// bilinçli olarak çok daha güçlüdür. Böylece müşteri no / işlem ref
-// gibi uzun rakamlar, sırf OCR onları daha temiz okudu diye tutarı geçemez.
 return {
 ...group,
-amountCandidateScore:
-baseScore +
-context.score +
-anchor.score +
-templateScore +
-labelContext.score,
+amountCandidateScore: baseScore + context.score + anchor.score + templateScore,
 context,
 anchor,
-labelContext,
 templateScore,
 };
 }).sort((a, b) => {
@@ -3245,19 +3134,6 @@ return String(a.text).localeCompare(String(b.text));
 const candidate = rankedCandidates[0];
 const rawRegion = candidate.region;
 
-const hasStrongAmountLabel =
-Number(candidate?.labelContext?.score || 0) >= 170;
-
-console.log(
-"DETERMINISTIC AMOUNT SELECTION:",
-JSON.stringify({
-amountText: candidate?.text || null,
-label: candidate?.labelContext?.label || null,
-labelScore: candidate?.labelContext?.score || 0,
-selectionMethod: hasStrongAmountLabel ? "label" : "ranked-ocr",
-})
-);
-
 console.log(
 "AMOUNT CANDIDATE RANKING:",
 JSON.stringify(rankedCandidates.slice(0, 8).map((item) => ({
@@ -3268,8 +3144,6 @@ templateScore: item.templateScore || 0,
 anchorContext: item.anchor?.anchors || [],
 positiveContext: item.context?.positive || [],
 negativeContext: item.context?.negative || [],
-amountLabel: item.labelContext?.label || null,
-amountLabelScore: item.labelContext?.score || 0,
 })))
 );
 
@@ -3840,9 +3714,6 @@ severity,
 score,
 fileFingerprint: fileFingerprint || currentFileFingerprint,
 amountText: candidate.text,
-selectionMethod: hasStrongAmountLabel ? "label" : "ranked-ocr",
-amountLabel: candidate?.labelContext?.label || null,
-amountLabelScore: Number(candidate?.labelContext?.score || 0),
 region: {
 ...rawRegion,
 pageIndex: candidate.pageIndex,
@@ -7030,36 +6901,6 @@ return text;
 if (result?.documentData) {
 result.documentData.amount =
 preserveAmount(result.documentData.amount);
-}
-
-// Etiket bazlı deterministik seçim yapıldıysa AI'ın aynı dekontta
-// farklı bir sayısal alanı "amount" olarak seçmesine izin verme.
-// Yapı Kredi FAST örneğinde bu değer:
-// GİDEN FAST TUTARI : -1000
-// şeklinde gelir; burada işleme ait tutar 1000 TL'dir.
-if (
-result?.documentData &&
-amountForensics?.selectionMethod === "label" &&
-amountForensics?.amountText
-) {
-const deterministicAmountText =
-String(amountForensics.amountText)
-.trim()
-.replace(/^[-+]/, "")
-.replace(/^\((.*)\)$/, "$1")
-.trim();
-
-if (deterministicAmountText) {
-result.documentData.amount =
-deterministicAmountText;
-
-console.log(
-"DETERMINISTIC DOCUMENT AMOUNT:",
-result.documentData.amount,
-"FROM LABEL:",
-amountForensics.amountLabel
-);
-}
 }
 
 if (amountForensics) {
