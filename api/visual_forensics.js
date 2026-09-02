@@ -3,7 +3,7 @@ import path from 'path';
 import sharp from 'sharp';
 
 // =====================================================
-// VERIFYDOC VISUAL FORENSICS HELPER v2 - PDFJS RENDER + DIAGNOSTIC LOGS
+// VERIFYDOC VISUAL FORENSICS HELPER v3 - PDFJS CANVAS FACTORY
 // =====================================================
 // Amaç: Güvenilen referans GÖRSELLERİ ile yeni JPG/PNG'yi
 // bütün sayfa seviyesinde karşılaştırmak.
@@ -50,25 +50,61 @@ async function renderPdfWithCanvas(pdfPath, outPath) {
     );
 
     const viewport = page.getViewport({ scale });
-    const canvas = createCanvas(
+
+    const canvasFactory = {
+      create(width, height) {
+        const canvas = createCanvas(width, height);
+        const context = canvas.getContext('2d');
+
+        if (!context) {
+          throw new Error('Canvas 2D context oluşturulamadı');
+        }
+
+        return { canvas, context };
+      },
+
+      reset(data, width, height) {
+        data.canvas.width = width;
+        data.canvas.height = height;
+        data.context = data.canvas.getContext('2d');
+
+        if (!data.context) {
+          throw new Error('Canvas 2D context reset edilemedi');
+        }
+      },
+
+      destroy(data) {
+        if (data?.canvas) {
+          data.canvas.width = 1;
+          data.canvas.height = 1;
+        }
+
+        if (data) {
+          data.canvas = null;
+          data.context = null;
+        }
+      }
+    };
+
+    const canvasAndContext = canvasFactory.create(
       Math.ceil(viewport.width),
       Math.ceil(viewport.height)
     );
 
-    const ctx = canvas.getContext('2d');
-
     await page.render({
-      canvasContext: ctx,
-      viewport
+      canvasContext: canvasAndContext.context,
+      viewport,
+      canvasFactory
     }).promise;
 
-    const png = canvas.toBuffer('image/png');
+    const png = canvasAndContext.canvas.toBuffer('image/png');
+
     await fs.writeFile(outPath, png);
     await fs.access(outPath);
 
     console.log('PDF RENDER PDFJS BAŞARILI:', JSON.stringify({
       file: path.basename(pdfPath),
-      method: 'pdfjs-napi-canvas',
+      method: 'pdfjs-napi-canvas-factory',
       width: Math.ceil(viewport.width),
       height: Math.ceil(viewport.height)
     }));
@@ -79,8 +115,11 @@ async function renderPdfWithCanvas(pdfPath, outPath) {
       file: path.basename(pdfPath),
       error: e?.message || String(e),
       name: e?.name || null,
-      stack: e?.stack ? String(e.stack).split('\n').slice(0, 4).join('\n') : null
+      stack: e?.stack
+        ? String(e.stack).split('\n').slice(0, 6).join('\n')
+        : null
     }));
+
     return null;
   }
 }
