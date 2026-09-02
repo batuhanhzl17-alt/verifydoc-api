@@ -2704,12 +2704,11 @@ count,
 }
 
 // =====================================================
-// TUTAR FORENSICS — KARAKTER DÜZEYİ GÖRSEL KONTROL
+// TUTAR FORENSICS V2 — MİKRO GÖRSEL KARAKTER KONTROLÜ
 // =====================================================
-// PaddleOCR bounding-box verisini kullanarak tutar alanını
-// görüntüden yeniden kontrol eder. Bu kontrol tek başına
-// sahtecilik kanıtı değildir; yalnızca lokal görsel
-// tutarsızlık sinyali üretir.
+// PaddleOCR kutularını ve gerçek piksel verisini birlikte kullanır.
+// Amaç: tutarın içindeki tek/az sayıdaki karakterin diğerlerinden
+// farklı render edilmesini yakalamaktır. Tek başına sahtecilik kanıtı değildir.
 async function analyzeAmountForensics(
 filePath,
 ocrResult
@@ -2721,478 +2720,566 @@ if (
 !Array.isArray(ocrResult?.regions) ||
 !ocrResult.regions.length
 ) {
+if (!filePath || !ocrResult?.success || !Array.isArray(ocrResult?.regions) || !ocrResult.regions.length) {
 return null;
+}
 }
 
 const moneyPattern =
-/(?:\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2}))(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?/i;
+/(?:₺|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?|(?:₺|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})?(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?/i;
 
-const candidates =
+const numericOnlyPattern =
+/^[₺€$£]?\s*[0-9][0-9.,\s]*\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
+
+function validRegion(region) {
+return !!(
+region &&
+Number.isFinite(Number(region.x1)) &&
+Number.isFinite(Number(region.y1)) &&
+Number.isFinite(Number(region.x2)) &&
+Number.isFinite(Number(region.y2)) &&
+Number(region.x2) > Number(region.x1) &&
+Number(region.y2) > Number(region.y1)
+);
+}
+
+function cleanAmountText(value) {
+return String(value || "")
+.replace(/\s+/g, " ")
+.trim();
+}
+
+function numericSignal(text) {
+const value = cleanAmountText(text);
+if (!value) return 0;
+if (moneyPattern.test(value)) return 5;
+if (numericOnlyPattern.test(value) && /\d/.test(value)) return 3;
+return 0;
+}
+
+const rawCandidates =
 ocrResult.regions
-.filter((item) =>
-item?.region &&
-moneyPattern.test(
-String(item.text || "")
-)
-)
-.sort((a, b) => {
-const aScore = Number(a.score) || 0;
-const bScore = Number(b.score) || 0;
-return bScore - aScore;
-});
+.filter((item) => validRegion(item?.region))
+.map((item) => ({
+...item,
+text: cleanAmountText(item.text),
+score: Number(item.score) || 0,
+}))
+.filter((item) => numericSignal(item.text) > 0);
 
-if (!candidates.length) {
+if (!rawCandidates.length) {
 return {
-available:
-false,
-status:
-"unknown",
-severity:
-"none",
-score:
-0,
-amountText:
-null,
-region:
-null,
-characterCount:
-0,
+available: false,
+status: "unknown",
+severity: "none",
+score: 0,
+amountText: null,
+region: null,
+characterCount: 0,
 metrics: {
-medianDarkness:
-null,
-maxLocalDarknessDifference:
-null,
-localAnomalyRatio:
-null,
+medianInkRatio: null,
+maxInkRatioDifference: null,
+maxStrokeProxyDifference: null,
+maxEdgeDensityDifference: null,
+localAnomalyRatio: null,
 },
 evidence:
 "Tutar benzeri OCR alanı bulunamadığı için karakter düzeyinde görsel tutarlılık kontrolü yapılamadı.",
 };
 }
 
+// Paddle bazen tutarı tek kutu yerine "1.700" + ",00" veya
+// "1.700," + "00" gibi komşu kutulara bölebilir. Aynı satırdaki
+// yakın sayısal kutuları birleştirerek tam tutar alanını oluştur.
+function buildCandidateGroups(items) {
+const groups = [];
+const sorted = [...items].sort((a, b) => {
+const ay = Number(a.region.y1) || 0;
+const by = Number(b.region.y1) || 0;
+if (Math.abs(ay - by) > 12) return ay - by;
+return (Number(a.region.x1) || 0) - (Number(b.region.x1) || 0);
+});
+
+for (const item of sorted) {
+let best = null;
+let bestGap = Infinity;
+
+for (const group of groups) {
+const g = group.region;
+const itemTop = Number(item.region.y1);
+const itemBottom = Number(item.region.y2);
+const groupHeight = Math.max(1, Number(g.y2) - Number(g.y1));
+const verticalTolerance = Math.max(10, groupHeight * 0.65);
+const verticalOverlap =
+Math.min(Number(g.y2), itemBottom) -
+Math.max(Number(g.y1), itemTop);
+
+if (verticalOverlap < -verticalTolerance) continue;
+
+const gap =
+Number(item.region.x1) > Number(g.x2)
+? Number(item.region.x1) - Number(g.x2)
+: Number(g.x1) - Number(item.region.x2);
+
+// Uzak kutuları birleştirme. Yüksek çözünürlüklü dekontlarda
+// 60px'e kadar boşluk, küçük görüntülerde daha azı kabul edilir.
+const maxGap = Math.max(24, Math.min(90, groupHeight * 2.2));
+if (gap <= maxGap && gap < bestGap) {
+best = group;
+bestGap = gap;
+}
+}
+
+if (!best) {
+groups.push({
+items: [item],
+text: item.text,
+score: item.score,
+region: {...item.region},
+pageIndex: item.pageIndex,
+});
+continue;
+}
+
+best.items.push(item);
+best.items.sort(
+(a, b) => Number(a.region.x1) - Number(b.region.x1)
+);
+best.text = best.items.map((x) => x.text).join("");
+best.score =
+best.items.reduce((sum, x) => sum + (Number(x.score) || 0), 0) / best.items.length;
+best.region = {
+x1: Math.min(...best.items.map((x) => Number(x.region.x1))),
+y1: Math.min(...best.items.map((x) => Number(x.region.y1))),
+x2: Math.max(...best.items.map((x) => Number(x.region.x2))),
+y2: Math.max(...best.items.map((x) => Number(x.region.y2))),
+};
+}
+
+return groups;
+}
+
+const groups = buildCandidateGroups(rawCandidates)
+.map((group) => ({
+...group,
+text: cleanAmountText(group.text),
+signal: numericSignal(group.text),
+}))
+.filter((group) => group.signal > 0)
+.sort((a, b) => {
+if (b.signal !== a.signal) return b.signal - a.signal;
+const ad = /[,\.][0-9]{1,2}/.test(a.text) ? 1 : 0;
+const bd = /[,\.][0-9]{1,2}/.test(b.text) ? 1 : 0;
+if (bd !== ad) return bd - ad;
+return (b.score || 0) - (a.score || 0);
+});
+
+if (!groups.length) {
+return {
+available: false,
+status: "unknown",
+severity: "none",
+score: 0,
+amountText: null,
+region: null,
+characterCount: 0,
+metrics: {},
+evidence: "Tutar alanı oluşturulamadı.",
+};
+}
+
+const candidate = groups[0];
+const rawRegion = candidate.region;
+
 let image;
-
 try {
-image =
-await sharp(filePath)
-.grayscale()
-.raw()
-.toBuffer({
-resolveWithObject:
-true,
-});
-}
-catch (error) {
+const meta = await sharp(filePath).metadata();
+if (!meta?.width || !meta?.height) throw new Error("Görüntü boyutu alınamadı.");
+image = {width: meta.width, height: meta.height};
+} catch (error) {
 return {
-available:
-false,
-status:
-"unknown",
-severity:
-"none",
-score:
-0,
-amountText:
-String(candidates[0].text || ""),
-region:
-candidates[0].region,
-characterCount:
-0,
-metrics: {
-medianDarkness:
-null,
-maxLocalDarknessDifference:
-null,
-localAnomalyRatio:
-null,
-},
-evidence:
-"Tutar alanı bulundu ancak görüntü piksel analizi yapılamadı.",
+available: false,
+status: "unknown",
+severity: "none",
+score: 0,
+amountText: candidate.text,
+region: rawRegion,
+characterCount: 0,
+metrics: {},
+evidence: "Tutar alanı bulundu ancak görüntü boyut bilgisi alınamadı.",
 };
 }
 
-const candidate =
-candidates[0];
+const left = Math.max(0, Math.floor(rawRegion.x1));
+const top = Math.max(0, Math.floor(rawRegion.y1));
+const right = Math.min(image.width, Math.ceil(rawRegion.x2));
+const bottom = Math.min(image.height, Math.ceil(rawRegion.y2));
 
-const rawRegion =
-candidate.region;
+const width = right - left;
+const height = bottom - top;
 
-const left =
-Math.max(0, Math.floor(rawRegion.x1));
-const top =
-Math.max(0, Math.floor(rawRegion.y1));
-const right =
-Math.min(image.info.width, Math.ceil(rawRegion.x2));
-const bottom =
-Math.min(image.info.height, Math.ceil(rawRegion.y2));
-
-const width =
-right - left;
-const height =
-bottom - top;
-
-if (
-width < 8 ||
-height < 5
-) {
+if (width < 12 || height < 6) {
 return {
-available:
-false,
-status:
-"unknown",
-severity:
-"none",
-score:
-0,
-amountText:
-String(candidate.text || ""),
-region:
-rawRegion,
-characterCount:
-0,
-metrics: {
-medianDarkness:
-null,
-maxLocalDarknessDifference:
-null,
-localAnomalyRatio:
-null,
-},
-evidence:
-"Tutar alanı bulundu ancak piksel analizi için yeterli çözünürlük yok.",
+available: true,
+status: "unknown",
+severity: "none",
+score: 0,
+amountText: candidate.text,
+region: rawRegion,
+characterCount: 0,
+metrics: {},
+evidence: "Tutar alanı bulundu ancak piksel analizi için yeterli çözünürlük yok.",
 };
 }
 
-const crop =
-await sharp(filePath)
+let crop;
+try {
+crop = await sharp(filePath)
 .grayscale()
-.extract({
-left,
-top,
-width,
-height,
-})
+.extract({left, top, width, height})
 .raw()
-.toBuffer({
-resolveWithObject:
-true,
-});
+.toBuffer({resolveWithObject: true});
+} catch (error) {
+return {
+available: false,
+status: "unknown",
+severity: "none",
+score: 0,
+amountText: candidate.text,
+region: rawRegion,
+characterCount: 0,
+metrics: {},
+evidence: "Tutar alanı bulundu ancak piksel analizi yapılamadı.",
+};
+}
 
 const data = crop.data;
 const w = crop.info.width;
 const h = crop.info.height;
 
+// Küçük bir üst/alt kenar payını kaldır. Böylece OCR kutusunun
+// etrafındaki arka plan ölçümü bozmaz.
+const padY = Math.max(0, Math.floor(h * 0.08));
+const yStart = padY;
+const yEnd = Math.max(yStart + 1, h - padY);
+
+const columnInk = [];
 const columnDarkness = [];
+const columnEdge = [];
 
-for (
-let x = 0;
-x < w;
-x++
-) {
-
-let ink = 0;
+for (let x = 0; x < w; x++) {
+let ink220 = 0;
+let darknessSum = 0;
+let edgeSum = 0;
 let count = 0;
 
-for (
-let y = 0;
-y < h;
-y++
-) {
+for (let y = yStart; y < yEnd; y++) {
+const idx = y * w + x;
+const value = data[idx];
 
-const value =
-data[y * w + x];
-
-if (
-value < 185
-) {
-ink +=
-255 - value;
+if (value < 220) ink220++;
+if (value < 185) {
+darknessSum += 255 - value;
 count++;
 }
 
+if (y > yStart) {
+const prev = data[(y - 1) * w + x];
+edgeSum += Math.abs(value - prev);
+}
 }
 
-columnDarkness.push(
-count
-?
-ink / count
-:
-0
-);
+const pixels = Math.max(1, yEnd - yStart);
+columnInk.push(ink220 / pixels);
+columnDarkness.push(count ? darknessSum / count : 0);
+columnEdge.push(edgeSum / pixels);
 }
 
-// Karakterler arasındaki boşlukları kullanarak yaklaşık
-// karakter segmentleri oluştur.
-const active =
-columnDarkness.map(
-(value) => value > 18
-);
+// Karakter aralarını belirlemek için iki sinyal kullanılır.
+// Tek bir koyuluk eşiğine bağlı kalmak önceki sürümdeki false-negative
+// problemini azaltır.
+const inkActive = columnInk.map((v) => v > 0.035);
+const darkActive = columnDarkness.map((v) => v > 10);
+const active = columnInk.map((v, i) => v > 0.035 || darkActive[i]);
+
+// 1-2 piksellik kopuklukları doldur.
+for (let i = 1; i < active.length - 1; i++) {
+if (!active[i] && active[i - 1] && active[i + 1]) active[i] = true;
+}
 
 const segments = [];
-let segmentStart = null;
+let segStart = null;
 
-for (
-let x = 0;
-x < active.length;
-x++
-) {
+for (let x = 0; x < active.length; x++) {
+if (active[x] && segStart === null) segStart = x;
 
-if (
-active[x] &&
-segmentStart === null
-) {
-segmentStart = x;
+const endNow =
+segStart !== null &&
+(!active[x] || x === active.length - 1);
+
+if (endNow) {
+const end = active[x] ? x + 1 : x;
+if (end - segStart >= 2) {
+segments.push({start: segStart, end});
+}
+segStart = null;
+}
 }
 
-const isEnd =
-segmentStart !== null &&
-(
-!active[x] ||
-x === active.length - 1
-);
-
-if (
-isEnd
-) {
-
-const end =
-active[x]
-?
-x + 1
-:
-x;
-
-if (
-end - segmentStart >= 1
-) {
-segments.push({
-start:
-segmentStart,
-end,
+// Çok dar noktaları temizle; fakat virgül/nokta gibi işaretlerin
+// tamamen kaybolmasına izin verme.
+const filteredSegments = segments.filter((segment) => {
+const sw = segment.end - segment.start;
+return sw >= 2 && sw <= Math.max(4, Math.floor(w * 0.35));
 });
-}
 
-segmentStart = null;
-}
-}
-
-// Çok küçük gürültü segmentlerini at.
-const filteredSegments =
-segments.filter(
-(segment) =>
-(segment.end - segment.start) >= 1
-);
-
-if (
-filteredSegments.length < 4
-) {
+if (filteredSegments.length < 4) {
 return {
-available:
-true,
-status:
-"unknown",
-severity:
-"none",
-score:
-0,
-amountText:
-String(candidate.text || ""),
-region: {
-...rawRegion,
-pageIndex:
-candidate.pageIndex,
-},
-characterCount:
-filteredSegments.length,
-metrics: {
-medianDarkness:
-null,
-maxLocalDarknessDifference:
-null,
-localAnomalyRatio:
-null,
-},
-evidence:
-"Tutar alanında güvenilir karakter karşılaştırması için yeterli ayrı segment bulunamadı.",
+available: true,
+status: "unknown",
+severity: "none",
+score: 0,
+amountText: candidate.text,
+region: {...rawRegion, pageIndex: candidate.pageIndex},
+characterCount: filteredSegments.length,
+metrics: {},
+evidence: "Tutar alanında güvenilir karakter karşılaştırması için yeterli ayrı karakter bölgesi bulunamadı.",
 };
 }
 
-const segmentValues =
-filteredSegments.map(
-(segment) => {
-let total = 0;
-let count = 0;
+function segmentMetrics(segment) {
+let inkCount220 = 0;
+let inkCount200 = 0;
+let inkCount160 = 0;
+let darkTotal = 0;
+let darkCount = 0;
+let edgeTotal = 0;
+let pixelCount = 0;
+let minY = h;
+let maxY = -1;
 
-for (
-let x = segment.start;
-x < segment.end;
-x++
-) {
-const value =
-columnDarkness[x];
-if (value > 0) {
-total += value;
-count++;
+for (let x = segment.start; x < segment.end; x++) {
+for (let y = yStart; y < yEnd; y++) {
+const value = data[y * w + x];
+pixelCount++;
+if (value < 220) {
+inkCount220++;
+minY = Math.min(minY, y);
+maxY = Math.max(maxY, y);
+}
+if (value < 200) inkCount200++;
+if (value < 160) inkCount160++;
+if (value < 185) {
+darkTotal += 255 - value;
+darkCount++;
+}
+if (y > yStart) {
+edgeTotal += Math.abs(value - data[(y - 1) * w + x]);
 }
 }
-
-return count
-?
-total / count
-:
-0;
 }
-).filter(
-(value) => Number.isFinite(value) && value > 0
-);
 
-if (
-segmentValues.length < 4
-) {
+const sw = Math.max(1, segment.end - segment.start);
+const activeHeight = maxY >= minY ? maxY - minY + 1 : 0;
+
 return {
-available:
-true,
-status:
-"unknown",
-severity:
-"none",
-score:
-0,
-amountText:
-String(candidate.text || ""),
-region: rawRegion,
-characterCount:
-segmentValues.length,
-metrics: {
-medianDarkness:
-null,
-maxLocalDarknessDifference:
-null,
-localAnomalyRatio:
-null,
-},
-evidence:
-"Tutar alanında yeterli piksel sinyali bulunamadı.",
+width: sw,
+height: activeHeight,
+inkRatio: pixelCount ? inkCount220 / pixelCount : 0,
+inkRatio200: pixelCount ? inkCount200 / pixelCount : 0,
+inkRatio160: pixelCount ? inkCount160 / pixelCount : 0,
+darkness: darkCount ? darkTotal / darkCount : 0,
+edgeDensity: pixelCount ? edgeTotal / pixelCount : 0,
 };
 }
 
-const sorted =
-[...segmentValues].sort(
-(a, b) => a - b
+const features = filteredSegments.map(segmentMetrics);
+
+function median(values) {
+const a = values.filter(Number.isFinite).sort((x, y) => x - y);
+if (!a.length) return 0;
+const mid = Math.floor(a.length / 2);
+return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+function relativeOutlier(value, center) {
+return center > 0 ? Math.abs(value - center) / center : 0;
+}
+
+const inkValues = features.map((x) => x.inkRatio);
+const ink200Values = features.map((x) => x.inkRatio200);
+const ink160Values = features.map((x) => x.inkRatio160);
+const darknessValues = features.map((x) => x.darkness);
+const edgeValues = features.map((x) => x.edgeDensity);
+const widthValues = features.map((x) => x.width);
+const heightValues = features.map((x) => x.height);
+
+const medInk = median(inkValues);
+const medInk200 = median(ink200Values);
+const medInk160 = median(ink160Values);
+const medDark = median(darknessValues);
+const medEdge = median(edgeValues);
+const medWidth = median(widthValues);
+const medHeight = median(heightValues);
+
+const anomalyScores = features.map((feature) => {
+const inkDiff = relativeOutlier(feature.inkRatio, medInk);
+const ink200Diff = relativeOutlier(feature.inkRatio200, medInk200);
+const ink160Diff = relativeOutlier(feature.inkRatio160, medInk160);
+const darkDiff = relativeOutlier(feature.darkness, medDark);
+const edgeDiff = relativeOutlier(feature.edgeDensity, medEdge);
+const widthDiff = relativeOutlier(feature.width, medWidth);
+const heightDiff = relativeOutlier(feature.height, medHeight);
+
+let votes = 0;
+if (inkDiff >= 0.22) votes++;
+if (ink200Diff >= 0.20) votes++;
+if (ink160Diff >= 0.20) votes++;
+if (darkDiff >= 0.18) votes++;
+if (edgeDiff >= 0.22) votes++;
+if (widthDiff >= 0.18) votes++;
+if (heightDiff >= 0.12) votes++;
+
+return {
+votes,
+inkDiff,
+ink200Diff,
+ink160Diff,
+darkDiff,
+edgeDiff,
+widthDiff,
+heightDiff,
+};
+});
+
+const maxScore = Math.max(...anomalyScores.map((x) => x.votes));
+const maxIndex = anomalyScores.findIndex((x) => x.votes === maxScore);
+const maxAnomaly = anomalyScores[maxIndex] || null;
+
+const maxInkDifference = Math.max(
+...features.map((x) => relativeOutlier(x.inkRatio, medInk))
+);
+const maxStrokeProxyDifference = Math.max(
+...features.map((x) => Math.max(
+relativeOutlier(x.inkRatio200, medInk200),
+relativeOutlier(x.inkRatio160, medInk160),
+relativeOutlier(x.width, medWidth)
+))
+);
+const maxEdgeDifference = Math.max(
+...features.map((x) => relativeOutlier(x.edgeDensity, medEdge))
+);
+const maxDarkDifference = Math.max(
+...features.map((x) => relativeOutlier(x.darkness, medDark))
 );
 
-const median =
-sorted[Math.floor(sorted.length / 2)];
+const anomalousCount = anomalyScores.filter((x) => x.votes >= 3).length;
+const anomalyRatio = features.length ? anomalousCount / features.length : 0;
 
-const deviations =
-segmentValues.map(
-(value) =>
-Math.abs(value - median)
-);
+// Özellikle tek bir karakterin diğerlerinden ayrılması değerlidir.
+// Çok sayıda karakter aynı şekilde değişmişse bunun belge/render etkisi
+// olma ihtimali daha yüksektir.
+const localized =
+maxScore >= 3 &&
+anomalyRatio <= 0.35;
 
-const maxDeviation =
-Math.max(...deviations);
+let status = "pass";
+let severity = "none";
+let score = 0;
 
-const relativeDifference =
-median > 0
-?
-maxDeviation / median
-:
-0;
-
-const anomalyThreshold =
-Math.max(
-18,
-median * 0.18
-);
-
-const anomalousSegments =
-segmentValues.filter(
-(value) =>
-Math.abs(value - median) >=
-anomalyThreshold
-).length;
-
-const anomalyRatio =
-segmentValues.length
-?
-anomalousSegments /
-segmentValues.length
-:
-0;
-
-let status =
-"pass";
-let severity =
-"none";
-let score =
-0;
-
-// Güçlü lokal fark: en az 4 segment olmalı ve fark hem
-// mutlak hem göreceli olarak belirgin olmalı.
 if (
-segmentValues.length >= 4 &&
-maxDeviation >= 24 &&
-relativeDifference >= 0.22 &&
-(anomalyRatio <= 0.50)
+localized &&
+maxScore >= 4 &&
+(
+maxInkDifference >= 0.28 ||
+maxStrokeProxyDifference >= 0.28 ||
+maxEdgeDifference >= 0.32 ||
+maxDarkDifference >= 0.30
+)
 ) {
-status =
-"warning";
-severity =
-"strong";
-score =
-85;
+status = "warning";
+severity = "strong";
+score = 85;
 }
 else if (
-segmentValues.length >= 4 &&
-maxDeviation >= 18 &&
-relativeDifference >= 0.18 &&
-(anomalyRatio <= 0.35)
+localized &&
+maxScore >= 3 &&
+(
+maxInkDifference >= 0.20 ||
+maxStrokeProxyDifference >= 0.20 ||
+maxEdgeDifference >= 0.22 ||
+maxDarkDifference >= 0.22
+)
 ) {
-status =
-"warning";
-severity =
-"moderate";
-score =
-65;
+status = "warning";
+severity = "moderate";
+score = 65;
 }
+
+const outlierFeature =
+maxIndex >= 0 ? features[maxIndex] : null;
 
 let evidence;
+if (status === "warning") {
+evidence =
+`Tutar alanında ${features.length} karakter bölgesi karşılaştırıldı. ${maxScore} ayrı mikro-görsel özellik aynı karakter bölgesinde diğer karakterlerden ayrıştı. En belirgin fark; ink/stroke yoğunluğu, kenar yapısı veya karakter geometrisinde lokalize bir tutarsızlık olarak ölçüldü. Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
+} else {
+evidence =
+`Tutar alanında ${features.length} karakter bölgesi mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
+}
 
-if (
-status === "warning"
-) {
-evidence =
-`Tutar alanında ${segmentValues.length} karakter segmenti üzerinde lokal koyuluk/stroke tutarsızlığı sinyali bulundu. En belirgin segment farkı yaklaşık %${Math.round(relativeDifference * 100)} seviyesinde. Bu bulgu tek başına sahtecilik kanıtı değildir; JPEG sıkıştırması, yeniden boyutlandırma ve render farkları da benzer etki oluşturabilir.`;
-}
-else {
-evidence =
-"Tutar alanındaki karakter segmentleri arasında belirgin bir lokal koyuluk/stroke tutarsızlığı sinyali tespit edilmedi.";
-}
+console.log(
+"AMOUNT FORENSICS V2 DETAIL:",
+JSON.stringify({
+amountText: candidate.text,
+characterCount: features.length,
+maxScore,
+maxInkDifference,
+maxStrokeProxyDifference,
+maxEdgeDifference,
+maxDarkDifference,
+anomalyRatio,
+outlierFeature,
+})
+);
 
 return {
-available:
-true,
+available: true,
 status,
 severity,
 score,
-amountText:
-String(candidate.text || ""),
+amountText: candidate.text,
 region: {
 ...rawRegion,
-pageIndex:
-candidate.pageIndex,
+pageIndex: candidate.pageIndex,
 },
-characterCount:
-segmentValues.length,
+characterCount: features.length,
 metrics: {
-medianDarkness:
-Number(median.toFixed(2)),
-maxLocalDarknessDifference:
-Number(maxDeviation.toFixed(2)),
-localAnomalyRatio:
-Number(anomalyRatio.toFixed(3)),
+medianInkRatio: Number(medInk.toFixed(4)),
+medianInkRatio200: Number(medInk200.toFixed(4)),
+medianInkRatio160: Number(medInk160.toFixed(4)),
+medianDarkness: Number(medDark.toFixed(2)),
+medianEdgeDensity: Number(medEdge.toFixed(2)),
+medianCharacterWidth: Number(medWidth.toFixed(2)),
+medianCharacterHeight: Number(medHeight.toFixed(2)),
+maxInkRatioDifference: Number(maxInkDifference.toFixed(3)),
+maxStrokeProxyDifference: Number(maxStrokeProxyDifference.toFixed(3)),
+maxEdgeDensityDifference: Number(maxEdgeDifference.toFixed(3)),
+maxDarknessDifference: Number(maxDarkDifference.toFixed(3)),
+localAnomalyRatio: Number(anomalyRatio.toFixed(3)),
+maxFeatureVotes: maxScore,
 },
+segmentFeatures: features.map((feature, index) => ({
+index,
+width: Number(feature.width.toFixed(2)),
+height: Number(feature.height.toFixed(2)),
+inkRatio: Number(feature.inkRatio.toFixed(4)),
+inkRatio200: Number(feature.inkRatio200.toFixed(4)),
+inkRatio160: Number(feature.inkRatio160.toFixed(4)),
+darkness: Number(feature.darkness.toFixed(2)),
+edgeDensity: Number(feature.edgeDensity.toFixed(2)),
+votes: anomalyScores[index]?.votes || 0,
+})),
 evidence,
 };
 }
