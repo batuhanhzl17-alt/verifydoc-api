@@ -12,17 +12,24 @@ import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
 import { createRequire } from "module"
 import { pathToFileURL } from "url"
-import * as napiCanvas from "@napi-rs/canvas"
+const require = createRequire(import.meta.url);
+
+// Vercel/ESM ortamında @napi-rs/canvas named export her zaman düzgün gelmeyebilir.
+// createRequire ile CommonJS yükleyerek createCanvas erişimini sabitliyoruz.
+let napiCanvas = null;
+try {
+  napiCanvas = require("@napi-rs/canvas");
+} catch (error) {
+  console.warn("NAPI CANVAS LOAD HATASI:", error?.message || error);
+}
 
 const createCanvas =
-  napiCanvas.createCanvas ||
-  napiCanvas.default?.createCanvas;
+  napiCanvas?.createCanvas ||
+  napiCanvas?.default?.createCanvas;
 
 const ImageData =
-  napiCanvas.ImageData ||
-  napiCanvas.default?.ImageData;
-
-const require = createRequire(import.meta.url);
+  napiCanvas?.ImageData ||
+  napiCanvas?.default?.ImageData;
 
 const pdfWorkerPath = require.resolve(
 "pdfjs-dist/build/pdf.worker.mjs"
@@ -2836,7 +2843,7 @@ function groupPdfTextLines(items, viewport) {
 
 async function renderPdfPagePng(pdf, pageNumber, scale = 1) {
   if (typeof createCanvas !== "function") {
-    console.warn("REFERENCE PDF RENDER: createCanvas yok; metin/konum profili ile devam ediliyor.");
+    console.warn("REFERENCE PDF RENDER: createCanvas kullanılamıyor; referans metin/konum/font metadata profiliyle devam ediliyor.");
     return null;
   }
   try {
@@ -2905,7 +2912,7 @@ async function buildReferenceTemplateProfile(bank) {
         const x = Number(tr[4]);
         const y = Number(tr[5]);
         const height = Math.abs(Number(tr[3])) || Number(item?.height) || 0;
-        return { str: String(item?.str || "").trim(), x, y, width: Number(item?.width) || 0, height };
+        return { str: String(item?.str || "").trim(), x, y, width: Number(item?.width) || 0, height, fontName: item?.fontName || null };
       }).filter((x) => x.str && Number.isFinite(x.x) && Number.isFinite(x.y));
       const rows = groupPdfTextLines(items, viewport);
       for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
