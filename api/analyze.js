@@ -2800,10 +2800,10 @@ return JSON.parse(JSON.stringify(cached));
 }
 
 const moneyPattern =
-/^(?:[+\\-()]?\\s*(?:₺|€|\\$|£|TL|TRY|EUR|USD|GBP)?\\s*\\d{1,3}(?:[. ]\\d{3})*(?:[,\\.]\\d{1,2})?\\s*(?:TL|TRY|₺|EUR|USD|GBP)?\\s*[)]?|[+\\-()]?\\s*(?:₺|€|\\$|£|TL|TRY|EUR|USD|GBP)?\\s*\\d+(?:[,\\.]\\d{1,2})?\\s*(?:TL|TRY|₺|EUR|USD|GBP)?\\s*[)]?)$/i;
+/^(?:[+()-]?\s*(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?|[+()-]?\s*(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?)$/i;
 
 const numericOnlyPattern =
-/^[+\\-(]?[₺€$£]?\\s*[0-9][0-9.,\\s]*\\s*(?:TL|TRY|₺|EUR|USD|GBP)?\\s*[)]?$/i;
+/^[+(-]?[₺€$£]?\s*[0-9][0-9.,\s]*\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?$/i;
 
 function validRegion(region) {
 return !!(
@@ -2828,14 +2828,14 @@ const value = cleanAmountText(text);
 if (!value) return 0;
 
 const anchoredMoneyPattern =
-/^[+\\-\\(]?(?:₺|€|\\$|£|TL|TRY|EUR|USD|GBP)?\\s*\\d{1,3}(?:[. ]\\d{3})*(?:[,\\.]\\d{1,2})?\\s*(?:TL|TRY|₺|EUR|USD|GBP)?\\s*\\)?$/i;
+/^[+(-]?(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*\)?$/i;
 
 const anchoredDecimalPattern =
-/^[+\\-\\(]?(?:₺|€|\\$|£|TL|TRY|EUR|USD|GBP)?\\s*\\d+(?:[,\\.]\\d{1,2})\\s*(?:TL|TRY|₺|EUR|USD|GBP)?\\s*\\)?$/i;
+/^[+(-]?(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*\)?$/i;
 
 if (anchoredDecimalPattern.test(value)) return 9;
-if (anchoredMoneyPattern.test(value) && /[,\\.]\\d{1,2}/.test(value)) return 8;
-if (anchoredMoneyPattern.test(value) && /\\d/.test(value)) return 5;
+if (anchoredMoneyPattern.test(value) && /[,\.]\d{1,2}/.test(value)) return 8;
+if (anchoredMoneyPattern.test(value) && /\d/.test(value)) return 5;
 if (numericOnlyPattern.test(value)) return 3;
 return 0;
 }
@@ -2849,19 +2849,19 @@ return 0;
 //   GİDEN FAST TUTARI : -1000
 // satırı, ana işlem tutarı için birincil kaynaktır.
 const AMOUNT_LABEL_RULES = [
-{ pattern: /giden\\s+fast\\s+tutar[ıi]/i, score: 220 },
-{ pattern: /gönderilen\\s+(?:fast\\s+)?tutar[ıi]/i, score: 210 },
-{ pattern: /transfer\\s+tutar[ıi]/i, score: 200 },
-{ pattern: /işlem\\s+tutar[ıi]/i, score: 190 },
-{ pattern: /islem\\s+tutar[ıi]/i, score: 190 },
-{ pattern: /ana\\s+tutar/i, score: 180 },
-{ pattern: /gönderim\\s+tutar[ıi]/i, score: 175 },
-{ pattern: /giden\\s+tutar[ıi]/i, score: 175 },
-{ pattern: /\\btutar[ıi]\\b/i, score: 120 },
+{ pattern: /giden\s+fast\s+tutar[ıi]/i, score: 220 },
+{ pattern: /gönderilen\s+(?:fast\s+)?tutar[ıi]/i, score: 210 },
+{ pattern: /transfer\s+tutar[ıi]/i, score: 200 },
+{ pattern: /işlem\s+tutar[ıi]/i, score: 190 },
+{ pattern: /islem\s+tutar[ıi]/i, score: 190 },
+{ pattern: /ana\s+tutar/i, score: 180 },
+{ pattern: /gönderim\s+tutar[ıi]/i, score: 175 },
+{ pattern: /giden\s+tutar[ıi]/i, score: 175 },
+{ pattern: /\btutar[ıi]\b/i, score: 120 },
 ];
 
 const NON_AMOUNT_LABEL_RULE =
-/müşteri\\s*no|customer\\s*no|işlem\\s*ref|islem\\s*ref|işlem\\s*no|islem\\s*no|fiş\\s*no|fis\\s*no|sorgu\\s*no|sorgu|referans|seri\\s*no|sıra\\s*no|sira\\s*no|belge\\s*(?:no|numarası|numarasi)|iban|hesap\\s*no|hesap\\s*numarası|hesap\\s*numarasi|tckn|vergi\\s*no/i;
+/müşteri\s*no|customer\s*no|işlem\s*ref|islem\s*ref|işlem\s*no|islem\s*no|fiş\s*no|fis\s*no|sorgu\s*no|sorgu|referans|seri\s*no|sıra\s*no|sira\s*no|belge\s*(?:no|numarası|numarasi)|iban|hesap\s*no|hesap\s*numarası|hesap\s*numarasi|tckn|vergi\s*no/i;
 
 function amountLabelContext(group) {
 const gx1 = Number(group?.region?.x1) || 0;
@@ -2896,7 +2896,7 @@ for (const item of items) {
 for (const rule of AMOUNT_LABEL_RULES) {
 if (rule.pattern.test(item.text)) {
 let score = rule.score;
-if (/toplam\\s+işlem\\s+tutar[ıi]|toplam\\s+islem\\s+tutar[ıi]/i.test(item.text)) {
+if (/toplam\s+işlem\s+tutar[ıi]|toplam\s+islem\s+tutar[ıi]/i.test(item.text)) {
 score -= 90;
 }
 if (score > best.score) {
@@ -2917,7 +2917,7 @@ combined = `${combined} ${items[j].text}`.trim();
 for (const rule of AMOUNT_LABEL_RULES) {
 if (rule.pattern.test(combined)) {
 let score = rule.score - 5;
-if (/toplam\\s+işlem\\s+tutar[ıi]|toplam\\s+islem\\s+tutar[ıi]/i.test(combined)) {
+if (/toplam\s+işlem\s+tutar[ıi]|toplam\s+islem\s+tutar[ıi]/i.test(combined)) {
 score -= 90;
 }
 if (score > best.score) {
