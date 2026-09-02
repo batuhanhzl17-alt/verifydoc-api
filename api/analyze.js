@@ -6636,66 +6636,7 @@ reference?.fileName ||
 "YOK"
 );
 
-// =====================================================
-// AMOUNT FORENSICS CONTEXT
-// =====================================================
 
-let amountForensicsContext = "";
-
-if (
-amountRegionAnalysis?.available
-) {
-
-amountForensicsContext = `
-
-=====================================================
-OTOMATİK LOKAL TUTAR BÖLGESİ ÖLÇÜMÜ
-=====================================================
-
-Bu ölçüm gerçek belge görüntüsünden çıkarılmıştır.
-
-OCR tarafından bulunan tutar bölgesi:
-
-${findAmountBoxFromOCR(paddleImageOCR)?.text || "Bilinmiyor"}
-
-Bölge koordinatları:
-
-left:
-${amountRegionAnalysis.left}
-
-top:
-${amountRegionAnalysis.top}
-
-width:
-${amountRegionAnalysis.width}
-
-height:
-${amountRegionAnalysis.height}
-
-Ortalama piksel yoğunluğu:
-
-${amountRegionAnalysis.averageIntensity}
-
-Koyu piksel oranı:
-
-${amountRegionAnalysis.darkRatio}
-
-ÇOK ÖNEMLİ:
-
-Bu ölçüm tek başına manipülasyon kanıtı değildir.
-
-Kamera, ışık, perspektif, JPEG sıkıştırması,
-ekran fotoğrafı ve odak farklılıklarını dikkate al.
-
-Bu veriyi yalnızca görüntüdeki tutar bölgesini
-değerlendirirken yardımcı kanıt olarak kullan.
-
-ASIL KAYNAK BELGE GÖRÜNTÜSÜDÜR.
-
-=====================================================
-`;
-
-}
  
 // -------------------------------------------------
 // OPENAI INPUT
@@ -7252,7 +7193,68 @@ console.log(
  
 }
 }
- 
+
+// =====================================================
+// AMOUNT FORENSICS CONTEXT
+// =====================================================
+
+let amountForensicsContext = "";
+
+if (
+amountRegionAnalysis?.available
+) {
+
+amountForensicsContext = `
+
+=====================================================
+OTOMATİK LOKAL TUTAR BÖLGESİ ÖLÇÜMÜ
+=====================================================
+
+Bu ölçüm gerçek belge görüntüsünden çıkarılmıştır.
+
+OCR tarafından bulunan tutar bölgesi:
+
+${findAmountBoxFromOCR(paddleImageOCR)?.text || "Bilinmiyor"}
+
+Bölge koordinatları:
+
+left:
+${amountRegionAnalysis.left}
+
+top:
+${amountRegionAnalysis.top}
+
+width:
+${amountRegionAnalysis.width}
+
+height:
+${amountRegionAnalysis.height}
+
+Ortalama piksel yoğunluğu:
+
+${amountRegionAnalysis.averageIntensity}
+
+Koyu piksel oranı:
+
+${amountRegionAnalysis.darkRatio}
+
+ÇOK ÖNEMLİ:
+
+Bu ölçüm tek başına manipülasyon kanıtı değildir.
+
+Kamera, ışık, perspektif, JPEG sıkıştırması,
+ekran fotoğrafı ve odak farklılıklarını dikkate al.
+
+Bu veriyi yalnızca görüntüdeki tutar bölgesini
+değerlendirirken yardımcı kanıt olarak kullan.
+
+ASIL KAYNAK BELGE GÖRÜNTÜSÜDÜR.
+
+=====================================================
+`;
+
+}
+  
 // -------------------------------------------------
 // OPENAI
 // -------------------------------------------------
