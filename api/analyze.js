@@ -606,6 +606,9 @@ const viewport = page.getViewport({
 scale,
 });
 
+if (typeof createCanvas !== "function") {
+  throw new Error("PDF_TO_IMAGE_CANVAS_UNAVAILABLE");
+}
 const canvas = createCanvas(
 Math.ceil(viewport.width),
 Math.ceil(viewport.height)
@@ -2897,12 +2900,15 @@ async function buildReferenceTemplateProfile(bank) {
   if (referenceTemplateProfileCache.has(normalizedBank)) return referenceTemplateProfileCache.get(normalizedBank);
   const referencePath = getReferenceFile(normalizedBank);
   if (!referencePath) return null;
+
   try {
     const buffer = await fs.readFile(referencePath);
     if (!buffer?.length) return null;
     const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
     const fields = {};
-    const renderedPages = new Map();
+
+    // Referans PDF'nin text layer'ını kullanıyoruz. Böylece canvas olmadan da
+    // alanların normalize konumu, boyutu ve PDF font metadata'sı çıkarılabilir.
     for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 5); pageNumber++) {
       const page = await pdf.getPage(pageNumber);
       const viewport = page.getViewport({ scale: 1 });
@@ -2912,26 +2918,53 @@ async function buildReferenceTemplateProfile(bank) {
         const x = Number(tr[4]);
         const y = Number(tr[5]);
         const height = Math.abs(Number(tr[3])) || Number(item?.height) || 0;
-        return { str: String(item?.str || "").trim(), x, y, width: Number(item?.width) || 0, height, fontName: item?.fontName || null };
+        return {
+          str: String(item?.str || "").trim(),
+          x,
+          y,
+          width: Number(item?.width) || 0,
+          height,
+          fontName: item?.fontName || null,
+          hasEOL: Boolean(item?.hasEOL),
+        };
       }).filter((x) => x.str && Number.isFinite(x.x) && Number.isFinite(x.y));
+
       const rows = groupPdfTextLines(items, viewport);
+
       for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
         const row = rows[rowIndex];
         const rule = referenceFieldRuleForText(row.text);
         if (!rule) continue;
+
         const labelItemIndex = row.items.findIndex((item) => referenceFieldRuleForText(item.str)?.key === rule.key);
         const labelItem = labelItemIndex >= 0 ? row.items[labelItemIndex] : row.items[0];
+
+        // Öncelik: aynı satırdaki etiketin sağındaki değer. Değer alt satırdaysa
+        // bir sonraki yakın satırı kullan.
         let valueItems = row.items.slice(Math.max(0, labelItemIndex + 1));
         if (!valueItems.length) {
           const next = rows[rowIndex + 1];
-          if (next && next.top - row.top <= Math.max(55, row.y2 - row.y1 + 30)) valueItems = next.items.slice(0, 10);
+          if (next && next.top - row.top <= Math.max(55, row.y2 - row.y1 + 30)) {
+            valueItems = next.items.slice(0, 20);
+          }
         }
         valueItems = valueItems.filter((item) => !referenceFieldRuleForText(item.str));
         if (!valueItems.length) continue;
+
         const x1 = Math.min(...valueItems.map((x) => x.x));
         const x2 = Math.max(...valueItems.map((x) => x.x + x.width));
         const y1 = Math.min(...valueItems.map((x) => viewport.height - x.y - x.height));
         const y2 = Math.max(...valueItems.map((x) => viewport.height - x.y));
+
+        const chars = valueItems.reduce((sum, x) => sum + Math.max(1, String(x.str || "").length), 0);
+        const avgFontHeight = valueItems.length
+          ? valueItems.reduce((sum, x) => sum + (Number(x.height) || 0), 0) / valueItems.length
+          : 0;
+        const avgCharWidth = chars
+          ? valueItems.reduce((sum, x) => sum + (Number(x.width) || 0), 0) / chars
+          : 0;
+        const fontNames = [...new Set(valueItems.map((x) => x.fontName).filter(Boolean))];
+
         const box = {
           xNorm: x1 / viewport.width,
           yNorm: y1 / viewport.height,
@@ -2939,43 +2972,35 @@ async function buildReferenceTemplateProfile(bank) {
           heightNorm: Math.max(0.001, (y2 - y1) / viewport.height),
           pageNumber,
           labelKey: rule.key,
+          label: String(row.text || ""),
           labelPresent: Boolean(labelItem),
+          valueTextLength: chars,
+          style: {
+            source: "pdf-text-metadata",
+            fontNames,
+            avgFontHeight,
+            avgCharWidth,
+            itemCount: valueItems.length,
+          },
         };
-        // Referans PDF'den piksel render'ı mümkünse al; ancak canvas yoksa
-        // profil yine de çalışmaya devam eder. PDF'nin kendi textContent'i
-        // fontName, transform, yükseklik ve genişlik bilgilerini taşıdığı için
-        // bunları deterministik tipografi profiline dönüştürüyoruz.
-        if (!renderedPages.has(pageNumber)) {
-          renderedPages.set(pageNumber, await renderPdfPagePng(pdf, pageNumber, 1));
-        }
-        const rendered = renderedPages.get(pageNumber);
-        const styleItems = valueItems.length ? valueItems : row.items;
-        const fontNames = [...new Set(styleItems.map((x) => x.fontName).filter(Boolean))];
-        const avgFontHeight = styleItems.length
-          ? styleItems.reduce((sum, x) => sum + (Number(x.height) || 0), 0) / styleItems.length
-          : 0;
-        const avgCharWidth = styleItems.length
-          ? styleItems.reduce((sum, x) => {
-              const chars = Math.max(1, String(x.str || "").length);
-              return sum + ((Number(x.width) || 0) / chars);
-            }, 0) / styleItems.length
-          : 0;
-        const pdfStyle = {
-          source: "pdf-text-metadata",
-          fontNames,
-          avgFontHeight,
-          avgCharWidth,
-          itemCount: styleItems.length,
-        };
-        const renderedStyle = rendered
-          ? await calculateReferenceStyleMetrics(rendered.buffer, box, rendered.width, rendered.height)
-          : null;
-        box.style = { ...pdfStyle, ...(renderedStyle || {}) };
+
+        // Aynı alandan birden fazla aday çıkarsa daha geniş/kompleks alanı tercih et.
         const existing = fields[rule.key];
-        if (!existing || box.widthNorm * box.heightNorm > existing.widthNorm * existing.heightNorm) fields[rule.key] = box;
+        if (!existing || box.widthNorm * box.heightNorm > existing.widthNorm * existing.heightNorm) {
+          fields[rule.key] = box;
+        }
       }
     }
-    const profile = { bank: normalizedBank, fields, fieldCount: Object.keys(fields).length };
+
+    const profile = {
+      bank: normalizedBank,
+      referenceFile: path.basename(referencePath),
+      fields,
+      fieldCount: Object.keys(fields).length,
+      renderAvailable: false,
+      styleSource: "pdf-text-metadata",
+    };
+
     referenceTemplateProfileCache.set(normalizedBank, profile);
     console.log("REFERENCE TEMPLATE PROFILE:", JSON.stringify(profile));
     return profile;
@@ -2986,94 +3011,190 @@ async function buildReferenceTemplateProfile(bank) {
   }
 }
 
+function normalizeRegionBox(region, size) {
+  if (!region || !size?.width || !size?.height) return null;
+  const x1 = Number(region.x1), y1 = Number(region.y1), x2 = Number(region.x2), y2 = Number(region.y2);
+  if (![x1,y1,x2,y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1) return null;
+  return {
+    xNorm: x1 / size.width,
+    yNorm: y1 / size.height,
+    widthNorm: Math.max(0.001, (x2 - x1) / size.width),
+    heightNorm: Math.max(0.001, (y2 - y1) / size.height),
+  };
+}
+
+function referenceFieldTargetCandidates(field, ref, regions, size) {
+  const candidates = [];
+  const refCx = ref.xNorm + ref.widthNorm / 2;
+  const refCy = ref.yNorm + ref.heightNorm / 2;
+  const rule = REFERENCE_FIELD_RULES.find((r) => r.key === field);
+
+  for (const item of regions) {
+    const text = String(item.text || "").trim();
+    const box = normalizeRegionBox(item.region, size);
+    if (!box) continue;
+
+    // Etiket eşleşmesi varsa en güçlü sinyal budur.
+    let labelScore = 0;
+    if (rule && rule.patterns.some((p) => p.test(text))) labelScore = 80;
+
+    const cx = box.xNorm + box.widthNorm / 2;
+    const cy = box.yNorm + box.heightNorm / 2;
+    const dx = Math.abs(cx - refCx);
+    const dy = Math.abs(cy - refCy);
+    const positionDistance = Math.sqrt(dx * dx + dy * dy);
+
+    // Etiketin kendisini değil, etiketin sağındaki/altındaki değeri seçmeye çalış.
+    if (labelScore > 0) {
+      const lr = item.region;
+      for (const valueItem of regions) {
+        if (valueItem === item) continue;
+        if (referenceFieldRuleForText(String(valueItem.text || ""))) continue;
+        const vr = valueItem.region;
+        const vbox = normalizeRegionBox(vr, size);
+        if (!vbox) continue;
+        const sameLine = Math.abs(Number(vr.y1) - Number(lr.y1)) <= Math.max(16, (Number(lr.y2)-Number(lr.y1))*1.0);
+        const right = Number(vr.x1) >= Number(lr.x2) - 6;
+        const below = Number(vr.y1) >= Number(lr.y2) - 4 && Number(vr.y1) - Number(lr.y2) <= Math.max(70, (Number(lr.y2)-Number(lr.y1))*4);
+        if (!((sameLine && right) || below)) continue;
+        const vcx = vbox.xNorm + vbox.widthNorm / 2;
+        const vcy = vbox.yNorm + vbox.heightNorm / 2;
+        const vdist = Math.sqrt(Math.pow(vcx-refCx,2)+Math.pow(vcy-refCy,2));
+        candidates.push({ item:valueItem, box:vbox, score:labelScore + 50 - Math.min(45, vdist*250) });
+      }
+    }
+
+    // Her durumda referans koordinatına yakınlığı ikinci bağımsız sinyal olarak kullan.
+    if (!referenceFieldRuleForText(text)) {
+      candidates.push({
+        item,
+        box,
+        score: Math.max(0, 42 - Math.min(42, positionDistance * 220)),
+      });
+    }
+  }
+
+  // Aynı OCR kutusunu iki kez aday yapma.
+  const seen = new Set();
+  return candidates.filter((x) => {
+    const key = `${x.item.pageIndex || 0}:${x.item.region?.x1}:${x.item.region?.y1}:${x.item.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).sort((a,b) => b.score-a.score);
+}
+
 async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocrResult) {
   const profile = await buildReferenceTemplateProfile(bank);
   if (!profile || !Object.keys(profile.fields || {}).length || !ocrResult?.success) return null;
-  const regions = Array.isArray(ocrResult.regions) ? ocrResult.regions.filter((x) => x?.region && String(x.text || "").trim()) : [];
+
+  const regions = Array.isArray(ocrResult.regions)
+    ? ocrResult.regions.filter((x) => x?.region && String(x.text || "").trim())
+    : [];
   if (!regions.length) return null;
-  let pageSizes = new Map();
-  let pageBuffers = new Map();
+
+  const pageSizes = new Map();
+  let imageBuffer = null;
   if (mime && mime.startsWith("image/")) {
     const meta = await sharp(filePath).metadata();
-    pageSizes.set(0, { width: Number(meta.width) || 0, height: Number(meta.height) || 0 });
-    pageBuffers.set(0, { buffer: await fs.readFile(filePath), width: Number(meta.width) || 0, height: Number(meta.height) || 0 });
+    pageSizes.set(0, { width:Number(meta.width)||0, height:Number(meta.height)||0 });
+    imageBuffer = await fs.readFile(filePath);
   } else if (mime === "application/pdf" || String(filePath).toLowerCase().endsWith(".pdf")) {
     const pdfBuffer = await fs.readFile(filePath);
-    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(pdfBuffer) }).promise;
-    for (const pageNumber of new Set(regions.map((x) => Number(x.pageIndex) + 1))) {
-      if (!Number.isFinite(pageNumber) || pageNumber < 1 || pageNumber > pdf.numPages) continue;
-      const page = await pdf.getPage(pageNumber);
-      const viewport = page.getViewport({ scale: 1 });
-      pageSizes.set(pageNumber - 1, { width: viewport.width, height: viewport.height });
+    const pdf = await pdfjsLib.getDocument({data:new Uint8Array(pdfBuffer)}).promise;
+    for (const pageIndex of new Set(regions.map(x => Number(x.pageIndex)||0))) {
+      const page = await pdf.getPage(pageIndex+1);
+      const viewport = page.getViewport({scale:1});
+      pageSizes.set(pageIndex,{width:viewport.width,height:viewport.height});
     }
   }
+
   const matches = [];
   for (const [field, ref] of Object.entries(profile.fields)) {
-    let best = null;
-    for (const labelRegion of regions) {
-      const rule = REFERENCE_FIELD_RULES.find((r) => r.key === field);
-      if (!rule || !rule.patterns.some((p) => p.test(String(labelRegion.text || "")))) continue;
-      const lr = labelRegion.region;
-      const candidates = regions.filter((item) => {
-        if (item === labelRegion) return false;
-        const r = item.region;
-        const sameLine = Math.abs(Number(r.y1) - Number(lr.y1)) <= Math.max(14, (Number(lr.y2) - Number(lr.y1)) * 0.9);
-        const right = Number(r.x1) >= Number(lr.x2) - 4;
-        const below = Number(r.y1) >= Number(lr.y2) - 3 && Number(r.y1) - Number(lr.y2) <= Math.max(55, (Number(lr.y2) - Number(lr.y1)) * 3.5);
-        return (sameLine && right) || below;
-      }).filter((item) => !referenceFieldRuleForText(item.text));
-      candidates.sort((a, b) => {
-        const ar = a.region, br = b.region;
-        const ad = Math.abs(Number(ar.y1) - Number(lr.y1)) + Math.max(0, Number(ar.x1) - Number(lr.x2));
-        const bd = Math.abs(Number(br.y1) - Number(lr.y1)) + Math.max(0, Number(br.x1) - Number(lr.x2));
-        return ad - bd;
-      });
-      if (candidates[0]) {
-        const r = candidates[0].region;
-        best = { pageIndex: Number(candidates[0].pageIndex) || 0, x1: Number(r.x1), y1: Number(r.y1), x2: Number(r.x2), y2: Number(r.y2), label: String(labelRegion.text || "") };
-        break;
-      }
-    }
-    if (!best) continue;
-    const size = pageSizes.get(best.pageIndex);
+    const size = pageSizes.get(0);
     if (!size?.width || !size?.height) continue;
-    const targetBox = { xNorm: best.x1 / size.width, yNorm: best.y1 / size.height, widthNorm: Math.max(0.001, (best.x2 - best.x1) / size.width), heightNorm: Math.max(0.001, (best.y2 - best.y1) / size.height) };
-    if (!pageBuffers.has(best.pageIndex) && (mime === "application/pdf" || String(filePath).toLowerCase().endsWith(".pdf"))) {
-      const pdfBuffer = await fs.readFile(filePath);
-      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(pdfBuffer) }).promise;
-      pageBuffers.set(best.pageIndex, await renderPdfPagePng(pdf, best.pageIndex + 1, 1));
+
+    const candidates = referenceFieldTargetCandidates(field, ref, regions, size);
+    if (!candidates.length) {
+      matches.push({ field, status:"missing", reference:{...ref} });
+      continue;
     }
-    const targetStyle = await calculateReferenceStyleMetrics(pageBuffers.get(best.pageIndex)?.buffer, targetBox, pageBuffers.get(best.pageIndex)?.width, pageBuffers.get(best.pageIndex)?.height);
-    const dx = Math.abs((targetBox.xNorm + targetBox.widthNorm / 2) - (ref.xNorm + ref.widthNorm / 2));
-    const dy = Math.abs((targetBox.yNorm + targetBox.heightNorm / 2) - (ref.yNorm + ref.heightNorm / 2));
-    const dw = Math.abs(Math.log(Math.max(0.001, targetBox.widthNorm) / Math.max(0.001, ref.widthNorm)));
-    const dh = Math.abs(Math.log(Math.max(0.001, targetBox.heightNorm) / Math.max(0.001, ref.heightNorm)));
-    // Canvas render'i yoksa referansın koyuluk/edge metrikleri ile
-    // gerçek JPEG piksel metriklerini karşılaştırmak metodolojik olarak doğru değildir.
-    // Bu nedenle styleScore yalnızca iki tarafta da gerçek piksel metriği varsa hesaplanır.
-    const hasPixelStyle = Boolean(ref.style?.inkRatio !== undefined && targetStyle?.inkRatio !== undefined);
-    const styleDiff = hasPixelStyle ? {
-      inkRatio: Math.abs(targetStyle.inkRatio - ref.style.inkRatio),
-      darkness: Math.abs(targetStyle.darkness - ref.style.darkness),
-      edgeDensity: Math.abs(targetStyle.edgeDensity - ref.style.edgeDensity),
-    } : null;
-    const geometryScore = Math.min(100, Math.round((dx / 0.03) * 35 + (dy / 0.03) * 35 + dw * 20 + dh * 10));
-    const styleScore = styleDiff ? Math.min(100, Math.round(styleDiff.inkRatio * 180 + styleDiff.darkness * 0.65 + styleDiff.edgeDensity * 0.35)) : 0;
-    matches.push({ field, reference: { xNorm: ref.xNorm, yNorm: ref.yNorm, widthNorm: ref.widthNorm, heightNorm: ref.heightNorm, pageNumber: ref.pageNumber, style: ref.style }, target: { ...targetBox, pageIndex: best.pageIndex, style: targetStyle }, geometryScore, styleScore });
+
+    const best = candidates[0];
+    const target = best.box;
+    const dx = Math.abs((target.xNorm + target.widthNorm/2) - (ref.xNorm + ref.widthNorm/2));
+    const dy = Math.abs((target.yNorm + target.heightNorm/2) - (ref.yNorm + ref.heightNorm/2));
+    const dw = Math.abs(Math.log(Math.max(.001,target.widthNorm)/Math.max(.001,ref.widthNorm)));
+    const dh = Math.abs(Math.log(Math.max(.001,target.heightNorm)/Math.max(.001,ref.heightNorm)));
+
+    const geometryScore = Math.min(100, Math.round((dx/.03)*35 + (dy/.03)*35 + dw*20 + dh*10));
+    const targetText = String(best.item.text || "");
+    const targetDigits = (targetText.match(/\d/g)||[]).length;
+    const referenceLength = Number(ref.valueTextLength)||0;
+    const lengthRatio = referenceLength ? Math.abs(targetText.length-referenceLength)/referenceLength : 0;
+    const contentTypeMismatch =
+      field === "iban" ? (!/[A-Z]{2}\d{2}/i.test(targetText) ? 1 : 0) :
+      field === "amount" ? (!/\d/.test(targetText) ? 1 : 0) : 0;
+
+    const styleSignals = {
+      referenceFontNames: ref.style?.fontNames || [],
+      referenceAvgFontHeight: ref.style?.avgFontHeight || 0,
+      referenceAvgCharWidth: ref.style?.avgCharWidth || 0,
+      targetOCRConfidence: Number(best.item.score)||0,
+      targetTextLength: targetText.length,
+      referenceTextLength: referenceLength,
+      lengthDifferenceRatio: lengthRatio,
+      contentTypeMismatch,
+      pixelComparisonAvailable:false,
+    };
+
+    // JPG'de PDF font adını birebir ölçmek mümkün değildir. Bunun yerine
+    // OCR kutu geometrisi + metin uzunluğu + gerçek piksel yoğunluğu kullanılır.
+    if (imageBuffer && field) {
+      try {
+        const meta = await sharp(imageBuffer).metadata();
+        const left=Math.max(0,Math.floor(best.item.region.x1));
+        const top=Math.max(0,Math.floor(best.item.region.y1));
+        const width=Math.max(1,Math.min(meta.width-left,Math.ceil(best.item.region.x2-best.item.region.x1)));
+        const height=Math.max(1,Math.min(meta.height-top,Math.ceil(best.item.region.y2-best.item.region.y1)));
+        const raw=await sharp(imageBuffer).grayscale().extract({left,top,width,height}).raw().toBuffer({resolveWithObject:true});
+        let ink=0,dark=0,pixels=0;
+        for(let i=0;i<raw.data.length;i++){ const v=raw.data[i]; pixels++; if(v<220) ink++; if(v<185) dark += 255-v; }
+        styleSignals.targetInkRatio=pixels?ink/pixels:0;
+        styleSignals.targetDarkness=pixels?dark/pixels:0;
+      } catch {}
+    }
+
+    matches.push({
+      field,
+      status:"matched",
+      reference:{xNorm:ref.xNorm,yNorm:ref.yNorm,widthNorm:ref.widthNorm,heightNorm:ref.heightNorm,pageNumber:ref.pageNumber,style:ref.style},
+      target:{...target,pageIndex:Number(best.item.pageIndex)||0,text:targetText,ocrScore:Number(best.item.score)||0},
+      matchScore:Math.max(0,Math.round(best.score)),
+      geometryScore,
+      styleSignals,
+    });
   }
-  if (!matches.length) return null;
-  const strongGeometry = matches.filter((x) => x.geometryScore >= 60);
-  const strongStyle = matches.filter((x) => x.styleScore >= 60);
+
+  const matched = matches.filter(x=>x.status==="matched");
+  const missing = matches.filter(x=>x.status==="missing");
+  const strongGeometry = matched.filter(x=>x.geometryScore>=60);
+  const weakPlacement = matched.filter(x=>x.geometryScore>=35);
+
   return {
-    bank: profile.bank,
-    referenceFieldCount: profile.fieldCount,
-    matchedFieldCount: matches.length,
-    strongGeometryCount: strongGeometry.length,
-    strongStyleCount: strongStyle.length,
-    fields: matches,
-    evidence: strongGeometry.length || strongStyle.length
-      ? `Referans şablonuyla ${matches.length} alan eşleştirildi; ${strongGeometry.length} alanda belirgin konum/geometri, ${strongStyle.length} alanda belirgin render yoğunluğu farkı bulundu.`
-      : "Referans şablonuyla eşleşen alanlarda belirgin konum veya render yoğunluğu farkı bulunmadı.",
+    bank:profile.bank,
+    referenceFile:profile.referenceFile,
+    referenceFieldCount:profile.fieldCount,
+    matchedFieldCount:matched.length,
+    missingFieldCount:missing.length,
+    strongGeometryCount:strongGeometry.length,
+    weakPlacementCount:weakPlacement.length,
+    strongStyleCount:0,
+    styleComparisonNote:"JPG'de PDF font adı birebir ölçülemez; PDF font metadata'sı referans profiline, gerçek piksel yoğunluğu ise JPG tarafına ayrı sinyal olarak kaydedilir.",
+    fields:matches,
+    evidence: strongGeometry.length || missing.length
+      ? `Referans şablonuyla ${matched.length} alan eşleştirildi; ${strongGeometry.length} alanda belirgin geometri farkı, ${missing.length} alanda beklenen alan bulunamadı.`
+      : `Referans şablonuyla ${matched.length} alan eşleştirildi; belirgin geometri farkı bulunmadı.`,
   };
 }
 
