@@ -2,6 +2,7 @@ import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
 import path from "path"
+import { createHash } from "crypto"
 import { execFile } from "child_process"
 import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
@@ -28,6 +29,8 @@ pathToFileURL(pdfWorkerPath).href;
 
 
 const execFileAsync = promisify(execFile);
+let currentFileFingerprint = null;
+const amountForensicsStrongCache = new Map();
 
 // =====================================================
 // PADDLEOCR CLIENT
@@ -2711,7 +2714,8 @@ count,
 // farklı render edilmesini yakalamaktır. Tek başına sahtecilik kanıtı değildir.
 async function analyzeAmountForensics(
 filePath,
-ocrResult
+ocrResult,
+fileFingerprint = currentFileFingerprint
 ) {
 
 if (
@@ -2723,6 +2727,12 @@ if (
 if (!filePath || !ocrResult?.success || !Array.isArray(ocrResult?.regions) || !ocrResult.regions.length) {
 return null;
 }
+}
+
+if (fileFingerprint && amountForensicsStrongCache.has(fileFingerprint)) {
+const cached = amountForensicsStrongCache.get(fileFingerprint);
+console.log("AMOUNT FORENSICS CACHE HIT:", fileFingerprint);
+return JSON.parse(JSON.stringify(cached));
 }
 
 const moneyPattern =
@@ -2894,6 +2904,40 @@ evidence: "Tutar alanı oluşturulamadı.",
 // OCR'ın düz rakamları (özellikle sorgu no / işlem no / fiş no)
 // tutar sanmasını engelle. Biçimsel tutar sinyalleri ve komşu
 // OCR metinleri birlikte değerlendirilir.
+function anchorContextScore(group) {
+const gx1 = Number(group.region.x1) || 0;
+const gy1 = Number(group.region.y1) || 0;
+const gx2 = Number(group.region.x2) || 0;
+const gy2 = Number(group.region.y2) || 0;
+const gh = Math.max(8, gy2 - gy1);
+let score = 0;
+const anchors = [];
+for (const item of ocrResult.regions) {
+if (!item?.text || !validRegion(item.region)) continue;
+const text = cleanAmountText(item.text);
+if (!text) continue;
+const ix1 = Number(item.region.x1) || 0;
+const iy1 = Number(item.region.y1) || 0;
+const ix2 = Number(item.region.x2) || 0;
+const iy2 = Number(item.region.y2) || 0;
+const ih = Math.max(8, iy2 - iy1);
+const overlap = Math.min(gy2, iy2) - Math.max(gy1, iy1);
+if (overlap < -Math.max(8, Math.min(gh, ih) * 0.55)) continue;
+if (/(işlem\s*tutarı|islem\s*tutari|ana\s*tutar|\btutar\b|\bamount\b)/i.test(text)) {
+const labelGap = gx1 >= ix2 ? gx1 - ix2 : Math.abs(gx1 - ix1);
+if (gx1 >= ix1 && labelGap <= Math.max(420, gh * 12)) {
+score += 35;
+anchors.push(text);
+}
+}
+if (/(?:TL|TRY|₺|EUR|USD|GBP)/i.test(text)) {
+const gap = Math.min(Math.abs(gx1 - ix2), Math.abs(ix1 - gx2));
+if (gap <= Math.max(180, gh * 5)) score += 10;
+}
+}
+return { score, anchors };
+}
+
 function candidateAmountScore(group) {
 const text = cleanAmountText(group.text);
 const digits = (text.match(/\d/g) || []).length;
@@ -2971,16 +3015,24 @@ return {score, positive, negative};
 const rankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
 const context = nearbyContextScore(group);
+const anchor = anchorContextScore(group);
 return {
 ...group,
-amountCandidateScore: baseScore + context.score,
+amountCandidateScore: baseScore + context.score + anchor.score,
 context,
+anchor,
 };
 }).sort((a, b) => {
-if (b.amountCandidateScore !== a.amountCandidateScore) {
-return b.amountCandidateScore - a.amountCandidateScore;
-}
-return (b.score || 0) - (a.score || 0);
+if (b.amountCandidateScore !== a.amountCandidateScore) return b.amountCandidateScore - a.amountCandidateScore;
+if ((b.signal || 0) !== (a.signal || 0)) return (b.signal || 0) - (a.signal || 0);
+if ((b.score || 0) !== (a.score || 0)) return (b.score || 0) - (a.score || 0);
+const ay = Number(a.region?.y1) || 0;
+const by = Number(b.region?.y1) || 0;
+if (ay !== by) return ay - by;
+const ax = Number(a.region?.x1) || 0;
+const bx = Number(b.region?.x1) || 0;
+if (ax !== bx) return ax - bx;
+return String(a.text).localeCompare(String(b.text));
 });
 
 const candidate = rankedCandidates[0];
@@ -2992,6 +3044,7 @@ JSON.stringify(rankedCandidates.slice(0, 8).map((item) => ({
 text: item.text,
 signal: item.signal,
 amountCandidateScore: item.amountCandidateScore,
+anchorContext: item.anchor?.anchors || [],
 positiveContext: item.context?.positive || [],
 negativeContext: item.context?.negative || [],
 })))
@@ -3016,10 +3069,14 @@ evidence: "Tutar alanı bulundu ancak görüntü boyut bilgisi alınamadı.",
 };
 }
 
-const left = Math.max(0, Math.floor(rawRegion.x1));
-const top = Math.max(0, Math.floor(rawRegion.y1));
-const right = Math.min(image.width, Math.ceil(rawRegion.x2));
-const bottom = Math.min(image.height, Math.ceil(rawRegion.y2));
+const rawWidth = Math.max(1, Number(rawRegion.x2) - Number(rawRegion.x1));
+const rawHeight = Math.max(1, Number(rawRegion.y2) - Number(rawRegion.y1));
+const padX = Math.max(6, Math.round(rawWidth * 0.08));
+const padYBox = Math.max(4, Math.round(rawHeight * 0.22));
+const left = Math.max(0, Math.floor(rawRegion.x1 - padX));
+const top = Math.max(0, Math.floor(rawRegion.y1 - padYBox));
+const right = Math.min(image.width, Math.ceil(rawRegion.x2 + padX));
+const bottom = Math.min(image.height, Math.ceil(rawRegion.y2 + padYBox));
 
 const width = right - left;
 const height = bottom - top;
@@ -3553,8 +3610,9 @@ evidence =
 }
 
 console.log(
-"AMOUNT FORENSICS V2 DETAIL:",
+"AMOUNT FORENSICS V3 DETAIL:",
 JSON.stringify({
+fileFingerprint: fileFingerprint || currentFileFingerprint,
 amountText: candidate.text,
 characterCount: features.length,
 maxScore,
@@ -3568,11 +3626,12 @@ outlierFeature,
 })
 );
 
-return {
+const finalForensics = {
 available: true,
 status,
 severity,
 score,
+fileFingerprint: fileFingerprint || currentFileFingerprint,
 amountText: candidate.text,
 region: {
 ...rawRegion,
@@ -3610,6 +3669,17 @@ votes: anomalyScores[index]?.votes || 0,
 })),
 evidence,
 };
+
+if (
+finalForensics.status === "warning" &&
+finalForensics.severity === "strong" &&
+fileFingerprint
+) {
+amountForensicsStrongCache.set(fileFingerprint, finalForensics);
+console.log("AMOUNT FORENSICS STRONG CACHED:", fileFingerprint);
+}
+
+return finalForensics;
 }
 
 // =====================================================
@@ -5645,6 +5715,15 @@ await fs.readFile(
 filePath
 );
 
+const fileFingerprint =
+createHash("sha256")
+.update(buffer)
+.digest("hex");
+
+currentFileFingerprint = fileFingerprint;
+
+console.log("FILE SHA256:", fileFingerprint);
+
 if (
 !buffer?.length
 ) {
@@ -5848,7 +5927,8 @@ paddleImageOCR.confidence
 amountForensics =
 await analyzeAmountForensics(
 filePath,
-paddleImageOCR
+paddleImageOCR,
+currentFileFingerprint
 );
 
 console.log(
@@ -6564,7 +6644,8 @@ if (!amountForensics) {
 amountForensics =
 await analyzeAmountForensics(
 filePath,
-paddleResult
+paddleResult,
+currentFileFingerprint
 );
 }
 
@@ -6629,6 +6710,7 @@ PaddleOCR bounding-box verisi kullanılarak oluşturulmuştur.
 
 Durum: ${amountForensics.status}
 Şiddet: ${amountForensics.severity}
+Dosya SHA256: ${amountForensics.fileFingerprint || "unknown"}
 OCR tutar alanı: ${amountForensics.amountText || "unknown"}
 Karakter segment sayısı: ${amountForensics.characterCount || 0}
 
