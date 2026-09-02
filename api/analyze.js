@@ -7,7 +7,7 @@ import { execFile } from "child_process"
 import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
-import { runVisualForensics } from "./visual_forensics_v3.js";
+import { runVisualForensics } from "./visual_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
