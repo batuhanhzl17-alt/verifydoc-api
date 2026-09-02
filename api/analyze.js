@@ -3601,17 +3601,137 @@ function amountLabelEvidence(group) {
 
 function referenceAmountPositionScore(group) {
   if (!referenceAmountField || !image?.width || !image?.height) return 0;
-  const cx = (Number(group.region.x1) + Number(group.region.x2)) / 2 / image.width;
-  const cy = (Number(group.region.y1) + Number(group.region.y2)) / 2 / image.height;
+
+  const gx1 = Number(group.region.x1) || 0;
+  const gy1 = Number(group.region.y1) || 0;
+  const gx2 = Number(group.region.x2) || 0;
+  const gy2 = Number(group.region.y2) || 0;
+  const gcx = (gx1 + gx2) / 2 / image.width;
+  const gcy = (gy1 + gy2) / 2 / image.height;
+
   const refCx = Number(referenceAmountField.xNorm || 0) + Number(referenceAmountField.widthNorm || 0) / 2;
   const refCy = Number(referenceAmountField.yNorm || 0) + Number(referenceAmountField.heightNorm || 0) / 2;
-  const d = Math.sqrt(Math.pow(cx - refCx, 2) + Math.pow(cy - refCy, 2));
-  if (d <= 0.018) return 260;
-  if (d <= 0.035) return 210;
-  if (d <= 0.055) return 150;
-  if (d <= 0.080) return 85;
-  if (d <= 0.120) return 30;
+  const refW = Math.max(0.008, Number(referenceAmountField.widthNorm || 0));
+  const refH = Math.max(0.008, Number(referenceAmountField.heightNorm || 0));
+
+  const dx = Math.abs(gcx - refCx);
+  const dy = Math.abs(gcy - refCy);
+  const d = Math.sqrt(dx * dx + dy * dy);
+
+  // Referans tutar kutusunun çevresinde normalize ROI oluştur.
+  // Gerçek tutarın rakam sayısı referanstan farklı olabileceği için
+  // X toleransı, Y toleransından biraz daha geniş tutulur.
+  const xTolerance = Math.max(0.035, refW * 1.8);
+  const yTolerance = Math.max(0.028, refH * 4.5);
+  const insideRoi = dx <= xTolerance && dy <= yTolerance;
+
+  if (insideRoi && dx <= Math.max(0.018, refW * 0.8) && dy <= Math.max(0.018, refH * 2.0)) return 320;
+  if (insideRoi && dx <= Math.max(0.035, refW * 1.5) && dy <= Math.max(0.028, refH * 3.5)) return 250;
+  if (insideRoi) return 180;
+  if (d <= 0.120) return 20;
   return 0;
+}
+
+// =====================================================
+// GERÇEK JPG'DEKİ TUTAR ETİKETİ -> DEĞER ROI
+// =====================================================
+// Referans PDF'nin normalize koordinatı; JPG'nin kırpılması, yeniden
+// boyutlandırılması veya farklı kenar boşluğu nedeniyle birkaç piksel
+// sapabilir. Bu nedenle gerçek JPG'deki açık tutar etiketini de ikinci
+// ve daha güçlü bir ROI kapısı olarak kullanıyoruz.
+function directAmountLabelEvidence(group) {
+  if (!group?.region) return { score: 0, label: null, distance: null, hard: false };
+
+  const target = group.region;
+  const gx1 = Number(target.x1) || 0;
+  const gy1 = Number(target.y1) || 0;
+  const gx2 = Number(target.x2) || 0;
+  const gy2 = Number(target.y2) || 0;
+  const gh = Math.max(8, gy2 - gy1);
+
+  const items = ocrResult.regions
+    .filter((item) => item?.text && validRegion(item.region))
+    .map((item) => ({
+      ...item,
+      clean: cleanAmountText(item.text),
+      x1: Number(item.region.x1) || 0,
+      y1: Number(item.region.y1) || 0,
+      x2: Number(item.region.x2) || 0,
+      y2: Number(item.region.y2) || 0,
+    }))
+    .filter((item) => item.clean);
+
+  const labels = [];
+  const strongLabel = /giden\s*fast\s*tutar[ıi]?/i;
+  const mediumLabel = /(?:gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar)/i;
+
+  for (const item of items) {
+    if (strongLabel.test(item.clean)) labels.push({ ...item, score: 180, label: item.clean });
+    else if (mediumLabel.test(item.clean)) labels.push({ ...item, score: 150, label: item.clean });
+  }
+
+  // OCR etiketi birden fazla kutuya bölmüşse aynı satırdaki kutuları birleştir.
+  const sorted = [...items].sort((a, b) => a.y1 - b.y1 || a.x1 - b.x1);
+  for (let i = 0; i < sorted.length; i++) {
+    let text = sorted[i].clean;
+    const x1 = sorted[i].x1;
+    const y1 = sorted[i].y1;
+    let x2 = sorted[i].x2;
+    let y2 = sorted[i].y2;
+
+    for (let j = i + 1; j < sorted.length && j < i + 8; j++) {
+      const next = sorted[j];
+      const sameLine = Math.abs(next.y1 - y1) <= Math.max(12, gh * 1.2);
+      const gap = next.x1 >= x2 ? next.x1 - x2 : Infinity;
+      if (!sameLine || gap > Math.max(80, gh * 6)) break;
+
+      text += " " + next.clean;
+      x2 = Math.max(x2, next.x2);
+      y2 = Math.max(y2, next.y2);
+
+      if (strongLabel.test(text)) {
+        labels.push({ x1, y1, x2, y2, score: 180, label: text });
+        break;
+      }
+      if (mediumLabel.test(text)) {
+        labels.push({ x1, y1, x2, y2, score: 150, label: text });
+      }
+    }
+  }
+
+  if (!labels.length) return { score: 0, label: null, distance: null, hard: false };
+
+  let best = { score: 0, label: null, distance: Infinity, hard: false };
+
+  for (const label of labels) {
+    const sameLine =
+      Math.abs(((gy1 + gy2) / 2) - ((label.y1 + label.y2) / 2)) <= Math.max(18, gh * 1.6);
+    const rightOfLabel = gx1 >= label.x2 - Math.max(8, gh * 0.5);
+    const gap = gx1 >= label.x2 ? gx1 - label.x2 : Infinity;
+
+    if (!sameLine || !rightOfLabel || gap > Math.max(520, gh * 16)) continue;
+
+    const labelCy = (label.y1 + label.y2) / 2;
+    const groupCy = (gy1 + gy2) / 2;
+    const distance = Math.sqrt(
+      Math.pow(gap / Math.max(1, image?.width || 1), 2) +
+      Math.pow((groupCy - labelCy) / Math.max(1, image?.height || 1), 2)
+    );
+
+    const proximityBonus = Math.max(0, 70 - Math.min(70, gap / Math.max(1, gh) * 4));
+    const score = label.score + proximityBonus;
+
+    if (score > best.score) {
+      best = {
+        score,
+        label: label.label,
+        distance,
+        hard: label.score >= 180,
+      };
+    }
+  }
+
+  return best;
 }
 
 const allRankedCandidates = groups.map((group) => {
@@ -3621,14 +3741,23 @@ const anchor = anchorContextScore(group);
 const templateScore = templatePositionScore(group);
 const labelEvidence = amountLabelEvidence(group);
 const referencePositionScore = referenceAmountPositionScore(group);
+const directLabelEvidence = directAmountLabelEvidence(group);
 return {
 ...group,
-amountCandidateScore: baseScore + context.score + anchor.score + templateScore + labelEvidence.score + referencePositionScore,
+amountCandidateScore:
+baseScore +
+context.score +
+anchor.score +
+templateScore +
+labelEvidence.score +
+referencePositionScore +
+directLabelEvidence.score,
 context,
 anchor,
 templateScore,
 labelEvidence,
 referencePositionScore,
+directLabelEvidence,
 };
 });
 
@@ -3645,42 +3774,56 @@ let selectionMethod = "legacy-scoring";
 
 if (referenceAmountField) {
   const referenceMatched = allRankedCandidates.filter((item) =>
-    Number(item.referencePositionScore || 0) > 0
+    Number(item.referencePositionScore || 0) >= 180
+  );
+  const directLabelMatched = allRankedCandidates.filter((item) =>
+    Number(item.directLabelEvidence?.score || 0) >= 150
   );
   const labelMatched = allRankedCandidates.filter((item) =>
     Number(item.labelEvidence?.score || 0) >= 150
   );
 
-  // Öncelik: hem referans bölgesinde hem de tutar etiketiyle desteklenen aday.
+  // En güçlü kapı: referans ROI + gerçek JPG'deki kesin tutar etiketi.
   const bothMatched = referenceMatched.filter((item) =>
-    Number(item.labelEvidence?.score || 0) >= 150
+    Number(item.directLabelEvidence?.score || 0) >= 150
   );
 
   if (bothMatched.length) {
     candidatePool = bothMatched;
-    selectionMethod = "reference-position-and-label";
+    selectionMethod = "reference-roi-and-direct-label";
+  } else if (directLabelMatched.length) {
+    // Gerçek JPG'de "GİDEN FAST TUTARI" gibi açık bir etiket varsa,
+    // etiketin hemen sağındaki sayıyı önceliklendir.
+    candidatePool = directLabelMatched;
+    selectionMethod = "direct-amount-label-roi";
   } else if (referenceMatched.length) {
     candidatePool = referenceMatched;
-    selectionMethod = "reference-position";
+    selectionMethod = "reference-roi";
   } else if (labelMatched.length) {
     candidatePool = labelMatched;
     selectionMethod = "amount-label";
   } else {
-    // Referans var ama OCR ölçeği/konumu nedeniyle hiçbir aday eşleşmedi.
-    // Bu durumda legacy sıralamaya dönmek yerine, en azından en yakın
-    // referans adayını seç. Böylece uzak bir müşteri/ref numarası kazanamaz.
+    // Referansla hiç eşleşme yoksa eski serbest seçim yöntemine dönme.
+    // Yalnızca referansın yakınında pozitif skor alan aday varsa onu kullan.
+    // Hiçbiri yoksa sonucu açıkça reference-unmatched olarak işaretle.
     const nearest = [...allRankedCandidates].sort((a, b) => {
       const ra = Number(a.referencePositionScore || 0);
       const rb = Number(b.referencePositionScore || 0);
       if (rb !== ra) return rb - ra;
+
+      const da = Number(a.directLabelEvidence?.score || 0);
+      const db = Number(b.directLabelEvidence?.score || 0);
+      if (db !== da) return db - da;
+
       return (b.amountCandidateScore || 0) - (a.amountCandidateScore || 0);
     });
+
     if (nearest.length && Number(nearest[0].referencePositionScore || 0) > 0) {
       candidatePool = [nearest[0]];
       selectionMethod = "reference-nearest";
     } else {
       candidatePool = allRankedCandidates;
-      selectionMethod = "reference-unmatched-legacy";
+      selectionMethod = "reference-unmatched";
     }
   }
 }
@@ -3713,6 +3856,8 @@ templateScore: item.templateScore || 0,
 referencePositionScore: item.referencePositionScore || 0,
 amountLabelScore: item.labelEvidence?.score || 0,
 amountLabel: item.labelEvidence?.positive || [],
+directAmountLabelScore: item.directLabelEvidence?.score || 0,
+directAmountLabel: item.directLabelEvidence?.label || null,
 anchorContext: item.anchor?.anchors || [],
 positiveContext: item.context?.positive || [],
 negativeContext: [...(item.context?.negative || []), ...(item.labelEvidence?.negative || [])],
@@ -4325,6 +4470,8 @@ referenceGuidedSelection: selectionMethod,
 referenceAmountPositionScore: Number(candidate.referencePositionScore || 0),
 amountLabelScore: Number(candidate.labelEvidence?.score || 0),
 amountLabelEvidence: candidate.labelEvidence?.positive || [],
+directAmountLabelScore: Number(candidate.directLabelEvidence?.score || 0),
+directAmountLabel: candidate.directLabelEvidence?.label || null,
 },
 selectionMethod,
 selectedAmountText: candidate.text,
@@ -7530,7 +7677,7 @@ preserveAmount(result.documentData.amount);
 // Eksi işareti dekontta çıkış yönünü gösterir; documentData.amount
 // tutarın büyüklüğünü korur.
 if (
-  ["reference-position-and-label", "reference-position", "reference-nearest", "amount-label"].includes(amountForensics?.selectionMethod) &&
+  ["reference-roi-and-direct-label", "direct-amount-label-roi", "reference-roi", "reference-position-and-label", "reference-position", "reference-nearest", "amount-label"].includes(amountForensics?.selectionMethod) &&
   amountForensics?.selectedAmountText
 ) {
   const selected = String(amountForensics.selectedAmountText)
