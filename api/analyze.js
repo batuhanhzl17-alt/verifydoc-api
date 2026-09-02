@@ -1,3 +1,15 @@
+Öğe seçilmedi 
+
+İçeriğe atla
+Gmail ürününü ekran okuyucularla birlikte kullanma
+Gmail için masaüstü bildirimlerini etkinleştirin.
+   Tamam  Hayır, teşekkürler
+İleti Dizileri
+100 GB kotanın %15 kadarı kullanıldı
+Aboneliği iptal et
+Şartlar · Gizlilik · Program Politikaları
+Son hesap etkinliği: 0 dakika önce
+1 farklı konumda daha açık · Ayrıntılar
 import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
@@ -7,7 +19,6 @@ import { execFile } from "child_process"
 import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
-import { runVisualForensics } from "./visual_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -2731,41 +2742,58 @@ count,
 // Referans PDF, yalnızca OpenAI bağlamı olarak değil, bankaya özgü tutar
 // konumunu belirlemek için de kullanılır. Sabit piksel yerine normalize konum kullanılır.
 async function getReferenceAmountAnchor(bank) {
-  const normalizedBank = normalizeBank(bank);
-  if (!normalizedBank) return null;
-  const cacheKey = `amount-anchor:${normalizedBank}`;
-  if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
-
-  try {
-    const profile = await buildReferenceTemplateProfile(normalizedBank);
-    const amountField = profile?.fields?.amount;
-    if (!amountField) {
-      referenceAmountAnchorCache.set(cacheKey, null);
-      return null;
-    }
-
-    const anchor = {
-      bank: normalizedBank,
-      pageNumber: Number(amountField.pageNumber) || 1,
-      xNorm: Number(amountField.xNorm) || null,
-      yNorm: Number(amountField.yNorm) || null,
-      widthNorm: Number(amountField.widthNorm) || null,
-      heightNorm: Number(amountField.heightNorm) || null,
-      label: amountField.label || 'tutar',
-      amountText: null,
-      referenceCount: Number(amountField.referenceCount) || 1,
-      spread: amountField.spread || null,
-      source: 'trusted-reference-ensemble',
-    };
-    referenceAmountAnchorCache.set(cacheKey, anchor);
-    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE:', JSON.stringify(anchor));
-    return anchor;
-  } catch (error) {
-    console.warn('REFERENCE AMOUNT ANCHOR ENSEMBLE HATASI:', normalizedBank, error?.message || error);
-    referenceAmountAnchorCache.set(cacheKey, null);
-    return null;
-  }
+const normalizedBank = normalizeBank(bank);
+if (!normalizedBank) return null;
+if (referenceAmountAnchorCache.has(normalizedBank)) return referenceAmountAnchorCache.get(normalizedBank);
+const referencePath = getReferenceFile(normalizedBank);
+if (!referencePath) return null;
+try {
+const buffer = await fs.readFile(referencePath);
+if (!buffer?.length) return null;
+const pdf = await pdfjsLib.getDocument({data: new Uint8Array(buffer)}).promise;
+const labelRegex = /(?:işlem\s*tutarı|islem\s*tutari|ana\s*tutar|\btutar\b|amount)/i;
+const moneyRegex = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
+const decimalRegex = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
+for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 3); pageNumber++) {
+const page = await pdf.getPage(pageNumber);
+const viewport = page.getViewport({scale: 1});
+const textContent = await page.getTextContent();
+const items = textContent.items.map((item) => {
+const tr = Array.isArray(item?.transform) ? item.transform : [];
+return {str: String(item?.str || '').trim(), x: Number(tr[4]), y: Number(tr[5]), width: Number(item?.width) || 0, height: Math.abs(Number(tr[3])) || Number(item?.height) || 0};
+}).filter((x) => x.str && Number.isFinite(x.x) && Number.isFinite(x.y));
+const labels = items.filter((x) => labelRegex.test(x.str));
+const amounts = items.filter((x) => (moneyRegex.test(x.str) || decimalRegex.test(x.str)) && /\d/.test(x.str));
+for (const label of labels) {
+let best = null;
+let bestDistance = Infinity;
+for (const amount of amounts) {
+const labelY = viewport.height - label.y;
+const amountY = viewport.height - amount.y;
+const verticalDistance = Math.abs(labelY - amountY);
+const horizontalDistance = amount.x >= label.x ? amount.x - (label.x + label.width) : Infinity;
+if (verticalDistance > Math.max(40, label.height * 3)) continue;
+if (horizontalDistance < 0 || horizontalDistance > Math.max(700, label.width * 12)) continue;
+const distance = verticalDistance * 5 + horizontalDistance;
+if (distance < bestDistance) { bestDistance = distance; best = amount; }
 }
+if (best) {
+const anchor = {bank: normalizedBank, pageNumber, xNorm: viewport.width ? (best.x + best.width / 2) / viewport.width : null, yNorm: viewport.height ? (viewport.height - best.y - best.height / 2) / viewport.height : null, widthNorm: viewport.width ? best.width / viewport.width : null, heightNorm: viewport.height ? best.height / viewport.height : null, label: label.str, amountText: best.str};
+referenceAmountAnchorCache.set(normalizedBank, anchor);
+console.log('REFERENCE AMOUNT ANCHOR:', JSON.stringify(anchor));
+return anchor;
+}
+}
+}
+referenceAmountAnchorCache.set(normalizedBank, null);
+return null;
+} catch (error) {
+console.warn('REFERENCE AMOUNT ANCHOR HATASI:', normalizedBank, error?.message || error);
+referenceAmountAnchorCache.set(normalizedBank, null);
+return null;
+}
+}
+
 
 // =====================================================
 // REFERANS ŞABLON PROFİLİ V2
@@ -2878,223 +2906,119 @@ async function calculateReferenceStyleMetrics(buffer, box, width, height) {
   }
 }
 
-async function getReferenceFiles(bank) {
-  const normalizedBank = normalizeBank(bank);
-  if (!normalizedBank) return [];
-
-  const files = [];
-  try {
-    const entries = await fs.readdir(REFERENCE_DIR, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile()) continue;
-      const ext = path.extname(entry.name).toLowerCase();
-      if (!['.pdf', '.jpg', '.jpeg', '.png', '.webp'].includes(ext)) continue;
-      const normalizedName = normalizeTurkishText(path.basename(entry.name, ext)).replace(/[^a-z0-9]/g, '');
-      if (normalizedName.includes(normalizedBank)) {
-        files.push(path.join(REFERENCE_DIR, entry.name));
-      }
-    }
-  } catch (error) {
-    console.warn('REFERENCE KLASORU OKUNAMADI:', error?.message || error);
-  }
-
-  // Önerilen yapı: references/yapikredi/*
-  const bankDir = path.join(REFERENCE_DIR, normalizedBank);
-  try {
-    const entries = await fs.readdir(bankDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile()) continue;
-      const ext = path.extname(entry.name).toLowerCase();
-      if (!['.pdf', '.jpg', '.jpeg', '.png', '.webp'].includes(ext)) continue;
-      files.push(path.join(bankDir, entry.name));
-    }
-  } catch {}
-
-  // Eski tek-referans yapısı bozulmasın.
-  const canonical = getReferenceFile(bank);
-  if (canonical) files.push(canonical);
-
-  return [...new Set(files)];
-}
-
-function aggregateReferenceField(entries) {
-  if (!entries.length) return null;
-  const median = (values) => {
-    const v = values.filter(Number.isFinite).sort((a,b)=>a-b);
-    if (!v.length) return 0;
-    const m = Math.floor(v.length/2);
-    return v.length % 2 ? v[m] : (v[m-1] + v[m]) / 2;
-  };
-  const representative = [...entries].sort((a,b) => {
-    const da = Math.abs(a.xNorm - median(entries.map(x=>x.xNorm))) + Math.abs(a.yNorm - median(entries.map(x=>x.yNorm)));
-    const db = Math.abs(b.xNorm - median(entries.map(x=>x.xNorm))) + Math.abs(b.yNorm - median(entries.map(x=>x.yNorm)));
-    return da-db;
-  })[0];
-  return {
-    ...representative,
-    xNorm: median(entries.map(x=>x.xNorm)),
-    yNorm: median(entries.map(x=>x.yNorm)),
-    widthNorm: median(entries.map(x=>x.widthNorm)),
-    heightNorm: median(entries.map(x=>x.heightNorm)),
-    referenceCount: entries.length,
-    variants: entries.map(x => ({...x})),
-    spread: {
-      x: Math.max(...entries.map(x=>x.xNorm)) - Math.min(...entries.map(x=>x.xNorm)),
-      y: Math.max(...entries.map(x=>x.yNorm)) - Math.min(...entries.map(x=>x.yNorm)),
-      width: Math.max(...entries.map(x=>x.widthNorm)) - Math.min(...entries.map(x=>x.widthNorm)),
-      height: Math.max(...entries.map(x=>x.heightNorm)) - Math.min(...entries.map(x=>x.heightNorm)),
-    },
-  };
-}
-
-async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
-  const ext = path.extname(referencePath).toLowerCase();
-  const fields = {};
-
-  if (ext !== '.pdf') {
-    // Görsel referanslar OCR olmadan alan koordinatı üretemez; dosyayı yine de
-    // trusted reference setinde tutuyoruz. PDF'ler alan kalibrasyonunun ana kaynağıdır.
-    return { bank: normalizedBank, referenceFile: path.basename(referencePath), fields, fieldCount: 0, referenceType: 'image' };
-  }
-
-  const buffer = await fs.readFile(referencePath);
-  if (!buffer?.length) return null;
-  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
-
-  for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 5); pageNumber++) {
-    const page = await pdf.getPage(pageNumber);
-    const viewport = page.getViewport({ scale: 1 });
-    const textContent = await page.getTextContent();
-    const items = textContent.items.map((item) => {
-      const tr = Array.isArray(item?.transform) ? item.transform : [];
-      const x = Number(tr[4]);
-      const y = Number(tr[5]);
-      const height = Math.abs(Number(tr[3])) || Number(item?.height) || 0;
-      return {
-        str: String(item?.str || '').trim(), x, y,
-        width: Number(item?.width) || 0, height,
-        fontName: item?.fontName || null, hasEOL: Boolean(item?.hasEOL),
-      };
-    }).filter((x) => x.str && Number.isFinite(x.x) && Number.isFinite(x.y));
-
-    const rows = groupPdfTextLines(items, viewport);
-    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-      const row = rows[rowIndex];
-      const rule = referenceFieldRuleForText(row.text);
-      if (!rule) continue;
-
-      const labelItemIndex = row.items.findIndex((item) => referenceFieldRuleForText(item.str)?.key === rule.key);
-      const labelItem = labelItemIndex >= 0 ? row.items[labelItemIndex] : row.items[0];
-      let valueItems = row.items.slice(Math.max(0, labelItemIndex + 1));
-      if (!valueItems.length) {
-        const next = rows[rowIndex + 1];
-        if (next && next.top - row.top <= Math.max(55, row.y2 - row.y1 + 30)) valueItems = next.items.slice(0, 20);
-      }
-      valueItems = valueItems.filter((item) => !referenceFieldRuleForText(item.str));
-      if (!valueItems.length) continue;
-
-      const x1 = Math.min(...valueItems.map((x) => x.x));
-      const x2 = Math.max(...valueItems.map((x) => x.x + x.width));
-      const y1 = Math.min(...valueItems.map((x) => viewport.height - x.y - x.height));
-      const y2 = Math.max(...valueItems.map((x) => viewport.height - x.y));
-      const chars = valueItems.reduce((sum, x) => sum + Math.max(1, String(x.str || '').length), 0);
-      const avgFontHeight = valueItems.length ? valueItems.reduce((sum,x)=>sum+(Number(x.height)||0),0)/valueItems.length : 0;
-      const avgCharWidth = chars ? valueItems.reduce((sum,x)=>sum+(Number(x.width)||0),0)/chars : 0;
-      const fontNames = [...new Set(valueItems.map(x=>x.fontName).filter(Boolean))];
-
-      const box = {
-        xNorm: x1 / viewport.width,
-        yNorm: y1 / viewport.height,
-        widthNorm: Math.max(0.001, (x2-x1)/viewport.width),
-        heightNorm: Math.max(0.001, (y2-y1)/viewport.height),
-        pageNumber,
-        labelKey: rule.key,
-        label: String(row.text || ''),
-        labelPresent: Boolean(labelItem),
-        valueTextLength: chars,
-        style: { source:'pdf-text-metadata', fontNames, avgFontHeight, avgCharWidth, itemCount:valueItems.length },
-        referenceFile: path.basename(referencePath),
-      };
-      (fields[rule.key] ||= []).push(box);
-    }
-  }
-
-  return {
-    bank: normalizedBank,
-    referenceFile: path.basename(referencePath),
-    fields,
-    fieldCount: Object.keys(fields).length,
-    referenceType: 'pdf',
-  };
-}
-
 async function buildReferenceTemplateProfile(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
-  const referencePaths = await getReferenceFiles(normalizedBank);
-  const statParts = [];
-  for (const referencePath of referencePaths) {
-    try { const st = await fs.stat(referencePath); statParts.push(`${referencePath}:${st.mtimeMs}:${st.size}`); } catch {}
-  }
-  const cacheKey = `${normalizedBank}|${statParts.sort().join('|')}`;
-  if (referenceTemplateProfileCache.has(cacheKey)) return referenceTemplateProfileCache.get(cacheKey);
-
-  if (!referencePaths.length) {
-    console.warn('REFERENCE ENSEMBLE BULUNAMADI:', normalizedBank);
-    referenceTemplateProfileCache.set(cacheKey, null);
-    return null;
-  }
+  if (referenceTemplateProfileCache.has(normalizedBank)) return referenceTemplateProfileCache.get(normalizedBank);
+  const referencePath = getReferenceFile(normalizedBank);
+  if (!referencePath) return null;
 
   try {
-    const extracted = [];
-    for (const referencePath of referencePaths) {
-      try {
-        const profile = await extractReferenceTemplateProfile(referencePath, normalizedBank);
-        if (profile) extracted.push(profile);
-      } catch (error) {
-        console.warn('REFERENCE TEK DOSYA HATASI:', path.basename(referencePath), error?.message || error);
-      }
-    }
-
-    const fieldBuckets = {};
-    for (const profile of extracted) {
-      for (const [field, values] of Object.entries(profile.fields || {})) {
-        if (!Array.isArray(values)) continue;
-        (fieldBuckets[field] ||= []).push(...values);
-      }
-    }
-
+    const buffer = await fs.readFile(referencePath);
+    if (!buffer?.length) return null;
+    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
     const fields = {};
-    for (const [field, entries] of Object.entries(fieldBuckets)) {
-      // Aynı PDF içinde farklı sayfalarda aynı alan bulunabilir. Sayfa 1'i tercih
-      // ediyoruz; ardından en sık görülen normalize konum kümesini temsilci olarak seçiyoruz.
-      const pageOne = entries.filter(x => Number(x.pageNumber) === 1);
-      fields[field] = aggregateReferenceField(pageOne.length ? pageOne : entries);
+
+    // Referans PDF'nin text layer'ını kullanıyoruz. Böylece canvas olmadan da
+    // alanların normalize konumu, boyutu ve PDF font metadata'sı çıkarılabilir.
+    for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 5); pageNumber++) {
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1 });
+      const textContent = await page.getTextContent();
+      const items = textContent.items.map((item) => {
+        const tr = Array.isArray(item?.transform) ? item.transform : [];
+        const x = Number(tr[4]);
+        const y = Number(tr[5]);
+        const height = Math.abs(Number(tr[3])) || Number(item?.height) || 0;
+        return {
+          str: String(item?.str || "").trim(),
+          x,
+          y,
+          width: Number(item?.width) || 0,
+          height,
+          fontName: item?.fontName || null,
+          hasEOL: Boolean(item?.hasEOL),
+        };
+      }).filter((x) => x.str && Number.isFinite(x.x) && Number.isFinite(x.y));
+
+      const rows = groupPdfTextLines(items, viewport);
+
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        const row = rows[rowIndex];
+        const rule = referenceFieldRuleForText(row.text);
+        if (!rule) continue;
+
+        const labelItemIndex = row.items.findIndex((item) => referenceFieldRuleForText(item.str)?.key === rule.key);
+        const labelItem = labelItemIndex >= 0 ? row.items[labelItemIndex] : row.items[0];
+
+        // Öncelik: aynı satırdaki etiketin sağındaki değer. Değer alt satırdaysa
+        // bir sonraki yakın satırı kullan.
+        let valueItems = row.items.slice(Math.max(0, labelItemIndex + 1));
+        if (!valueItems.length) {
+          const next = rows[rowIndex + 1];
+          if (next && next.top - row.top <= Math.max(55, row.y2 - row.y1 + 30)) {
+            valueItems = next.items.slice(0, 20);
+          }
+        }
+        valueItems = valueItems.filter((item) => !referenceFieldRuleForText(item.str));
+        if (!valueItems.length) continue;
+
+        const x1 = Math.min(...valueItems.map((x) => x.x));
+        const x2 = Math.max(...valueItems.map((x) => x.x + x.width));
+        const y1 = Math.min(...valueItems.map((x) => viewport.height - x.y - x.height));
+        const y2 = Math.max(...valueItems.map((x) => viewport.height - x.y));
+
+        const chars = valueItems.reduce((sum, x) => sum + Math.max(1, String(x.str || "").length), 0);
+        const avgFontHeight = valueItems.length
+          ? valueItems.reduce((sum, x) => sum + (Number(x.height) || 0), 0) / valueItems.length
+          : 0;
+        const avgCharWidth = chars
+          ? valueItems.reduce((sum, x) => sum + (Number(x.width) || 0), 0) / chars
+          : 0;
+        const fontNames = [...new Set(valueItems.map((x) => x.fontName).filter(Boolean))];
+
+        const box = {
+          xNorm: x1 / viewport.width,
+          yNorm: y1 / viewport.height,
+          widthNorm: Math.max(0.001, (x2 - x1) / viewport.width),
+          heightNorm: Math.max(0.001, (y2 - y1) / viewport.height),
+          pageNumber,
+          labelKey: rule.key,
+          label: String(row.text || ""),
+          labelPresent: Boolean(labelItem),
+          valueTextLength: chars,
+          style: {
+            source: "pdf-text-metadata",
+            fontNames,
+            avgFontHeight,
+            avgCharWidth,
+            itemCount: valueItems.length,
+          },
+        };
+
+        // Aynı alandan birden fazla aday çıkarsa daha geniş/kompleks alanı tercih et.
+        const existing = fields[rule.key];
+        if (!existing || box.widthNorm * box.heightNorm > existing.widthNorm * existing.heightNorm) {
+          fields[rule.key] = box;
+        }
+      }
     }
 
     const profile = {
       bank: normalizedBank,
-      referenceFiles: referencePaths.map(x=>path.basename(x)),
-      referenceCount: referencePaths.length,
-      usablePdfReferenceCount: extracted.filter(x=>x.referenceType==='pdf' && x.fieldCount>0).length,
+      referenceFile: path.basename(referencePath),
       fields,
       fieldCount: Object.keys(fields).length,
-      referenceMode: 'trusted-ensemble',
-      styleSource: 'pdf-text-metadata',
+      renderAvailable: false,
+      styleSource: "pdf-text-metadata",
     };
 
-    referenceTemplateProfileCache.set(cacheKey, profile);
-    console.log('REFERENCE TEMPLATE ENSEMBLE:', JSON.stringify({
-      bank: normalizedBank,
-      referenceCount: profile.referenceCount,
-      usablePdfReferenceCount: profile.usablePdfReferenceCount,
-      files: profile.referenceFiles,
-      fields: Object.fromEntries(Object.entries(fields).map(([k,v])=>[k,{referenceCount:v.referenceCount,spread:v.spread}]))
-    }));
+    referenceTemplateProfileCache.set(normalizedBank, profile);
+    console.log("REFERENCE TEMPLATE PROFILE:", JSON.stringify(profile));
     return profile;
   } catch (error) {
-    console.warn('REFERENCE TEMPLATE ENSEMBLE HATASI:', normalizedBank, error?.message || error);
-    referenceTemplateProfileCache.set(cacheKey, null);
+    console.warn("REFERENCE TEMPLATE PROFILE HATASI:", normalizedBank, error?.message || error);
+    referenceTemplateProfileCache.set(normalizedBank, null);
     return null;
   }
 }
@@ -3113,7 +3037,8 @@ function normalizeRegionBox(region, size) {
 
 function referenceFieldTargetCandidates(field, ref, regions, size) {
   const candidates = [];
-  const referenceVariants = Array.isArray(ref?.variants) && ref.variants.length ? ref.variants : [ref];
+  const refCx = ref.xNorm + ref.widthNorm / 2;
+  const refCy = ref.yNorm + ref.heightNorm / 2;
   const rule = REFERENCE_FIELD_RULES.find((r) => r.key === field);
 
   for (const item of regions) {
@@ -3127,17 +3052,9 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
 
     const cx = box.xNorm + box.widthNorm / 2;
     const cy = box.yNorm + box.heightNorm / 2;
-    const variantDistances = referenceVariants.map((rv) => {
-      const rcx = Number(rv.xNorm || 0) + Number(rv.widthNorm || 0) / 2;
-      const rcy = Number(rv.yNorm || 0) + Number(rv.heightNorm || 0) / 2;
-      const dx = Math.abs(cx - rcx);
-      const dy = Math.abs(cy - rcy);
-      return { dx, dy, distance: Math.sqrt(dx * dx + dy * dy), ref: rv };
-    }).sort((a,b)=>a.distance-b.distance);
-    const nearestVariant = variantDistances[0];
-    const dx = nearestVariant?.dx || 0;
-    const dy = nearestVariant?.dy || 0;
-    const positionDistance = nearestVariant?.distance || 0;
+    const dx = Math.abs(cx - refCx);
+    const dy = Math.abs(cy - refCy);
+    const positionDistance = Math.sqrt(dx * dx + dy * dy);
 
     // Etiketin kendisini değil, etiketin sağındaki/altındaki değeri seçmeye çalış.
     if (labelScore > 0) {
@@ -3152,15 +3069,10 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
         const right = Number(vr.x1) >= Number(lr.x2) - 6;
         const below = Number(vr.y1) >= Number(lr.y2) - 4 && Number(vr.y1) - Number(lr.y2) <= Math.max(70, (Number(lr.y2)-Number(lr.y1))*4);
         if (!((sameLine && right) || below)) continue;
-        const variantDistances = referenceVariants.map((rv) => {
-          const rcx = Number(rv.xNorm || 0) + Number(rv.widthNorm || 0) / 2;
-          const rcy = Number(rv.yNorm || 0) + Number(rv.heightNorm || 0) / 2;
-          const vcx = vbox.xNorm + vbox.widthNorm / 2;
-          const vcy = vbox.yNorm + vbox.heightNorm / 2;
-          return Math.sqrt(Math.pow(vcx-rcx,2)+Math.pow(vcy-rcy,2));
-        });
-        const vdist = Math.min(...variantDistances);
-        candidates.push({ item:valueItem, box:vbox, score:labelScore + 50 - Math.min(45, vdist*250), nearestReferenceDistance:vdist });
+        const vcx = vbox.xNorm + vbox.widthNorm / 2;
+        const vcy = vbox.yNorm + vbox.heightNorm / 2;
+        const vdist = Math.sqrt(Math.pow(vcx-refCx,2)+Math.pow(vcy-refCy,2));
+        candidates.push({ item:valueItem, box:vbox, score:labelScore + 50 - Math.min(45, vdist*250) });
       }
     }
 
@@ -3222,22 +3134,10 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
 
     const best = candidates[0];
     const target = best.box;
-    const variants = Array.isArray(ref?.variants) && ref.variants.length ? ref.variants : [ref];
-    const nearestRef = [...variants].sort((a,b) => {
-      const da = Math.sqrt(
-        Math.pow((target.xNorm + target.widthNorm/2) - (a.xNorm + a.widthNorm/2), 2) +
-        Math.pow((target.yNorm + target.heightNorm/2) - (a.yNorm + a.heightNorm/2), 2)
-      );
-      const db = Math.sqrt(
-        Math.pow((target.xNorm + target.widthNorm/2) - (b.xNorm + b.widthNorm/2), 2) +
-        Math.pow((target.yNorm + target.heightNorm/2) - (b.yNorm + b.heightNorm/2), 2)
-      );
-      return da-db;
-    })[0] || ref;
-    const dx = Math.abs((target.xNorm + target.widthNorm/2) - (nearestRef.xNorm + nearestRef.widthNorm/2));
-    const dy = Math.abs((target.yNorm + target.heightNorm/2) - (nearestRef.yNorm + nearestRef.heightNorm/2));
-    const dw = Math.abs(Math.log(Math.max(.001,target.widthNorm)/Math.max(.001,nearestRef.widthNorm)));
-    const dh = Math.abs(Math.log(Math.max(.001,target.heightNorm)/Math.max(.001,nearestRef.heightNorm)));
+    const dx = Math.abs((target.xNorm + target.widthNorm/2) - (ref.xNorm + ref.widthNorm/2));
+    const dy = Math.abs((target.yNorm + target.heightNorm/2) - (ref.yNorm + ref.heightNorm/2));
+    const dw = Math.abs(Math.log(Math.max(.001,target.widthNorm)/Math.max(.001,ref.widthNorm)));
+    const dh = Math.abs(Math.log(Math.max(.001,target.heightNorm)/Math.max(.001,ref.heightNorm)));
 
     const geometryScore = Math.min(100, Math.round((dx/.03)*35 + (dy/.03)*35 + dw*20 + dh*10));
     const targetText = String(best.item.text || "");
@@ -3280,7 +3180,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
     matches.push({
       field,
       status:"matched",
-      reference:{xNorm:nearestRef.xNorm,yNorm:nearestRef.yNorm,widthNorm:nearestRef.widthNorm,heightNorm:nearestRef.heightNorm,pageNumber:nearestRef.pageNumber,style:nearestRef.style,referenceFile:nearestRef.referenceFile,referenceCount:ref.referenceCount,spread:ref.spread},
+      reference:{xNorm:ref.xNorm,yNorm:ref.yNorm,widthNorm:ref.widthNorm,heightNorm:ref.heightNorm,pageNumber:ref.pageNumber,style:ref.style},
       target:{...target,pageIndex:Number(best.item.pageIndex)||0,text:targetText,ocrScore:Number(best.item.score)||0},
       matchScore:Math.max(0,Math.round(best.score)),
       geometryScore,
@@ -3295,9 +3195,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
 
   return {
     bank:profile.bank,
-    referenceFile:profile.referenceFiles?.[0] || null,
-    referenceFiles:profile.referenceFiles || [],
-    referenceCount:profile.referenceCount || 1,
+    referenceFile:profile.referenceFile,
     referenceFieldCount:profile.fieldCount,
     matchedFieldCount:matched.length,
     missingFieldCount:missing.length,
@@ -6936,7 +6834,6 @@ buffer.toString(
 let paddleImageOCR = null;
 let amountForensics = null;
 let referenceTemplateAnalysis = null;
-let visualForensics = null;
 
 if (
 type === "image" ||
@@ -7017,24 +6914,6 @@ if (
     console.log("REFERENCE TEMPLATE ANALYSIS:", JSON.stringify(referenceTemplateAnalysis));
   } catch (error) {
     console.warn("REFERENCE TEMPLATE ANALYSIS HATASI:", error?.message || error);
-  }
-}
-
-// =====================================================
-// GÖRSEL FORENSICS — BÜTÜN SAYFA REFERANS KARŞILAŞTIRMASI
-// =====================================================
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
-  try {
-    const trustedReferencePaths = await getReferenceFiles(bank);
-    visualForensics = await runVisualForensics({
-      targetPath: filePath,
-      referencePaths: trustedReferencePaths,
-      bank,
-      tempDir: "/tmp",
-    });
-    console.log("VISUAL FORENSICS:", JSON.stringify(visualForensics));
-  } catch (error) {
-    console.warn("VISUAL FORENSICS HATASI:", error?.message || error);
   }
 }
 
@@ -7446,14 +7325,24 @@ detail:
 },
 
 // =================================================
-// REFERANS DOSYASI — MODEL İZOLASYONU
+// REFERANS PDF
+// SADECE GÖRSEL / ŞABLON KARŞILAŞTIRMASI
 // =================================================
-// Referans PDF modele DOSYA olarak gönderilmez.
-// Güvenilir referanslar yalnızca backend'deki şablon ve
-// görsel forensics katmanlarında kullanılır.
-// Böylece referanstaki gerçek tutar/tarih/IBAN/isim gibi
-// değerlerin gerçek dekont verisine sızması engellenir.
-console.log("REFERENCE VALUE ISOLATION: REFERANS DOSYASI MODELE GONDERILMEDI");
+...(
+reference?.base64
+? [
+{
+type:
+"input_file",
+
+filename:
+reference.fileName,
+file_data:
+`data:application/pdf;base64,${reference.base64}`,
+},
+]
+: []
+),
 ];
 
 }
@@ -7512,31 +7401,58 @@ file_data: pdfDataUrl,
 },
 
 // =================================================
-// REFERANS BANKA ŞABLONU — MODEL İZOLASYONU
+// REFERANS BANKA ŞABLONU
 // =================================================
-// Referans PDF modele gönderilmez. Model yalnızca gerçek
-// dekont PDF'sini görür. Referanslardan çıkarılan yapı
-// özeti backend tarafından zaten hesaplanmıştır.
-content.push({
-  type: "input_text",
-  text: `
+
+...(
+reference?.base64
+? [
+
+{
+type: "input_text",
+text: `
 ==================================================
-REFERANS ŞABLON ÖZETİ — SADECE YAPI / GEOMETRİ
+REFERANS DEKONT — SADECE ŞABLON / KONUM BİLGİSİ
 ==================================================
-Referans dosyalarının kendisi modele verilmedi.
-Referans kümesinden backend tarafından çıkarılan
-şablon bilgileri aşağıdadır.
 
-Gerçek tutar, tarih, IBAN, isim ve işlem/reference
-numarası yalnızca GERÇEK DEKONT PDF'sinden alınmalıdır.
+Aşağıdaki PDF, ${bank || "seçilen bankanın"} REFERANS
+DEKONT ŞABLONUDUR.
+BU DOSYADAN GERÇEK İŞLEM DEĞERİ ALMA.
 
-Referans alanları:
-${JSON.stringify(referenceTemplateAnalysis?.fields || [], null, 2)}
+Bu PDF'yi yalnızca:
 
-Görsel forensic özeti:
-${JSON.stringify(visualForensics || null, null, 2)}
+- alanların nerede bulunduğunu,
+- alanların hangi etiketlerle gösterildiğini,
+- gönderen alanının konumunu,
+- alıcı alanının konumunu,
+- IBAN alanının konumunu,
+- tutar alanının konumunu,
+- tarih alanının konumunu,
+- işlem/reference numarası alanlarının konumunu,
+- bankaya özgü belge düzenini
+anlamak için kullan.
+
+ÖNEMLİ:
+Referans PDF'deki isimleri, IBAN'ları, tutarları,
+tarihleri veya işlem numaralarını analiz edilen dekonta
+AKTARMA.
+
+Gerçek değerlerin tamamı GERÇEK DEKONT PDF'sinden
+çıkarılmalıdır.
+
+Referans dosya adı:
+${reference.fileName}
 `
-});
+},
+{
+type: "input_file",
+filename: reference.fileName,
+file_data: `data:application/pdf;base64,${reference.base64}`,
+},
+
+]
+: []
+),
 
 ];
 }
@@ -7782,11 +7698,6 @@ ${JSON.stringify(referenceTemplateAnalysis.fields || [], null, 2)}
 Referansın konumu, alan ölçüsü ve render yoğunluğu gerçek dekonttaki karşılığıyla birlikte değerlendirilsin.
 
 Konum veya font/render farkı tek başına sahtecilik kanıtı değildir; başka bağımsız bulgularla birlikte değerlendirilmelidir.
-
-GÖRSEL FORENSICS:
-${JSON.stringify(visualForensics || null, null, 2)}
-
-Görsel forensics sonucu bütün sayfa benzerlik/sapma sinyalidir. Tek başına sahtecilik kararı verme; alan geometrisi, OCR ve diğer bağımsız bulgularla birlikte değerlendir.
 =====================================================
 `,
   });
@@ -7898,10 +7809,6 @@ if (
 }
 }
 
-if (visualForensics) {
-  result.visualForensics = visualForensics;
-}
-
 if (amountForensics) {
 result.amountForensics = amountForensics;
 }
@@ -7939,19 +7846,6 @@ amountForensics.evidence,
 ]
 .filter(Boolean)
 .join(" ");
-}
-
-// Görsel forensics güçlü bir sapma bulduğunda, tek başına değil,
-// referans alan eşleşmeleri/missing alanlar gibi bağımsız yapı sinyalleriyle birlikte
-// nihai risk için bir alt sınır uygulanır.
-if (visualForensics?.available && visualForensics?.severity === "strong") {
-  const structuralSupport =
-    Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
-    Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
-  if (structuralSupport) {
-    result.overallRisk = Math.max(Number(result.overallRisk) || 0, 70);
-    result.summary = [result.summary, visualForensics.evidence].filter(Boolean).join(" ");
-  }
 }
 
 // Risk motorunu amount forensics değişikliğinden sonra tekrar hesapla.
@@ -7999,13 +7893,6 @@ Math.abs(amountDifference) >= 1000;
 // Mevcut JavaScript risk motorunun sonucunu temel al
 let finalRiskScore =
 Number(calculatedRisk.overallRisk) || 0;
-
-if (visualForensics?.available && visualForensics?.severity === "strong") {
-  const structuralSupport =
-    Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
-    Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
-  if (structuralSupport) finalRiskScore = Math.max(finalRiskScore, 70);
-}
 // Tutar farkı varsa riski ciddi şekilde yükselt
 if (hasMajorAmountMismatch) {
 finalRiskScore = Math.max(
@@ -8183,3 +8070,5 @@ err?.message ||
 
 }
 }
+analyze 17.txt
+analyze 17.txt görüntüleniyor.
