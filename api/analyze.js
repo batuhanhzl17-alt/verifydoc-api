@@ -7,6 +7,7 @@ import { execFile } from "child_process"
 import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
+import { runVisualForensics } from "./visual_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -6935,6 +6936,7 @@ buffer.toString(
 let paddleImageOCR = null;
 let amountForensics = null;
 let referenceTemplateAnalysis = null;
+let visualForensics = null;
 
 if (
 type === "image" ||
@@ -7015,6 +7017,24 @@ if (
     console.log("REFERENCE TEMPLATE ANALYSIS:", JSON.stringify(referenceTemplateAnalysis));
   } catch (error) {
     console.warn("REFERENCE TEMPLATE ANALYSIS HATASI:", error?.message || error);
+  }
+}
+
+// =====================================================
+// GÖRSEL FORENSICS — BÜTÜN SAYFA REFERANS KARŞILAŞTIRMASI
+// =====================================================
+if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+  try {
+    const trustedReferencePaths = await getReferenceFiles(bank);
+    visualForensics = await runVisualForensics({
+      targetPath: filePath,
+      referencePaths: trustedReferencePaths,
+      bank,
+      tempDir: "/tmp",
+    });
+    console.log("VISUAL FORENSICS:", JSON.stringify(visualForensics));
+  } catch (error) {
+    console.warn("VISUAL FORENSICS HATASI:", error?.message || error);
   }
 }
 
@@ -7910,6 +7930,10 @@ if (
 }
 }
 
+if (visualForensics) {
+  result.visualForensics = visualForensics;
+}
+
 if (amountForensics) {
 result.amountForensics = amountForensics;
 }
@@ -7947,6 +7971,19 @@ amountForensics.evidence,
 ]
 .filter(Boolean)
 .join(" ");
+}
+
+// Görsel forensics güçlü bir sapma bulduğunda, tek başına değil,
+// referans alan eşleşmeleri/missing alanlar gibi bağımsız yapı sinyalleriyle birlikte
+// nihai risk için bir alt sınır uygulanır.
+if (visualForensics?.available && visualForensics?.severity === "strong") {
+  const structuralSupport =
+    Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
+    Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
+  if (structuralSupport) {
+    result.overallRisk = Math.max(Number(result.overallRisk) || 0, 70);
+    result.summary = [result.summary, visualForensics.evidence].filter(Boolean).join(" ");
+  }
 }
 
 // Risk motorunu amount forensics değişikliğinden sonra tekrar hesapla.
@@ -7994,6 +8031,13 @@ Math.abs(amountDifference) >= 1000;
 // Mevcut JavaScript risk motorunun sonucunu temel al
 let finalRiskScore =
 Number(calculatedRisk.overallRisk) || 0;
+
+if (visualForensics?.available && visualForensics?.severity === "strong") {
+  const structuralSupport =
+    Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
+    Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
+  if (structuralSupport) finalRiskScore = Math.max(finalRiskScore, 70);
+}
 // Tutar farkı varsa riski ciddi şekilde yükselt
 if (hasMajorAmountMismatch) {
 finalRiskScore = Math.max(
