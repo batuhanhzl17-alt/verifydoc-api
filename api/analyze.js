@@ -12,10 +12,15 @@ import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
 import { createRequire } from "module"
 import { pathToFileURL } from "url"
-import {
-createCanvas,
-ImageData,
-} from "@napi-rs/canvas"
+import * as napiCanvas from "@napi-rs/canvas"
+
+const createCanvas =
+  napiCanvas.createCanvas ||
+  napiCanvas.default?.createCanvas;
+
+const ImageData =
+  napiCanvas.ImageData ||
+  napiCanvas.default?.ImageData;
 
 const require = createRequire(import.meta.url);
 
@@ -2830,6 +2835,9 @@ function groupPdfTextLines(items, viewport) {
 }
 
 async function renderPdfPagePng(pdf, pageNumber, scale = 1) {
+  if (typeof createCanvas !== "function") {
+    throw new Error("@napi-rs/canvas createCanvas kullanılamıyor. Canvas bağımlılığı yüklenmemiş veya export yapısı uyumsuz.");
+  }
   const page = await pdf.getPage(pageNumber);
   const viewport = page.getViewport({ scale });
   const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
