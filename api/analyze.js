@@ -7446,24 +7446,13 @@ detail:
 },
 
 // =================================================
-// REFERANS PDF
-// SADECE GÖRSEL / ŞABLON KARŞILAŞTIRMASI
+// REFERANS PDF BINARY GONDERILMEZ
+// Terra yalnızca gerçek hedef belgeyi görür.
+// Referanslar backend tarafında OCR/şablon/forensic
+// istatistikleri olarak kullanılabilir; ham referans
+// dosyası modele verilmez.
 // =================================================
-...(
-reference?.base64
-? [
-{
-type:
-"input_file",
 
-filename:
-reference.fileName,
-file_data:
-`data:application/pdf;base64,${reference.base64}`,
-},
-]
-: []
-),
 ];
 
 }
@@ -7522,58 +7511,12 @@ file_data: pdfDataUrl,
 },
 
 // =================================================
-// REFERANS BANKA ŞABLONU
+// REFERANS BANKA ŞABLONU — HAM PDF MODELE GONDERILMEZ
 // =================================================
+// Referans bilgileri backend tarafında çıkarılır ve
+// yalnızca türetilmiş, değer-izole edilmiş şablon bilgisi
+// daha sonraki context katmanından kullanılabilir.
 
-...(
-reference?.base64
-? [
-
-{
-type: "input_text",
-text: `
-==================================================
-REFERANS DEKONT — SADECE ŞABLON / KONUM BİLGİSİ
-==================================================
-
-Aşağıdaki PDF, ${bank || "seçilen bankanın"} REFERANS
-DEKONT ŞABLONUDUR.
-BU DOSYADAN GERÇEK İŞLEM DEĞERİ ALMA.
-
-Bu PDF'yi yalnızca:
-
-- alanların nerede bulunduğunu,
-- alanların hangi etiketlerle gösterildiğini,
-- gönderen alanının konumunu,
-- alıcı alanının konumunu,
-- IBAN alanının konumunu,
-- tutar alanının konumunu,
-- tarih alanının konumunu,
-- işlem/reference numarası alanlarının konumunu,
-- bankaya özgü belge düzenini
-anlamak için kullan.
-
-ÖNEMLİ:
-Referans PDF'deki isimleri, IBAN'ları, tutarları,
-tarihleri veya işlem numaralarını analiz edilen dekonta
-AKTARMA.
-
-Gerçek değerlerin tamamı GERÇEK DEKONT PDF'sinden
-çıkarılmalıdır.
-
-Referans dosya adı:
-${reference.fileName}
-`
-},
-{
-type: "input_file",
-filename: reference.fileName,
-file_data: `data:application/pdf;base64,${reference.base64}`,
-},
-
-]
-: []
-),
 
 ];
 }
