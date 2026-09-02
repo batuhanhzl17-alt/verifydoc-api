@@ -7446,24 +7446,14 @@ detail:
 },
 
 // =================================================
-// REFERANS PDF
-// SADECE GÖRSEL / ŞABLON KARŞILAŞTIRMASI
+// REFERANS DOSYASI — MODEL İZOLASYONU
 // =================================================
-...(
-reference?.base64
-? [
-{
-type:
-"input_file",
-
-filename:
-reference.fileName,
-file_data:
-`data:application/pdf;base64,${reference.base64}`,
-},
-]
-: []
-),
+// Referans PDF modele DOSYA olarak gönderilmez.
+// Güvenilir referanslar yalnızca backend'deki şablon ve
+// görsel forensics katmanlarında kullanılır.
+// Böylece referanstaki gerçek tutar/tarih/IBAN/isim gibi
+// değerlerin gerçek dekont verisine sızması engellenir.
+console.log("REFERENCE VALUE ISOLATION: REFERANS DOSYASI MODELE GONDERILMEDI");
 ];
 
 }
@@ -7522,58 +7512,31 @@ file_data: pdfDataUrl,
 },
 
 // =================================================
-// REFERANS BANKA ŞABLONU
+// REFERANS BANKA ŞABLONU — MODEL İZOLASYONU
 // =================================================
-
-...(
-reference?.base64
-? [
-
-{
-type: "input_text",
-text: `
+// Referans PDF modele gönderilmez. Model yalnızca gerçek
+// dekont PDF'sini görür. Referanslardan çıkarılan yapı
+// özeti backend tarafından zaten hesaplanmıştır.
+content.push({
+  type: "input_text",
+  text: `
 ==================================================
-REFERANS DEKONT — SADECE ŞABLON / KONUM BİLGİSİ
+REFERANS ŞABLON ÖZETİ — SADECE YAPI / GEOMETRİ
 ==================================================
+Referans dosyalarının kendisi modele verilmedi.
+Referans kümesinden backend tarafından çıkarılan
+şablon bilgileri aşağıdadır.
 
-Aşağıdaki PDF, ${bank || "seçilen bankanın"} REFERANS
-DEKONT ŞABLONUDUR.
-BU DOSYADAN GERÇEK İŞLEM DEĞERİ ALMA.
+Gerçek tutar, tarih, IBAN, isim ve işlem/reference
+numarası yalnızca GERÇEK DEKONT PDF'sinden alınmalıdır.
 
-Bu PDF'yi yalnızca:
+Referans alanları:
+${JSON.stringify(referenceTemplateAnalysis?.fields || [], null, 2)}
 
-- alanların nerede bulunduğunu,
-- alanların hangi etiketlerle gösterildiğini,
-- gönderen alanının konumunu,
-- alıcı alanının konumunu,
-- IBAN alanının konumunu,
-- tutar alanının konumunu,
-- tarih alanının konumunu,
-- işlem/reference numarası alanlarının konumunu,
-- bankaya özgü belge düzenini
-anlamak için kullan.
-
-ÖNEMLİ:
-Referans PDF'deki isimleri, IBAN'ları, tutarları,
-tarihleri veya işlem numaralarını analiz edilen dekonta
-AKTARMA.
-
-Gerçek değerlerin tamamı GERÇEK DEKONT PDF'sinden
-çıkarılmalıdır.
-
-Referans dosya adı:
-${reference.fileName}
+Görsel forensic özeti:
+${JSON.stringify(visualForensics || null, null, 2)}
 `
-},
-{
-type: "input_file",
-filename: reference.fileName,
-file_data: `data:application/pdf;base64,${reference.base64}`,
-},
-
-]
-: []
-),
+});
 
 ];
 }
@@ -7819,6 +7782,11 @@ ${JSON.stringify(referenceTemplateAnalysis.fields || [], null, 2)}
 Referansın konumu, alan ölçüsü ve render yoğunluğu gerçek dekonttaki karşılığıyla birlikte değerlendirilsin.
 
 Konum veya font/render farkı tek başına sahtecilik kanıtı değildir; başka bağımsız bulgularla birlikte değerlendirilmelidir.
+
+GÖRSEL FORENSICS:
+${JSON.stringify(visualForensics || null, null, 2)}
+
+Görsel forensics sonucu bütün sayfa benzerlik/sapma sinyalidir. Tek başına sahtecilik kararı verme; alan geometrisi, OCR ve diğer bağımsız bulgularla birlikte değerlendir.
 =====================================================
 `,
   });
