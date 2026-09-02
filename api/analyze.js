@@ -1,15 +1,3 @@
-Öğe seçilmedi 
-
-İçeriğe atla
-Gmail ürününü ekran okuyucularla birlikte kullanma
-Gmail için masaüstü bildirimlerini etkinleştirin.
-   Tamam  Hayır, teşekkürler
-İleti Dizileri
-100 GB kotanın %15 kadarı kullanıldı
-Aboneliği iptal et
-Şartlar · Gizlilik · Program Politikaları
-Son hesap etkinliği: 0 dakika önce
-1 farklı konumda daha açık · Ayrıntılar
 import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
@@ -8070,5 +8058,3 @@ err?.message ||
 
 }
 }
-analyze 17.txt
-analyze 17.txt görüntüleniyor.
