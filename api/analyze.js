@@ -18,769 +18,159 @@ ImageData,
 
 const require = createRequire(import.meta.url);
 
-let pdfjsWorker;
-try {
-const workerPath = require.resolve("pdfjs-dist/build/pdf.worker.mjs");
-pdfjsWorker = pathToFileURL(workerPath).toString();
-} catch (e) {
-pdfjsWorker = null;
-}
+const pdfWorkerPath = require.resolve(
+"pdfjs-dist/build/pdf.worker.mjs"
+);
 
-if (pdfjsWorker) {
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
-}
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+pathToFileURL(pdfWorkerPath).href;
+
+
 
 const execFileAsync = promisify(execFile);
 
-const client = new OpenAI({
-apiKey: process.env.OPENAI_API_KEY,
+// =====================================================
+// PADDLEOCR CLIENT
+// =====================================================
+
+let paddleOCRClient = null;
+
+function getPaddleOCRClient() {
+
+if (
+!process.env.PADDLEOCR_ACCESS_TOKEN
+) {
+
+console.warn(
+"PADDLEOCR_ACCESS_TOKEN bulunamadı."
+);
+
+return null;
+
+}
+
+if (
+!paddleOCRClient
+) {
+
+paddleOCRClient =
+new PaddleOCRClient({
+
+token:
+process.env.PADDLEOCR_ACCESS_TOKEN,
+
+requestTimeout:
+300000,
+
+pollTimeout:
+600000,
+
 });
 
-const MODEL = "gpt-5.6-terra";
-
-const MAX_FILE_SIZE = 25 * 1024 * 1024;
-
-const ALLOWED_IMAGE_TYPES = [
-"image/jpeg",
-"image/png",
-"image/webp",
-];
-
-const ALLOWED_DOCUMENT_TYPES = [
-"application/pdf",
-"image/jpeg",
-"image/png",
-"image/webp",
-];
-
-const VIDEO_TYPES = [
-"video/mp4",
-"video/quicktime",
-"video/x-matroska",
-"video/webm",
-];
-
-const CHECK_SCHEMA = {
-type: "object",
-additionalProperties: false,
-properties: {
-status: {
-type: "string",
-enum: ["pass", "fail", "unknown"],
-},
-score: {
-type: "number",
-},
-evidence: {
-type: "array",
-items: {
-type: "string",
-},
-},
-},
-required: ["status", "score", "evidence"],
-};
-
-const RESPONSE_SCHEMA = {
-type: "object",
-additionalProperties: false,
-properties: {
-documentType: {
-type: "string",
-},
-
-bank: {
-type: "string",
-},
-
-documentData: {
-type: "object",
-additionalProperties: false,
-properties: {
-senderName: {
-type: "string",
-},
-senderIBAN: {
-type: "string",
-},
-receiverName: {
-type: "string",
-},
-receiverIBAN: {
-type: "string",
-},
-amount: {
-type: "string",
-},
-currency: {
-type: "string",
-},
-date: {
-type: "string",
-},
-time: {
-type: "string",
-},
-transactionId: {
-type: "string",
-},
-referenceNo: {
-type: "string",
-},
-description: {
-type: "string",
-},
-},
-required: [
-"senderName",
-"senderIBAN",
-"receiverName",
-"receiverIBAN",
-"amount",
-"currency",
-"date",
-"time",
-"transactionId",
-"referenceNo",
-"description",
-],
-},
-
-checks: {
-type: "object",
-additionalProperties: false,
-properties: {
-amountConsistency: CHECK_SCHEMA,
-ibanConsistency: CHECK_SCHEMA,
-dateConsistency: CHECK_SCHEMA,
-transactionIdConsistency: CHECK_SCHEMA,
-layoutConsistency: CHECK_SCHEMA,
-typographyConsistency: CHECK_SCHEMA,
-metadataConsistency: CHECK_SCHEMA,
-pdfStructureConsistency: CHECK_SCHEMA,
-ocrConsistency: CHECK_SCHEMA,
-imageManipulation: CHECK_SCHEMA,
-templateConsistency: CHECK_SCHEMA,
-writtenAmountConsistency: CHECK_SCHEMA,
-transactionLogic: CHECK_SCHEMA,
-},
-required: [
-"amountConsistency",
-"ibanConsistency",
-"dateConsistency",
-"transactionIdConsistency",
-"layoutConsistency",
-"typographyConsistency",
-"metadataConsistency",
-"pdfStructureConsistency",
-"ocrConsistency",
-"imageManipulation",
-"templateConsistency",
-"writtenAmountConsistency",
-"transactionLogic",
-],
-},
-
-amountAnalysis: {
-type: "object",
-additionalProperties: false,
-properties: {
-numericAmount: {
-type: "string",
-},
-formattedAmount: {
-type: "string",
-},
-suspiciousFormatting: {
-type: "boolean",
-},
-evidence: {
-type: "array",
-items: {
-type: "string",
-},
-},
-},
-required: [
-"numericAmount",
-"formattedAmount",
-"suspiciousFormatting",
-"evidence",
-],
-},
-
-findings: {
-type: "array",
-items: {
-type: "object",
-additionalProperties: false,
-properties: {
-severity: {
-type: "string",
-},
-category: {
-type: "string",
-},
-description: {
-type: "string",
-},
-evidence: {
-type: "string",
-},
-},
-required: [
-"severity",
-"category",
-"description",
-"evidence",
-],
-},
-},
-
-overallRisk: {
-type: "number",
-},
-
-summary: {
-type: "string",
-},
-},
-required: [
-"documentType",
-"bank",
-"documentData",
-"checks",
-"amountAnalysis",
-"findings",
-"overallRisk",
-"summary",
-],
-};
-
-const REFERENCE_MAP = {
-akbank: {
-name: "Akbank",
-aliases: ["akbank", "akbank t.a.ş."],
-},
-
-enpara: {
-name: "Enpara",
-aliases: ["enpara", "enpara.com"],
-},
-
-vakifbank: {
-name: "VakıfBank",
-aliases: ["vakıfbank", "vakifbank", "türkiye vakıflar bankası"],
-},
-
-isbankasi: {
-name: "İş Bankası",
-aliases: ["iş bankası", "is bankasi", "türkiye iş bankası"],
-},
-
-ziraat: {
-name: "Ziraat Bankası",
-aliases: ["ziraat", "ziraat bankası", "t.c. ziraat bankası"],
-},
-
-denizbank: {
-name: "DenizBank",
-aliases: ["denizbank", "deniz bank"],
-},
-
-halkbank: {
-name: "Halkbank",
-aliases: ["halkbank", "türkiye halk bankası"],
-},
-
-yapikredi: {
-name: "Yapı Kredi",
-aliases: ["yapı kredi", "yapi kredi", "yapı ve kredi bankası"],
-},
-
-garanti: {
-name: "Garanti BBVA",
-aliases: [
-"garanti",
-"garanti bbva",
-"garanti bankası",
-"türkiye garanti bankası",
-],
-},
-};
-
-function normalizeText(value) {
-return String(value ?? "")
-.normalize("NFKC")
-.replace(/\s+/g, " ")
-.trim();
 }
 
-function normalizeIBAN(value) {
-return String(value ?? "")
-.toUpperCase()
-.replace(/[^A-Z0-9]/g, "");
+return paddleOCRClient;
+
 }
 
-function normalizeAmount(value) {
-return String(value ?? "")
-.replace(/\s/g, "")
-.replace(/₺/g, "")
-.replace(/TL/gi, "")
-.trim();
-}
+// =====================================================
+// PADDLEOCR OCR
+// =====================================================
+//
+// Yerel dosyayı PaddleOCR resmi API'ye gönderir.
+// Token Vercel Environment Variables üzerinden gelir.
+//
+// PADDLEOCR_ACCESS_TOKEN
+//
+// PP-OCRv6 kullanılır.
+// =====================================================
 
-function parseAmount(value) {
-if (value === null || value === undefined) {
-return null;
-}
-
-let s = String(value)
-.trim()
-.replace(/[^\d,.-]/g, "");
-
-if (!s) {
-return null;
-}
-
-const commaCount = (s.match(/,/g) || []).length;
-const dotCount = (s.match(/\./g) || []).length;
-
-if (commaCount > 0 && dotCount > 0) {
-if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
-s = s.replace(/\./g, "").replace(",", ".");
-} else {
-s = s.replace(/,/g, "");
-}
-} else if (commaCount > 0) {
-if (/,\d{1,2}$/.test(s)) {
-s = s.replace(",", ".");
-} else {
-s = s.replace(/,/g, "");
-}
-} else if (dotCount > 0) {
-if (!/\.\d{1,2}$/.test(s)) {
-s = s.replace(/\./g, "");
-}
-}
-
-const number = Number(s);
-
-return Number.isFinite(number) ? number : null;
-}
-
-function amountsEqual(a, b, tolerance = 0.01) {
-const aa = parseAmount(a);
-const bb = parseAmount(b);
-
-if (aa === null || bb === null) {
-return false;
-}
-
-return Math.abs(aa - bb) <= tolerance;
-}
-
-function validateIBANMod97(iban) {
-const normalized = normalizeIBAN(iban);
-
-if (!normalized) {
-return {
-valid: false,
-reason: "IBAN boş",
-};
-}
-
-if (!/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(normalized)) {
-return {
-valid: false,
-reason: "IBAN formatı geçersiz",
-};
-}
-
-const rearranged =
-normalized.slice(4) +
-normalized.slice(0, 4);
-
-let numeric = "";
-
-for (const char of rearranged) {
-if (/[A-Z]/.test(char)) {
-numeric += String(char.charCodeAt(0) - 55);
-} else {
-numeric += char;
-}
-}
-
-let remainder = 0;
-
-for (const digit of numeric) {
-remainder =
-(remainder * 10 + Number(digit)) % 97;
-}
-
-return {
-valid: remainder === 1,
-reason:
-remainder === 1
-? "IBAN checksum geçerli"
-: "IBAN checksum geçersiz",
-};
-}
-
-function compareProvidedInfoWithDocument(
-providedInfo,
-documentData
+async function runPaddleOCR(
+filePath
 ) {
-const comparison = {
-available: false,
-amount: {
-available: false,
-matches: null,
-provided: null,
-document: null,
-difference: null,
-},
-senderIBAN: {
-available: false,
-matches: null,
-},
-receiverIBAN: {
-available: false,
-matches: null,
-},
-};
-
-if (!providedInfo || !documentData) {
-return comparison;
-}
 
 if (
-providedInfo.amount !== undefined &&
-providedInfo.amount !== null &&
-String(providedInfo.amount).trim() !== ""
+!filePath
 ) {
-comparison.available = true;
-comparison.amount.available = true;
-comparison.amount.provided =
-String(providedInfo.amount);
-comparison.amount.document =
-String(documentData.amount ?? "");
 
-const providedAmount =
-parseAmount(providedInfo.amount);
-const documentAmount =
-parseAmount(documentData.amount);
-
-if (
-providedAmount !== null &&
-documentAmount !== null
-) {
-comparison.amount.difference =
-Math.abs(
-providedAmount - documentAmount
+console.warn(
+"PADDLEOCR: filePath bulunamadı."
 );
-
-comparison.amount.matches =
-comparison.amount.difference <= 0.01;
-}
-}
-
-if (
-providedInfo.senderIBAN &&
-documentData.senderIBAN
-) {
-comparison.available = true;
-comparison.senderIBAN.available = true;
-
-comparison.senderIBAN.matches =
-normalizeIBAN(providedInfo.senderIBAN) ===
-normalizeIBAN(documentData.senderIBAN);
-}
-
-if (
-providedInfo.receiverIBAN &&
-documentData.receiverIBAN
-) {
-comparison.available = true;
-comparison.receiverIBAN.available = true;
-
-comparison.receiverIBAN.matches =
-normalizeIBAN(providedInfo.receiverIBAN) ===
-normalizeIBAN(documentData.receiverIBAN);
-}
-
-return comparison;
-}
-
-function getRiskLabel(score) {
-if (score <= 20) {
-return "Düşük Risk";
-}
-
-if (score <= 45) {
-return "Orta Risk";
-}
-
-if (score <= 70) {
-return "Yüksek Risk";
-}
-
-return "Çok Yüksek Risk";
-}
-
-function clampScore(value) {
-const score = Number(value);
-
-if (!Number.isFinite(score)) {
-return 0;
-}
-
-return Math.max(0, Math.min(100, score));
-}
-
-function safeString(value) {
-if (value === null || value === undefined) {
-return "";
-}
-
-return String(value);
-}
-
-function cleanOCRText(text) {
-return String(text ?? "")
-.replace(/\r/g, "\n")
-.replace(/[ \t]+/g, " ")
-.replace(/\n{3,}/g, "\n\n")
-.trim();
-}
-
-function isMoneyLikeText(text) {
-const value = normalizeText(text);
-
-if (!value) {
-return false;
-}
-
-return (
-/(?:₺|TL|TRY)\s*\d/.test(value) ||
-/\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})/.test(
-value
-) ||
-/^\d+(?:[.,]\d{1,2})?$/.test(value)
-);
-}
-
-function normalizeBox(box) {
-if (!Array.isArray(box)) {
-return null;
-}
-
-if (
-box.length >= 4 &&
-typeof box[0] === "number" &&
-typeof box[1] === "number" &&
-typeof box[2] === "number" &&
-typeof box[3] === "number"
-) {
-const x1 = Number(box[0]);
-const y1 = Number(box[1]);
-const x2 = Number(box[2]);
-const y2 = Number(box[3]);
-
-return {
-x1: Math.min(x1, x2),
-y1: Math.min(y1, y2),
-x2: Math.max(x1, x2),
-y2: Math.max(y1, y2),
-};
-}
-
-if (
-box.length >= 4 &&
-Array.isArray(box[0]) &&
-Array.isArray(box[1])
-) {
-const points = box
-.filter(
-(point) =>
-Array.isArray(point) &&
-point.length >= 2
-)
-.map((point) => [
-Number(point[0]),
-Number(point[1]),
-])
-.filter(
-(point) =>
-Number.isFinite(point[0]) &&
-Number.isFinite(point[1])
-);
-
-if (!points.length) {
-return null;
-}
-
-const xs = points.map((point) => point[0]);
-const ys = points.map((point) => point[1]);
-
-return {
-x1: Math.min(...xs),
-y1: Math.min(...ys),
-x2: Math.max(...xs),
-y2: Math.max(...ys),
-};
-}
-
-return null;
-}
-
-function cropRegionForImage(
-imageWidth,
-imageHeight,
-region
-) {
-if (!region) {
-return null;
-}
-
-const x1 = Math.max(
-0,
-Math.floor(region.x1)
-);
-const y1 = Math.max(
-0,
-Math.floor(region.y1)
-);
-const x2 = Math.min(
-imageWidth,
-Math.ceil(region.x2)
-);
-const y2 = Math.min(
-imageHeight,
-Math.ceil(region.y2)
-);
-
-if (
-x2 <= x1 ||
-y2 <= y1
-) {
-return null;
-}
-
-return {
-left: x1,
-top: y1,
-width: x2 - x1,
-height: y2 - y1,
-};
-}
-
-async function runOCR(
-filePath,
-language = "eng"
-) {
-let worker;
-
-try {
-worker =
-await createWorker(language);
-
-const result =
-await worker.recognize(filePath);
 
 return {
 text:
-result?.data?.text || "",
+"",
 confidence:
-Number(
-result?.data?.confidence
-) || 0,
-success: true,
+0,
+success:
+false,
+regions:
+[],
 };
-} catch (error) {
-console.error(
-"Tesseract OCR error:",
-error
-);
 
-return {
-text: "",
-confidence: 0,
-success: false,
-error:
-error?.message ||
-String(error),
-};
-} finally {
-if (worker) {
-try {
-await worker.terminate();
-} catch {}
-}
-}
 }
 
-let paddleClient = null;
-
-function getPaddleClient() {
-if (paddleClient) {
-return paddleClient;
-}
-
-try {
-paddleClient =
-new PaddleOCRClient({
-apiKey:
-process.env.PADDLEOCR_API_KEY,
-});
-
-return paddleClient;
-} catch (error) {
-console.error(
-"PaddleOCR client init error:",
-error
-);
-
-return null;
-}
-}
-
-async function runPaddleOCR(
-filePath,
-options = {}
-) {
 const client =
-getPaddleClient();
+getPaddleOCRClient();
 
-if (!client) {
+if (
+!client
+) {
+
 return {
-text: "",
-confidence: 0,
-success: false,
-pages: 0,
-regions: [],
+text:
+"",
+confidence:
+0,
+success:
+false,
+regions:
+[],
 };
+
 }
 
 try {
-const model =
-options.model ||
-"PaddleOCR-VL-1.5";
 
-const input = {
-model,
-file: filePath,
-};
+console.log(
+"================================================"
+);
+
+console.log(
+"PADDLEOCR BAŞLADI"
+);
+
+console.log(
+"DOSYA:",
+filePath
+);
+
+console.log(
+"MODEL: PP-OCRv6"
+);
+
+console.log(
+"================================================"
+);
 
 const result =
-await client.ocr.predict(input);
+await client.ocr({
+filePath:
+filePath,
+model:
+Model.PPOCRv6,
+});
 
 const pages =
-Array.isArray(result?.pages)
-? result.pages
-: [];
+Array.isArray(
+result?.pages
+)
+?
+result.pages
+:
+[];
 
-const allText = [];
+const allTexts = [];
 const allScores = [];
 const allRegions = [];
 
@@ -789,1283 +179,1877 @@ let pageIndex = 0;
 pageIndex < pages.length;
 pageIndex++
 ) {
-const page =
-pages[pageIndex];
 
+const page = pages[pageIndex];
 const pruned =
+page?.prunedResult ||
 page?.pruned_result ||
-page?.result ||
-page;
+{};
 
 const texts =
 Array.isArray(
 pruned?.rec_texts
 )
-? pruned.rec_texts
-: [];
+?
+pruned.rec_texts
+:
+[];
 
 const scores =
 Array.isArray(
 pruned?.rec_scores
 )
-? pruned.rec_scores
-: [];
+?
+pruned.rec_scores
+:
+[];
 
 const boxes =
 Array.isArray(
 pruned?.rec_boxes
 )
-? pruned.rec_boxes
-: [];
+?
+pruned.rec_boxes
+:
+[];
 
 const polys =
 Array.isArray(
 pruned?.rec_polys
 )
-? pruned.rec_polys
-: [];
+?
+pruned.rec_polys
+:
+[];
 
 for (
 let textIndex = 0;
 textIndex < texts.length;
 textIndex++
 ) {
+
 const text =
-String(
-texts[textIndex] ?? ""
-).trim();
-
-if (text) {
-allText.push(text);
-}
-
-const score =
-Number(
-scores[textIndex]
-) || 0;
+texts[textIndex];
 
 if (
-Number.isFinite(score) &&
-score > 0
+text !== null &&
+text !== undefined &&
+String(text).trim()
+) {
+
+const cleanText =
+String(text).trim();
+
+allTexts.push(
+cleanText
+);
+
+const score =
+Number(scores[textIndex]);
+
+if (
+Number.isFinite(score)
 ) {
 allScores.push(score);
 }
 
-const rawRegion =
-boxes[textIndex] ||
-polys[textIndex];
+let region = null;
 
-const region =
-normalizeBox(
-rawRegion
-);
+if (
+Array.isArray(boxes[textIndex]) &&
+boxes[textIndex].length >= 4
+) {
 
-if (region) {
+const box =
+boxes[textIndex]
+.map(Number);
+
+if (
+box.every(Number.isFinite)
+) {
+
+region = {
+
+type:
+"box",
+
+x1:
+Math.min(box[0], box[2]),
+
+y1:
+Math.min(box[1], box[3]),
+
+x2:
+Math.max(box[0], box[2]),
+
+y2:
+Math.max(box[1], box[3]),
+};
+
+}
+
+}
+else if (
+Array.isArray(polys[textIndex])
+) {
+
+const points =
+polys[textIndex]
+.flat(Infinity)
+.map(Number)
+.filter(Number.isFinite);
+
+if (
+points.length >= 8
+) {
+
+const xs = [];
+const ys = [];
+
+for (
+let i = 0;
+i + 1 < points.length;
+i += 2
+) {
+
+xs.push(points[i]);
+ys.push(points[i + 1]);
+
+}
+
+if (
+xs.length &&
+ys.length
+) {
+
+region = {
+type:
+"polygon",
+
+x1:
+Math.min(...xs),
+
+y1:
+Math.min(...ys),
+
+x2:
+Math.max(...xs),
+
+y2:
+Math.max(...ys),
+};
+
+}
+
+}
+
+}
+
 allRegions.push({
 pageIndex,
-text,
-score,
+text:
+cleanText,
+score:
+Number.isFinite(score)
+?
+score
+:
+0,
 region,
 });
+
 }
+
 }
+
 }
 
 const text =
-cleanOCRText(
-allText.join("\n")
+allTexts.join(
+"\n"
 );
 
 const confidence =
 allScores.length
-? allScores.reduce(
-(sum, value) =>
+?
+Math.round(
+(
+allScores.reduce(
+(
+sum,
+value
+) =>
 sum + value,
 0
-) / allScores.length
-: 0;
+) /
+allScores.length
+) * 100
+)
+:
+0;
+
+console.log(
+"PADDLEOCR TAMAMLANDI"
+);
+
+console.log(
+"PADDLEOCR SAYFA:",
+pages.length
+);
+
+console.log(
+"PADDLEOCR METİN:",
+text.length,
+"karakter"
+);
+
+console.log(
+"PADDLEOCR CONFIDENCE:",
+confidence
+);
+
+console.log(
+"PADDLEOCR REGION SAYISI:",
+allRegions.length
+);
 
 return {
 text,
 confidence,
-success: true,
-pages: pages.length,
-regions: allRegions,
-raw: result,
+success:
+true,
+pages:
+pages.length,
+regions:
+allRegions,
+raw:
+result,
 };
-} catch (error) {
+
+}
+
+catch (
+error
+) {
+
 console.error(
-"PaddleOCR error:",
+"================================================"
+);
+
+console.error(
+"PADDLEOCR HATASI:"
+);
+
+console.error(
 error
 );
 
+console.error(
+"================================================"
+);
+
+return {
+text:
+"",
+confidence:
+0,
+success:
+false,
+regions:
+[],
+error:
+error?.message ||
+"Unknown PaddleOCR error",
+};
+
+}
+
+}
+let ocrWorker = null;
+async function getOCRWorker() {
+if (!ocrWorker) {
+ocrWorker = await createWorker("tur+eng");
+}
+
+return ocrWorker;
+}
+async function runOCR(imagePath) {
+const worker = await getOCRWorker();
+const { data } = await worker.recognize(imagePath);
+
+return {
+text: data.text || "",
+confidence: Number(data.confidence) || 0,
+};
+}
+
+
+
+
+function extractPaddleOCRText(result) {
+
+if (!result) {
 return {
 text: "",
 confidence: 0,
-success: false,
 pages: 0,
-regions: [],
-error:
-error?.message ||
-String(error),
-};
-}
-}
-
-async function extractPaddleOCRText(
-filePath
-) {
-const result =
-await runPaddleOCR(
-filePath
-);
-
-return result?.text || "";
-}
-
-async function analyzeAmountForensics(
-filePath,
-ocrResult
-) {
-if (
-!ocrResult?.success ||
-!Array.isArray(
-ocrResult.regions
-) ||
-!ocrResult.regions.length
-) {
-return {
-available: false,
-status: "unknown",
-severity: "none",
-score: 0,
-amountText: "",
-region: null,
-characterCount: 0,
-metrics: {
-medianDarkness: null,
-maxLocalDarknessDifference:
-null,
-localAnomalyRatio: null,
-},
-evidence: [
-"Amount forensics için OCR bölge bilgisi bulunamadı.",
-],
 };
 }
 
-const candidates =
-ocrResult.regions
-.filter(
-(item) =>
-item?.text &&
-isMoneyLikeText(
-item.text
-) &&
-item?.region
-)
-.sort(
-(a, b) =>
-String(b.text).length -
-String(a.text).length
-);
+const pages = Array.isArray(result.pages)
+? result.pages
+: [];
+const textParts = [];
+const confidenceValues = [];
 
-if (!candidates.length) {
-return {
-available: false,
-status: "unknown",
-severity: "none",
-score: 0,
-amountText: "",
-region: null,
-characterCount: 0,
-metrics: {
-medianDarkness: null,
-maxLocalDarknessDifference:
-null,
-localAnomalyRatio: null,
-},
-evidence: [
-"OCR sonucunda analiz edilebilir para tutarı bölgesi bulunamadı.",
-],
-};
-}
+for (const page of pages) {
 
-const selected =
-candidates[0];
+const raw = page?.raw || {};
+const pruned =
+page?.prunedResult ||
+raw?.prunedResult ||
+{};
 
-try {
-const metadata =
-await sharp(filePath)
-.metadata();
+const texts =
+Array.isArray(pruned?.rec_texts)
+? pruned.rec_texts
+: [];
 
-const width =
-Number(metadata.width) || 0;
-const height =
-Number(metadata.height) || 0;
-
-if (!width || !height) {
-throw new Error(
-"Görüntü boyutları alınamadı."
-);
-}
-
-const crop =
-cropRegionForImage(
-width,
-height,
-selected.region
-);
-
-if (!crop) {
-throw new Error(
-"Amount OCR bölgesi geçersiz."
-);
-}
-
-const paddingX =
-Math.max(
-4,
-Math.round(
-crop.width * 0.08
-)
-);
-
-const paddingY =
-Math.max(
-4,
-Math.round(
-crop.height * 0.15
-)
-);
-
-const left =
-Math.max(
-0,
-crop.left - paddingX
-);
-
-const top =
-Math.max(
-0,
-crop.top - paddingY
-);
-
-const right =
-Math.min(
-width,
-crop.left +
-crop.width +
-paddingX
-);
-
-const bottom =
-Math.min(
-height,
-crop.top +
-crop.height +
-paddingY
-);
-
-const finalWidth =
-Math.max(
-1,
-right - left
-);
-
-const finalHeight =
-Math.max(
-1,
-bottom - top
-);
-
-const { data, info } =
-await sharp(filePath)
-.extract({
-left,
-top,
-width: finalWidth,
-height: finalHeight,
-})
-.grayscale()
-.raw()
-.toBuffer({
-resolveWithObject: true,
-});
-
-const columns =
-new Array(info.width)
-.fill(0);
-
-for (
-let x = 0;
-x < info.width;
-x++
-) {
-let darkness = 0;
-
-for (
-let y = 0;
-y < info.height;
-y++
-) {
-const pixel =
-data[
-y * info.width + x
-];
-
-darkness +=
-255 - pixel;
-}
-
-columns[x] =
-darkness /
-(info.height * 255);
-}
-
-const activeColumns =
-columns.map(
-(value) =>
-value >= 0.08
-);
-
-const segments = [];
-
-let start = -1;
-
-for (
-let x = 0;
-x < activeColumns.length;
-x++
-) {
-if (
-activeColumns[x] &&
-start === -1
-) {
-start = x;
-}
-
-const isLast =
-x ===
-activeColumns.length - 1;
-
-if (
-start !== -1 &&
-(!activeColumns[x] ||
-isLast)
-) {
-const end =
-activeColumns[x] &&
-isLast
-? x
-: x - 1;
-
-if (
-end - start + 1 >= 1
-) {
-segments.push({
-start,
-end,
-});
-}
-
-start = -1;
-}
-}
-
-const filteredSegments =
-segments.filter(
-(segment) =>
-segment.end -
-segment.start +
-1 >= 1
-);
-
-const segmentDarkness =
-filteredSegments.map(
-(segment) => {
-let total = 0;
-let count = 0;
-
-for (
-let x =
-segment.start;
-x <= segment.end;
-x++
-) {
-total +=
-columns[x];
-count++;
-}
-
-return count
-? total / count
-: 0;
-}
-);
-
-const sorted =
-[...segmentDarkness].sort(
-(a, b) => a - b
-);
-
-const median =
-sorted.length
-? sorted[
-Math.floor(
-sorted.length / 2
-)
-]
-: 0;
-
-const deviations =
-segmentDarkness.map(
-(value) =>
-Math.abs(
-value - median
-)
-);
-
-const maxDeviation =
-deviations.length
-? Math.max(
-...deviations
-)
-: 0;
-
-const relativeDifference =
-median > 0
-? maxDeviation /
-median
-: 0;
-
-const anomalyCount =
-deviations.filter(
-(value) =>
-value >= 0.18
-).length;
-
-const anomalyRatio =
-segmentDarkness.length
-? anomalyCount /
-segmentDarkness.length
-: 0;
-
-let status = "pass";
-let severity = "none";
-let score = 0;
-
-if (
-segmentDarkness.length >= 4 &&
-maxDeviation >= 0.24 &&
-relativeDifference >= 0.22 &&
-anomalyRatio <= 0.5
-) {
-status = "warning";
-severity = "strong";
-score = 85;
-} else if (
-segmentDarkness.length >= 4 &&
-maxDeviation >= 0.18 &&
-relativeDifference >= 0.18 &&
-anomalyRatio <= 0.35
-) {
-status = "warning";
-severity = "moderate";
-score = 65;
-}
-
-const evidence =
-status === "warning"
-? [
-`Tutar bölgesinde karakter seviyesinde lokal yoğunluk farkı tespit edildi: maksimum sapma ${maxDeviation.toFixed(
-3
-)}, göreli fark ${relativeDifference.toFixed(
-3
-)}.`,
-`Analiz edilen karakter-benzeri segment sayısı: ${segmentDarkness.length}; lokal anomali oranı: ${anomalyRatio.toFixed(
-3
-)}.`,
-"Bu bulgu tek başına sahtecilik kanıtı değildir; görüntü sıkıştırması, tarama veya yeniden boyutlandırma da benzer farklar oluşturabilir.",
-]
-: [
-"Tutar bölgesinde karakter seviyesinde belirgin bir lokal yoğunluk anomalisi tespit edilmedi.",
-];
-
-return {
-available: true,
-status,
-severity,
-score,
-amountText:
-String(
-selected.text
-),
-region: {
-pageIndex:
-selected.pageIndex,
-x1:
-selected.region.x1,
-y1:
-selected.region.y1,
-x2:
-selected.region.x2,
-y2:
-selected.region.y2,
-},
-characterCount:
-segmentDarkness.length,
-metrics: {
-medianDarkness:
-Number(
-median.toFixed(4)
-),
-maxLocalDarknessDifference:
-Number(
-maxDeviation.toFixed(
-4
-)
-),
-localAnomalyRatio:
-Number(
-anomalyRatio.toFixed(
-4
-)
-),
-},
-evidence,
-};
-} catch (error) {
-console.error(
-"Amount forensics error:",
-error
-);
-
-return {
-available: false,
-status: "unknown",
-severity: "none",
-score: 0,
-amountText:
-String(
-selected.text
-),
-region:
-selected.region,
-characterCount: 0,
-metrics: {
-medianDarkness: null,
-maxLocalDarknessDifference:
-null,
-localAnomalyRatio: null,
-},
-evidence: [
-`Amount forensics çalıştırılamadı: ${
-error?.message ||
-String(error)
-}`,
-],
-};
-}
-}
-
-function preserveAmount(
-value
-) {
-if (
-value === null ||
-value === undefined
-) {
-return "";
-}
-
-return String(value)
-.replace(/\s+/g, " ")
-.trim();
-}
-
-function parseAIResponse(
-raw
-) {
-if (
-raw &&
-typeof raw === "object"
-) {
-return raw;
-}
+const scores =
+Array.isArray(pruned?.rec_scores)
+? pruned.rec_scores
+: [];
+for (let i = 0; i < texts.length; i++) {
 
 const text =
-String(raw ?? "")
-.trim();
-
+typeof texts[i] === "string"
+? texts[i].trim()
+: ""
 if (!text) {
-throw new Error(
-"OpenAI boş yanıt döndürdü."
-);
+continue;
 }
 
-try {
-return JSON.parse(text);
-} catch {
-const fenced =
-text
-.replace(
-/^```json\s*/i,
-""
+textParts.push(text);
+
+const score =
+Number(scores[i]);
+if (Number.isFinite(score)) {
+confidenceValues.push(score);
+}
+}
+// Bazı SDK sürümlerinde sayfa metni doğrudan bulunabilir.
+if (!texts.length && typeof page?.text === "string") {
+
+const directText = page.text.trim();
+if (directText) {
+textParts.push(directText);
+}
+
+}
+}
+
+const confidence =
+confidenceValues.length
+? Math.round(
+(
+confidenceValues.reduce(
+(sum, value) => sum + value,
+0
+) /
+confidenceValues.length
+) * 100
 )
-.replace(
-/^```\s*/i,
-""
-)
-.replace(
-/\s*```$/i,
-""
-)
-.trim();
+: 0;
+return {
 
-try {
-return JSON.parse(
-fenced
-);
-} catch {
-throw new Error(
-"OpenAI yanıtı geçerli JSON değil."
-);
-}
-}
-}
-async function renderPdfPages(
-filePath,
-outputDir,
-maxPages = 5
-) {
-await fs.mkdir(
-outputDir,
-{ recursive: true }
-);
+text:
+textParts.join("\n"),
+confidence,
 
-const data =
-await fs.readFile(filePath);
+pages:
+pages.length,
 
-const loadingTask =
-pdfjsLib.getDocument({
-data,
-useWorkerFetch: false,
-isEvalSupported: false,
+};
+}
+
+// =====================================================
+// PDF → IMAGE — OCR FALLBACK
+// =====================================================
+
+async function pdfToImg(buffer, options = {}) {
+const scale = options.scale || 2;
+
+const pdf = await pdfjsLib.getDocument({
+data: new Uint8Array(buffer),
+}).promise;
+
+const images = [];
+for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+const page = await pdf.getPage(pageNumber);
+const viewport = page.getViewport({
+scale,
 });
 
-const pdf =
-await loadingTask.promise;
-
-const pages = [];
-
-const totalPages =
-Math.min(
-pdf.numPages,
-maxPages
+const canvas = createCanvas(
+Math.ceil(viewport.width),
+Math.ceil(viewport.height)
 );
-
-for (
-let pageNumber = 1;
-pageNumber <= totalPages;
-pageNumber++
-) {
-const page =
-await pdf.getPage(
-pageNumber
-);
-
-const viewport =
-page.getViewport({
-scale: 2,
-});
-
-const canvas =
-createCanvas(
-Math.ceil(
-viewport.width
-),
-Math.ceil(
-viewport.height
-)
-);
-
-const context =
-canvas.getContext("2d");
-
-const renderContext = {
-canvasContext:
-context,
+const context = canvas.getContext("2d");
+await page.render({
+canvasContext: context,
 viewport,
-};
+}).promise;
 
-await page.render(
-renderContext
-).promise;
-
-const outputPath =
-path.join(
-outputDir,
-`page-${pageNumber}.png`
+images.push(
+canvas.toBuffer("image/png")
 );
-
-await fs.writeFile(
-outputPath,
-canvas.toBuffer(
-"image/png"
-)
-);
-
-pages.push({
-pageNumber,
-path: outputPath,
-width:
-Math.ceil(
-viewport.width
-),
-height:
-Math.ceil(
-viewport.height
-),
-});
 }
-
 return {
-pages,
-totalPages:
-pdf.numPages,
+async *[Symbol.asyncIterator]() {
+for (const image of images) {
+yield image;
+}
+},
+async destroy() {
+images.length = 0;
+},
 };
 }
+// =====================================================
+// REFERANS KLASÖRÜ
+// =====================================================
+const REFERENCE_DIR =
+path.join(process.cwd(), "references");
 
-async function extractPdfText(
-filePath
+
+// =====================================================
+// BANKA → REFERANS PDF MAP
+// =====================================================
+
+const REFERENCE_MAP = {
+akbank: "akbank.pdf",
+enpara: "enpara.pdf",
+vakifbank: "vakifbank.pdf",
+isbankasi: "isbankasi.pdf",
+ziraat: "ziraat.pdf",
+denizbank: "denizbank.pdf",
+halkbank: "halkbank.pdf",
+yapikredi: "yapikredi.pdf",
+garanti: "garanti.pdf",
+};
+function normalizeTurkishText(value) {
+if (
+!value ||
+typeof value !== "string"
 ) {
+return ""
+}
+return value
+.toLocaleLowerCase("tr-TR")
+.replace(/\s+/g, " ")
+.trim()
+.replace(/ı/g, "i")
+.replace(/İ/g, "i");
+
+}
+
+
+// =====================================================
+// BANKA NORMALİZASYONU
+// =====================================================
+function normalizeBank(bank) {
+
+if (
+!bank ||
+typeof bank !== "string"
+) {
+return null;
+}
+const value =
+bank
+.toLowerCase()
+.trim()
+.replace(/\s+/g, "")
+.replace(/ı/g, "i")
+.replace(/İ/g, "i")
+.replace(/ş/g, "s")
+.replace(/Ş/g, "s")
+.replace(/ğ/g, "g")
+.replace(/Ğ/g, "g")
+.replace(/ü/g, "u")
+.replace(/Ü/g, "u")
+.replace(/ö/g, "o")
+.replace(/Ö/g, "o")
+.replace(/ç/g, "c")
+.replace(/Ç/g, "c");
+if (
+value === "akbank"
+) {
+return "akbank"
+}
+
+if (
+value === "enpara" ||
+value === "enparafinans"
+) {
+return "enpara"
+}
+
+if (
+value.includes("vakifbank")
+) {
+return "vakifbank"
+}
+
+if (
+value.includes("isbankasi") ||
+value.includes("isbank")
+) {
+return "isbankasi"
+}
+if (
+value.includes("ziraat")
+) {
+return "ziraat"
+}
+
+
+if (
+value.includes("garanti")
+) {
+return "garanti"
+}
+
+if (
+value.includes("denizbank")
+) {
+return "denizbank"
+}
+
+
+if (
+value.includes("halkbank")
+) {
+return "halkbank"
+}
+if (
+value.includes("yapikredi")
+) {
+return "yapikredi"
+}
+
+return null;
+}
+
+// =====================================================
+// REFERANS DOSYASI BUL
+// =====================================================
+function getReferenceFile(bank) {
+
+const normalizedBank =
+normalizeBank(bank);
+if (!normalizedBank) {
+return null;
+}
+const fileName =
+REFERENCE_MAP[
+normalizedBank
+];
+if (!fileName) {
+return null;
+}
+return path.join(
+REFERENCE_DIR,
+fileName
+);
+}
+
+// =====================================================
+// REFERANS PDF OKUMA
+// =====================================================
+async function loadReferenceFile(bank) {
+const normalizedBank =
+normalizeBank(bank);
+
+if (!normalizedBank) {
+
+console.log(
+"REFERENCE BANK TANINMADI:",
+bank
+);
+
+return null;
+}
+const referencePath =
+getReferenceFile(
+normalizedBank
+);
+
+if (!referencePath) {
+
+console.log(
+"REFERENCE PATH BULUNAMADI:",
+normalizedBank
+);
+
+return null;
+}
+
 try {
-const data =
+
+const buffer =
 await fs.readFile(
-filePath
+referencePath
 );
 
-const loadingTask =
-pdfjsLib.getDocument({
-data,
-useWorkerFetch: false,
-isEvalSupported: false,
+
+if (
+!buffer?.length
+) {
+
+console.log(
+"REFERENCE DOSYASI BOŞ:",
+referencePath
+);
+return null;
+}
+
+
+console.log(
+"REFERENCE LOADED:",
+referencePath
+);
+
+return {
+
+bank:
+normalizedBank,
+
+fileName:
+path.basename(
+referencePath
+),
+
+base64:
+buffer.toString(
+"base64"
+),
+
+};
+
+} catch (error) {
+
+console.error(
+"REFERENCE LOAD ERROR:",
+error
+);
+
+return null;
+}
+}
+
+export const config = {
+api: {
+bodyParser:
+false,
+
+},
+};
+
+// =====================================================
+// OPENAI
+// =====================================================
+const openai =
+new OpenAI({
+
+apiKey:
+process.env.OPENAI_API_KEY,
 });
 
-const pdf =
-await loadingTask.promise;
 
-const pageTexts = [];
+// =====================================================
+// CHECKLER
+// =====================================================
+
+const CHECK_NAMES = [
+
+"ocrConsistency",
+"fontConsistency",
+"fontSizeConsistency",
+"characterSpacing",
+"lineSpacing",
+"textAlignment",
+"baselineConsistency",
+"compressionArtifacts",
+"copyPasteRegions",
+"editingTraces",
+"photoshopArtifacts",
+"aiGeneratedIndicators",
+"logoConsistency",
+"stampConsistency",
+"signatureConsistency",
+"dateConsistency",
+"amountConsistency",
+"currencyFormatting",
+"ibanFormatting",
+"swiftFormatting",
+"qrBarcodeConsistency",
+"layoutIntegrity",
+"suspiciousElements",
+"documentTypeConsistency",
+"imageQuality",
+
+];
+
+// =====================================================
+// CHECK SCHEMA
+// =====================================================
+
+const CHECK_SCHEMA =
+Object.fromEntries(
+CHECK_NAMES.map(
+(name) => [
+
+name,
+{
+
+type:
+"object",
+
+properties: {
+
+status: {
+
+type:
+"string",
+
+enum: [
+
+"pass",
+"fail",
+"unknown",
+],
+
+},
+
+score: {
+type:
+"integer",
+
+minimum:
+0,
+maximum:
+100,
+},
+
+evidence: {
+type:
+"string",
+
+},
+
+},
+required: [
+
+"status",
+"score",
+"evidence",
+
+],
+
+additionalProperties:
+false,
+
+},
+
+]
+)
+
+);
+
+
+// =====================================================
+// VERIFYDOC DETERMINISTIK RISK MOTORU
+// =====================================================
+const RISK_CATEGORY_WEIGHTS = Object.freeze({
+visualRisk: 15,
+textRisk: 15,
+layoutRisk: 15,
+financialDataRisk: 25,
+editingRisk: 30,
+});
+
+const MAX_RISK_SCORE = 100;
+
+// -----------------------------------------------------
+// 25 KONTROLÜ KATEGORİLERE DAĞIT
+// -----------------------------------------------------
+const RISK_CHECK_MAP = {
+
+visualRisk: {
+compressionArtifacts: 1.0,
+
+aiGeneratedIndicators: 1.0,
+
+logoConsistency: 1.0,
+
+stampConsistency: 0.8,
+signatureConsistency: 0.8,
+imageQuality: 0.7,
+},
+
+textRisk: {
+
+ocrConsistency: 1.0,
+
+fontConsistency: 1.0,
+fontSizeConsistency: 0.9,
+characterSpacing: 0.8,
+
+lineSpacing: 0.7,
+
+textAlignment: 0.7,
+
+baselineConsistency: 0.8,
+
+dateConsistency: 0.8,
+
+currencyFormatting: 0.8,
+
+ibanFormatting: 0.8,
+swiftFormatting: 0.7,
+},
+
+layoutRisk: {
+textAlignment: 0.8,
+
+baselineConsistency: 0.7,
+
+logoConsistency: 0.8,
+
+qrBarcodeConsistency: 0.7,
+layoutIntegrity: 1.0,
+documentTypeConsistency: 0.9,
+
+},
+financialDataRisk: {
+
+dateConsistency: 0.8,
+
+amountConsistency: 1.0,
+
+currencyFormatting: 0.8,
+ibanFormatting: 0.8,
+swiftFormatting: 0.7,
+
+qrBarcodeConsistency: 0.5,
+
+suspiciousElements: 0.8,
+},
+editingRisk: {
+
+copyPasteRegions: 1.0,
+editingTraces: 1.0,
+photoshopArtifacts: 1.0,
+aiGeneratedIndicators: 0.8,
+
+suspiciousElements: 1.0,
+fontConsistency: 0.6,
+
+fontSizeConsistency: 0.5,
+
+characterSpacing: 0.5,
+
+baselineConsistency: 0.5,
+
+},
+
+};
+
+
+// =====================================================
+// KATEGORİ SKORU HESAPLA
+// =====================================================
+
+function calculateCategoryRisk(
+checks,
+mapping
+) {
+
+if (
+!checks ||
+typeof checks !== "object"
+) {
+
+return 0;
+
+}
+let weightedTotal = 0;
+
+let totalWeight = 0;
 
 for (
-let pageNumber = 1;
-pageNumber <=
-pdf.numPages;
-pageNumber++
+const [
+checkName,
+weight
+]
+of Object.entries(mapping)
 ) {
-const page =
-await pdf.getPage(
-pageNumber
-);
 
-const content =
-await page.getTextContent();
-
-const text =
-content.items
-.map(
-(item) =>
-item?.str || ""
-)
-.join(" ");
-
-pageTexts.push(
-text
-);
-}
-
-return cleanOCRText(
-pageTexts.join("\n")
-);
-} catch (error) {
-console.error(
-"PDF text extraction error:",
-error
-);
-
-return "";
-}
-}
-
-function detectBank(
-text
-) {
-const normalized =
-normalizeText(
-text
-).toLowerCase();
-
-for (
-const [key, reference]
-of Object.entries(
-REFERENCE_MAP
-)
-) {
+const check =
+checks?.[checkName];
 if (
-reference.aliases.some(
-(alias) =>
-normalized.includes(
-alias.toLowerCase()
-)
-)
+!check ||
+typeof check !== "object"
 ) {
-return {
-key,
-name:
-reference.name,
-};
-}
+
+continue;
+
 }
 
-return {
-key: "unknown",
-name: "Bilinmiyor",
-};
-}
-
-function extractCurrency(
-text
-) {
-const value =
-normalizeText(text);
+// UNKNOWN → RİSK EKLEME
 
 if (
-/₺|TL|TRY/i.test(value)
+check.status === "unknown"
 ) {
-return "TRY";
+continue;
+
 }
 
-if (
-/€|EUR/i.test(value)
-) {
-return "EUR";
-}
-
-if (
-/\$|USD/i.test(value)
-) {
-return "USD";
-}
-
-if (
-/£|GBP/i.test(value)
-) {
-return "GBP";
-}
-
-return "";
-}
-
-function extractIBANs(
-text
-) {
-const normalized =
-normalizeText(text)
-.toUpperCase()
-.replace(
-/[^A-Z0-9 ]/g,
-" "
-);
-
-const matches =
-normalized.match(
-/\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/g
-) || [];
-
-return [
-...new Set(
-matches.map(
-normalizeIBAN
-)
-),
-];
-}
-
-function validateExtractedIBANs(
-text
-) {
-const ibans =
-extractIBANs(
-text
-);
-
-return ibans.map(
-(iban) => ({
-iban,
-...validateIBANMod97(
-iban
-),
-})
-);
-}
-
-function extractMoneyCandidates(
-text
-) {
-const value =
-normalizeText(text);
-
-const candidates =
-value.match(
-/(?:₺|TL|TRY)?\s*\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})?(?:\s*(?:₺|TL|TRY))?/gi
-) || [];
-
-return candidates
-.map(
-(item) =>
-item.trim()
-)
-.filter(
-(item) =>
-parseAmount(
-item
-) !== null
-);
-}
-
-function chooseLikelyAmount(
-text
-) {
-const candidates =
-extractMoneyCandidates(
-text
-);
-
-if (!candidates.length) {
-return "";
-}
-
-const currency =
-extractCurrency(
-text
-);
-
-const withCurrency =
-candidates.filter(
-(item) =>
-currency === "TRY"
-? /₺|TL|TRY/i.test(
-item
-)
-: true
-);
-
-if (
-withCurrency.length
-) {
-return withCurrency[
-withCurrency.length - 1
-];
-}
-
-return candidates[
-candidates.length - 1
-];
-}
-
-function normalizeName(
-value
-) {
-return normalizeText(
-value
-)
-.toLocaleUpperCase(
-"tr-TR"
-)
-.replace(
-/[^A-ZÇĞİÖŞÜ0-9 ]/gi,
-" "
-)
-.replace(
-/\s+/g,
-" "
-)
-.trim();
-}
-
-function namesLikelyMatch(
-a,
-b
-) {
-const aa =
-normalizeName(a);
-const bb =
-normalizeName(b);
-
-if (!aa || !bb) {
-return null;
-}
-
-if (aa === bb) {
-return true;
-}
-
-if (
-aa.includes(bb) ||
-bb.includes(aa)
-) {
-return true;
-}
-
-return false;
-}
-
-function ibansLikelyMatch(
-a,
-b
-) {
-const aa =
-normalizeIBAN(a);
-const bb =
-normalizeIBAN(b);
-
-if (!aa || !bb) {
-return null;
-}
-
-return aa === bb;
-}
-
-function amountDifference(
-a,
-b
-) {
-const aa =
-parseAmount(a);
-const bb =
-parseAmount(b);
-
-if (
-aa === null ||
-bb === null
-) {
-return null;
-}
-
-return Math.abs(
-aa - bb
-);
-}
-
-function buildProvidedInfoContext(
-providedInfo,
-documentData
-) {
-if (
-!providedInfo
-) {
-return "";
-}
-
-const comparison =
-compareProvidedInfoWithDocument(
-providedInfo,
-documentData
-);
-
-return `
-KULLANICI TARAFINDAN SAĞLANAN BİLGİLER:
-${JSON.stringify(
-providedInfo,
-null,
-2
-)}
-
-BELGEDEN ÇIKARILAN BİLGİLER:
-${JSON.stringify(
-documentData || {},
-null,
-2
-)}
-
-SAĞLANAN BİLGİ / BELGE KARŞILAŞTIRMASI:
-${JSON.stringify(
-comparison,
-null,
-2
-)}
-
-ÖNEMLİ:
-- Sağlanan bilgi belge üzerinde açıkça görünen bilgiyle uyuşmuyorsa bunu bulgu olarak değerlendir.
-- Ancak yalnızca sağlanan bilginin belge üzerinde bulunmaması, belgenin sahte olduğunu tek başına kanıtlamaz.
-- Tutar karşılaştırmasında 0.01 TRY'ye kadar farkı eşleşme kabul et.
-`;
-}
-
-function buildAmountForensicsContext(
-amountForensics
-) {
-if (
-!amountForensics?.available
-) {
-return "";
-}
-
-return `
-DETERMİNİSTİK TUTAR FORENSICS ANALİZİ:
-${JSON.stringify(
-amountForensics,
-null,
-2
-)}
-
-Bu analiz OCR'ın bulduğu tutar bölgesindeki karakter-benzeri segmentlerin
-görsel yoğunluklarını karşılaştırır.
-
-Yorumlama:
-- status=pass: belirgin lokal yoğunluk anomalisi tespit edilmedi.
-- status=warning/moderate: lokal görsel tutarsızlık bulundu; tek başına sahtecilik kanıtı değildir.
-- status=warning/strong: daha güçlü lokal tutarsızlık bulundu; diğer bulgularla birlikte değerlendirilmelidir.
-- JPEG sıkıştırması, ekran görüntüsü, yeniden boyutlandırma, tarama ve farklı render süreçleri de lokal yoğunluk farkı oluşturabilir.
-- Belgenin gerçek içeriği ve görünen görüntüsü her zaman esas alınmalıdır.
-`;
-}
-
-function getFileExtension(
-filePath
-) {
-return path
-.extname(filePath)
+const status =
+String(check.status || "")
+.trim()
 .toLowerCase();
+
+const STATUS_SCORE = {
+pass: 0,
+fail: 100
+};
+
+if (!(status in STATUS_SCORE)) {
+continue;
 }
 
-function isPdfFile(
-mimeType,
-filePath
+const safeScore =
+STATUS_SCORE[status];
+
+
+weightedTotal +=
+safeScore * weight;
+
+totalWeight +=
+weight;
+
+}
+if (
+totalWeight === 0
 ) {
-return (
-mimeType ===
-"application/pdf" ||
-getFileExtension(
-filePath
-) === ".pdf"
-);
+
+return 0;
+
 }
 
-function isImageFile(
-mimeType,
-filePath
-) {
-const extension =
-getFileExtension(
-filePath
+return Math.round(
+weightedTotal /
+totalWeight
 );
 
-return (
-ALLOWED_IMAGE_TYPES.includes(
-mimeType
-) ||
+}
+
+// =====================================================
+// RİSK ETİKETİ
+// =====================================================
+
+function getRiskLabel(
+score
+) {
+
+if (
+score <= 20
+) {
+return "LOW RISK"
+
+}
+
+if (
+score <= 45
+) {
+
+return "MODERATE RISK"
+
+}
+
+if (
+score <= 70
+) {
+return "HIGH RISK"
+}
+
+return "VERY HIGH RISK"
+
+}
+
+
+// =====================================================
+// NİHAİ RİSK HESAPLA
+// =====================================================
+
+function calculateOverallRisk(result) {
+const checks = result?.checks || {};
+
+
+// -----------------------------------------------------
+// KATEGORİLERİ 25 KONTROLDEN HESAPLA
+// -----------------------------------------------------
+const calculatedCategories = {
+visualRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.visualRisk
+),
+
+textRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.textRisk
+),
+layoutRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.layoutRisk
+),
+
+financialDataRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.financialDataRisk
+),
+
+editingRisk:
+calculateCategoryRisk(
+checks,
+RISK_CHECK_MAP.editingRisk
+),
+
+};
+
+
+// -----------------------------------------------------
+// AĞIRLIKLI ANA SKOR
+// -----------------------------------------------------
+
+let score =
+calculatedCategories.visualRisk *
+RISK_CATEGORY_WEIGHTS.visualRisk
+
++
+
+calculatedCategories.textRisk *
+RISK_CATEGORY_WEIGHTS.textRisk
++
+calculatedCategories.layoutRisk *
+RISK_CATEGORY_WEIGHTS.layoutRisk
++
+
+calculatedCategories.financialDataRisk *
+RISK_CATEGORY_WEIGHTS.financialDataRisk
+
++
+calculatedCategories.editingRisk *
+RISK_CATEGORY_WEIGHTS.editingRisk;
+
+// -----------------------------------------------------
+// MATEMATİKSEL TUTARSIZLIK BONUSU
+// -----------------------------------------------------
+//
+// Yeterli veri varsa ve matematik tutmuyorsa
+// finansal riski ayrıca artır.
+// -----------------------------------------------------
+
+const amountAnalysis =
+result?.amountAnalysis;
+
+
+if (
+amountAnalysis &&
+amountAnalysis.totalAmount !== null &&
+amountAnalysis.calculatedTotal !== null
+) {
+const totalAmount = Number(
+amountAnalysis.totalAmount
+);
+const calculatedTotal = Number(
+amountAnalysis.calculatedTotal
+);
+if (
+Number.isFinite(totalAmount) &&
+Number.isFinite(calculatedTotal)
+) {
+const difference = Math.abs(
+totalAmount - calculatedTotal
+);
+console.log("===== TUTAR DEBUG =====");
+console.log("totalAmount:", totalAmount);
+console.log("calculatedTotal:", calculatedTotal);
+console.log("difference:", difference);
+console.log("=======================");
+
+if (difference > 0.01) {
+score += 10;
+}
+}
+}
+// -----------------------------------------------------
+// SKORU 0-100 ARASINDA TUT
+// -----------------------------------------------------
+
+score =
+Math.round(
+Math.max(
+0,
+Math.min(
+100,
+score
+)
+)
+);
+
+
+// -----------------------------------------------------
+// YENİ KATEGORİLERİ DÖNDÜR
+// -----------------------------------------------------
+return {
+overallRisk:
+score,
+
+riskLabel:
+getRiskLabel(score),
+
+categories:
+calculatedCategories,
+};
+
+}
+
+// =====================================================
+// NORMAL DEKONT RESPONSE SCHEMA
+// =====================================================
+const RESPONSE_SCHEMA = {
+type:
+"object",
+
+properties: {
+overallRisk: {
+
+type:
+"integer",
+minimum:
+0,
+maximum:
+100,
+
+},
+riskLabel: {
+type:
+"string",
+
+enum: [
+
+"LOW RISK",
+"MODERATE RISK",
+"HIGH RISK",
+"VERY HIGH RISK",
+
+],
+
+},
+
+confidence: {
+type:
+"integer",
+
+minimum:
+0,
+maximum:
+100,
+},
+
+summary: {
+
+type:
+"string",
+},
+documentData: {
+
+type:
+"object",
+properties: {
+senderName: {
+type:
+["string", "null"],
+},
+
+recipientName: {
+type:
+["string", "null"],
+},
+
+recipientIban: {
+type:
+["string", "null"],
+},
+
+amount: {
+type:
+["string", "null"],
+},
+
+currency: {
+type:
+["string", "null"],
+},
+
+iban: {
+type:
+["string", "null"],
+},
+},
+
+required: [
+"senderName",
+"recipientName",
+"recipientIban",
+"amount",
+"currency",
+"iban",
+],
+
+additionalProperties:
+false,
+},
+categories: {
+
+type:
+"object",
+
+properties: {
+
+visualRisk: {
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+},
+
+textRisk: {
+type:
+"integer",
+
+minimum:
+0,
+maximum:
+100,
+},
+
+layoutRisk: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+financialDataRisk: {
+
+type:
+"integer",
+minimum:
+0,
+
+maximum:
+100,
+},
+editingRisk: {
+type:
+"integer",
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+},
+
+required: [
+
+"visualRisk",
+"textRisk",
+"layoutRisk",
+"financialDataRisk",
+"editingRisk",
+
+],
+
+additionalProperties:
+false,
+},
+checks: {
+type:
+"object",
+
+properties:
+CHECK_SCHEMA,
+
+required:
+CHECK_NAMES,
+additionalProperties:
+false,
+},
+limitations: {
+type:
+"array",
+
+items: {
+
+type:
+"string",
+},
+
+},
+amountAnalysis: {
+type:
+"object",
+
+properties: {
+amount: {
+
+type:
 [
-".jpg",
-".jpeg",
-".png",
-".webp",
-].includes(
-extension
-)
-);
-}
+"string",
+"null"
+],
 
-function isVideoFile(
-mimeType,
-filePath
-) {
-const extension =
-getFileExtension(
-filePath
-);
+},
 
-return (
-VIDEO_TYPES.includes(
-mimeType
-) ||
+subtotal: {
+
+type:
 [
-".mp4",
-".mov",
-".mkv",
-".webm",
-].includes(
-extension
-)
+"number",
+"null"
+],
+
+},
+
+taxAmount: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+totalAmount: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+calculatedTotal: {
+
+type:
+[
+"number",
+"null"
+],
+},
+difference: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+calculationConsistent: {
+
+type:
+"boolean",
+
+},
+
+evidence: {
+type:
+"string",
+
+},
+},
+required: [
+
+"amount",
+"subtotal",
+"taxAmount",
+"totalAmount",
+"calculatedTotal",
+"difference",
+"calculationConsistent",
+"evidence",
+
+],
+
+additionalProperties:
+false,
+
+},
+
+},
+
+required: [
+
+"overallRisk",
+"riskLabel",
+"confidence",
+"summary",
+"documentData",
+"categories",
+"checks",
+"limitations",
+"amountAnalysis",
+
+],
+
+additionalProperties:
+false,
+};
+
+// =====================================================
+// HESAP ÖZETİ RESPONSE SCHEMA
+// =====================================================
+const STATEMENT_RESPONSE_SCHEMA = {
+type:
+"object",
+properties: {
+
+overallRisk: {
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+riskLabel: {
+type:
+"string",
+enum: [
+
+"LOW RISK",
+"MODERATE RISK",
+"HIGH RISK",
+"VERY HIGH RISK",
+],
+
+},
+confidence: {
+
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+
+summary: {
+
+type:
+"string",
+
+},
+
+categories: {
+type:
+"object",
+
+properties: {
+visualRisk: {
+
+type:
+"integer",
+minimum:
+0,
+
+maximum:
+100,
+
+},
+textRisk: {
+type:
+"integer",
+
+minimum:
+0,
+
+maximum:
+100,
+
+},
+layoutRisk: {
+type:
+"integer",
+
+minimum:
+0,
+maximum:
+100,
+},
+
+financialDataRisk: {
+
+type:
+"integer",
+minimum:
+0,
+
+maximum:
+100,
+},
+
+editingRisk: {
+type:
+"integer",
+
+minimum:
+0,
+maximum:
+100,
+
+},
+},
+
+required: [
+
+"visualRisk",
+"textRisk",
+"layoutRisk",
+"financialDataRisk",
+"editingRisk",
+
+],
+
+additionalProperties:
+false,
+
+},
+balanceAnalysis: {
+type:
+"object",
+
+properties: {
+
+openingBalance: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+totalIncoming: {
+type:
+[
+"number",
+"null"
+],
+
+},
+totalOutgoing: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+
+calculatedClosingBalance: {
+type:
+[
+"number",
+"null"
+],
+
+},
+
+documentClosingBalance: {
+
+type:
+[
+"number",
+"null"
+],
+
+},
+difference: {
+
+type:
+[
+"number",
+"null"
+],
+},
+
+calculationConsistent: {
+
+type:
+"boolean",
+
+},
+evidence: {
+
+type:
+"string",
+},
+
+},
+required: [
+
+"openingBalance",
+"totalIncoming",
+"totalOutgoing",
+"calculatedClosingBalance",
+"documentClosingBalance",
+"difference",
+"calculationConsistent",
+"evidence",
+
+],
+additionalProperties:
+false,
+
+},
+transactionAnalysis: {
+type:
+"object",
+
+properties: {
+
+transactionCount: {
+type:
+"integer",
+
+minimum:
+0,
+},
+
+dateConsistency: {
+type:
+"string",
+},
+
+duplicateTransactions: {
+type:
+"array",
+
+items: {
+
+type:
+"string",
+
+},
+},
+
+suspiciousTransactions: {
+
+type:
+"array",
+
+items: {
+type:
+"string",
+},
+
+},
+
+},
+
+required: [
+
+"transactionCount",
+"dateConsistency",
+"duplicateTransactions",
+"suspiciousTransactions",
+
+],
+additionalProperties:
+false,
+
+},
+
+limitations: {
+
+type:
+"array",
+items: {
+
+type:
+"string",
+},
+
+},
+
+evidence: {
+
+type:
+"array",
+
+items: {
+
+type:
+"string",
+
+},
+},
+
+},
+required: [
+
+"overallRisk",
+"riskLabel",
+"confidence",
+"summary",
+"categories",
+"balanceAnalysis",
+"transactionAnalysis",
+"limitations",
+"evidence",
+],
+
+additionalProperties:
+false,
+
+};
+
+
+// =====================================================
+// FORMIDABLE
+// =====================================================
+
+function parseMultipart(req) {
+
+return new Promise(
+(resolve, reject) => {
+const form =
+formidable({
+
+multiples:
+false,
+
+keepExtensions:
+true,
+maxFileSize:
+25 * 1024 * 1024,
+});
+
+
+form.parse(
+req,
+(
+err,
+fields,
+files
+) => {
+
+if (err) {
+reject(err);
+
+return;
+}
+
+resolve({
+
+fields,
+files,
+});
+}
 );
-}
 
-async function getImageMetadata(
-filePath
-) {
-try {
-return await sharp(
-filePath
-).metadata();
-} catch (error) {
-console.error(
-"Image metadata error:",
-error
+}
 );
 
-return null;
-}
 }
 
-async function normalizeImage(
-filePath,
-outputPath
-) {
-await sharp(
-filePath
-)
-.rotate()
-.png()
-.toFile(
-outputPath
-);
 
-return outputPath;
-}
+// =====================================================
+// VIDEO → FRAME ÇIKARMA
+// =====================================================
 
 async function extractVideoFrames(
-filePath,
-outputDir,
-maxFrames = 4
+videoPath
 ) {
+
+const outputDir =
+`/tmp/verifydoc-${Date.now()}`;
+
 await fs.mkdir(
 outputDir,
 {
-recursive: true,
+recursive:
+true,
 }
 );
 
-const outputPattern =
-path.join(
-outputDir,
-"frame-%02d.jpg"
-);
 
-try {
+const outputPattern =
+`${outputDir}/frame-%03d.jpg`;
+
 await execFileAsync(
 ffmpegPath,
+
 [
-"-y",
+
 "-i",
-filePath,
+videoPath,
 "-vf",
 "fps=1,scale=1280:-2",
+
 "-frames:v",
-String(maxFrames),
+"4",
+"-q:v",
+"5",
+
 outputPattern,
 ],
+
 {
+
 maxBuffer:
 10 * 1024 * 1024,
 }
@@ -2076,3566 +2060,2869 @@ await fs.readdir(
 outputDir
 );
 
-return files
+const frameFiles =
+files
 .filter(
 (file) =>
-/^frame-\d+\.jpg$/i.test(
-file
+file.endsWith(".jpg")
 )
-)
-.sort()
-.map(
-(file) =>
-path.join(
-outputDir,
-file
-)
+.sort();
+
+if (
+!frameFiles.length
+) {
+
+throw new Error(
+"Videodan analiz edilecek kare çıkarılamadı."
 );
+
+}
+
+const frames = [];
+
+for (
+const file of frameFiles
+) {
+const framePath =
+`${outputDir}/${file}`;
+
+const buffer =
+await fs.readFile(
+framePath
+);
+frames.push({
+
+file,
+framePath,
+base64:
+buffer.toString(
+"base64"
+),
+});
+
+}
+
+return frames;
+
+}
+
+// =====================================================
+// VIDEO FRAME ANALİZİ
+// REFERANS KULLANILMAZ
+// =====================================================
+async function analyzeVideoFrames(
+frames
+) {
+
+if (
+!frames ||
+!frames.length
+) {
+
+throw new Error(
+"Analiz edilecek video karesi bulunamadı."
+);
+
+}
+
+
+console.log(
+"VIDEO FRAME SAYISI:",
+frames.length
+);
+
+// =====================================================
+// VIDEO FRAME PADDLEOCR
+// =====================================================
+
+const videoOCRResults = await Promise.all(
+frames.map(async (frame, index) => {
+
+console.log(
+`VIDEO FRAME ${index + 1}/${frames.length} PADDLEOCR`
+);
+
+try {
+
+const ocrResult =
+await runPaddleOCR(frame.framePath);
+
+return {
+frame: index + 1,
+file: frame.file,
+text: ocrResult?.text || "",
+confidence:
+Number(ocrResult?.confidence) || 0,
+success:
+Boolean(ocrResult?.success),
+};
+
 } catch (error) {
+
 console.error(
-"Video frame extraction error:",
+`FRAME ${index + 1} PADDLEOCR HATASI:`,
 error
 );
 
-return [];
-}
-}
-
-async function cleanupFiles(
-filePaths
-) {
-for (
-const filePath of filePaths
-) {
-try {
-await fs.rm(
-filePath,
-{
-recursive: true,
-force: true,
-}
-);
-} catch {}
-}
-}
-
-function ensureArray(
-value
-) {
-return Array.isArray(
-value
-)
-? value
-: [];
-}
-
-function ensureObject(
-value
-) {
-return value &&
-typeof value === "object"
-? value
-: {};
-}
-
-function safeJson(
-value
-) {
-try {
-return JSON.stringify(
-value,
-null,
-2
-);
-} catch {
-return "{}";
-}
-}
-
-function buildOCRContext(
-paddleResult,
-tesseractResult,
-pdfText = ""
-) {
-return `
-PADDLEOCR METNİ:
-${safeString(
-paddleResult?.text
-)}
-
-PADDLEOCR CONFIDENCE:
-${Number(
-paddleResult?.confidence ||
-0
-).toFixed(4)}
-
-TESSERACT METNİ:
-${safeString(
-tesseractResult?.text
-)}
-
-TESSERACT CONFIDENCE:
-${Number(
-tesseractResult?.confidence ||
-0
-).toFixed(2)}
-
-PDF NATIVE TEXT:
-${safeString(
-pdfText
-)}
-
-OCR BİLGİSİ YORUMLAMA:
-- OCR metni yalnızca yardımcı kanıttır.
-- Görsel belge üzerinde açıkça görünen bilgi önceliklidir.
-- OCR motorlarının farklı okuması tek başına sahtecilik kanıtı değildir.
-- Aynı alan farklı OCR motorlarında tutarlı biçimde okunuyorsa bu destekleyici kanıttır.
-- OCR ile görüntü arasında anlamlı ve tekrarlanabilir bir fark varsa bunu bulgu olarak değerlendir.
-`;
-}
-
-function buildTemplateContext(
-bank,
-text
-) {
-return `
-BANKA / ŞABLON BAĞLAMI:
-${safeString(
-bank?.name
-)}
-
-BELGE METNİ:
-${safeString(
-text
-)}
-
-Şablon değerlendirmesinde:
-- banka adı,
-- başlık,
-- alan sırası,
-- tipografi,
-- hizalama,
-- boşluklar,
-- tutar konumu,
-- IBAN biçimi,
-- tarih/saat biçimi,
-- işlem numarası biçimi
-birlikte değerlendirilmelidir.
-
-Banka şablonunda farklılık görülmesi tek başına sahtecilik kanıtı değildir;
-resmî uygulama sürümleri, kanal farkları ve ekran görüntüsü/reformatlama da farklılık oluşturabilir.
-`;
-}
-
-function buildTransactionLogicContext(
-documentData
-) {
-const amount =
-parseAmount(
-documentData?.amount
-);
-
-const currency =
-safeString(
-documentData?.currency
-);
-
-const senderIBAN =
-safeString(
-documentData?.senderIBAN
-);
-
-const receiverIBAN =
-safeString(
-documentData?.receiverIBAN
-);
-
-const senderValidation =
-validateIBANMod97(
-senderIBAN
-);
-
-const receiverValidation =
-validateIBANMod97(
-receiverIBAN
-);
-
-return `
-İŞLEM MANTIĞI / MATEMATİKSEL KONTROLLER:
-
-Belgedeki tutar:
-${safeString(
-documentData?.amount
-)}
-
-Sayısal tutar:
-${amount === null ? "unknown" : amount}
-
-Para birimi:
-${currency}
-
-Gönderen IBAN:
-${senderIBAN}
-
-Gönderen IBAN doğrulaması:
-${safeJson(
-senderValidation
-)}
-
-Alıcı IBAN:
-${receiverIBAN}
-
-Alıcı IBAN doğrulaması:
-${safeJson(
-receiverValidation
-)}
-
-IBAN checksum geçersizse bunu yüksek öncelikli teknik tutarsızlık olarak değerlendir.
-Ancak OCR hatası ihtimalini de göz önünde bulundur.
-`;
-}
-
-function normalizeCheck(
-check
-) {
-const value =
-ensureObject(check);
-
-const status =
-["pass", "fail", "unknown"].includes(
-value.status
-)
-? value.status
-: "unknown";
-
-const score =
-clampScore(
-value.score
-);
-
-const evidence =
-ensureArray(
-value.evidence
-).map(
-(item) =>
-safeString(
-item
-)
-);
-
 return {
-status,
-score,
-evidence,
-};
-}
-
-function normalizeChecks(
-checks
-) {
-const source =
-ensureObject(
-checks
-);
-
-const result = {};
-
-for (
-const key of Object.keys(
-RESPONSE_SCHEMA
-.properties
-.checks
-.properties
-)
-) {
-result[key] =
-normalizeCheck(
-source[key]
-);
-}
-
-return result;
-}
-
-function normalizeFindings(
-findings
-) {
-return ensureArray(
-findings
-).map(
-(finding) => {
-const item =
-ensureObject(
-finding
-);
-
-return {
-severity:
-safeString(
-item.severity
-),
-category:
-safeString(
-item.category
-),
-description:
-safeString(
-item.description
-),
-evidence:
-safeString(
-item.evidence
-),
-};
-}
-);
-}
-
-function normalizeDocumentData(
-documentData
-) {
-const source =
-ensureObject(
-documentData
-);
-
-return {
-senderName:
-safeString(
-source.senderName
-),
-senderIBAN:
-safeString(
-source.senderIBAN
-),
-receiverName:
-safeString(
-source.receiverName
-),
-receiverIBAN:
-safeString(
-source.receiverIBAN
-),
-amount:
-preserveAmount(
-source.amount
-),
-currency:
-safeString(
-source.currency
-),
-date:
-safeString(
-source.date
-),
-time:
-safeString(
-source.time
-),
-transactionId:
-safeString(
-source.transactionId
-),
-referenceNo:
-safeString(
-source.referenceNo
-),
-description:
-safeString(
-source.description
-),
-};
-}
-
-function normalizeAmountAnalysis(
-amountAnalysis
-) {
-const source =
-ensureObject(
-amountAnalysis
-);
-
-return {
-numericAmount:
-safeString(
-source.numericAmount
-),
-formattedAmount:
-preserveAmount(
-source.formattedAmount
-),
-suspiciousFormatting:
-Boolean(
-source.suspiciousFormatting
-),
-evidence:
-ensureArray(
-source.evidence
-).map(
-safeString
-),
-};
-}
-
-function normalizeAIResult(
-result
-) {
-const source =
-ensureObject(
-result
-);
-
-return {
-documentType:
-safeString(
-source.documentType
-),
-bank:
-safeString(
-source.bank
-),
-documentData:
-normalizeDocumentData(
-source.documentData
-),
-checks:
-normalizeChecks(
-source.checks
-),
-amountAnalysis:
-normalizeAmountAnalysis(
-source.amountAnalysis
-),
-findings:
-normalizeFindings(
-source.findings
-),
-overallRisk:
-clampScore(
-source.overallRisk
-),
-summary:
-safeString(
-source.summary
-),
-};
-}
-function calculateRiskFromChecks(
-checks
-) {
-const normalized =
-normalizeChecks(
-checks
-);
-
-let total = 0;
-let count = 0;
-
-for (
-const check of Object.values(
-normalized
-)
-) {
-if (
-check.status === "fail"
-) {
-total += 100;
-count++;
-} else if (
-check.status === "pass"
-) {
-total += 0;
-count++;
-}
-}
-
-if (!count) {
-return 0;
-}
-
-return clampScore(
-total / count
-);
-}
-
-function applyDeterministicRiskRules(
-result,
-comparison,
-amountForensics
-) {
-const checks =
-result.checks ||
-{};
-
-/*
-* Kullanıcı tarafından verilen tutar ile
-* belgede görünen tutar arasında fark varsa
-* bu farkı deterministic kanıt olarak sakla.
-*/
-if (
-comparison?.amount?.available &&
-comparison.amount.matches === false
-) {
-const difference =
-Number(
-comparison.amount.difference
-);
-
-const amountCheck =
-normalizeCheck(
-checks.amountConsistency
-);
-
-amountCheck.status =
-"fail";
-
-/*
-* Büyük tutar farklarını daha güçlü
-* işaretle.
-*/
-if (
-Number.isFinite(
-difference
-)
-) {
-if (
-difference >= 1000
-) {
-amountCheck.score =
-Math.max(
-amountCheck.score,
-85
-);
-} else if (
-difference >= 100
-) {
-amountCheck.score =
-Math.max(
-amountCheck.score,
-60
-);
-} else {
-amountCheck.score =
-Math.max(
-amountCheck.score,
-40
-);
-}
-}
-
-amountCheck.evidence.push(
-`Sağlanan tutar ile belgede görünen tutar uyuşmuyor. Sağlanan: ${safeString(
-comparison.amount.provided
-)}, belge: ${safeString(
-comparison.amount.document
-)}, fark: ${Number.isFinite(
-difference
-)
-? difference.toFixed(2)
-: "unknown"}.`
-);
-
-checks.amountConsistency =
-amountCheck;
-}
-
-/*
-* IBAN karşılaştırmaları.
-*/
-if (
-comparison?.senderIBAN?.available &&
-comparison.senderIBAN.matches ===
-false
-) {
-const check =
-normalizeCheck(
-checks.ibanConsistency
-);
-
-check.status =
-"fail";
-
-check.score =
-Math.max(
-check.score,
-85
-);
-
-check.evidence.push(
-"Sağlanan gönderen IBAN ile belgede görünen gönderen IBAN uyuşmuyor."
-);
-
-checks.ibanConsistency =
-check;
-}
-
-if (
-comparison?.receiverIBAN?.available &&
-comparison.receiverIBAN.matches ===
-false
-) {
-const check =
-normalizeCheck(
-checks.ibanConsistency
-);
-
-check.status =
-"fail";
-
-check.score =
-Math.max(
-check.score,
-85
-);
-
-check.evidence.push(
-"Sağlanan alıcı IBAN ile belgede görünen alıcı IBAN uyuşmuyor."
-);
-
-checks.ibanConsistency =
-check;
-}
-
-/*
-* Amount forensics:
-*
-* Moderate:
-* sadece forensic uyarı olarak saklanır.
-*
-* Strong:
-* amountConsistency deterministic olarak
-* fail yapılır.
-*
-* Böylece OpenAI'nin overallRisk değerine
-* güvenmek zorunda kalmayız.
-*/
-if (
-amountForensics?.status ===
-"warning"
-) {
-const check =
-normalizeCheck(
-checks.amountConsistency
-);
-
-for (
-const evidence of
-ensureArray(
-amountForensics.evidence
-)
-) {
-if (
-!check.evidence.includes(
-evidence
-)
-) {
-check.evidence.push(
-evidence
-);
-}
-}
-
-if (
-amountForensics.severity ===
-"strong"
-) {
-check.status =
-"fail";
-
-check.score =
-Math.max(
-check.score,
-85
-);
-}
-
-checks.amountConsistency =
-check;
-}
-
-result.checks =
-checks;
-
-/*
-* Deterministic risk hesabı.
-*
-* Burada check.score değerleri yerine
-* check.status kullanılır:
-*
-* pass = 0
-* fail = 100
-* unknown = hesaba katılmaz
-*
-* Böylece modelin verdiği sayısal
-* overallRisk nihai sonucu doğrudan
-* belirleyemez.
-*/
-const risk =
-calculateRiskFromChecks(
-checks
-);
-
-result.overallRisk =
-risk;
-
-return result;
-}
-
-function buildFinalSummary(
-result,
-amountForensics
-) {
-const findings =
-ensureArray(
-result.findings
-);
-
-const warningEvidence =
-ensureArray(
-amountForensics?.evidence
-);
-
-const parts = [];
-
-if (
-result.documentType
-) {
-parts.push(
-`Belge tipi: ${result.documentType}.`
-);
-}
-
-if (
-result.bank
-) {
-parts.push(
-`Banka: ${result.bank}.`
-);
-}
-
-if (
-result.documentData?.amount
-) {
-parts.push(
-`Tutar: ${result.documentData.amount}.`
-);
-}
-
-if (
-findings.length
-) {
-parts.push(
-`${findings.length} adet bulgu değerlendirildi.`
-);
-}
-
-if (
-amountForensics?.status ===
-"warning"
-) {
-parts.push(
-"Tutar bölgesinde lokal görsel tutarsızlık tespit edildi."
-);
-}
-
-if (
-warningEvidence.length
-) {
-parts.push(
-warningEvidence[0]
-);
-}
-
-if (
-!parts.length
-) {
-return safeString(
-result.summary
-);
-}
-
-return parts.join(
-" "
-);
-}
-
-function getFinalRiskLabel(
-score
-) {
-const value =
-clampScore(score);
-
-if (
-value >= 85
-) {
-return "Çok Yüksek Risk";
-}
-
-if (
-value >= 60
-) {
-return "Yüksek Risk";
-}
-
-if (
-value >= 46
-) {
-return "Orta Risk";
-}
-
-return "Düşük Risk";
-}
-
-function appendFinding(
-result,
-finding
-) {
-if (
-!result
-) {
-return;
-}
-
-if (
-!Array.isArray(
-result.findings
-)
-) {
-result.findings = [];
-}
-
-const normalized = {
-severity:
-safeString(
-finding?.severity
-),
-category:
-safeString(
-finding?.category
-),
-description:
-safeString(
-finding?.description
-),
-evidence:
-safeString(
-finding?.evidence
-),
+frame: index + 1,
+file: frame.file,
+text: "",
+confidence: 0,
+success: false,
+error:
+error?.message ||
+"PaddleOCR başarısız.",
 };
 
-const exists =
-result.findings.some(
-(item) =>
-item?.category ===
-normalized.category &&
-item?.description ===
-normalized.description &&
-item?.evidence ===
-normalized.evidence
-);
-
-if (!exists) {
-result.findings.push(
-normalized
-);
-}
 }
 
-function applyAmountForensicsFinding(
-result,
-amountForensics
-) {
-if (
-!amountForensics?.available ||
-amountForensics.status !==
-"warning"
-) {
-return;
-}
-
-const severity =
-amountForensics.severity ===
-"strong"
-? "high"
-: "medium";
-
-const description =
-amountForensics.severity ===
-"strong"
-? "Tutar bölgesinde güçlü lokal görsel yoğunluk farkı tespit edildi."
-: "Tutar bölgesinde orta seviyede lokal görsel yoğunluk farkı tespit edildi.";
-
-appendFinding(
-result,
-{
-severity,
-category:
-"amount_forensics",
-description,
-evidence:
-ensureArray(
-amountForensics.evidence
-).join(" "),
-}
-);
-}
-
-function addIBANChecksumFindings(
-result
-) {
-const documentData =
-result?.documentData;
-
-if (!documentData) {
-return;
-}
-
-const fields = [
-{
-label:
-"Gönderen IBAN",
-value:
-documentData.senderIBAN,
-},
-{
-label:
-"Alıcı IBAN",
-value:
-documentData.receiverIBAN,
-},
-];
-
-for (
-const field of fields
-) {
-if (!field.value) {
-continue;
-}
-
-const validation =
-validateIBANMod97(
-field.value
-);
-
-if (
-validation.valid ===
-false
-) {
-appendFinding(
-result,
-{
-severity:
-"high",
-category:
-"iban_checksum",
-description:
-`${field.label} checksum doğrulamasından geçmedi.`,
-evidence:
-`${field.label}: ${field.value}. ${validation.reason}.`,
-}
-);
-
-const check =
-normalizeCheck(
-result.checks
-?.ibanConsistency
-);
-
-check.status =
-"fail";
-
-check.score =
-Math.max(
-check.score,
-85
-);
-
-check.evidence.push(
-`${field.label} checksum doğrulaması başarısız.`
-);
-
-result.checks =
-result.checks ||
-{};
-
-result.checks.ibanConsistency =
-check;
-}
-}
-}
-
-function buildRiskExplanation(
-result
-) {
-const checks =
-normalizeChecks(
-result?.checks
-);
-
-const failed =
-Object.entries(
-checks
-).filter(
-([, check]) =>
-check.status ===
-"fail"
-);
-
-const passed =
-Object.entries(
-checks
-).filter(
-([, check]) =>
-check.status ===
-"pass"
-);
-
-const unknown =
-Object.entries(
-checks
-).filter(
-([, check]) =>
-check.status ===
-"unknown"
-);
-
-return {
-score:
-clampScore(
-result?.overallRisk
-),
-label:
-getFinalRiskLabel(
-result?.overallRisk
-),
-failedChecks:
-failed.map(
-([name, check]) => ({
-name,
-score:
-check.score,
-evidence:
-check.evidence,
 })
-),
-passedChecks:
-passed.map(
-([name]) =>
-name
-),
-unknownChecks:
-unknown.map(
-([name]) =>
-name
-),
-};
-}
+);
 
-async function callOpenAIAnalysis(
-content
-) {
+console.log(
+"VIDEO PADDLEOCR TAMAMLANDI"
+);
+
+
+console.log(
+"VIDEO PADDLEOCR TAMAMLANDI"
+);
+
+const videoOCRText =
+videoOCRResults
+.map((item) => {
+
+return `
+KARE ${item.frame}
+DOSYA: ${item.file}
+OCR BAŞARILI: ${item.success}
+OCR CONFIDENCE: ${item.confidence}/100
+
+OCR METNİ:
+${item.text || "Metin okunamadı."}
+`;
+
+})
+.join("\n");
+const imageMessages =
+frames.map(
+(frame) => ({
+type:
+"input_image",
+
+image_url:
+`data:image/jpeg;base64,${frame.base64}`,
+
+detail:
+"high",
+})
+);
+
+const videoPrompt = `
+
+Sen VerifyDoc video analiz sistemisin.
+
+TÜM ANALİZ TÜRKÇE OLMALIDIR.
+
+Bu belge bir video içerisinden çıkarılmış
+${frames.length} ayrı kare üzerinden analiz edilmektedir.
+
+Tüm kareleri birlikte değerlendir.
+
+Bu analiz yalnızca otomatik ön incelemedir.
+Belgenin kesin olarak gerçek veya sahte olduğunu söyleme.
+
+=====================================================
+ANA AMAÇ
+=====================================================
+
+Videodaki belgeyi genel olarak analiz et.
+
+Kareler arasındaki tutarlılığı kontrol et.
+
+Özellikle:
+
+- gönderen
+- alıcı
+- IBAN
+- işlem tutarı
+- para birimi
+- tarih
+- saat
+- işlem numarası
+- açıklama
+- banka
+- logo
+- QR
+- barkod
+- belge üzerindeki metin ve rakamlar
+
+üzerinde değişiklik olup olmadığını incele.
+
+=====================================================
+VİDEO HAREKETLERİ
+=====================================================
+
+Kamera hareketi, zoom, odak değişimi, perspektif,
+ışık değişimi, titreme, JPEG/video sıkıştırması veya
+hafif bulanıklığı tek başına manipülasyon olarak
+değerlendirme.
+
+=====================================================
+MANİPÜLASYON
+=====================================================
+
+Aşağıdakileri yalnızca gerçekten görünüyorsa değerlendir:
+
+- sonradan ekleme
+- sonradan silme
+- kesme
+- kırpma
+- yapıştırma
+- dijital montaj
+- farklı font
+- farklı karakter yapısı
+- farklı görüntü kalitesi
+- kareler arasında değişen belge alanı
+
+Somut kanıt yoksa şüpheli sonuç üretme.
+
+=====================================================
+TUTAR
+=====================================================
+
+Videoda görünen ana işlem tutarını belirle.
+
+Farklı karelerde tutarın değişip değişmediğini kontrol et.
+
+IBAN, hesap numarası, işlem numarası, tarih veya saat
+gibi rakamları işlem tutarıyla karıştırma.
+
+Yeterli veri yoksa tahmin etme.
+
+=====================================================
+ALICI VE IBAN
+=====================================================
+
+Alıcı adı ve IBAN'ı kareler arasında karşılaştır.
+
+Değişiklik varsa açıkça belirt.
+
+Okunamıyorsa tahmin etme.
+
+=====================================================
+TARİH / SAAT
+=====================================================
+
+Görünen tarih ve saat bilgilerini kareler arasında
+karşılaştır.
+
+Gerçek bir değişiklik görülmüyorsa değişiklik varmış
+gibi yorumlama.
+
+=====================================================
+GENEL SUMMARY
+=====================================================
+
+summary alanı kullanıcıya gösterilecek ana sonuçtur.
+
+summary:
+
+- TEK BİR PARAGRAF olmalıdır.
+- Türkçe olmalıdır.
+- Doğal bir analiz dili kullanılmalıdır.
+- Kare kare anlatım yapılmamalıdır.
+- "Tutar:", "Alıcı:", "IBAN:", "Oynama:" gibi ayrı
+başlıklar kullanılmamalıdır.
+- Önemli bulgular tek bir genel analiz içerisinde
+birleştirilmelidir.
+
+Örneğin belge tutarlıysa:
+
+"Belge, video içerisinden alınan farklı kareler üzerinden
+incelenmiştir. Kareler arasında işlem tutarı, alıcı bilgileri,
+IBAN ve tarih/saat açısından belirgin bir tutarsızlık
+görülmemiştir. Görüntü hareketleri doğal video koşullarıyla
+uyumlu değerlendirilmiş ve belirgin bir sonradan ekleme,
+silme veya montaj belirtisi tespit edilmemiştir."
+
+Bu yalnızca örnektir.
+
+Gerçek summary yalnızca videoda görülen kanıtlara göre
+oluşturulmalıdır.
+
+Eğer önemli bir tutarsızlık varsa bunu aynı paragraf
+içerisinde açıkça anlat.
+
+=====================================================
+DİĞER ALANLAR
+=====================================================
+
+documentData alanlarını yalnızca videoda gerçekten
+okunabilen bilgilerle doldur.
+
+Okunamayan değerleri null yap.
+
+amountAnalysis alanında yeterli veri yoksa null kullan.
+
+limitations alanında video nedeniyle gerçekten
+oluşan sınırlamaları belirt.
+
+checks alanındaki 25 kontrolü:
+
+pass = sorun görülmedi
+fail = somut sorun/tutarsızlık görüldü
+unknown = güvenilir şekilde değerlendirilemedi
+
+olarak doldur.
+
+Risk skorunu kendin hesaplama.
+
+overallRisk, riskLabel ve categories değerleri
+backend tarafından deterministik risk motoruyla
+hesaplanacaktır.
+
+SONUCU SADECE JSON OLARAK DÖNDÜR.
+
+=====================================================
+PADDLEOCR VİDEO KARE SONUÇLARI
+=====================================================
+
+Aşağıdaki OCR sonuçları videodan çıkarılan JPG
+karelerinin her biri üzerinde ayrı ayrı çalıştırılmıştır.
+
+ÇOK ÖNEMLİ:
+
+OCR yalnızca yardımcı veridir.
+
+ASIL KAYNAK:
+video karelerinin gerçek görüntüsüdür.
+
+OCR sonucu görüntüyle çelişirse görüntüyü esas al.
+
+OCR tarafından tahmin edilmiş veya yanlış okunmuş
+değerleri gerçek belge bilgisi olarak kabul etme.
+
+KARELER ARASI OCR KARŞILAŞTIRMASI YAP.
+
+Özellikle:
+
+- alıcı adı
+- IBAN
+- tutar
+- tarih
+- saat
+- işlem numarası
+- açıklama
+
+alanlarının kareler arasında değişip değişmediğini kontrol et.
+
+${videoOCRText}
+
+=====================================================
+`;
+
+console.log(
+"OPENAI VIDEO REQUEST START"
+);
+
 const response =
-await client.responses.create(
-{
-model: MODEL,
+await openai.responses.create({
+model:
+"gpt-5.6-terra",
+
+reasoning: {
+effort: "medium",
+},
 
 input: [
+
 {
-role: "system",
+
+role:
+"user",
+
 content: [
+
 {
 type:
 "input_text",
-text: `
-Sen VerifyDoc'un belge adli inceleme motorusun.
+text:
+videoPrompt,
 
-Görevin:
-- banka dekontları,
-- ödeme belgeleri,
-- transfer belgeleri,
-- hesap hareketleri,
-- benzeri finansal belgelerde
-sahtecilik veya manipülasyon belirtilerini
-çok katmanlı şekilde incelemektir.
-
-ÇOK ÖNEMLİ KURALLAR:
-
-1. Görmediğin bilgiyi uydurma.
-2. OCR hatasını sahtecilik olarak yorumlama.
-3. Görsel kanıt ile OCR bilgisini birbirinden ayır.
-4. Bir alanın farklı görünmesi tek başına sahtecilik kanıtı değildir.
-5. Ekran görüntüsü, JPEG sıkıştırması, yeniden boyutlandırma, tarama ve farklı render süreçlerinin oluşturabileceği doğal farklılıkları dikkate al.
-6. Tutar alanını özellikle dikkatli incele.
-7. "1700,00" gibi bir tutarın "00" kısmı ile "1700" kısmı arasında lokal font, stroke, darkness, spacing veya rendering farkı varsa bunu değerlendir; fakat yalnızca görsel fark gördün diye kesin sahte deme.
-8. Verilen amountForensics bilgisini yardımcı deterministic kanıt olarak kullan.
-9. amountForensics strong warning ise bunu önemli bir bulgu olarak değerlendir.
-10. Belgenin gerçek görüntüsü her zaman nihai görsel referanstır.
-11. Kanıt yoksa unknown kullan.
-12. Her bulguda somut kanıt yaz.
-13. OverallRisk alanını kendi değerlendirmen olarak üret; backend deterministic risk motoru nihai skoru ayrıca hesaplayabilir.
-
-Tutar konusunda:
-- Binlik ayırıcı ile ondalık ayırıcıyı karıştırma.
-- "1.700,00 TL" Türkiye formatında 1700.00 TRY anlamına gelebilir.
-- "1,700.00" farklı locale formatıdır.
-- Görseldeki karakterlerin tek tek okunabilirliği önemlidir.
-- Bir tutarın yalnızca OCR tarafından yanlış okunması sahtecilik kanıtı değildir.
-
-IBAN konusunda:
-- IBAN karakterlerini dikkatle incele.
-- OCR kaynaklı karakter karışıklıkları olabilir.
-- Checksum tutarsızlığı teknik bulgudur fakat OCR hatası ihtimalini değerlendir.
-
-Şablon konusunda:
-- Bankanın resmî şablonundaki makul varyasyonları dikkate al.
-- Farklı uygulama sürümleri ve ekran görüntülerini otomatik olarak sahte kabul etme.
-
-Çıktı kesinlikle verilen JSON şemasına uygun olmalıdır.
-`,
 },
+...imageMessages,
 ],
-},
-{
-role: "user",
-content,
+
 },
 ],
 
 text: {
+
+format: {
+
+type:
+"json_schema",
+
+name:
+"verifydoc_video_analysis",
+
+strict:
+true,
+
+schema:
+RESPONSE_SCHEMA,
+
+},
+},
+
+});
+
+console.log("KULLANILAN OPENAI MODEL:", response.model);
+
+console.log(
+"OPENAI VIDEO RESPONSE RECEIVED"
+);
+
+
+const content =
+response?.output_text;
+
+
+if (
+!content
+) {
+
+throw new Error(
+"OpenAI'dan video analiz sonucu alınamadı."
+);
+
+}
+console.log(
+"OPENAI VIDEO ANALYSIS:",
+content
+);
+
+const result =
+parseAIResponse(
+content
+);
+
+
+if (
+!result ||
+typeof result !== "object"
+) {
+throw new Error(
+"Video analiz sonucu geçersiz."
+);
+}
+
+console.log(
+"VIDEO OVERALL RISK:",
+result.overallRisk
+);
+
+console.log(
+"VIDEO RISK LABEL:",
+result.riskLabel
+);
+
+console.log(
+"VIDEO CONFIDENCE:",
+result.confidence
+);
+
+return result;
+}
+
+// =====================================================
+// ARRAY'DEN İLK DEĞERİ AL
+// =====================================================
+function first(value) {
+
+if (
+Array.isArray(value)
+) {
+
+return value[0];
+}
+return value;
+}
+
+// =====================================================
+// DOSYA BUL
+// =====================================================
+
+function findUploadedFile(
+files
+) {
+
+const possibleNames = [
+
+"image",
+"file",
+"video",
+
+];
+
+
+for (
+const name of possibleNames
+) {
+
+const value =
+files?.[name];
+
+if (!value) {
+
+continue;
+
+}
+
+if (
+Array.isArray(value)
+) {
+return value[0];
+
+}
+
+
+return value;
+}
+
+return null;
+}
+
+// =====================================================
+// MİKRO KARAKTER / RAKAM TUTARLILIK ANALİZİ
+// =====================================================
+
+function analyzeTextCharacterConsistency(
+text
+) {
+
+if (
+!text ||
+typeof text !== "string"
+) {
+
+return {
+score:
+0,
+
+suspicious:
+false,
+
+reason:
+"Analiz edilecek metin bulunamadı.",
+};
+
+}
+
+const characters =
+[...text].filter(
+(char) =>
+/[0-9]/.test(char)
+);
+
+if (
+characters.length < 2
+) {
+
+return {
+score:
+0,
+suspicious:
+false,
+
+reason:
+"Karşılaştırma için yeterli rakam bulunamadı.",
+};
+}
+
+const frequency = {};
+
+
+for (
+const char of characters
+) {
+
+frequency[char] =
+(frequency[char] || 0) + 1;
+
+}
+
+
+const repeatedDigits =
+Object.entries(
+frequency
+).filter(
+([, count]) =>
+count >= 2
+);
+
+
+if (
+!repeatedDigits.length
+) {
+
+return {
+score:
+0,
+suspicious:
+false,
+
+reason:
+"Aynı rakamın yeterli tekrarı bulunamadı.",
+};
+
+}
+
+return {
+
+score:
+0,
+
+suspicious:
+false,
+
+reason:
+"Rakam karakterleri mikro tutarlılık analizi için hazır.",
+
+repeatedDigits:
+repeatedDigits.map(
+([digit, count]) => ({
+
+digit,
+count,
+})
+),
+};
+
+}
+
+// =====================================================
+// TUTAR FORENSICS — KARAKTER DÜZEYİ GÖRSEL KONTROL
+// =====================================================
+// PaddleOCR bounding-box verisini kullanarak tutar alanını
+// görüntüden yeniden kontrol eder. Bu kontrol tek başına
+// sahtecilik kanıtı değildir; yalnızca lokal görsel
+// tutarsızlık sinyali üretir.
+async function analyzeAmountForensics(
+filePath,
+ocrResult
+) {
+
+if (
+!filePath ||
+!ocrResult?.success ||
+!Array.isArray(ocrResult?.regions) ||
+!ocrResult.regions.length
+) {
+return null;
+}
+
+const moneyPattern =
+/(?:\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2}))(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?/i;
+
+const candidates =
+ocrResult.regions
+.filter((item) =>
+item?.region &&
+moneyPattern.test(
+String(item.text || "")
+)
+)
+.sort((a, b) => {
+const aScore = Number(a.score) || 0;
+const bScore = Number(b.score) || 0;
+return bScore - aScore;
+});
+
+if (!candidates.length) {
+return {
+available:
+false,
+status:
+"unknown",
+severity:
+"none",
+score:
+0,
+amountText:
+null,
+region:
+null,
+characterCount:
+0,
+metrics: {
+medianDarkness:
+null,
+maxLocalDarknessDifference:
+null,
+localAnomalyRatio:
+null,
+},
+evidence:
+"Tutar benzeri OCR alanı bulunamadığı için karakter düzeyinde görsel tutarlılık kontrolü yapılamadı.",
+};
+}
+
+let image;
+
+try {
+image =
+await sharp(filePath)
+.grayscale()
+.raw()
+.toBuffer({
+resolveWithObject:
+true,
+});
+}
+catch (error) {
+return {
+available:
+false,
+status:
+"unknown",
+severity:
+"none",
+score:
+0,
+amountText:
+String(candidates[0].text || ""),
+region:
+candidates[0].region,
+characterCount:
+0,
+metrics: {
+medianDarkness:
+null,
+maxLocalDarknessDifference:
+null,
+localAnomalyRatio:
+null,
+},
+evidence:
+"Tutar alanı bulundu ancak görüntü piksel analizi yapılamadı.",
+};
+}
+
+const candidate =
+candidates[0];
+
+const rawRegion =
+candidate.region;
+
+const left =
+Math.max(0, Math.floor(rawRegion.x1));
+const top =
+Math.max(0, Math.floor(rawRegion.y1));
+const right =
+Math.min(image.info.width, Math.ceil(rawRegion.x2));
+const bottom =
+Math.min(image.info.height, Math.ceil(rawRegion.y2));
+
+const width =
+right - left;
+const height =
+bottom - top;
+
+if (
+width < 8 ||
+height < 5
+) {
+return {
+available:
+false,
+status:
+"unknown",
+severity:
+"none",
+score:
+0,
+amountText:
+String(candidate.text || ""),
+region:
+rawRegion,
+characterCount:
+0,
+metrics: {
+medianDarkness:
+null,
+maxLocalDarknessDifference:
+null,
+localAnomalyRatio:
+null,
+},
+evidence:
+"Tutar alanı bulundu ancak piksel analizi için yeterli çözünürlük yok.",
+};
+}
+
+const crop =
+await sharp(filePath)
+.grayscale()
+.extract({
+left,
+top,
+width,
+height,
+})
+.raw()
+.toBuffer({
+resolveWithObject:
+true,
+});
+
+const data = crop.data;
+const w = crop.info.width;
+const h = crop.info.height;
+
+const columnDarkness = [];
+
+for (
+let x = 0;
+x < w;
+x++
+) {
+
+let ink = 0;
+let count = 0;
+
+for (
+let y = 0;
+y < h;
+y++
+) {
+
+const value =
+data[y * w + x];
+
+if (
+value < 185
+) {
+ink +=
+255 - value;
+count++;
+}
+
+}
+
+columnDarkness.push(
+count
+?
+ink / count
+:
+0
+);
+}
+
+// Karakterler arasındaki boşlukları kullanarak yaklaşık
+// karakter segmentleri oluştur.
+const active =
+columnDarkness.map(
+(value) => value > 18
+);
+
+const segments = [];
+let segmentStart = null;
+
+for (
+let x = 0;
+x < active.length;
+x++
+) {
+
+if (
+active[x] &&
+segmentStart === null
+) {
+segmentStart = x;
+}
+
+const isEnd =
+segmentStart !== null &&
+(
+!active[x] ||
+x === active.length - 1
+);
+
+if (
+isEnd
+) {
+
+const end =
+active[x]
+?
+x + 1
+:
+x;
+
+if (
+end - segmentStart >= 1
+) {
+segments.push({
+start:
+segmentStart,
+end,
+});
+}
+
+segmentStart = null;
+}
+}
+
+// Çok küçük gürültü segmentlerini at.
+const filteredSegments =
+segments.filter(
+(segment) =>
+(segment.end - segment.start) >= 1
+);
+
+if (
+filteredSegments.length < 4
+) {
+return {
+available:
+true,
+status:
+"unknown",
+severity:
+"none",
+score:
+0,
+amountText:
+String(candidate.text || ""),
+region: {
+...rawRegion,
+pageIndex:
+candidate.pageIndex,
+},
+characterCount:
+filteredSegments.length,
+metrics: {
+medianDarkness:
+null,
+maxLocalDarknessDifference:
+null,
+localAnomalyRatio:
+null,
+},
+evidence:
+"Tutar alanında güvenilir karakter karşılaştırması için yeterli ayrı segment bulunamadı.",
+};
+}
+
+const segmentValues =
+filteredSegments.map(
+(segment) => {
+let total = 0;
+let count = 0;
+
+for (
+let x = segment.start;
+x < segment.end;
+x++
+) {
+const value =
+columnDarkness[x];
+if (value > 0) {
+total += value;
+count++;
+}
+}
+
+return count
+?
+total / count
+:
+0;
+}
+).filter(
+(value) => Number.isFinite(value) && value > 0
+);
+
+if (
+segmentValues.length < 4
+) {
+return {
+available:
+true,
+status:
+"unknown",
+severity:
+"none",
+score:
+0,
+amountText:
+String(candidate.text || ""),
+region: rawRegion,
+characterCount:
+segmentValues.length,
+metrics: {
+medianDarkness:
+null,
+maxLocalDarknessDifference:
+null,
+localAnomalyRatio:
+null,
+},
+evidence:
+"Tutar alanında yeterli piksel sinyali bulunamadı.",
+};
+}
+
+const sorted =
+[...segmentValues].sort(
+(a, b) => a - b
+);
+
+const median =
+sorted[Math.floor(sorted.length / 2)];
+
+const deviations =
+segmentValues.map(
+(value) =>
+Math.abs(value - median)
+);
+
+const maxDeviation =
+Math.max(...deviations);
+
+const relativeDifference =
+median > 0
+?
+maxDeviation / median
+:
+0;
+
+const anomalyThreshold =
+Math.max(
+18,
+median * 0.18
+);
+
+const anomalousSegments =
+segmentValues.filter(
+(value) =>
+Math.abs(value - median) >=
+anomalyThreshold
+).length;
+
+const anomalyRatio =
+segmentValues.length
+?
+anomalousSegments /
+segmentValues.length
+:
+0;
+
+let status =
+"pass";
+let severity =
+"none";
+let score =
+0;
+
+// Güçlü lokal fark: en az 4 segment olmalı ve fark hem
+// mutlak hem göreceli olarak belirgin olmalı.
+if (
+segmentValues.length >= 4 &&
+maxDeviation >= 24 &&
+relativeDifference >= 0.22 &&
+(anomalyRatio <= 0.50)
+) {
+status =
+"warning";
+severity =
+"strong";
+score =
+85;
+}
+else if (
+segmentValues.length >= 4 &&
+maxDeviation >= 18 &&
+relativeDifference >= 0.18 &&
+(anomalyRatio <= 0.35)
+) {
+status =
+"warning";
+severity =
+"moderate";
+score =
+65;
+}
+
+let evidence;
+
+if (
+status === "warning"
+) {
+evidence =
+`Tutar alanında ${segmentValues.length} karakter segmenti üzerinde lokal koyuluk/stroke tutarsızlığı sinyali bulundu. En belirgin segment farkı yaklaşık %${Math.round(relativeDifference * 100)} seviyesinde. Bu bulgu tek başına sahtecilik kanıtı değildir; JPEG sıkıştırması, yeniden boyutlandırma ve render farkları da benzer etki oluşturabilir.`;
+}
+else {
+evidence =
+"Tutar alanındaki karakter segmentleri arasında belirgin bir lokal koyuluk/stroke tutarsızlığı sinyali tespit edilmedi.";
+}
+
+return {
+available:
+true,
+status,
+severity,
+score,
+amountText:
+String(candidate.text || ""),
+region: {
+...rawRegion,
+pageIndex:
+candidate.pageIndex,
+},
+characterCount:
+segmentValues.length,
+metrics: {
+medianDarkness:
+Number(median.toFixed(2)),
+maxLocalDarknessDifference:
+Number(maxDeviation.toFixed(2)),
+localAnomalyRatio:
+Number(anomalyRatio.toFixed(3)),
+},
+evidence,
+};
+}
+
+// =====================================================
+// JSON RESPONSE
+// =====================================================
+function parseAIResponse(
+text
+) {
+
+if (
+!text ||
+typeof text !== "string"
+) {
+throw new Error(
+"OpenAI boş cevap döndürdü."
+);
+
+}
+
+const cleaned =
+text
+.trim()
+.replace(
+/^```json\s*/i,
+""
+)
+.replace(
+/^```\s*/i,
+""
+)
+.replace(
+/\s*```$/,
+""
+);
+
+try {
+
+return JSON.parse(
+cleaned
+);
+
+} catch {
+
+const start =
+cleaned.indexOf("{");
+
+
+const end =
+cleaned.lastIndexOf("}");
+
+if (
+start >= 0 &&
+end > start
+) {
+return JSON.parse(
+cleaned.slice(
+start,
+end + 1
+)
+);
+}
+
+throw new Error(
+"OpenAI geçerli JSON döndürmedi."
+);
+
+}
+
+}
+// =====================================================
+// PROMPT
+// =====================================================
+const PROMPT = `
+
+You are VerifyDoc, an AI-assisted document forensic screening system.
+
+IMPORTANT LANGUAGE RULE:
+
+All analysis, summaries, evidence, findings, warnings, and limitations
+MUST be written in TURKISH.
+
+Use proper Turkish characters whenever applicable:
+
+ç, Ç
+ğ, Ğ
+ı, I, İ
+ö, Ö
+ş, Ş
+ü, Ü
+
+Do NOT replace Turkish characters with their ASCII equivalents when the
+correct Turkish spelling is known.
+For example:
+
+"Çağrı" is correct.
+"Cagri" is not the preferred spelling when the Turkish character is visible.
+
+"Şahin" is correct.
+"Sahin" is not the preferred spelling when the Turkish character is visible.
+"İş Bankası" is correct.
+"Is Bankasi" is not the preferred spelling when the Turkish characters
+are visible.
+
+Analyze the supplied document carefully.
+
+This is ONLY a screening assessment.
+Never claim that a document is definitely authentic.
+
+Never claim that a document is definitely fake.
+
+Do not invent evidence.
+
+Every finding must be based only on visible or actually available evidence.
+
+If something cannot be reliably determined, use "unknown".
+A clean-looking document does NOT prove authenticity.
+
+Do not treat unknown checks as suspicious.
+
+=====================================================
+TURKISH TEXT AND CHARACTER ANALYSIS
+=====================================================
+
+When Turkish text is visible in the document:
+
+1. Carefully inspect Turkish characters:
+ç, ğ, ı, İ, ö, ş, ü
+2. Compare visually similar characters.
+3. Check whether a Turkish character appears inconsistent with the
+surrounding text.
+
+4. Check whether Turkish characters have unusual:
+- shape
+- spacing
+- baseline
+- font
+- size
+- alignment
+- rendering quality
+5. Do NOT mark a Turkish character as suspicious merely because it is
+different from an ASCII character.
+6. Do NOT assume a character is Turkish unless the visible evidence
+supports that conclusion.
+
+7. If the image quality is insufficient to determine whether a character
+is "ı" or "i", "İ" or "I", "ş" or "s", etc., use "unknown" or mention
+the limitation.
+
+8. Never invent missing Turkish characters.
+=====================================================
+OCR CONSISTENCY
+=====================================================
+Pay special attention to OCR consistency in Turkish words.
+
+If visible text contains names, bank names, addresses, explanations,
+or other Turkish content, preserve the characters exactly when they
+can be reliably read.
+
+Examples of Turkish characters that must be preserved:
+"Çağrı"
+"Şahin"
+"İşlem"
+"Ödeme"
+"Gönderici"
+"Alıcı"
+"Türk"
+"Ücret"
+"Çıkış"
+"İş Bankası"
+
+Do not normalize these to ASCII unnecessarily.
+
+=====================================================
+DOCUMENT ANALYSIS
+=====================================================
+
+Evaluate the document for signs of possible manipulation, inconsistency,
+editing, compositing, unusual typography, layout problems, or suspicious
+financial information.
+
+Check these 25 areas:
+
+1. OCR/text consistency
+2. Font consistency
+3. Font size consistency
+4. Character spacing
+5. Line spacing
+6. Text alignment
+7. Baseline consistency
+8. Image compression artifacts
+9. Copy/paste regions
+10. Editing traces
+11. Photoshop-like manipulation artifacts
+12. AI-generated image indicators
+13. Logo/branding consistency
+14. Stamp consistency
+15. Signature consistency
+16. Date consistency
+17. Amount consistency
+18. Currency formatting
+19. IBAN formatting if visible
+20. SWIFT/BIC formatting if visible
+21. QR/barcode consistency if visible
+22. Overall layout integrity
+23. Missing or suspicious elements
+24. Document type consistency
+25. Image quality limitations
+
+IMPORTANT AMOUNT CONSISTENCY:
+As part of the amountConsistency check, also verify whether
+the main transaction amount matches any written statement such as
+"... TL has been sent".
+
+If the visible numeric amount and the written transaction amount
+do not match, report this as a fail under amountConsistency.
+Only report this when both values are actually visible and readable.
+For each check:
+status:
+- pass = sorun görülmedi
+- fail = somut bir sorun veya tutarsızlık görüldü
+- unknown = güvenilir şekilde değerlendirilmedi
+score:
+0 = no suspicious evidence detected
+100 = very strong suspicious evidence
+Evidence must be concise and written in Turkish.
+Do not invent evidence.
+
+=====================================================
+TURKISH CHARACTER RISK
+=====================================================
+
+When evaluating OCR/text consistency, consider whether Turkish characters
+are visually and typographically consistent with the surrounding document.
+
+However:
+
+A Turkish character being unusual or difficult to read because of image
+quality MUST NOT automatically increase the fraud risk.
+
+Only increase suspicion when there is actual visible evidence of
+inconsistency or manipulation.
+
+=====================================================
+TUTAR / VERGİ / MATEMATİKSEL KONTROL
+=====================================================
+Belgede görünen finansal tutarları ayrıca dikkatlice incele.
+
+Özellikle:
+- ana işlem tutarı
+- ara toplam
+- mal/hizmet tutarı
+- KDV
+- diğer vergiler
+- komisyon
+- ücret
+- indirim
+- toplam tutar
+alanlarını tespit et.
+
+Ana işlem tutarını IBAN, hesap numarası, işlem numarası,
+referans numarası, tarih veya başka bir finansal rakamla karıştırma.
+Varsa matematiksel ilişkiyi kontrol et.
+
+Örneğin:
+
+ara toplam + KDV + diğer vergiler + ücret + komisyon - indirim = toplam
+Belgede birden fazla vergi veya ücret varsa mümkün olduğunca
+toplamını hesapla.
+
+Görünmeyen, okunamayan veya belirsiz rakamları tahmin etme.
+
+Ara toplam görülemiyorsa subtotal = null.
+Vergi görülemiyorsa taxAmount = null.
+
+Toplam görülemiyorsa totalAmount = null.
+
+Hesaplanabilecek değerler varsa:
+
+calculatedTotal
+alanında matematiksel olarak hesaplanan toplamı belirt.
+
+difference alanında:
+
+hesaplanan toplam - belgede görünen toplam
+
+farkını belirt.
+
+Hesaplama için yeterli veri yoksa:
+
+calculatedTotal = null
+difference = null
+kullan.
+Yeterli veri yoksa calculationConsistent değerini otomatik olarak
+true yapma.
+
+Hesaplama için yeterli veri bulunmadığında calculationConsistent
+değerini false olarak kullan ve nedenini evidence alanında açıkla.
+Çok küçük yuvarlama farklarını tek başına şüpheli olarak değerlendirme.
+Matematiksel tutarsızlık varsa bunun nedenini amountAnalysis.evidence
+alanında açıkça belirt.
+=====================================================
+ANA TUTAR KARAKTER / FONT KONTROLÜ
+=====================================================
+
+Ana işlem tutarının karakterlerini görsel olarak incele.
+
+Özellikle:
+
+- karakter yüksekliği
+- karakter genişliği
+- font ağırlığı
+- stroke kalınlığı
+- karakter aralığı
+- baseline
+- hizalama
+- kenar yapısı
+- anti-aliasing
+- genel render görünümü
+
+açısından çevresindeki aynı tip metinlerle tutarlılığını değerlendir.
+
+Farklı rakamların doğal olarak farklı şekillere sahip olduğunu unutma.
+Tek başına bir karakterin diğer rakamlardan farklı görünmesi
+şüpheli değildir.
+
+Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması veya görüntü
+kalitesi kaynaklı küçük farklılıkları sahtecilik olarak değerlendirme.
+
+Yeterli görsel kanıt yoksa şüpheli sonuç üretme.
+
+==================================================
+RISK CALCULATION
+==================================================
+
+DO NOT calculate any risk score.
+Do NOT calculate:
+- visualRisk
+- textRisk
+- layoutRisk
+- financialDataRisk
+- editingRisk
+- overallRisk
+
+You MAY provide confidence as a 0-100 value
+representing how confident you are that your
+observable findings are reliable.
+
+Confidence is NOT a risk score.
+
+Do not use confidence to calculate any risk score.
+
+Your job is ONLY to inspect the document and report
+observable evidence.
+
+For every check, return a deterministic finding:
+- "pass" = no visible problem found
+- "fail" = visible evidence of a problem exists
+- "unknown" = the check cannot be reliably determined
+
+IMPORTANT:
+Do not use intuition, probability, suspicion, or guesswork.
+
+Do not assign a numeric score.
+
+Do not decide LOW / MODERATE / HIGH / VERY HIGH risk.
+Do not compensate one finding with another.
+
+Only report what is actually visible in the document.
+
+If evidence is insufficient, return "unknown".
+
+
+Risk labels:
+
+0-20 = LOW RISK
+21-45 = MODERATE RISK
+46-70 = HIGH RISK
+71-100 = VERY HIGH RISK
+
+Confidence must be 0-100.
+
+Lower confidence if the document is:
+
+- blurry
+- cropped
+- low resolution
+- partially hidden
+- poorly lit
+- photographed from an angle
+- otherwise difficult to inspect
+=====================================================
+IMPORTANT
+=====================================================
+Do not confuse language recognition with authenticity.
+
+Correct Turkish characters do NOT prove that a document is authentic.
+
+Incorrect or missing Turkish characters do NOT automatically prove that
+a document is fake.
+
+Only actual visible evidence should affect the risk score.
+
+=====================================================
+PDF / DOCUMENT QUALITY ANALYSIS
+=====================================================
+When analyzing a PDF document, DO NOT automatically describe the document
+as "low resolution" simply because it is a PDF.
+First determine what kind of document is available:
+
+1. Native digital PDF:
+- Text appears digitally generated/selectable.
+- Characters are clean and consistent.
+- No obvious rasterization or scanning artifacts.
+- Treat this as potentially high-quality evidence.
+
+2. Scanned PDF:
+- Pages appear to be scanned images.
+- Evaluate sharpness, character clarity, compression, noise and scan quality.
+
+3. Image-based PDF:
+- PDF contains photographs or raster images.
+- Evaluate the actual visible image quality.
+
+4. Photograph converted to PDF:
+- Perspective distortion, shadows, lighting problems, glare, camera noise,
+or background artifacts may be present.
+- Evaluate these separately from PDF format itself.
+5. Mixed PDF:
+- Some content may be digital text while other content may be scanned or
+rasterized.
+- Evaluate each visible component separately.
+
+IMPORTANT:
+Being a PDF is NOT evidence of low resolution.
+Do NOT lower confidence merely because the file is a PDF.
+
+Only report a quality limitation when there is actual visible evidence such as:
+
+- blurry text
+- unreadable characters
+- severe compression
+- pixelation
+- scanning noise
+- image degradation
+- cropping
+- missing portions
+- excessive shadows
+- glare
+- perspective distortion
+- insufficient detail
+
+If the PDF is clear enough for reliable analysis, do NOT report low image
+quality simply because the document is a PDF.
+If the document is digitally generated and the text is clearly readable,
+recognize that as a quality advantage.
+
+When quality is limited, explain specifically WHY it is limited.
+For example:
+"Belge PDF formatında olduğu için değil, sayfa görüntüsü düşük kaliteli
+olduğu için bazı karakterler güvenilir şekilde doğrulanamıyor."
+
+If the quality is sufficient, use wording similar to:
+
+"Belge kalitesi analiz için yeterli görünüyor."
+Never invent the PDF's internal structure if it cannot actually be determined.
+If the distinction between native digital PDF and image-based PDF cannot be
+reliably determined, use "unknown".
+
+=====================================================
+BANK / INSTITUTION TEMPLATE & STYLE ANALYSIS
+=====================================================
+Identify the apparent bank, financial institution, company, government
+organization, or document issuer ONLY when there is sufficient visible
+evidence.
+
+If the issuer cannot be reliably identified, use "unknown".
+Do NOT guess the issuer.
+Analyze whether the document's visual and textual characteristics are
+internally consistent with the apparent issuer and document type.
+IMPORTANT:
+
+Do NOT assume that every document from the same institution uses exactly
+the same font, layout, spacing, colors, or visual design.
+
+Different versions, channels, dates, applications, web banking systems,
+mobile banking systems, PDF generators, branches, transaction types,
+languages, and software versions may legitimately produce different
+document designs.
+
+Therefore:
+A different font, layout, color, or spacing by itself is NOT evidence of
+fraud.
+Look for MULTIPLE independent inconsistencies before treating something as
+suspicious.
+Analyze the following:
+
+1. Apparent issuer / institution identity
+2. Logo and branding consistency
+3. Header and title structure
+4. Font family appearance
+5. Font weight and typography consistency
+6. Font size hierarchy
+7. Turkish character rendering
+8. Date and time formatting
+9. Currency and amount formatting
+10. IBAN formatting
+11. SWIFT / BIC formatting if visible
+12. Transaction reference formatting if visible
+13. Sender / recipient field structure
+14. Account information formatting
+15. Alignment and spacing
+16. Section ordering
+17. Color and visual hierarchy
+18. Footer / legal text structure if visible
+19. QR / barcode placement and consistency if visible
+20. Overall template coherence
+
+TURKISH CHARACTER ANALYSIS:
+
+Pay special attention to Turkish characters:
+ç Ç
+ğ Ğ
+ı I İ i
+ö Ö
+ş Ş
+ü Ü
+
+Check whether Turkish characters appear visually consistent with the rest
+of the document.
+Do NOT treat normal font rendering differences as suspicious.
+Only flag a character-related issue when there is visible evidence such as:
+
+- inconsistent glyph appearance within the same text style
+- unusual character spacing
+- incorrect character substitution
+- a character appearing to have been inserted from another font
+- visibly different rendering between otherwise identical text fields
+
+BANK / INSTITUTION TEMPLATE REASONING:
+If the apparent institution is identifiable, compare the document's
+different sections against each other.
+
+For example:
+- Does the header style match the transaction details?
+- Does the amount field visually belong to the same document?
+- Does the IBAN field use a consistent typography and spacing pattern?
+- Does the date/time format remain consistent?
+- Do sender and recipient fields follow the same visual structure?
+- Are there isolated elements that look composited or inserted?
+- Does the logo appear naturally integrated with the surrounding document?
+- Are there unusual gaps, misalignments, or inconsistent text blocks?
+
+Do NOT claim that a document is fake merely because its template differs
+from another document from the same institution.
+
+Do NOT claim that a document is authentic merely because its template looks
+familiar.
+
+If there is insufficient evidence to determine whether a particular
+institutional style is normal, use "unknown" or "review".
+============================================================
+TRANSACTION DATA CONSISTENCY — HIGH PRIORITY
+============================================================
+
+For EVERY document analysis, whether the uploaded document is a JPG/PNG
+image or a PDF, perform a dedicated transaction-data consistency check.
+This check has HIGHER PRIORITY than general visual/template observations.
+Pay particular attention to these fields:
+
+1. RECIPIENT NAME
+2. RECIPIENT IBAN
+3. TRANSACTION DATE AND TIME
+4. TRANSACTION AMOUNT
+5. WRITTEN AMOUNT / AMOUNT IN WORDS
+6. TOTAL / FEE / EXPENSE INFORMATION
+7. DESCRIPTION / TRANSACTION TEXT
+
+For each field:
+- Read the value directly from the analyzed document.
+- Do not invent, complete, or infer unreadable values.
+- If a value cannot be read reliably, use null or state that it is unreadable.
+- Compare repeated occurrences of the same information within the document.
+- Check whether the recipient name and recipient IBAN appear internally consistent.
+- Check whether the transaction date/time is internally consistent.
+- Check whether the numeric transaction amount is internally consistent.
+- If an amount is written both numerically and in words, compare the two.
+- Check whether fees, expenses, commissions, or additional charges mathematically
+agree with the displayed total.
+- Check whether the amount mentioned in the description agrees with the actual
+transaction amount.
+- Pay special attention to decimal separators, thousands separators, TRY/EUR/USD
+notation, and possible OCR digit substitutions.
+- Do not treat a formatting difference alone as evidence of fraud.
+IMPORTANT AMOUNT CHECK:
+
+If the document contains multiple monetary values, determine what each value
+represents before comparing them.
+
+Do NOT automatically assume that every monetary number is the transaction amount.
+
+For example, distinguish between:
+
+- main transaction amount
+- fee
+- commission
+- expense
+- total amount
+- remaining balance
+- previous balance
+- reference number
+- account number
+- IBAN
+- date/time
+Perform arithmetic checks whenever the visible information allows it.
+If:
+
+transaction amount + fee + other applicable charges != displayed total
+report the exact visible values and the mathematical discrepancy.
+
+If a written amount and numeric amount disagree, treat this as an important
+consistency finding and explicitly report both values.
+
+RECIPIENT PRIORITY:
+
+Recipient name and recipient IBAN are especially important.
+Check whether:
+- the recipient name is clearly visible,
+- the recipient IBAN is clearly visible,
+- the same recipient information appears consistently,
+- there are suspicious inconsistencies between recipient fields,
+- a recipient name appears to have been inserted or altered,
+- the IBAN format contains unusual or inconsistent characters.
+DATE/TIME PRIORITY:
+Check:
+
+- transaction date,
+- transaction time,
+- repeated date/time values,
+- chronological consistency,
+- unusual formatting or visible inconsistencies.
+DO NOT invent a discrepancy.
+
+Only report a discrepancy when it is supported by information actually visible
+in the analyzed document.
+If a field is unreadable, explicitly say that it could not be reliably verified.
+
+------------------------------------------------------------
+ANALYSIS ORDER
+------------------------------------------------------------
+Always analyze the actual uploaded document first.
+
+For an image document:
+- analyze the actual image,
+- extract the visible transaction information,
+- perform the transaction consistency checks above,
+- then perform visual/template analysis.
+For a PDF document:
+- analyze the actual PDF,
+- extract the visible transaction information from the PDF,
+- perform the SAME transaction consistency checks above,
+- then perform visual/template analysis.
+
+The same transaction-consistency rules apply to BOTH image and PDF analysis.
+Do not redirect image analysis to the PDF analysis path.
+Do not redirect PDF analysis to the image analysis path.
+
+When a reference document is supplied, use it only according to the existing
+reference-document rules. Never copy transaction values from a reference document
+into the analyzed document.
+------------------------------------------------------------
+RESULT EXPLANATION
+------------------------------------------------------------
+The final explanation should be similar to a forensic consistency summary.
+Prioritize concrete findings over generic statements.
+When a meaningful inconsistency is found, explain:
+
+- WHAT was found,
+- WHERE it was found,
+- WHAT the expected relationship was,
+- WHY the values are inconsistent,
+- and, when applicable, the exact arithmetic difference.
+
+Example style:
+"The document shows a transaction amount of 3090.00 TRY, while the description
+states that 3090.40 TRY was deducted. The displayed fee is 6.40 TRY, so the
+amounts do not reconcile as presented. This is a financial-data inconsistency
+and should increase the risk assessment."
+
+Do not state that a document is definitely fake solely because of one
+inconsistency.
+
+Instead distinguish between:
+
+- consistent,
+- minor inconsistency,
+- significant inconsistency,
+- suspicious visual/data inconsistency,
+- insufficient evidence.
+The final summary should mention the most important transaction-data findings
+before less important template/style observations.
+
+IMPORTANT:
+
+This is a forensic consistency check, NOT a definitive authenticity test.
+A familiar-looking bank template does not prove authenticity.
+An unfamiliar-looking bank template does not prove fraud.
+Use the available visible evidence only.
+
+If the issuer is identifiable, mention it in the summary only when supported
+by visible evidence.
+
+If the issuer cannot be reliably identified, do not invent a bank or
+institution name.
+
+Return ONLY the JSON object matching the supplied schema.
+
+
+
+JPEG VE PDF İÇİN AYNI FORMAT KULLANILACAKTIR.
+DOSYA TÜRÜNE GÖRE BAŞLIK, SIRA VE YAPI DEĞİŞTİRME.
+=====================================================
+YORUM / SUMMARY FORMATI
+=====================================================
+
+summary alanı kullanıcıya gösterilecek ana yorumdur.
+
+ÇOK ÖNEMLİ:
+
+summary yalnızca gerçekten tespit edilen önemli bulguları
+içermelidir.
+
+TEMİZ / SORUNSUZ KONTROLLERİ TEK TEK YAZMA.
+
+Örneğin:
+
+Tutar sorunsuzsa:
+"1. TUTAR KONTROLÜ: Sorun tespit edilmedi."
+
+şeklinde ayrı ayrı yazma.
+
+Bunun yerine yalnızca önemli bir sorun varsa belirt.
+
+=====================================================
+KULLANILACAK KONTROL SIRASI
+=====================================================
+
+Analiz mantıksal olarak aşağıdaki 5 alanı kontrol etmelidir:
+
+1. TUTAR KONTROLÜ
+2. ALICI BİLGİLERİ
+3. TOPLAM / YAZILI TUTAR UYUMU
+4. OYNAMA / KIRPMA / KESME KONTROLÜ
+5. TARİH / SAAT KONTROLÜ
+
+Ancak summary içerisinde yalnızca sorun veya dikkat edilmesi
+gereken somut bir bulgu bulunan alanları göster.
+
+Sorunsuz alanları tekrar tekrar yazma.
+
+=====================================================
+YORUM YAZIM KURALI
+=====================================================
+
+Eğer önemli bir sorun / tutarsızlık / görsel anormallik varsa:
+
+summary içerisinde kısa maddeler halinde belirt.
+
+Örnek:
+
+"• İşlem tutarı ile yazılı tutar arasında uyumsuzluk tespit edildi.
+• Alıcı IBAN'ında belge içerisindeki diğer bilgilerle tutarsızlık görüldü."
+
+Her madde en fazla 1 kısa cümle olsun.
+
+Gereksiz açıklama yapma.
+
+Kare kare anlatma.
+
+OCR sürecini anlatma.
+
+Teknik analiz sürecini anlatma.
+
+Model veya algoritmadan bahsetme.
+
+=====================================================
+SORUN YOKSA
+=====================================================
+
+Eğer anlamlı hiçbir tutarsızlık veya manipülasyon göstergesi
+tespit edilmemişse summary yalnızca şu anlama gelen kısa bir
+cümle olmalıdır:
+
+"Belgede belirgin bir tutarsızlık veya manipülasyon göstergesi
+tespit edilmedi."
+
+Bu cümleyi gereksiz şekilde uzatma.
+
+=====================================================
+BELİRSİZ DURUMLAR
+=====================================================
+
+Bir alan okunamıyorsa veya güvenilir şekilde değerlendirilemiyorsa
+bunu yalnızca gerçekten önemliyse belirt.
+
+Örneğin:
+
+"• Görüntü kalitesi nedeniyle alıcı IBAN'ının tamamı güvenilir
+şekilde doğrulanamadı."
+
+Belirsizliği sahtecilik olarak değerlendirme.
+
+=====================================================
+ÖNCELİK
+=====================================================
+
+Bulgu varsa öncelik sırası:
+
+1. Tutar uyumsuzluğu
+2. Yazılı tutar / rakamsal tutar uyumsuzluğu
+3. Alıcı adı / IBAN uyumsuzluğu
+4. Tarih / saat tutarsızlığı
+5. Görsel oynama / ekleme / silme / kesme
+6. Diğer önemli finansal tutarsızlıklar
+
+Önemsiz veya normal görsel farklılıkları summary'ye yazma.
+
+=====================================================
+KANIT KURALI
+=====================================================
+
+"Şüpheli",
+"uyumsuz",
+"oynama var",
+"değiştirilmiş",
+"manipüle edilmiş"
+
+gibi ifadeleri yalnızca gözlemlenebilir ve açıklanabilir
+kanıt varsa kullan.
+
+Tek başına:
+
+- farklı font görünümü
+- fotoğraf açısı
+- JPEG sıkıştırması
+- görüntü kalitesi
+- tarama kalitesi
+- normal karakter farklılığı
+
+sahtecilik kanıtı değildir.
+
+Görsel veya veri kanıtı yoksa sorun üretme.
+
+=====================================================
+SUMMARY ÇIKTI KURALI
+=====================================================
+
+summary:
+
+- Türkçe olmalıdır.
+- Kısa olmalıdır.
+- Yalnızca önemli bulguları içermelidir.
+- Temiz kontrolleri tek tek listelememelidir.
+- En fazla 3-5 kısa madde kullanılmalıdır.
+- Sorun yoksa tek kısa cümle kullanılmalıdır.
+- Aynı bulguyu tekrar etmemelidir.
+- Kesin "sahte" veya "gerçek" sonucu vermemelidir.
+============================================================
+KANIT KURALI
+============================================================
+"Şüpheli", "uyumsuz", "oynama var", "değiştirilmiş" veya benzeri bir sonuç
+SADECE gözlemlenebilir ve açıklanabilir kanıt varsa kullanılmalıdır.
+Tek başına:
+- farklı font görünümü,
+- fotoğraf açısı,
+- JPEG sıkıştırması,
+- görüntü kalitesi,
+- tarama kalitesi,
+- normal karakter farklılığı
+
+sahtecilik kanıtı olarak kabul edilmemelidir.
+
+Bir kontrol güvenilir şekilde yapılamıyorsa:
+"Belirlenemedi — yeterli görsel kanıt yok."
+şeklinde cevap ver.
+
+Özellikle tutar, alıcı adı, alıcı IBAN, yazıyla belirtilen tutar,
+"Hesabınızdan..." tutarı, tarih ve saat üzerinde görülen somut
+uyumsuzluklara öncelik ver.
+
+`;
+
+
+// =====================================================
+// HESAP ÖZETİ PROMPT
+// REFERANS KULLANILMAZ
+// =====================================================
+
+const STATEMENT_PROMPT = `
+Sen VerifyDoc isimli AI destekli belge inceleme sistemisin.
+
+Bu belge bir banka hesap özeti / hesap ekstresi olarak
+incelenmektedir.
+
+ÇOK ÖNEMLİ:
+
+Bu analizde banka referans PDF'i KULLANMA.
+Referans şablon kullanma.
+
+Referans belge kullanma.
+
+Başka banka belgesi ile karşılaştırma yapma.
+
+Yalnızca gönderilen hesap özeti üzerinden analiz yap.
+
+Bu analiz kesin gerçeklik veya sahtecilik kararı değildir.
+
+Kesin olarak "gerçek" deme.
+
+Kesin olarak "sahte" deme.
+
+Yalnızca gerçekten görülebilen veya güvenilir şekilde
+hesaplanabilen bilgiler üzerinden değerlendirme yap.
+
+Görülemeyen bilgileri tahmin etme.
+
+=====================================================
+HESAP ÖZETİ TANIMLAMA
+=====================================================
+Belgenin hesap özeti / hesap ekstresi niteliğinde olup
+olmadığını değerlendir.
+
+Görülebiliyorsa:
+
+- banka
+- hesap sahibi
+- IBAN
+- hesap numarası
+- hesap dönemi
+- para birimi
+- açılış bakiyesi
+- kapanış bakiyesi
+
+bilgilerini incele.
+
+Banka adı kesin olarak görülemiyorsa banka adı uydurma.
+
+=====================================================
+İŞLEM SATIRLARI
+=====================================================
+
+Görünen işlem satırlarını incele.
+Özellikle:
+- işlem tarihi
+- işlem açıklaması
+- para girişi
+- para çıkışı
+- işlem tutarı
+- işlem sonrası bakiye
+- gönderen
+- alıcı
+- işlem/ref numarası
+alanlarını kontrol et.
+
+Bir rakamın ne olduğu kesin değilse tahmin etme.
+=====================================================
+BAKİYE MATEMATİĞİ
+=====================================================
+Yeterli veri varsa:
+
+önceki bakiye
++
+para girişleri
+-
+para çıkışları
+=
+sonraki bakiye
+ilişkisini kontrol et.
+Birden fazla işlem varsa mümkün olduğunca ardışık
+bakiyeleri kontrol et.
+Örneğin:
+Başlangıç bakiyesi: 10.000 TL
+
+Giriş: 2.000 TL
+
+Çıkış: 500 TL
+
+Beklenen bakiye: 11.500 TL
+
+Belgede farklı bir bakiye görünüyorsa bunu açıkça belirt.
+Belgede tüm sütunlarda giriş çıkışlarda rakamlar tutmuyorsa bunu belirt.
+
+Ancak:
+
+- ücret
+- komisyon
+- faiz
+- kur farkı
+- bloke
+- otomatik tahsilat
+- başka finansal hareket
+gibi görünür kalemleri de hesaba kat.
+
+Yeterli veri yoksa matematiksel tutarlılık hakkında
+kesin sonuç verme.
+
+=====================================================
+TOPLAM GİRİŞ / ÇIKIŞ
+=====================================================
+
+Belgede toplam giriş ve çıkış tutarları görünüyorsa
+işlem satırlarıyla karşılaştır.
+
+Hesaplanabiliyorsa:
+
+- toplam giriş
+- toplam çıkış
+- net hareket
+- hesaplanan kapanış bakiyesi
+değerlerini hesapla.
+
+Eksik veri varsa tahmin etme.
+
+=====================================================
+TARİH KONTROLÜ
+=====================================================
+
+İşlem tarihlerini kontrol et.
+
+Özellikle:
+
+- hesap dönemi
+- işlem tarihleri
+- tarih sıralaması
+- dönem dışı işlem
+- imkansız veya şüpheli tarih
+- farklı tarih formatları
+incelenmelidir.
+
+Farklı tarih formatı tek başına sahtecilik kanıtı değildir.
+=====================================================
+BAKİYE DEVAMLILIĞI
+=====================================================
+Bir işlem sonrası bakiye ile sonraki işlem öncesi
+bakiye arasında tutarlılık varsa kontrol et.
+
+Sayfalar arasında bakiye devamlılığı varsa ayrıca
+kontrol et.
+
+Birinci sayfanın son bakiyesi ile ikinci sayfanın
+başlangıç/devam bakiyesi arasında tutarsızlık varsa
+açıkça belirt.
+
+=====================================================
+TEKRARLAYAN İŞLEMLER
+=====================================================
+
+Aynı:
+- tarih
+- tutar
+- açıklama
+- gönderen/alıcı
+kombinasyonlarının olağandışı tekrar edip etmediğini
+incele.
+
+Tekrar tek başına sahtecilik kanıtı değildir.
+
+=====================================================
+GÖRSEL MANİPÜLASYON
+=====================================================
+
+Hesap özetinde:
+- font farklılığı
+- font boyutu farklılığı
+- karakter aralığı
+- baseline
+- hizalama
+- farklı sıkıştırma
+- kopyala-yapıştır bölgeleri
+- sonradan eklenmiş alan
+- sonradan silinmiş alan
+- farklı keskinlik
+- farklı render
+- dijital montaj
+- Photoshop benzeri düzenleme
+- yapay olarak değiştirilmiş rakamlar
+- sayfalar arası görsel tutarsızlık
+olup olmadığını incele.
+
+Görüntü kalitesinden kaynaklanan küçük farklılıkları
+otomatik olarak sahtecilik kabul etme.
+=====================================================
+SAYFALAR ARASI KONTROL
+=====================================================
+
+Birden fazla sayfa varsa:
+
+- hesap sahibi
+- IBAN
+- hesap numarası
+- hesap dönemi
+- para birimi
+- işlem sırası
+- bakiye devamlılığı
+- sayfa numarası
+
+alanlarını karşılaştır.
+
+Farklı sayfalarda aynı bilgiler farklı görünüyorsa
+bunu incele.
+
+Ancak normal PDF oluşturma farklılıklarını otomatik
+olarak manipülasyon olarak değerlendirme.
+=====================================================
+PDF KALİTESİ
+=====================================================
+
+PDF olması tek başına düşük kalite değildir.
+Belge okunabiliyorsa bunu olumlu kalite göstergesi
+olarak değerlendir.
+
+Yalnızca gerçekten:
+
+- bulanıklık
+- pikselizasyon
+- okunamayan rakam
+- kırpılma
+- ciddi sıkıştırma
+- tarama gürültüsü
+- gölge
+- parlama
+- perspektif bozulması
+
+varsa limitation belirt.
+
+=====================================================
+RİSK HESAPLAMA
+=====================================================
+
+Şunları hesapla:
+
+visualRisk
+textRisk
+layoutRisk
+financialDataRisk
+editingRisk
+
+overallRisk:
+0-20 LOW RISK
+21-45 MODERATE RISK
+46-70 HIGH RISK
+71-100 VERY HIGH RISK
+
+Confidence 0-100 arasında olmalıdır.
+Matematiksel bakiye tutarsızlığı varsa
+financialDataRisk'i artır.
+Görsel manipülasyon kanıtı varsa
+editingRisk'i artır.
+Yalnızca belirsizlik varsa confidence düşür.
+
+Belirsizliği otomatik olarak HIGH RISK yapma.
+
+=====================================================
+SONUÇ
+=====================================================
+
+Sonuç yalnızca geçerli JSON olmalıdır.
+Tüm açıklamalar TÜRKÇE olmalıdır.
+Şu alanların tamamını döndür:
+overallRisk
+riskLabel
+confidence
+summary
+categories
+balanceAnalysis
+transactionAnalysis
+limitations
+evidence
+
+Kesin gerçek veya kesin sahte kararı verme.
+
+`;
+
+// =====================================================
+// HESAP ÖZETİ ANALİZ FONKSİYONU
+// REFERANS KULLANILMAZ
+// =====================================================
+async function analyzeStatement(
+base64,
+mime,
+fileName
+) {
+
+console.log(
+"================================================"
+);
+console.log(
+"HESAP ÖZETİ ANALİZİ BAŞLADI"
+);
+console.log(
+"HESAP ÖZETİ REFERANS KULLANILMAYACAK"
+);
+console.log(
+"FILE:",
+fileName
+);
+
+console.log(
+"MIME:",
+mime
+);
+console.log(
+"================================================"
+);
+
+
+let fileContent;
+if (
+mime === "application/pdf" ||
+mime.includes("pdf")
+) {
+fileContent = {
+
+type:
+"input_file",
+
+filename:
+fileName,
+
+file_data:
+`data:application/pdf;base64,${base64}`,
+};
+
+}
+else {
+
+fileContent = {
+type:
+"input_image",
+
+image_url:
+`data:${mime};base64,${base64}`,
+detail:
+"high",
+
+};
+
+}
+
+const response =
+await openai.responses.create({
+
+
+model:
+"gpt-5.6-terra",
+input: [
+{
+role:
+"user",
+content: [
+
+{
+type:
+"input_text",
+
+text:
+STATEMENT_PROMPT,
+},
+
+fileContent,
+],
+},
+
+],
+
+text: {
+
 format: {
 type:
 "json_schema",
 name:
-"verifydoc_result",
-strict: true,
+"verifydoc_statement_analysis",
+
+strict:
+true,
+
 schema:
-RESPONSE_SCHEMA,
+STATEMENT_RESPONSE_SCHEMA,
+
 },
+
 },
-}
-);
-
-return response;
-}
-async function analyzePdfStructure(
-filePath
-) {
-try {
-const data =
-await fs.readFile(
-filePath
-);
-
-const loadingTask =
-pdfjsLib.getDocument({
-data,
-useWorkerFetch: false,
-isEvalSupported: false,
 });
-
-const pdf =
-await loadingTask.promise;
-
-const pages = [];
-
-for (
-let pageNumber = 1;
-pageNumber <=
-pdf.numPages;
-pageNumber++
-) {
-const page =
-await pdf.getPage(
-pageNumber
-);
-
-const content =
-await page.getTextContent();
-
-const items =
-Array.isArray(
-content?.items
-)
-? content.items
-: [];
-
-const fonts =
-new Set();
-
-const positions = [];
-
-for (
-const item of items
-) {
-if (
-item?.fontName
-) {
-fonts.add(
-String(
-item.fontName
-)
-);
-}
-
-if (
-Array.isArray(
-item?.transform
-)
-) {
-positions.push({
-x:
-Number(
-item.transform[4]
-) || 0,
-y:
-Number(
-item.transform[5]
-) || 0,
-width:
-Number(
-item.width
-) || 0,
-height:
-Number(
-item.height
-) || 0,
-text:
-safeString(
-item.str
-),
-font:
-safeString(
-item.fontName
-),
-});
-}
-}
-
-pages.push({
-pageNumber,
-textItemCount:
-items.length,
-fontCount:
-fonts.size,
-fonts:
-[...fonts],
-positions,
-});
-}
-
-return {
-available: true,
-pageCount:
-pdf.numPages,
-pages,
-};
-} catch (error) {
-console.error(
-"PDF structure analysis error:",
-error
-);
-
-return {
-available: false,
-pageCount: 0,
-pages: [],
-error:
-error?.message ||
-String(error),
-};
-}
-}
-
-async function analyzeImageForensics(
-filePath
-) {
-try {
-const metadata =
-await sharp(
-filePath
-).metadata();
-
-const stats =
-await sharp(
-filePath
-)
-.stats();
-
-const channels =
-Array.isArray(
-stats?.channels
-)
-? stats.channels
-: [];
-
-const channelStats =
-channels.map(
-(channel, index) => ({
-channel: index,
-min:
-Number(
-channel.min
-) || 0,
-max:
-Number(
-channel.max
-) || 0,
-mean:
-Number(
-channel.mean
-) || 0,
-stdev:
-Number(
-channel.stdev
-) || 0,
-})
-);
-
-return {
-available: true,
-format:
-safeString(
-metadata?.format
-),
-width:
-Number(
-metadata?.width
-) || 0,
-height:
-Number(
-metadata?.height
-) || 0,
-channels:
-Number(
-metadata?.channels
-) || 0,
-density:
-Number(
-metadata?.density
-) || 0,
-hasAlpha:
-Boolean(
-metadata?.hasAlpha
-),
-space:
-safeString(
-metadata?.space
-),
-channelStats,
-};
-} catch (error) {
-console.error(
-"Image forensics error:",
-error
-);
-
-return {
-available: false,
-error:
-error?.message ||
-String(error),
-};
-}
-}
-
-function compareOCRTexts(
-first,
-second
-) {
-const a =
-normalizeText(
-first
-).toLowerCase();
-
-const b =
-normalizeText(
-second
-).toLowerCase();
-
-if (!a || !b) {
-return {
-available: false,
-similarity: null,
-exact: false,
-};
-}
-
-if (a === b) {
-return {
-available: true,
-similarity: 1,
-exact: true,
-};
-}
-
-const maxLength =
-Math.max(
-a.length,
-b.length
-);
-
-if (!maxLength) {
-return {
-available: false,
-similarity: null,
-exact: false,
-};
-}
-
-const distance =
-levenshteinDistance(
-a,
-b
-);
-
-return {
-available: true,
-similarity:
-Math.max(
-0,
-1 -
-distance /
-maxLength
-),
-exact: false,
-};
-}
-
-function levenshteinDistance(
-a,
-b
-) {
-const aa =
-String(a ?? "");
-
-const bb =
-String(b ?? "");
-
-if (!aa.length) {
-return bb.length;
-}
-
-if (!bb.length) {
-return aa.length;
-}
-
-let previous =
-new Array(
-bb.length + 1
-);
-
-for (
-let j = 0;
-j <= bb.length;
-j++
-) {
-previous[j] = j;
-}
-
-for (
-let i = 1;
-i <= aa.length;
-i++
-) {
-const current =
-new Array(
-bb.length + 1
-);
-
-current[0] = i;
-
-for (
-let j = 1;
-j <= bb.length;
-j++
-) {
-const cost =
-aa[i - 1] ===
-bb[j - 1]
-? 0
-: 1;
-
-current[j] =
-Math.min(
-current[j - 1] + 1,
-previous[j] + 1,
-previous[j - 1] +
-cost
-);
-}
-
-previous =
-current;
-}
-
-return previous[
-bb.length
-];
-}
-
-function buildPDFForensicsContext(
-pdfStructure
-) {
-if (
-!pdfStructure?.available
-) {
-return "";
-}
-
-return `
-PDF YAPISAL FORENSİK BİLGİSİ:
-${safeJson(
-pdfStructure
-)}
-
-PDF yapısal bilgisi yardımcı kanıttır.
-Tek başına farklı font sayısı, text item sayısı veya
-koordinat farklılığı sahtecilik kanıtı değildir.
-
-Özellikle:
-- aynı sayfada olağandışı font kullanımı,
-- belirli bir alanın diğer metinlerden farklı fontla oluşturulması,
-- olağandışı text item ayrışması,
-- tutar alanında sıra dışı koordinat / boyut farklılığı
-
-varsa bunu diğer görsel ve içerik bulgularıyla birlikte değerlendir.
-`;
-}
-
-function buildImageForensicsContext(
-imageForensics
-) {
-if (
-!imageForensics?.available
-) {
-return "";
-}
-
-return `
-GÖRSEL DOSYA FORENSİKS BİLGİSİ:
-${safeJson(
-imageForensics
-)}
-
-Bu bilgiler dosyanın teknik görüntü özelliklerini gösterir.
-Bunları tek başına sahtecilik kanıtı kabul etme.
-
-Özellikle JPEG/PNG dönüşümü, yeniden boyutlandırma,
-ekran görüntüsü ve sıkıştırma gibi işlemlerin doğal etkilerini dikkate al.
-`;
-}
-
-function buildRiskMotorEvidence(
-result
-) {
-const checks =
-normalizeChecks(
-result?.checks
-);
-
-const evidence = [];
-
-for (
-const [
-name,
-check,
-] of Object.entries(
-checks
-)
-) {
-if (
-check.status ===
-"fail"
-) {
-evidence.push({
-check:
-name,
-score:
-check.score,
-evidence:
-check.evidence,
-});
-}
-}
-
-return evidence;
-}
-
-function sanitizeResult(
-result
-) {
-const normalized =
-normalizeAIResult(
-result
-);
-
-normalized.checks =
-normalizeChecks(
-normalized.checks
-);
-
-normalized.findings =
-normalizeFindings(
-normalized.findings
-);
-
-normalized.documentData =
-normalizeDocumentData(
-normalized.documentData
-);
-
-normalized.amountAnalysis =
-normalizeAmountAnalysis(
-normalized.amountAnalysis
-);
-
-return normalized;
-}
-
-async function buildOpenAIContent({
-documentText,
-ocrText,
-paddleResult,
-tesseractResult,
-pdfText,
-pdfStructure,
-imageForensics,
-amountForensics,
-providedInfo,
-documentData,
-bank,
-fileType,
-}) {
-const providedContext =
-buildProvidedInfoContext(
-providedInfo,
-documentData
-);
-
-const amountContext =
-buildAmountForensicsContext(
-amountForensics
-);
-
-const ocrContext =
-buildOCRContext(
-paddleResult,
-tesseractResult,
-pdfText
-);
-
-const templateContext =
-buildTemplateContext(
-bank,
-documentText
-);
-
-const transactionContext =
-buildTransactionLogicContext(
-documentData
-);
-
-const pdfContext =
-buildPDFForensicsContext(
-pdfStructure
-);
-
-const imageContext =
-buildImageForensicsContext(
-imageForensics
-);
-
-return `
-BELGE TÜRÜ:
-${safeString(
-fileType
-)}
-
-BELGEDEN ÇIKARILAN ANA METİN:
-${safeString(
-documentText
-)}
-
-${ocrContext}
-
-${providedContext}
-
-${amountContext}
-
-${pdfContext}
-
-${imageContext}
-
-${templateContext}
-
-${transactionContext}
-
-BELGE İNCELEME TALİMATI:
-
-Aşağıdaki alanların tamamını mümkün olduğunca dikkatli değerlendir:
-
-1. Tutar
-2. Para birimi
-3. Gönderen adı
-4. Gönderen IBAN
-5. Alıcı adı
-6. Alıcı IBAN
-7. Tarih
-8. Saat
-9. İşlem numarası
-10. Referans numarası
-11. Açıklama
-12. IBAN checksum
-13. OCR tutarlılığı
-14. Görsel tutarlılık
-15. Font tutarlılığı
-16. Layout
-17. Hizalama
-18. Boşluklar
-19. Şablon uyumu
-20. PDF yapısı
-21. Metadata
-22. Görsel sıkıştırma izleri
-23. Tutar karakterlerinin kendi içindeki tutarlılığı
-24. Yazıyla tutar / rakamla tutar uyumu
-25. İşlem mantığı
-
-TUTAR FORENSICS İÇİN ÖZEL KURAL:
-
-Özellikle şu tür durumları ara:
-
-- "1.700,00" gibi bir tutarın "1.700" kısmı ile ",00" kısmının farklı görünmesi
-- aynı rakamların stroke kalınlıklarının farklı olması
-- aynı rakamların darkness değerlerinin farklı olması
-- bazı karakterlerin diğerlerine göre daha keskin veya daha bulanık olması
-- karakter aralıklarının lokal olarak değişmesi
-- decimal kısmının farklı font / rendering ile görünmesi
-- tutarın geri kalan metinden farklı bir şekilde rasterize edilmiş görünmesi
-
-Ancak:
-
-- tek bir piksel farkını,
-- JPEG artefaktını,
-- ekran görüntüsü kaynaklı farkı,
-- anti-aliasing farkını,
-- yeniden boyutlandırma etkisini
-
-sahtecilik olarak yorumlama.
-
-SONUÇ KURALI:
-
-Bir bulgu yalnızca gerçekten destekleniyorsa fail yap.
-
-Kanıt yetersizse unknown kullan.
-
-Görsel olarak şüpheli fakat kesin olmayan bulguları findings içine
-uygun severity ile ekleyebilirsin.
-
-Deterministic backend forensics tarafından sağlanan bilgiler
-OpenAI değerlendirmesini destekler; ancak bunların da bağlam içinde
-yorumlanması gerekir.
-`;
-}
-
-function collectDocumentDataForComparison(
-result
-) {
-return {
-senderName:
-safeString(
-result?.documentData
-?.senderName
-),
-senderIBAN:
-safeString(
-result?.documentData
-?.senderIBAN
-),
-receiverName:
-safeString(
-result?.documentData
-?.receiverName
-),
-receiverIBAN:
-safeString(
-result?.documentData
-?.receiverIBAN
-),
-amount:
-preserveAmount(
-result?.documentData
-?.amount
-),
-currency:
-safeString(
-result?.documentData
-?.currency
-),
-date:
-safeString(
-result?.documentData
-?.date
-),
-time:
-safeString(
-result?.documentData
-?.time
-),
-transactionId:
-safeString(
-result?.documentData
-?.transactionId
-),
-referenceNo:
-safeString(
-result?.documentData
-?.referenceNo
-),
-description:
-safeString(
-result?.documentData
-?.description
-),
-};
-}
-
-function ensureRequiredResultShape(
-result
-) {
-const normalized =
-sanitizeResult(
-result
-);
-
-normalized.documentData =
-normalized.documentData ||
-{};
-
-normalized.checks =
-normalized.checks ||
-{};
-
-normalized.findings =
-normalized.findings ||
-[];
-
-normalized.amountAnalysis =
-normalized.amountAnalysis ||
-{
-numericAmount: "",
-formattedAmount: "",
-suspiciousFormatting:
-false,
-evidence: [],
-};
-
-return normalized;
-}
-
-function finalizeAnalysisResult(
-result,
-{
-amountForensics = null,
-providedInfo = null,
-} = {}
-) {
-let finalResult =
-ensureRequiredResultShape(
-result
-);
-
-finalResult.documentData.amount =
-preserveAmount(
-finalResult.documentData.amount
-);
-
-const documentData =
-collectDocumentDataForComparison(
-finalResult
-);
-
-const comparison =
-compareProvidedInfoWithDocument(
-providedInfo,
-documentData
-);
-
-applyAmountForensicsFinding(
-finalResult,
-amountForensics
-);
-
-addIBANChecksumFindings(
-finalResult
-);
-
-applyDeterministicRiskRules(
-finalResult,
-comparison,
-amountForensics
-);
-
-finalResult.overallRisk =
-clampScore(
-finalResult.overallRisk
-);
-
-finalResult.summary =
-buildFinalSummary(
-finalResult,
-amountForensics
-);
-
-finalResult.riskLabel =
-getFinalRiskLabel(
-finalResult.overallRisk
-);
-
-finalResult.riskExplanation =
-buildRiskExplanation(
-finalResult
-);
-
-finalResult.riskEvidence =
-buildRiskMotorEvidence(
-finalResult
-);
-
-finalResult.informationCheck =
-comparison;
-
-if (
-amountForensics
-) {
-finalResult.amountForensics =
-amountForensics;
-}
-
-return finalResult;
-}
-async function processImageDocument(
-filePath,
-{
-providedInfo = null,
-} = {}
-) {
+console.log("KULLANILAN OPENAI MODEL:", response.model);
 console.log(
-"IMAGE ANALYSIS BAŞLADI"
+"HESAP ÖZETİ OPENAI RESPONSE RECEIVED"
 );
 
-const paddleImageOCR =
-await runPaddleOCR(
-filePath
+const output =
+response?.output_text;
+
+
+if (
+!output
+) {
+throw new Error(
+"OpenAI'dan hesap özeti analiz sonucu alınamadı."
 );
+
+}
 
 console.log(
-"IMAGE PADDLEOCR TAMAMLANDI",
-{
-success:
-paddleImageOCR?.success,
-confidence:
-paddleImageOCR?.confidence,
-regions:
-paddleImageOCR?.regions
-?.length || 0,
-}
+"HESAP ÖZETİ ANALİZ SONUCU:",
+output
 );
 
-const tesseractImageOCR =
-await runOCR(
-filePath,
-"eng"
-);
-
-const imageForensics =
-await analyzeImageForensics(
-filePath
-);
-
-/*
-* Yeni tutar forensics katmanı.
-*
-* Burada OCR'ın koordinat bilgisini kullanarak
-* tutar bölgesini doğrudan görüntü üzerinden
-* inceliyoruz.
-*/
-const amountForensics =
-await analyzeAmountForensics(
-filePath,
-paddleImageOCR
-);
-
-console.log(
-"AMOUNT FORENSICS:",
-amountForensics
-);
-
-const documentText =
-cleanOCRText(
-[
-paddleImageOCR?.text ||
-"",
-tesseractImageOCR?.text ||
-"",
-].join("\n")
-);
-
-const bank =
-detectBank(
-documentText
-);
-
-/*
-* İlk OpenAI çağrısında belge verisini
-* çıkarttırıyoruz.
-*
-* Buradaki overallRisk nihai risk olarak
-* kullanılmayacak.
-*/
-const initialContent =
-await buildOpenAIContent({
-documentText,
-ocrText:
-paddleImageOCR?.text ||
-"",
-paddleResult:
-paddleImageOCR,
-tesseractResult:
-tesseractImageOCR,
-pdfText: "",
-pdfStructure: null,
-imageForensics,
-amountForensics,
-providedInfo,
-documentData: null,
-bank,
-fileType:
-"image",
-});
-
-const response =
-await callOpenAIAnalysis(
-initialContent
-);
-
-const rawOutput =
-response?.output_text ||
-"";
-
-let result =
+const result =
 parseAIResponse(
-rawOutput
+output
+);
+if (
+!result ||
+typeof result !== "object"
+) {
+
+throw new Error(
+"Hesap özeti analiz sonucu geçersiz."
 );
 
-result =
-ensureRequiredResultShape(
-result
-);
-
-/*
-* Belgeden çıkan gerçek documentData
-* üzerinden kullanıcı tarafından sağlanan
-* bilgiler tekrar karşılaştırılır.
-*/
-const documentData =
-collectDocumentDataForComparison(
-result
-);
-
-const comparison =
-compareProvidedInfoWithDocument(
-providedInfo,
-documentData
-);
-
-/*
-* Deterministic risk motoru burada
-* devreye girer.
-*
-* OpenAI overallRisk yalnızca model görüşüdür.
-* Nihai score backend tarafından hesaplanır.
-*/
-result =
-finalizeAnalysisResult(
-result,
-{
-amountForensics,
-providedInfo,
 }
-);
-
-/*
-* Ek teknik bilgiler.
-* Bunlar RESPONSE_SCHEMA'ın parçası olmadığı
-* için OpenAI structured output'u bozmaz.
-*/
-result.ocr = {
-paddle: {
-success:
-Boolean(
-paddleImageOCR?.success
-),
-confidence:
-Number(
-paddleImageOCR?.confidence
-) || 0,
-text:
-safeString(
-paddleImageOCR?.text
-),
-},
-tesseract: {
-success:
-Boolean(
-tesseractImageOCR?.success
-),
-confidence:
-Number(
-tesseractImageOCR?.confidence
-) || 0,
-text:
-safeString(
-tesseractImageOCR?.text
-),
-},
-};
-
-result.imageForensics =
-imageForensics;
-
-result.informationCheck =
-comparison;
 
 return result;
 }
 
-async function processPdfDocument(
-filePath,
-{
-providedInfo = null,
-tempDir = null,
-} = {}
+// =====================================================
+// KULLANICININ VERDİĞİ DEKONT BİLGİLERİ
+// =====================================================
+//
+// Bu bilgiler RİSK SKORUNA DAHİL EDİLMEZ.
+// Yalnızca dekonttan çıkarılan bilgilerle karşılaştırılır.
+// =====================================================
+
+function normalizeComparisonText(value) {
+
+if (
+value === null ||
+value === undefined
 ) {
-console.log(
-"PDF ANALYSIS BAŞLADI"
-);
 
-/*
-* Önce PDF'in native text layer'ını
-* çıkartıyoruz.
-*/
-const pdfText =
-await extractPdfText(
-filePath
-);
+return ""
 
-console.log(
-"PDF NATIVE TEXT LENGTH:",
-pdfText.length
-);
-
-/*
-* PDF yapısal forensics.
-*/
-const pdfStructure =
-await analyzePdfStructure(
-filePath
-);
-
-/*
-* PDF sayfalarını görüntüye render ediyoruz.
-*
-* Bu sayede görsel OCR ve amount
-* forensics PDF üzerinde de çalışabilir.
-*/
-const renderDir =
-tempDir ||
-path.join(
-path.dirname(
-filePath
-),
-"verifydoc-pdf-pages"
-);
-
-let renderedPages = [];
-
-try {
-const rendered =
-await renderPdfPages(
-filePath,
-renderDir,
-5
-);
-
-renderedPages =
-rendered?.pages ||
-[];
-} catch (error) {
-console.error(
-"PDF render error:",
-error
-);
+}
+return String(value)
+.toLocaleLowerCase("tr-TR")
+.trim()
+.replace(/\s+/g, " ")
+.replace(/[.,;:()\-_/\\]+/g, " ")
+.replace(/\s+/g, " ")
+.trim();
 }
 
-/*
-* PDF native text varsa bunu temel
-* metin olarak kullan.
-*
-* Render edilmiş sayfalardan OCR da
-* ayrıca alınır.
-*/
-let paddleResult = {
-text: "",
-confidence: 0,
-success: false,
-pages: 0,
-regions: [],
+function normalizeIBAN(value) {
+
+if (
+value === null ||
+value === undefined
+) {
+return ""
+}
+
+return String(value)
+.toUpperCase()
+.replace(/\s+/g, "")
+.replace(/[^A-Z0-9]/g, "");
+}
+
+function validateIBANMod97(value) {
+const iban = normalizeIBAN(value);
+if (!iban) {
+return {
+valid: false,
+reason: "IBAN okunamadı"
 };
-
-let tesseractResult = {
-text: "",
-confidence: 0,
-success: false,
+}
+if (!/^[A-Z]{2}[0-9]{2}[A-Z0-9]+$/.test(iban)) {
+return {
+valid: false,
+reason: "IBAN formatı geçersiz"
 };
+}
+const rearranged = iban.slice(4) + iban.slice(0, 4);
+let remainder = 0;
 
-let amountForensics =
-null;
+for (const char of rearranged) {
+const value = /[A-Z]/.test(char)
+? char.charCodeAt(0) - 55
+: Number(char);
 
+const digits = String(value);
+
+for (const digit of digits) {
+remainder = (remainder * 10 + Number(digit)) % 97;
+}
+}
+return {
+valid: remainder === 1,
+remainder
+};
+}
+function parseComparisonAmount(value) {
 if (
-renderedPages.length
+value === null ||
+value === undefined
 ) {
-const pageResults = [];
 
-for (
-const page of
-renderedPages
-) {
-const paddle =
-await runPaddleOCR(
-page.path
-);
+return null;
 
-pageResults.push(
-paddle
-);
-
-if (
-!amountForensics &&
-paddle?.success
-) {
-amountForensics =
-await analyzeAmountForensics(
-page.path,
-paddle
-);
 }
 
 if (
-paddle?.success &&
-paddle?.text
+typeof value === "number" &&
+Number.isFinite(value)
 ) {
-paddleResult.text +=
-"\n" +
-paddle.text;
+return value;
 }
 
+let raw =
+String(value)
+.trim()
+.replace(/\s/g, "")
+.replace(/[₺]/g, "")
+.replace(/TL/gi, "")
+.replace(/TRY/gi, "");
+
+if (!raw) {
+
+return null;
+}
 if (
-paddle?.confidence
+raw.includes(",") &&
+raw.includes(".")
 ) {
-paddleResult.confidence =
-Math.max(
-paddleResult.confidence,
-Number(
-paddle.confidence
-) || 0
-);
+
+raw =
+raw.replace(/\./g, "")
+.replace(",", ".");
+
+}
+else if (
+raw.includes(",")
+) {
+raw =
+raw.replace(",", ".");
+
 }
 
-paddleResult.success =
-paddleResult.success ||
-Boolean(
-paddle?.success
-);
+else {
 
-paddleResult.pages +=
-Number(
-paddle?.pages
-) || 0;
-
+const parts =
+raw.split(".");
 if (
-Array.isArray(
-paddle?.regions
-)
+parts.length === 2 &&
+parts[1].length === 3
 ) {
-paddleResult.regions.push(
-...paddle.regions.map(
-(item) => ({
-...item,
-pageIndex:
-Number(
-page.pageNumber
-) - 1,
-})
-)
-);
+
+raw =
+raw.replace(/\./g, "");
+
 }
 
-const tesseract =
-await runOCR(
-page.path,
-"eng"
-);
-
-if (
-tesseract?.text
-) {
-tesseractResult.text +=
-"\n" +
-tesseract.text;
 }
 
-if (
-tesseract?.confidence
-) {
-tesseractResult.confidence =
-Math.max(
-tesseractResult.confidence,
-Number(
-tesseract.confidence
-) || 0
-);
-}
+const number =
+Number(raw);
 
-tesseractResult.success =
-tesseractResult.success ||
-Boolean(
-tesseract?.success
-);
-}
-}
-
-paddleResult.text =
-cleanOCRText(
-paddleResult.text
-);
-
-tesseractResult.text =
-cleanOCRText(
-tesseractResult.text
-);
-
-const combinedText =
-cleanOCRText(
-[
-pdfText,
-paddleResult.text,
-tesseractResult.text,
-].join("\n")
-);
-
-const bank =
-detectBank(
-combinedText
-);
-
-console.log(
-"PDF BANK:",
-bank
-);
-
-console.log(
-"PDF AMOUNT FORENSICS:",
-amountForensics
-);
-
-const imageForensics =
-renderedPages.length
-? await analyzeImageForensics(
-renderedPages[0].path
-)
+return Number.isFinite(number)
+? number
 : null;
 
-const content =
-await buildOpenAIContent({
-documentText:
-combinedText,
-ocrText:
-paddleResult.text,
-paddleResult,
-tesseractResult,
-pdfText,
-pdfStructure,
-imageForensics,
-amountForensics,
-providedInfo,
-documentData: null,
-bank,
-fileType:
-"pdf",
-});
-
-const response =
-await callOpenAIAnalysis(
-content
-);
-
-const rawOutput =
-response?.output_text ||
-"";
-
-let result =
-parseAIResponse(
-rawOutput
-);
-
-result =
-ensureRequiredResultShape(
-result
-);
-
-result =
-finalizeAnalysisResult(
-result,
-{
-amountForensics,
-providedInfo,
-}
-);
-
-result.pdfForensics =
-pdfStructure;
-
-result.ocr = {
-paddle: {
-success:
-Boolean(
-paddleResult.success
-),
-confidence:
-Number(
-paddleResult.confidence
-) || 0,
-text:
-paddleResult.text,
-},
-tesseract: {
-success:
-Boolean(
-tesseractResult.success
-),
-confidence:
-Number(
-tesseractResult.confidence
-) || 0,
-text:
-tesseractResult.text,
-},
-};
-
-result.renderedPages =
-renderedPages.map(
-(page) => ({
-pageNumber:
-page.pageNumber,
-width:
-page.width,
-height:
-page.height,
-})
-);
-
-return result;
 }
 
-async function processVideoDocument(
-filePath,
-{
-providedInfo = null,
-tempDir = null,
-} = {}
-) {
-console.log(
-"VIDEO ANALYSIS BAŞLADI"
-);
-
-const framesDir =
-tempDir ||
-path.join(
-path.dirname(
-filePath
-),
-"verifydoc-video-frames"
-);
-
-const framePaths =
-await extractVideoFrames(
-filePath,
-framesDir,
-4
-);
-
-console.log(
-"VIDEO FRAMES:",
-framePaths.length
-);
+function normalizeProvidedInfo(value) {
 
 if (
-!framePaths.length
+!value ||
+typeof value !== "object"
 ) {
-return {
-documentType:
-"video",
-bank:
-"Bilinmiyor",
-documentData:
-normalizeDocumentData(
-{}
-),
-checks:
-normalizeChecks(
-{}
-),
-amountAnalysis:
-normalizeAmountAnalysis(
-{}
-),
-findings: [
-{
-severity:
-"high",
-category:
-"video_processing",
-description:
-"Video kareleri çıkarılamadı.",
-evidence:
-"FFmpeg video karelerini üretemedi.",
-},
-],
-overallRisk: 85,
-summary:
-"Video analiz edilemedi.",
-riskLabel:
-"Çok Yüksek Risk",
-};
+
+return null;
 }
 
-const frameResults = [];
-
-for (
-let index = 0;
-index < framePaths.length;
-index++
-) {
-const framePath =
-framePaths[index];
-
-/*
-* ÖNEMLİ:
-* PaddleOCR'a MP4 değil,
-* çıkarılmış JPG frame gönderilir.
-*/
-const paddle =
-await runPaddleOCR(
-framePath
-);
-
-console.log(
-"VIDEO PADDLEOCR TAMAMLANDI",
-index + 1
-);
-
-const tesseract =
-await runOCR(
-framePath,
-"eng"
-);
-
-const imageForensics =
-await analyzeImageForensics(
-framePath
-);
-
-const amountForensics =
-await analyzeAmountForensics(
-framePath,
-paddle
-);
-
-frameResults.push({
-frame:
-index + 1,
-path:
-framePath,
-paddle,
-tesseract,
-imageForensics,
-amountForensics,
-});
-}
-
-const allPaddleText =
-cleanOCRText(
-frameResults
-.map(
-(frame) =>
-`FRAME ${
-frame.frame
-}:\n${
-frame.paddle
-?.text || ""
-}`
-)
-.join("\n\n")
-);
-
-const allTesseractText =
-cleanOCRText(
-frameResults
-.map(
-(frame) =>
-`FRAME ${
-frame.frame
-}:\n${
-frame.tesseract
-?.text || ""
-}`
-)
-.join("\n\n")
-);
-
-const videoAmountForensics =
-frameResults.find(
-(frame) =>
-frame.amountForensics
-?.available
-)?.amountForensics ||
-null;
-
-const combinedVideoText =
-cleanOCRText(
-[
-allPaddleText,
-allTesseractText,
-].join("\n\n")
-);
-
-const bank =
-detectBank(
-combinedVideoText
-);
-
-const content =
-await buildOpenAIContent({
-documentText:
-combinedVideoText,
-ocrText:
-allPaddleText,
-paddleResult: {
-text:
-allPaddleText,
-confidence:
-Math.max(
-0,
-...frameResults.map(
-(frame) =>
-Number(
-frame.paddle
-?.confidence
-) || 0
-)
-),
-success:
-frameResults.some(
-(frame) =>
-frame.paddle
-?.success
-),
-pages:
-frameResults.length,
-regions:
-frameResults.flatMap(
-(frame) =>
-frame.paddle
-?.regions || []
-),
-},
-tesseractResult: {
-text:
-allTesseractText,
-confidence:
-Math.max(
-0,
-...frameResults.map(
-(frame) =>
-Number(
-frame.tesseract
-?.confidence
-) || 0
-)
-),
-success:
-frameResults.some(
-(frame) =>
-frame.tesseract
-?.success
-),
-},
-pdfText: "",
-pdfStructure: null,
-imageForensics:
-frameResults[0]
-?.imageForensics ||
+const normalized = {
+senderName:
+value.senderName ??
+value.sender ??
 null,
-amountForensics:
-videoAmountForensics,
-providedInfo,
-documentData: null,
-bank,
-fileType:
-"video",
-});
+recipientName:
+value.recipientName ??
+value.recipient ??
+null,
+amount:
+value.amount ??
+null,
+currency:
+value.currency ??
+null,
 
-const response =
-await callOpenAIAnalysis(
-content
-);
-
-const rawOutput =
-response?.output_text ||
-"";
-
-let result =
-parseAIResponse(
-rawOutput
-);
-
-result =
-ensureRequiredResultShape(
-result
-);
-
-result =
-finalizeAnalysisResult(
-result,
-{
-amountForensics:
-videoAmountForensics,
-providedInfo,
-}
-);
-
-result.videoForensics = {
-frameCount:
-frameResults.length,
-frames:
-frameResults.map(
-(frame) => ({
-frame:
-frame.frame,
-paddleConfidence:
-Number(
-frame.paddle
-?.confidence
-) || 0,
-tesseractConfidence:
-Number(
-frame.tesseract
-?.confidence
-) || 0,
-amountForensics:
-frame.amountForensics,
-})
-),
+iban:
+value.iban ??
+null,
 };
+const hasValue =
+Object.values(normalized)
+.some(
+item =>
+item !== null &&
+item !== undefined &&
+String(item).trim() !== ""
+);
 
-return result;
+return hasValue
+? normalized
+: null;
+
 }
-function getRiskScoreFromResult(
- result
+
+function compareProvidedInfoWithDocument(
+providedInfo,
+documentData
 ) {
- const checks =
- normalizeChecks(
- result?.checks
- );
 
- const failed =
- Object.values(
- checks
- ).filter(
- (check) =>
- check.status ===
- "fail"
- ).length;
+const provided =
+normalizeProvidedInfo(
+providedInfo
+);
+if (!provided) {
 
- const passed =
- Object.values(
- checks
- ).filter(
- (check) =>
- check.status ===
- "pass"
- ).length;
+return {
 
- const unknown =
- Object.values(
- checks
- ).filter(
- (check) =>
- check.status ===
- "unknown"
- ).length;
+enabled:
+false,
+matches:
+{},
 
- const total =
- failed +
- passed;
+warnings:
+[],
 
- if (!total) {
- return {
- score: 0,
- failed,
- passed,
- unknown,
- };
- }
+provided:
+null,
+document:
+documentData ||
+null,
 
- /*
- * Her fail 100 puan,
- * pass 0 puan.
- *
- * Unknown kontrole dahil edilmez.
- */
- const score =
- clampScore(
- (failed /
- total) *
- 100
- );
-
- return {
- score,
- failed,
- passed,
- unknown,
- };
+};
 }
 
-function applyRiskCeiling(
- result
+const document =
+documentData ||
+{};
+
+const matches = {};
+const warnings = [];
+
+if (
+provided.senderName
 ) {
- const checks =
- normalizeChecks(
- result?.checks
- );
-
- let minimumRisk =
- 0;
-
- /*
- * Kritik teknik bulgular için
- * minimum risk seviyeleri.
- */
- for (
- const check of Object.values(
- checks
- )
- ) {
- if (
- check.status !==
- "fail"
- ) {
- continue;
- }
-
- if (
- Number(
- check.score
- ) >= 85
- ) {
- minimumRisk =
- Math.max(
- minimumRisk,
- 60
- );
- } else if (
- Number(
- check.score
- ) >= 60
- ) {
- minimumRisk =
- Math.max(
- minimumRisk,
- 46
- );
- } else {
- minimumRisk =
- Math.max(
- minimumRisk,
- 30
- );
- }
- }
-
- result.overallRisk =
- Math.max(
- clampScore(
- result.overallRisk
- ),
- minimumRisk
- );
-
- return result;
-}
-
-function applyStrongAmountForensics(
- result,
- amountForensics
+if (
+!document.senderName
 ) {
- if (
- !amountForensics?.available
- ) {
- return;
- }
-
- if (
- amountForensics.status !==
- "warning"
- ) {
- return;
- }
-
- const check =
- normalizeCheck(
- result?.checks
- ?.amountConsistency
- );
-
- /*
- * Moderate warning:
- * kanıt olarak sakla fakat
- * doğrudan fail yapma.
- */
- if (
- amountForensics.severity ===
- "moderate"
- ) {
- for (
- const evidence of
- ensureArray(
- amountForensics.evidence
- )
- ) {
- if (
- !check.evidence.includes(
- evidence
- )
- ) {
- check.evidence.push(
- evidence
- );
- }
- }
-
- result.checks =
- result.checks ||
- {};
-
- result.checks.amountConsistency =
- check;
-
- return;
- }
-
- /*
- * Strong warning:
- * amountConsistency fail.
- */
- if (
- amountForensics.severity ===
- "strong"
- ) {
- check.status =
- "fail";
-
- check.score =
- Math.max(
- Number(
- check.score
- ) || 0,
- 85
- );
-
- for (
- const evidence of
- ensureArray(
- amountForensics.evidence
- )
- ) {
- if (
- !check.evidence.includes(
- evidence
- )
- ) {
- check.evidence.push(
- evidence
- );
- }
- }
-
- result.checks =
- result.checks ||
- {};
-
- result.checks.amountConsistency =
- check;
-
- appendFinding(
- result,
- {
- severity:
- "high",
- category:
- "amount_forensics",
- description:
- "Tutar alanında karakter seviyesinde güçlü lokal görsel tutarsızlık bulundu.",
- evidence:
- ensureArray(
- amountForensics.evidence
- ).join(" "),
- }
- );
- }
+matches.senderName =
+"unknown"
+warnings.push(
+"Gönderen adı kontrol edilemedi: dekonttan gönderen adı güvenilir şekilde okunamadı."
+);
 }
+else {
+const expected =
+normalizeTurkishText(
+normalizeComparisonText(
+provided.senderName
+)
+);
+const actual =
+normalizeTurkishText(
+normalizeComparisonText(
+document.senderName
+)
+);
 
-function applyOCRConsistency(
- result,
- paddleText,
- tesseractText
+matches.senderName =
+expected === actual
+? "match"
+: "mismatch"
+
+if (
+expected !== actual
 ) {
- const comparison =
- compareOCRTexts(
- paddleText,
- tesseractText
- );
 
- const check =
- normalizeCheck(
- result?.checks
- ?.ocrConsistency
- );
+warnings.push(
+`Gönderen adı uyuşmuyor. Beklenen: "${provided.senderName}", dekontta görülen: "${document.senderName}".`
+);
 
- if (
- !comparison.available
- ) {
- return;
- }
-
- /*
- * OCR motorları tamamen aynıysa
- * destekleyici geçiş.
- */
- if (
- comparison.exact
- ) {
- check.status =
- "pass";
-
- check.score =
- 0;
-
- check.evidence.push(
- "PaddleOCR ve Tesseract metinleri aynı."
- );
- } else if (
- comparison.similarity >=
- 0.90
- ) {
- check.status =
- "pass";
-
- check.score =
- 0;
-
- check.evidence.push(
- `PaddleOCR ve Tesseract arasında yüksek metin benzerliği bulundu: ${comparison.similarity.toFixed(
- 3
- )}.`
- );
- } else if (
- comparison.similarity >=
- 0.70
- ) {
- check.status =
- "unknown";
-
- check.evidence.push(
- `OCR motorları arasında orta seviyede farklılık bulundu: ${comparison.similarity.toFixed(
- 3
- )}. Bu fark OCR hatasından kaynaklanabilir.`
- );
- } else {
- check.status =
- "unknown";
-
- check.evidence.push(
- `OCR motorları arasında belirgin farklılık bulundu: ${comparison.similarity.toFixed(
- 3
- )}. Tek başına sahtecilik kanıtı değildir.`
- );
- }
-
- result.checks =
- result.checks ||
- {};
-
- result.checks.ocrConsistency =
- check;
 }
 
-function applyAmountFormattingCheck(
- result
+}
+}
+
+
+if (
+provided.recipientName
 ) {
- const amount =
- safeString(
- result?.documentData
- ?.amount
- );
 
- if (!amount) {
- return;
- }
-
- const check =
- normalizeCheck(
- result?.checks
- ?.amountConsistency
- );
-
- const parsed =
- parseAmount(
- amount
- );
-
- if (
- parsed === null
- ) {
- check.status =
- "unknown";
-
- check.evidence.push(
- `Belgedeki tutar sayısal olarak çözümlenemedi: ${amount}.`
- );
- } else {
- /*
- * Türkçe para formatı için
- * makul örnekleri kabul ediyoruz.
- */
- const looksTurkish =
- /^\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?$/.test(
- amount
- .replace(
- /₺|TL|TRY/gi,
- ""
- )
- .trim()
- );
-
- const looksEnglish =
- /^\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?$/.test(
- amount
- .replace(
- /\$|USD/gi,
- ""
- )
- .trim()
- );
-
- if (
- looksTurkish ||
- looksEnglish
- ) {
- check.evidence.push(
- `Tutar biçimi çözümlenebilir: ${amount} = ${parsed}.`
- );
- } else {
- /*
- * Biçim olağandışıysa sadece
- * uyarı olarak sakla.
- */
- check.evidence.push(
- `Tutar biçimi standart para gösterimlerinden farklı olabilir: ${amount}.`
- );
- }
- }
-
- result.checks =
- result.checks ||
- {};
-
- result.checks.amountConsistency =
- check;
-}
-
-function finalizeRiskEngine(
- result,
- {
- amountForensics = null,
- paddleText = "",
- tesseractText = "",
- } = {}
+if (
+!document.recipientName
 ) {
- /*
- * Önce deterministic bulguları
- * uygula.
- */
- applyStrongAmountForensics(
- result,
- amountForensics
- );
 
- applyOCRConsistency(
- result,
- paddleText,
- tesseractText
- );
-
- applyAmountFormattingCheck(
- result
- );
-
- /*
- * Check statuslarından temel
- * risk puanını hesapla.
- */
- const calculated =
- getRiskScoreFromResult(
- result
- );
-
- /*
- * Modelin overallRisk değeri burada
- * nihai sonuç olarak kullanılmaz.
- */
- result.overallRisk =
- calculated.score;
-
- /*
- * Kritik fail varsa minimum risk
- * seviyesini koru.
- */
- applyRiskCeiling(
- result
- );
-
- result.overallRisk =
- clampScore(
- result.overallRisk
- );
-
- result.riskLabel =
- getFinalRiskLabel(
- result.overallRisk
- );
-
- result.riskExplanation =
- buildRiskExplanation(
- result
- );
-
- result.riskEvidence =
- buildRiskMotorEvidence(
- result
- );
-
- return result;
+matches.recipientName =
+"unknown"
+warnings.push(
+"Alıcı adı kontrol edilemedi: dekonttan alıcı adı güvenilir şekilde okunamadı."
+);
 }
 
-function makeErrorResult(
- message,
- category = "processing"
+else {
+const expected =
+normalizeComparisonText(
+provided.recipientName
+);
+const actual =
+normalizeComparisonText(
+document.recipientName
+);
+matches.recipientName =
+expected === actual
+? "match"
+: "mismatch"
+if (
+expected !== actual
 ) {
- return {
- documentType:
- "unknown",
 
- bank:
- "Bilinmiyor",
-
- documentData:
- normalizeDocumentData(
- {}
- ),
-
- checks:
- normalizeChecks(
- {}
- ),
-
- amountAnalysis:
- normalizeAmountAnalysis(
- {}
- ),
-
- findings: [
- {
- severity:
- "high",
- category,
- description:
- message,
- evidence:
- message,
- },
- ],
-
- overallRisk:
- 85,
-
- summary:
- message,
-
- riskLabel:
- "Çok Yüksek Risk",
-
- riskExplanation: {
- score: 85,
- label:
- "Çok Yüksek Risk",
- failedChecks: [],
- passedChecks: [],
- unknownChecks: [],
- },
-
- riskEvidence: [],
- };
+warnings.push(
+`Alıcı adı uyuşmuyor. Beklenen: "${provided.recipientName}", dekontta görülen: "${document.recipientName}".`
+);
 }
 
-async function processDocument(
- filePath,
- {
- mimeType = "",
- providedInfo = null,
- tempDir = null,
- } = {}
+}
+}
+
+if (
+provided.iban
 ) {
- console.log(
- "VERIFYDOC PROCESS DOCUMENT:",
- {
- filePath,
- mimeType,
- }
- );
-
- if (
- isVideoFile(
- mimeType,
- filePath
- )
- ) {
- return await processVideoDocument(
- filePath,
- {
- providedInfo,
- tempDir,
- }
- );
- }
-
- if (
- isPdfFile(
- mimeType,
- filePath
- )
- ) {
- return await processPdfDocument(
- filePath,
- {
- providedInfo,
- tempDir,
- }
- );
- }
-
- if (
- isImageFile(
- mimeType,
- filePath
- )
- ) {
- return await processImageDocument(
- filePath,
- {
- providedInfo,
- }
- );
- }
-
- throw new Error(
- `Desteklenmeyen dosya türü: ${mimeType || "unknown"}`
- );
-}
-
-function getIncomingFile(
- files
+if (
+!document.iban
 ) {
- if (
- !files ||
- typeof files !==
- "object"
- ) {
- return null;
- }
 
- const possibleKeys = [
- "file",
- "document",
- "image",
- "video",
- "upload",
- ];
+matches.iban =
+"unknown"
 
- for (
- const key of possibleKeys
- ) {
- const value =
- files[key];
-
- if (
- Array.isArray(value) &&
- value.length
- ) {
- return value[0];
- }
-
- if (
- value &&
- typeof value ===
- "object"
- ) {
- return value;
- }
- }
-
- /*
- * Son çare:
- * multipart parser'ın verdiği
- * ilk dosyayı kullan.
- */
- for (
- const value of Object.values(
- files
- )
- ) {
- if (
- Array.isArray(value) &&
- value[0]?.filepath
- ) {
- return value[0];
- }
-
- if (
- value?.filepath
- ) {
- return value;
- }
- }
-
- return null;
+warnings.push(
+"IBAN kontrol edilemedi: dekonttan IBAN güvenilir şekilde okunamadı."
+);
 }
 
-function parseProvidedInfo(
- fields
+else {
+
+const expected =
+normalizeIBAN(
+provided.iban
+);
+const actual =
+normalizeIBAN(
+document.recipientIban
+);
+
+if (actual) {
+const ibanMod97 = validateIBANMod97(actual);
+warnings.push(
+`MOD-97 TEST: ${ibanMod97.valid ? "GEÇERLİ" : "GEÇERSİZ"} | Kalan: ${ibanMod97.remainder}`
+);
+
+console.log("===== IBAN MOD-97 =====");
+console.log("IBAN:", actual);
+console.log("MOD-97 VALID:", ibanMod97.valid);
+console.log("MOD-97 REMAINDER:", ibanMod97.remainder);
+console.log("========================");
+
+if (!ibanMod97.valid) {
+warnings.push(
+`Dekonttaki alıcı IBAN'ı MOD-97 kontrolünden geçmedi. Kalan: ${
+ibanMod97.remainder ?? "bilinmiyor"
+}.`
+);
+}
+}
+matches.iban =
+expected === actual
+? "match"
+: "mismatch"
+
+if (
+expected !== actual
 ) {
- if (
- !fields ||
- typeof fields !==
- "object"
- ) {
- return null;
- }
+warnings.push(
+`IBAN uyuşmuyor. Beklenen: "${provided.iban}", dekontta görülen: "${document.recipientIban}".`
+);
 
- const raw =
- fields.providedInfo ??
- fields.info ??
- fields.expectedInfo;
-
- if (
- raw === undefined ||
- raw === null
- ) {
- /*
- * Bazı istemciler bilgileri
- * ayrı form alanları olarak gönderebilir.
- */
- const result = {};
-
- const keys = [
- "amount",
- "senderIBAN",
- "receiverIBAN",
- "senderName",
- "receiverName",
- "date",
- "time",
- "transactionId",
- "referenceNo",
- ];
-
- for (
- const key of keys
- ) {
- if (
- fields[key] !==
- undefined &&
- fields[key] !==
- null &&
- String(
- fields[key]
- ).trim() !== ""
- ) {
- result[key] =
- Array.isArray(
- fields[key]
- )
- ? fields[key][0]
- : fields[key];
- }
- }
-
- return Object.keys(
- result
- ).length
- ? result
- : null;
- }
-
- if (
- typeof raw ===
- "object"
- ) {
- return raw;
- }
-
- const rawString =
- Array.isArray(raw)
- ? raw[0]
- : String(raw);
-
- try {
- return JSON.parse(
- rawString
- );
- } catch {
- /*
- * JSON değilse amount olarak
- * gönderilmiş olma ihtimaline karşı
- * basit fallback.
- */
- return {
- amount:
- rawString,
- };
- }
 }
+
+}
+
+}
+
+
+if (
+provided.amount !== null &&
+provided.amount !== undefined &&
+String(provided.amount).trim() !== ""
+) {
+
+const expected =
+parseComparisonAmount(
+provided.amount
+);
+
+const actual =
+parseComparisonAmount(
+document.amount
+);
+
 if (
 expected === null
 ) {
@@ -6143,6 +5430,17 @@ console.log(
 paddleImageOCR.confidence
 );
 
+amountForensics =
+await analyzeAmountForensics(
+filePath,
+paddleImageOCR
+);
+
+console.log(
+"AMOUNT FORENSICS:",
+JSON.stringify(amountForensics)
+);
+
 }
 
 }
@@ -6463,172 +5761,122 @@ JPG / JPEG GÖRÜNTÜSÜNDEN ÇIKAR.
 JPG / JPEG üzerinde gerçekten görünmeyen hiçbir
 bilgiyi yazma.
 JPG / JPEG üzerinde bir bilgi okunamıyorsa:
-"unknown" kullan.
-
+null kullan.
 =====================================================
-TUTAR ANALİZİ
-=====================================================
-
-Ana işlem tutarını özellikle kontrol et.
-
-Aşağıdaki tutar alanlarını birbirleriyle karşılaştır:
-
-1. Ana işlem tutarı
-2. Varsa üst/alt özet tutarı
-3. Varsa yazıyla tutar
-4. Varsa toplam tutar
-5. Varsa komisyon / masraf
-6. Varsa bakiye değişimi
-7. Varsa başka yerde tekrar eden tutar
-
-Aynı işlemi temsil eden tutarlar birbirini desteklemelidir.
-
-Özellikle şu durumlara dikkat et:
-
-- 1.700,00 ↔ 1.700,01
-- 1.700,00 ↔ 1.700,10
-- 1.700,00 ↔ 1.700,000
-- 1700 ↔ 1.700
-- 1.700,00 ↔ 17.000,00
-- 1.700,00 ↔ 700,00
-- 1.700,00 ↔ 1.070,00
-- rakamların eksik/fazla olması
-- virgül/nokta yerinin değişmesi
-- son iki ondalık hanenin farklı olması
-- aynı rakamın farklı font/stroke ile görünmesi
-
-Fakat yalnızca görsel benzerlikten hareketle
-"değiştirilmiştir" iddiasında bulunma.
-
-=====================================================
-KARAKTER DÜZEYİ TUTAR KONTROLÜ
+REFERANS PDF — SADECE GÖRSEL / ŞABLON REFERANSI
 =====================================================
 
-Özellikle ana tutar alanındaki rakamları tek tek incele.
+Aşağıda ayrıca bir banka referans PDF'i verilebilir.
 
-Şunları karşılaştır:
+REFERANS PDF:
 
-- rakamların stroke kalınlığı
-- koyuluk
-- kenar keskinliği
-- font ağırlığı
-- baseline hizası
-- karakter yüksekliği
-- karakter genişliği
-- rakamlar arası boşluk
-- virgül/nokta şekli
-- son iki ondalık hanenin görünümü
-- aynı karakterlerin birbirine benzerliği
+SADECE şu amaçlarla kullanılabilir:
 
-Örneğin:
-
-"1700,00"
-
-içindeki:
-
-"1"
-"7"
-"0"
-"0"
-","
-"0"
-"0"
-
-karakterlerini mümkün olduğunca ayrı ayrı değerlendir.
-
-Bir veya iki karakter diğerlerinden belirgin şekilde
-farklı görünüyorsa bunu "localized visual inconsistency"
-olarak değerlendir.
-
-Ancak:
-
-- JPEG sıkıştırması
-- ekran görüntüsü
-- yeniden boyutlandırma
-- tarama kalitesi
-- gölge
-- belge arka planı
-- anti-aliasing
-
-gibi faktörlerin de böyle fark oluşturabileceğini unutma.
-
-Bu nedenle tek başına renk/koyuluk farkı kesin sahtecilik
-kanıtı değildir.
+- belge şablonu
+- sayfa düzeni
+- alanların konumu
+- banka logosu
+- başlık yapısı
+- tipografi
+- font görünümü
+- font boyutu
+- karakter aralıkları
+- satır aralıkları
+- hizalama
+- tarih biçiminin görsel yapısı
+- tutar biçiminin görsel yapısı
+- IBAN alanının görsel yapısı
+- gönderen/alıcı alanlarının görsel yerleşimi
+- genel görsel yapı
+- belge üzerindeki olası düzenleme izlerinin karşılaştırılması
 
 =====================================================
-SAHTECİLİK İÇİN GÜÇLÜ KANITLAR
+KESİN KURAL — VERİ AKTARMA YASAK
 =====================================================
 
-Aşağıdakiler birlikte görülüyorsa şüphe seviyesini artır:
+REFERANS PDF'DEKİ HİÇBİR GERÇEK İŞLEM BİLGİSİNİ
+JPG / JPEG'E AKTARMA.
 
-- aynı tutarın farklı bölümlerde farklı olması
-- yazıyla tutar ile rakamsal tutarın uyuşmaması
-- karakter düzeyinde lokal font/stroke farkı
-- yalnızca tek veya birkaç karakterin belirgin şekilde
-farklı render edilmiş görünmesi
-- hizalama bozukluğu
-- karakter aralığında anormallik
-- tutar alanında lokal blur/sharpness farkı
-- tutar çevresinde farklı compression/noise davranışı
-- belgenin geri kalanıyla tutar alanının görsel olarak
-uyumsuz olması
+Özellikle REFERANS PDF'den:
 
+- isim
+- soyisim
+- gönderen adı
+- alıcı adı
+- IBAN
+- hesap numarası
+- tutar
+- para birimi
+- tarih
+- saat
+- işlem numarası
+- referans numarası
+- açıklama
+- vergi numarası
+- müşteri numarası
+- diğer herhangi bir rakam veya metin
+ALMA.
+JPG / JPEG'DE YOKSA BU BİLGİLERİ
+REFERANS PDF'DEN TAMAMLAMA.
+
+JPG / JPEG'DEKİ BİR ALAN REFERANS PDF'DEKİ
+DEĞERDEN FARKLIYSA REFERANS PDF'Yİ DOĞRU
+KABUL ETME.
+
+GERÇEK DEĞER HER ZAMAN JPG / JPEG ÜZERİNDE
+GERÇEKTEN GÖRÜLEN DEĞERDİR.
+
+JPG / JPEG'DE OKUNAMAYAN BİR DEĞER İÇİN
+TAHMİN YAPMA VE REFERANS PDF'DEN DEĞER
+KOPYALAMA.
 =====================================================
-NEGATİF KANIT
-=====================================================
-
-Sadece:
-
-- hafif renk farkı
-- hafif koyuluk farkı
-- JPEG artefaktı
-- görüntü sıkıştırması
-- küçük keskinlik farkı
-
-görülüyorsa bunu otomatik olarak sahtecilik olarak işaretleme.
-
-=====================================================
-REFERANS BELGE
-=====================================================
-
-Varsa reference_image de karşılaştırma amacıyla
-kullanılabilir.
-
-Fakat reference_image üzerinde bulunmayan bir bilgiyi
-asıl belgede varmış gibi kabul etme.
-
-Referans yalnızca:
-
-- layout
-- font
-- alan sırası
-- etiketler
-- tipik hizalama
-- görsel yapı
-
-karşılaştırması için yardımcıdır.
-
-ASLI BELGE HER ZAMAN ÖNCELİKLİDİR.
-
-=====================================================
-SONUÇ
+DOCUMENT DATA
 =====================================================
 
-Tutar konusunda kesin olmayan bir fark varsa:
+Aşağıdaki alanları YALNIZCA JPG / JPEG
+görüntüsünden çıkar:
 
-"unknown"
+documentData.senderName
+documentData.recipientName
+documentData.amount
+documentData.currency
+documentData.iban
 
-veya
+Kurallar:
 
-"warning"
+- Yalnızca JPG / JPEG üzerinde gerçekten görülen bilgileri yaz.
+- Güvenilir şekilde okunamıyorsa null kullan.
+- IBAN'ı mümkünse standart biçimde yaz.
+- amount alanına yalnızca JPG / JPEG üzerinde görülen
+ana işlem tutarını yaz.
+- IBAN, hesap numarası, işlem numarası,
+referans numarası veya tarih gibi rakamları
+amount olarak kullanma.
+- Gönderen ve alıcıyı JPG / JPEG üzerindeki
+alan etiketlerine göre ayırt et.
+- Açıklama alanındaki isimleri gönderen/alıcı
+yerine kullanma.
+- REFERANS PDF'dEKİ DEĞERLERİ documentData'YA
+KOPYALAMA.
+- JPG / JPEG'de yoksa null döndür.
 
-seviyesinde değerlendir.
+=====================================================
+ANALİZ SIRASI
+=====================================================
+1. Önce JPG / JPEG görüntüsünü baştan sona analiz et.
+2. JPG / JPEG'de görülen tüm bilgileri belirle.
+3. documentData alanlarını yalnızca JPG / JPEG'den doldur.
+4. Daha sonra referans PDF'yi yalnızca görsel/şablon
+karşılaştırması için kullan.
+5. Referans PDF'deki gerçek işlem bilgilerini
+analiz edilen JPG / JPEG'in bilgileri olarak kullanma.
 
-Görüntü açıkça desteklemiyorsa "fail" verme.
-
-`,
-
+Dosya adı:
+${fileName}`,
 },
+// =================================================
+// ASIL ANALİZ EDİLECEK JPEG
+// =================================================
 
 {
 type:
@@ -6636,283 +5884,385 @@ type:
 
 image_url:
 imageDataUrl,
-
+detail:
+"high",
 },
 
-];
-
-
-// =====================================================
-// PDF
-// =====================================================
-
-} else if (
-type === "pdf"
-) {
-
-const pdfTextContext =
-extractedPdfText.trim()
-?
-`
-
-=====================================================
-PDF YEREL METİN ÇIKARMA SONUCU
-=====================================================
-
-Aşağıdaki metin PDF'in yerel text extraction
-sonucudur.
-
-Bu metin yardımcı veridir.
-
-ASLINDA BELGE ÜZERİNDE GÖRÜLEN BİLGİLER
-HER ZAMAN ÖNCELİKLİDİR.
-
-PDF yerel metni:
-
-${extractedPdfText}
-
-`
-:
-"";
-
-
-content = [
-
-{
-type:
-"input_text",
-
-text: `${PROMPT}
-
-=====================================================
-PDF ANALİZİ
-=====================================================
-
-Bu dosya PDF formatındadır.
-
-PDF'in hem:
-
-1. görsel içeriğini
-2. çıkarılmış metin içeriğini
-3. varsa OCR sonucunu
-4. belge yapısını
-5. font/layout davranışını
-
-birlikte değerlendir.
-
-${pdfTextContext}
-
-=====================================================
-TUTAR ANALİZİ
-=====================================================
-
-Ana işlem tutarını özellikle incele.
-
-Aynı tutarın PDF içinde tekrarlandığı alanları
-karşılaştır.
-
-Özellikle:
-
-- ana tutar
-- yazıyla tutar
-- toplam
-- komisyon
-- işlem özeti
-- bakiye değişimi
-
-arasında mantıksal tutarlılık ara.
-
-Tutarın yalnızca tek bir yerde bulunması halinde
-uydurma karşılaştırma yapma.
-
-=====================================================
-PDF FORENSICS
-=====================================================
-
-PDF yapısında aşağıdaki belirtilere dikkat et:
-
-- farklı font kullanımı
-- font subset farklılıkları
-- aynı satır içinde farklı font
-- karakter spacing anormalliği
-- text positioning anormalliği
-- farklı encoding davranışı
-- farklı render karakteristikleri
-- metadata tutarsızlığı
-- sayfa yapısındaki anormallikler
-- overlay text ihtimali
-- aynı bilginin farklı katmanlarda bulunması
-
-Bunlar yalnızca destekleyici kanıttır.
-
-Tek başına PDF metadata farklılığı sahtecilik kanıtı değildir.
-
-=====================================================
-GÖRSEL TUTAR FORENSICS
-=====================================================
-
-Tutar alanında:
-
-- karakter koyuluğu
-- stroke kalınlığı
-- edge sharpness
-- baseline
-- karakter yüksekliği
-- karakter genişliği
-- spacing
-- virgül/nokta
-- son iki ondalık
-
-gibi özellikleri incele.
-
-Bir veya birkaç karakterin diğerlerinden belirgin şekilde
-ayrılması durumunda localized visual inconsistency
-olarak bildir.
-
-Fakat compression / rasterization / scan gibi etkileri
-de dikkate al.
-
-=====================================================
-KESİNLİK
-=====================================================
-
-Kesin kanıt yoksa:
-
-"unknown"
-
-veya
-
-"warning"
-
-kullan.
-
-Belge üzerinde açıkça desteklenmeyen bir tutarı
-veya değişikliği icat etme.
-
-`,
-
-},
-
+// =================================================
+// REFERANS PDF
+// SADECE GÖRSEL / ŞABLON KARŞILAŞTIRMASI
+// =================================================
+...(
+reference?.base64
+? [
 {
 type:
 "input_file",
 
-file_id:
-`data:application/pdf;base64,${base64}`,
-
+filename:
+reference.fileName,
+file_data:
+`data:application/pdf;base64,${reference.base64}`,
 },
-
-];
-
-
-// =====================================================
-// FALLBACK — PDF INPUT FILE ÇALIŞMAZSA
-// =====================================================
-
-} else {
-
-content = [
-
-{
-type:
-"input_text",
-
-text: `${PROMPT}
-
-=====================================================
-GENEL BELGE ANALİZİ
-=====================================================
-
-Bu belgeyi görsel olarak analiz et.
-
-Belge üzerinde açıkça görünmeyen hiçbir bilgiyi
-uydurma.
-
-Ana işlem tutarını özellikle kontrol et.
-
-Aynı tutarın farklı bölümlerde tekrarlandığı yerleri
-karşılaştır.
-
-Karakter düzeyinde:
-
-- stroke
-- koyuluk
-- font ağırlığı
-- hizalama
-- spacing
-- karakter boyutu
-- kenar keskinliği
-
-farklarını incele.
-
-Lokal farklılıklar varsa bunları kanıt seviyesine göre
-"warning" veya "unknown" olarak değerlendir.
-
-Tek başına hafif renk/koyuluk farkını sahtecilik olarak
-kabul etme.
-
-`,
-
-},
-
-{
-type:
-"input_image",
-
-image_url:
-imageDataUrl,
-
-},
-
+]
+: []
+),
 ];
 
 }
 
+// =================================================
+// PDF
+// =================================================
 
-// =====================================================
-// OPENAI REQUEST
-// =====================================================
+else if (
+type === "pdf"
+) {
+
+const pdfDataUrl =
+`data:application/pdf;base64,${base64}`;
+
+
+content = [
+// =================================================
+// PROMPT
+// =================================================
+{
+type: "input_text",
+
+text: `${PROMPT}`
+},
+
+
+// =================================================
+// GERÇEK DEKONT
+// =================================================
+{
+type: "input_text",
+text: `
+==================================================
+GERÇEK DEKONT — ANALİZ EDİLECEK DOSYA
+==================================================
+
+Aşağıdaki PDF, kullanıcının yüklediği GERÇEK DEKONT'tur.
+
+ÇIKARILACAK GERÇEK DEĞERLER YALNIZCA BU PDF'DEN
+ALINMALIDIR.
+Gönderen adı, alıcı adı, IBAN, tutar, tarih, işlem numarası
+ve diğer belge değerlerini bu PDF üzerinde göründüğü
+şekilde belirle.
+REFERANS PDF'deki hiçbir değer gerçek dekontun değeri
+olarak kullanılmamalıdır.
+
+Dosya adı:
+${fileName}
+`
+},
+{
+type: "input_file",
+filename: fileName,
+file_data: pdfDataUrl,
+},
+
+// =================================================
+// REFERANS BANKA ŞABLONU
+// =================================================
+
+...(
+reference?.base64
+? [
+
+{
+type: "input_text",
+text: `
+==================================================
+REFERANS DEKONT — SADECE ŞABLON / KONUM BİLGİSİ
+==================================================
+
+Aşağıdaki PDF, ${bank || "seçilen bankanın"} REFERANS
+DEKONT ŞABLONUDUR.
+BU DOSYADAN GERÇEK İŞLEM DEĞERİ ALMA.
+
+Bu PDF'yi yalnızca:
+
+- alanların nerede bulunduğunu,
+- alanların hangi etiketlerle gösterildiğini,
+- gönderen alanının konumunu,
+- alıcı alanının konumunu,
+- IBAN alanının konumunu,
+- tutar alanının konumunu,
+- tarih alanının konumunu,
+- işlem/reference numarası alanlarının konumunu,
+- bankaya özgü belge düzenini
+anlamak için kullan.
+
+ÖNEMLİ:
+Referans PDF'deki isimleri, IBAN'ları, tutarları,
+tarihleri veya işlem numaralarını analiz edilen dekonta
+AKTARMA.
+
+Gerçek değerlerin tamamı GERÇEK DEKONT PDF'sinden
+çıkarılmalıdır.
+
+Referans dosya adı:
+${reference.fileName}
+`
+},
+{
+type: "input_file",
+filename: reference.fileName,
+file_data: `data:application/pdf;base64,${reference.base64}`,
+},
+
+]
+: []
+),
+
+];
+}
+
+// =================================================
+// VIDEO
+// =================================================
+
+else if (
+type === "video"
+) {
 
 console.log(
-"OPENAI ANALİZİ BAŞLIYOR..."
+"VIDEO ANALYSIS START"
+);
+
+const frames =
+await extractVideoFrames(
+filePath
+);
+
+
+console.log(
+"VIDEO FRAMES EXTRACTED:",
+frames.length
+);
+
+const videoResult =
+await analyzeVideoFrames(
+frames
+);
+
+console.log(
+"VIDEO ANALYSIS COMPLETE"
+);
+console.log(
+"VIDEO RESULT:",
+videoResult
+);
+// =====================================================
+// DETERMINISTIK VIDEO RISK MOTORU
+// =====================================================
+
+const videoRisk =
+calculateOverallRisk(
+videoResult
+);
+
+// =====================================================
+// AI RISK SKORU KULLANILMAZ
+// =====================================================
+
+videoResult.overallRisk =
+videoRisk.overallRisk;
+
+videoResult.riskLabel =
+videoRisk.riskLabel;
+
+videoResult.categories =
+videoRisk.categories;
+
+// =====================================================
+// FINAL VIDEO SCORE
+// =====================================================
+const videoScore =
+Number(
+videoResult?.overallRisk
+) || 0;
+
+const videoSuspicious =
+videoScore >= 46;
+
+const videoEvidence =
+videoResult?.summary ||
+"Video analizi tamamlandı."
+
+
+return res
+.status(200)
+.json({
+
+success:
+true,
+
+fileName,
+type,
+
+bank:
+bank,
+reference:
+null,
+videoFrames:
+frames.length,
+
+...videoResult,
+
+score:
+videoScore,
+suspicious:
+videoSuspicious,
+evidence:
+videoEvidence,
+});
+}
+
+else {
+throw new Error(
+"Desteklenmeyen dosya türü."
+);
+}
+
+// -------------------------------------------------
+// PADDLEOCR CONTEXT
+// -------------------------------------------------
+
+// PaddleOCR sonucu, OpenAI'nin belge görüntüsü/PDF'si ile birlikte
+// yalnızca yardımcı OCR metni olarak verilir.
+// Gerçek görsel/PDF her zaman ana kaynaktır.
+if (
+(type === "image" || type === "pdf") &&
+process.env.PADDLEOCR_ACCESS_TOKEN &&
+!paddleOcrAttempted
+) {
+
+const paddleResult =
+await runPaddleOCR(filePath);
+paddleOcrAttempted = true;
+
+if (!amountForensics) {
+amountForensics =
+await analyzeAmountForensics(
+filePath,
+paddleResult
+);
+}
+
+if (paddleResult.text?.trim()) {
+
+paddleOcrText =
+paddleResult.text.trim();
+paddleOcrConfidence =
+Number(paddleResult.confidence) || 0;
+
+content.unshift({
+type:
+"input_text",
+text: `
+=====================================================
+PADDLEOCR YARDIMCI OCR SONUCU
+=====================================================
+
+Bu metin PaddleOCR tarafından gerçek yüklenen dosyadan
+çıkarılmış yardımcı OCR sonucudur.
+OCR güven skoru: ${paddleOcrConfidence}/100
+ÇOK ÖNEMLİ:
+
+Bu metni tek başına gerçek belge kabul etme.
+Ana kaynak her zaman aşağıdaki gerçek JPG/PDF dosyasıdır.
+
+PaddleOCR'da okunamayan veya belirsiz görünen bilgileri
+ana belge görüntüsünden doğrula.
+
+Referans PDF'den hiçbir bilgi aktarma.
+
+OCR METNİ:
+${paddleOcrText}
+
+=====================================================
+`,
+});
+
+console.log(
+"PADDLEOCR CONTEXT OPENAI'YE EKLENDİ"
+);
+
+}
+}
+// -------------------------------------------------
+// DETERMINISTIK TUTAR FORENSICS CONTEXT
+// -------------------------------------------------
+if (
+amountForensics
+) {
+
+content.unshift({
+type:
+"input_text",
+text: `
+=====================================================
+DETERMINISTIK TUTAR FORENSICS SONUCU
+=====================================================
+
+Bu sonuç backend tarafından görüntü pikselleri ve
+PaddleOCR bounding-box verisi kullanılarak oluşturulmuştur.
+
+Durum: ${amountForensics.status}
+Şiddet: ${amountForensics.severity}
+OCR tutar alanı: ${amountForensics.amountText || "unknown"}
+Karakter segment sayısı: ${amountForensics.characterCount || 0}
+
+Metrikler:
+${JSON.stringify(amountForensics.metrics || {})}
+
+Kanıt:
+${amountForensics.evidence || "Yok"}
+
+ÖNEMLİ:
+Bu sinyal tek başına sahtecilik kanıtı değildir.
+JPEG sıkıştırması, yeniden boyutlandırma, tarama ve
+render farklılıkları da lokal koyuluk/stroke farkı oluşturabilir.
+Bu sonucu görsel belgeyle birlikte değerlendir.
+=====================================================
+`,
+});
+}
+
+// -------------------------------------------------
+// OPENAI
+// -------------------------------------------------
+console.log(
+"OPENAI REQUEST START"
 );
 
 const response =
-await fetch(
-"https://api.openai.com/v1/responses",
-{
-
-method:
-"POST",
-
-headers: {
-
-"Authorization":
-`Bearer ${process.env.OPENAI_API_KEY}`,
-
-"Content-Type":
-"application/json",
-
-},
-
-body:
-JSON.stringify({
-
+await openai.responses.create({
 model:
 "gpt-5.6-terra",
 
-input:
+input: [
+
+{
+
+role:
+"user",
+
 content,
+},
 
+],
 text: {
-
 format: {
-
 type:
 "json_schema",
 
 name:
-"verifydoc_result",
+"verifydoc_analysis",
 
 strict:
 true,
@@ -6923,244 +6273,71 @@ RESPONSE_SCHEMA,
 },
 
 },
+});
 
-}),
-}
+console.log("KULLANILAN OPENAI MODEL:", response.model);
+console.log(
+"OPENAI RESPONSE RECEIVED"
 );
-
 
 console.log(
-"OPENAI STATUS:",
-response.status
+"OPENAI SURE:",
+(
+(Date.now() - startTime) /
+1000
+).toFixed(2),
+"seconds"
 );
 
-const responseText =
-await response.text();
 
-console.log(
-"OPENAI RESPONSE LENGTH:",
-responseText.length
-);
-
-if (
-!response.ok
-) {
-
-console.error(
-"OPENAI HATASI:",
-responseText
-);
-
-throw new Error(
-`OpenAI API hatası. HTTP ${response.status}: ${responseText.slice(0, 1000)}`
-);
-}
-
-
-// =====================================================
-// OPENAI RESPONSE PARSE
-// =====================================================
-
-let openAIResponse;
-
-try {
-
-openAIResponse =
-JSON.parse(
-responseText
-);
-
-}
-catch (error) {
-
-console.error(
-"OPENAI JSON PARSE HATASI:",
-error
-);
-
-console.error(
-"OPENAI RAW RESPONSE:",
-responseText.slice(
-0,
-3000
-)
-);
-
-throw new Error(
-"OpenAI response JSON olarak parse edilemedi."
-);
-
-}
-
-
-// =====================================================
-// OUTPUT TEXT
-// =====================================================
-
-let outputText =
-"";
-
-if (
-typeof openAIResponse?.output_text ===
-"string"
-) {
-
-outputText =
-openAIResponse.output_text;
-
-}
-else if (
-Array.isArray(
-openAIResponse?.output
-)
-) {
-
-for (
-const item
-of openAIResponse.output
-) {
-
-if (
-Array.isArray(
-item?.content
-)
-) {
-
-for (
-const part
-of item.content
-) {
-
-if (
-typeof part?.text ===
-"string"
-) {
-
-outputText +=
-part.text;
-
-}
-
-}
-
-}
-
-}
-
-}
-
-console.log(
-"OPENAI OUTPUT TEXT LENGTH:",
-outputText.length
-);
-
-if (
-!outputText.trim()
-) {
-
-console.error(
-"OPENAI OUTPUT YOK:",
-JSON.stringify(
-openAIResponse
-).slice(
-0,
-5000
-)
-);
-
-throw new Error(
-"OpenAI API boş output döndürdü."
-);
-}
-
-
-// =====================================================
-// PARSE AI RESULT
-// =====================================================
-
+// -------------------------------------------------
+// PARSE
+// -------------------------------------------------
 result =
 parseAIResponse(
-outputText
+response.output_text
 );
+function preserveAmount(value) {
+if (value === null || value === undefined) {
+return null;
+}
 
+const text = String(value).trim();
 
-// =====================================================
-// AMOUNT PRESERVATION
-// =====================================================
+if (!text) {
+return null;
+}
 
-if (
-result?.documentData
-) {
+// Tutarı değiştirme:
+// - sondaki sıfırları koru
+// - nokta/virgülü koru
+// - yuvarlama yapma
+return text;
+}
 
+if (result?.documentData) {
 result.documentData.amount =
-preserveAmount(
-result.documentData.amount
-);
-
+preserveAmount(result.documentData.amount);
 }
 
-if (
-amountForensics
-) {
-
-result.amountForensics =
-amountForensics;
-
+if (amountForensics) {
+result.amountForensics = amountForensics;
 }
 
-
 // =====================================================
-// PROVIDED INFO KARŞILAŞTIRMA
+// DETERMINISTIK RİSK MOTORU
 // =====================================================
-
-const informationCheck =
-compareProvidedInfoWithDocument(
-providedInfo,
-result?.documentData
+const calculatedRisk =
+calculateOverallRisk(
+result
 );
 
+// Güçlü karakter-düzeyi tutar anomalisi varsa risk motoruna
+// deterministik bir üst sınır uygula. Orta seviye sinyal
+// tek başına skoru değiştirmez.
 if (
-informationCheck?.enabled
-) {
-
-result.informationCheck =
-informationCheck;
-
-}
-
-
-// =====================================================
-// DETERMINISTIC RISK ENGINE
-// =====================================================
-
-const riskEngine =
-calculateDeterministicRisk(
-result?.checks,
-result?.documentData
-);
-
-
-// =====================================================
-// AMOUNT FORENSICS — RİSK MOTORU ENTEGRASYONU
-// =====================================================
-
-if (
-amountForensics?.status ===
-"warning"
-) {
-
-if (
-amountForensics.severity ===
-"strong"
-) {
-
-riskEngine.score =
-Math.max(
-riskEngine.score,
-85
-);
-
-if (
+amountForensics?.status === "warning" &&
+amountForensics?.severity === "strong" &&
 result?.checks?.amountConsistency
 ) {
 
@@ -7169,207 +6346,178 @@ result.checks.amountConsistency.status =
 
 result.checks.amountConsistency.score =
 Math.max(
-Number(
-result.checks.amountConsistency.score
-) || 0,
+Number(result.checks.amountConsistency.score) || 0,
 85
 );
 
-const existingEvidence =
-Array.isArray(
-result.checks.amountConsistency.evidence
+result.checks.amountConsistency.evidence =
+[
+result.checks.amountConsistency.evidence,
+amountForensics.evidence,
+]
+.filter(Boolean)
+.join(" ");
+}
+
+// Risk motorunu amount forensics değişikliğinden sonra tekrar hesapla.
+const deterministicRiskAfterForensics =
+calculateOverallRisk(
+result
+);
+
+calculatedRisk.overallRisk =
+Math.max(
+Number(calculatedRisk.overallRisk) || 0,
+Number(deterministicRiskAfterForensics.overallRisk) || 0
+);
+
+calculatedRisk.categories =
+deterministicRiskAfterForensics.categories;
+
+// ==========================================
+// KRİTİK TUTAR TUTARSIZLIĞI
+// ==========================================
+
+const amountAnalysis = result?.amountAnalysis;
+
+const totalAmount = Number(
+amountAnalysis?.totalAmount
+);
+
+const calculatedTotal = Number(
+amountAnalysis?.calculatedTotal
+);
+
+const amountDifference =
+Number.isFinite(totalAmount) &&
+Number.isFinite(calculatedTotal)
+? Math.abs(totalAmount - calculatedTotal)
+: Number(amountAnalysis?.difference);
+
+const hasMajorAmountMismatch =
+Number.isFinite(amountDifference) &&
+Math.abs(amountDifference) >= 100;
+const hasSevereAmountMismatch =
+Number.isFinite(amountDifference) &&
+Math.abs(amountDifference) >= 1000;
+
+// Mevcut JavaScript risk motorunun sonucunu temel al
+let finalRiskScore =
+Number(calculatedRisk.overallRisk) || 0;
+// Tutar farkı varsa riski ciddi şekilde yükselt
+if (hasMajorAmountMismatch) {
+finalRiskScore = Math.max(
+finalRiskScore,
+60
+);
+}
+
+// Çok büyük fark varsa VERY HIGH seviyesine zorla
+if (hasSevereAmountMismatch) {
+finalRiskScore = Math.max(
+finalRiskScore,
+85
+);
+}
+
+// 0-100 arasında tut
+finalRiskScore = Math.round(
+Math.max(
+0,
+Math.min(100, finalRiskScore)
 )
-?
-result.checks.amountConsistency.evidence
-:
-[];
+);
+let finalRiskLabel;
 
-result.checks.amountConsistency.evidence = [
-...existingEvidence,
-amountForensics.evidence
-];
-
+if (finalRiskScore >= 85) {
+finalRiskLabel = "VERY HIGH RISK"
+} else if (finalRiskScore >= 60) {
+finalRiskLabel = "HIGH RISK"
+} else if (finalRiskScore >= 46) {
+finalRiskLabel = "MODERATE RISK"
+} else {
+finalRiskLabel = "LOW RISK"
 }
+result.overallRisk =
+finalRiskScore;
+result.riskLabel =
+finalRiskLabel;
 
-}
+result.categories =
+calculatedRisk.categories;
 
-}
+// AI'ın overallRisk değerini kullanma.
+// Nihai skor JavaScript risk motorundan gelir.
 
 
 // =====================================================
-// FINAL SCORE
+// KULLANICI BİLGİLERİ ↔ DEKONT KARŞILAŞTIRMASI
+// =====================================================
+//
+// ÖNEMLİ:
+// Bu kontrol risk skorunu değiştirmez.
+// Sadece ayrı bir uyarı olarak döndürülür.
+
+const informationCheck =
+compareProvidedInfoWithDocument(
+providedInfo,
+result?.documentData
+);
+result.informationCheck =
+informationCheck;
+
+// =====================================================
+// ANA SKOR
 // =====================================================
 
 const finalScore =
-Math.max(
-0,
-Math.min(
-100,
 Number(
-riskEngine.score
-) || 0
-)
-);
+result.overallRisk
+) || 0;
 
+const finalSuspicious =
+finalScore >= 46;
 
-// =====================================================
-// FINAL LABEL
-// =====================================================
-
-let finalLabel;
-
-if (
-finalScore >=
-85
-) {
-
-finalLabel =
-"ÇOK YÜKSEK RİSK";
-
-}
-else if (
-finalScore >=
-60
-) {
-
-finalLabel =
-"YÜKSEK RİSK";
-
-}
-else if (
-finalScore >=
-46
-) {
-
-finalLabel =
-"ORTA RİSK";
-
-}
-else {
-
-finalLabel =
-"DÜŞÜK RİSK";
-
-}
-
-
-// =====================================================
-// FINAL EVIDENCE
-// =====================================================
-
-const finalEvidence = [];
-
-if (
-amountForensics?.status ===
-"warning"
-) {
-
-finalEvidence.push(
-amountForensics.evidence
-);
-
-}
-
-if (
-Array.isArray(
-riskEngine.evidence
-)
-) {
-
-finalEvidence.push(
-...riskEngine.evidence
-);
-
-}
-
-if (
-informationCheck?.warnings?.length
-) {
-
-finalEvidence.push(
-...informationCheck.warnings
-);
-
-}
-
-
-// =====================================================
-// RESULT NORMALIZATION
-// =====================================================
-
-result.score =
-finalScore;
-
-result.risk =
-finalLabel;
-
-result.suspicious =
-finalScore >=
-46;
-
-result.evidence =
-finalEvidence;
-
-result.riskEngine =
-{
-
-score:
-finalScore,
-
-label:
-finalLabel,
-
-checks:
-riskEngine.checks,
-
-};
-
-
-// =====================================================
-// DEBUG
-// =====================================================
+const finalEvidence =
+result?.amountAnalysis?.evidence ||
+result?.summary ||
+"Analiz tamamlandı."
 
 console.log(
 "FINAL SCORE:",
 finalScore
 );
 
-console.log(
-"FINAL LABEL:",
-finalLabel
-);
 
 console.log(
 "FINAL SUSPICIOUS:",
-result.suspicious
+finalSuspicious
 );
-
 console.log(
-"FINAL EVIDENCE COUNT:",
-finalEvidence.length
-);
-
-console.log(
-"AMOUNT FORENSICS:",
+"INFORMATION CHECK:",
 JSON.stringify(
-amountForensics
+informationCheck
 )
 );
 
 
-// =====================================================
-// RESPONSE
-// =====================================================
-
-const duration =
-Date.now() -
-startTime;
+console.log(
+"ANALYSIS SUCCESS"
+);
 
 console.log(
-"VERIFYDOC API TAMAMLANDI:",
-duration,
-"ms"
+"TOTAL SURE:",
+(
+(Date.now() - startTime) /
+1000
+).toFixed(2),
+"seconds"
 );
+
+console.log(
+"=============================="
+);
+
 
 return res
 .status(200)
@@ -7377,57 +6525,59 @@ return res
 
 success:
 true,
-
 fileName,
 
 type,
 
 bank:
-bank ||
-null,
+bank,
 
 reference:
 reference?.fileName ||
 null,
-
 ...result,
+
+score:
+finalScore,
+
+suspicious:
+finalSuspicious,
+evidence:
+finalEvidence,
 
 });
 
 }
-catch (
-error
-) {
 
+catch (err) {
 console.error(
 "=============================="
 );
 
 console.error(
-"VERIFYDOC API ERROR"
+"VERIFYDOC API ERROR:"
 );
 
+
 console.error(
-error
+err
 );
+
 
 console.error(
 "=============================="
 );
-
 return res
 .status(500)
 .json({
 
 success:
 false,
-
 error:
-error?.message ||
-"Beklenmeyen sunucu hatası.",
+err?.message ||
+"Analysis failed",
 
 });
 
 }
-
 }
