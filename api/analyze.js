@@ -2836,14 +2836,20 @@ function groupPdfTextLines(items, viewport) {
 
 async function renderPdfPagePng(pdf, pageNumber, scale = 1) {
   if (typeof createCanvas !== "function") {
-    throw new Error("@napi-rs/canvas createCanvas kullanılamıyor. Canvas bağımlılığı yüklenmemiş veya export yapısı uyumsuz.");
+    console.warn("REFERENCE PDF RENDER: createCanvas yok; metin/konum profili ile devam ediliyor.");
+    return null;
   }
-  const page = await pdf.getPage(pageNumber);
-  const viewport = page.getViewport({ scale });
-  const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
-  const context = canvas.getContext("2d");
-  await page.render({ canvasContext: context, viewport }).promise;
-  return { buffer: canvas.toBuffer("image/png"), width: Math.ceil(viewport.width), height: Math.ceil(viewport.height) };
+  try {
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale });
+    const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+    const context = canvas.getContext("2d");
+    await page.render({ canvasContext: context, viewport }).promise;
+    return { buffer: canvas.toBuffer("image/png"), width: Math.ceil(viewport.width), height: Math.ceil(viewport.height) };
+  } catch (error) {
+    console.warn("REFERENCE PDF RENDER HATASI:", error?.message || error);
+    return null;
+  }
 }
 
 async function calculateReferenceStyleMetrics(buffer, box, width, height) {
@@ -2928,8 +2934,36 @@ async function buildReferenceTemplateProfile(bank) {
           labelKey: rule.key,
           labelPresent: Boolean(labelItem),
         };
-        if (!renderedPages.has(pageNumber)) renderedPages.set(pageNumber, await renderPdfPagePng(pdf, pageNumber, 1));
-        box.style = await calculateReferenceStyleMetrics(renderedPages.get(pageNumber).buffer, box, renderedPages.get(pageNumber).width, renderedPages.get(pageNumber).height);
+        // Referans PDF'den piksel render'ı mümkünse al; ancak canvas yoksa
+        // profil yine de çalışmaya devam eder. PDF'nin kendi textContent'i
+        // fontName, transform, yükseklik ve genişlik bilgilerini taşıdığı için
+        // bunları deterministik tipografi profiline dönüştürüyoruz.
+        if (!renderedPages.has(pageNumber)) {
+          renderedPages.set(pageNumber, await renderPdfPagePng(pdf, pageNumber, 1));
+        }
+        const rendered = renderedPages.get(pageNumber);
+        const styleItems = valueItems.length ? valueItems : row.items;
+        const fontNames = [...new Set(styleItems.map((x) => x.fontName).filter(Boolean))];
+        const avgFontHeight = styleItems.length
+          ? styleItems.reduce((sum, x) => sum + (Number(x.height) || 0), 0) / styleItems.length
+          : 0;
+        const avgCharWidth = styleItems.length
+          ? styleItems.reduce((sum, x) => {
+              const chars = Math.max(1, String(x.str || "").length);
+              return sum + ((Number(x.width) || 0) / chars);
+            }, 0) / styleItems.length
+          : 0;
+        const pdfStyle = {
+          source: "pdf-text-metadata",
+          fontNames,
+          avgFontHeight,
+          avgCharWidth,
+          itemCount: styleItems.length,
+        };
+        const renderedStyle = rendered
+          ? await calculateReferenceStyleMetrics(rendered.buffer, box, rendered.width, rendered.height)
+          : null;
+        box.style = { ...pdfStyle, ...(renderedStyle || {}) };
         const existing = fields[rule.key];
         if (!existing || box.widthNorm * box.heightNorm > existing.widthNorm * existing.heightNorm) fields[rule.key] = box;
       }
@@ -3007,7 +3041,11 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
     const dy = Math.abs((targetBox.yNorm + targetBox.heightNorm / 2) - (ref.yNorm + ref.heightNorm / 2));
     const dw = Math.abs(Math.log(Math.max(0.001, targetBox.widthNorm) / Math.max(0.001, ref.widthNorm)));
     const dh = Math.abs(Math.log(Math.max(0.001, targetBox.heightNorm) / Math.max(0.001, ref.heightNorm)));
-    const styleDiff = ref.style && targetStyle ? {
+    // Canvas render'i yoksa referansın koyuluk/edge metrikleri ile
+    // gerçek JPEG piksel metriklerini karşılaştırmak metodolojik olarak doğru değildir.
+    // Bu nedenle styleScore yalnızca iki tarafta da gerçek piksel metriği varsa hesaplanır.
+    const hasPixelStyle = Boolean(ref.style?.inkRatio !== undefined && targetStyle?.inkRatio !== undefined);
+    const styleDiff = hasPixelStyle ? {
       inkRatio: Math.abs(targetStyle.inkRatio - ref.style.inkRatio),
       darkness: Math.abs(targetStyle.darkness - ref.style.darkness),
       edgeDensity: Math.abs(targetStyle.edgeDensity - ref.style.edgeDensity),
