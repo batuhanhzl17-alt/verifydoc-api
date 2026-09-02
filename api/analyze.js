@@ -1,3 +1,4 @@
+// VERIFYDOC ANALYZE 8 - syntax-safe amount selection patch
 import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
@@ -2803,7 +2804,7 @@ const moneyPattern =
 /^(?:[+()-]?\s*(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?|[+()-]?\s*(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?)$/i;
 
 const numericOnlyPattern =
-/^[+(-]?[₺€$£]?\s*[0-9][0-9.,\s]*\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?$/i;
+/^[-+()]?[₺€$£]?\s*[0-9][0-9.,\s]*\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*[)]?$/i;
 
 function validRegion(region) {
 return !!(
@@ -2828,10 +2829,10 @@ const value = cleanAmountText(text);
 if (!value) return 0;
 
 const anchoredMoneyPattern =
-/^[+(-]?(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*\)?$/i;
+/^[-+()]?(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*\)?$/i;
 
 const anchoredDecimalPattern =
-/^[+(-]?(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*\)?$/i;
+/^[-+()]?(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?\s*\)?$/i;
 
 if (anchoredDecimalPattern.test(value)) return 9;
 if (anchoredMoneyPattern.test(value) && /[,\.]\d{1,2}/.test(value)) return 8;
@@ -7045,7 +7046,7 @@ const deterministicAmountText =
 String(amountForensics.amountText)
 .trim()
 .replace(/^[-+]/, "")
-.replace(/^\\((.*)\\)$/, "$1")
+.replace(/^\((.*)\)$/, "$1")
 .trim();
 
 if (deterministicAmountText) {
