@@ -2767,6 +2767,263 @@ return null;
 }
 }
 
+
+// =====================================================
+// REFERANS ŞABLON PROFİLİ V2
+// =====================================================
+// Referans PDF'ler artık yalnızca OpenAI'ye gösterilen görseller değildir.
+// Banka bazında alan konumları + alan geometrisi + render yoğunluğu kalibre edilir.
+// Referanstaki gerçek işlem değerleri hiçbir zaman gerçek dekont verisi olarak kullanılmaz.
+const referenceTemplateProfileCache = new Map();
+
+const REFERENCE_FIELD_RULES = [
+  { key: "senderName", patterns: [/gönderen\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /gönderici\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /gonderen\s*(?:adi|ad[ıi]\s*soyad[ıi]?)/i] },
+  { key: "recipientName", patterns: [/alıcı\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /alici\s*(?:adi|ad[ıi]\s*soyadi)/i, /alacaklı\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i] },
+  { key: "senderAddress", patterns: [/gönderen\s*adres/i, /gönderici\s*adres/i, /gonderen\s*adres/i, /gonderici\s*adres/i] },
+  { key: "recipientAddress", patterns: [/alıcı\s*adres/i, /alici\s*adres/i, /alacaklı\s*adres/i, /alacakli\s*adres/i] },
+  { key: "address", patterns: [/\badres\b/i] },
+  { key: "iban", patterns: [/\biban\b/i] },
+  { key: "amount", patterns: [/giden\s*fast\s*tutar/i, /gönderilen\s*(?:fast\s*)?tutar/i, /transfer\s*tutar/i, /işlem\s*tutar/i, /ana\s*tutar/i, /\btutar\b/i, /\bamount\b/i] },
+  { key: "date", patterns: [/işlem\s*tarihi/i, /islem\s*tarihi/i, /tarih/i, /date/i] },
+  { key: "time", patterns: [/saat/i, /time/i] },
+  { key: "transactionNo", patterns: [/işlem\s*(?:no|numarası|numarasi)/i, /islem\s*(?:no|numarasi)/i, /fiş\s*no/i, /fis\s*no/i, /referans\s*(?:no|numarası|numarasi)/i, /sorgu\s*no/i] },
+  { key: "accountNo", patterns: [/hesap\s*no/i, /hesap\s*numarası/i, /hesap\s*numarasi/i, /müşteri\s*no/i, /musteri\s*no/i] },
+  { key: "branch", patterns: [/şube/i, /sube/i] },
+  { key: "taxNo", patterns: [/vergi\s*no/i, /vergi\s*numarası/i, /vergi\s*numarasi/i, /tckn/i] },
+  { key: "description", patterns: [/açıklama/i, /aciklama/i, /description/i] },
+];
+
+function referenceFieldRuleForText(text) {
+  const value = String(text || "").toLocaleLowerCase("tr-TR");
+  for (const rule of REFERENCE_FIELD_RULES) {
+    if (rule.patterns.some((pattern) => pattern.test(value))) return rule;
+  }
+  return null;
+}
+
+function groupPdfTextLines(items, viewport) {
+  const rows = [];
+  const sorted = [...items].sort((a, b) => {
+    const ay = viewport.height - a.y - a.height;
+    const by = viewport.height - b.y - b.height;
+    if (Math.abs(ay - by) > 4) return ay - by;
+    return a.x - b.x;
+  });
+  for (const item of sorted) {
+    const top = viewport.height - item.y - item.height;
+    let row = rows.find((r) => Math.abs(r.top - top) <= Math.max(3, item.height * 0.35));
+    if (!row) {
+      row = { top, items: [] };
+      rows.push(row);
+    }
+    row.items.push(item);
+  }
+  for (const row of rows) {
+    row.items.sort((a, b) => a.x - b.x);
+    row.text = row.items.map((x) => x.str).join(" ").replace(/\s+/g, " ").trim();
+    row.x1 = Math.min(...row.items.map((x) => x.x));
+    row.x2 = Math.max(...row.items.map((x) => x.x + x.width));
+    row.y1 = Math.min(...row.items.map((x) => viewport.height - x.y - x.height));
+    row.y2 = Math.max(...row.items.map((x) => viewport.height - x.y));
+  }
+  return rows.sort((a, b) => a.top - b.top);
+}
+
+async function renderPdfPagePng(pdf, pageNumber, scale = 1) {
+  const page = await pdf.getPage(pageNumber);
+  const viewport = page.getViewport({ scale });
+  const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+  const context = canvas.getContext("2d");
+  await page.render({ canvasContext: context, viewport }).promise;
+  return { buffer: canvas.toBuffer("image/png"), width: Math.ceil(viewport.width), height: Math.ceil(viewport.height) };
+}
+
+async function calculateReferenceStyleMetrics(buffer, box, width, height) {
+  if (!buffer || !box || !width || !height) return null;
+  const left = Math.max(0, Math.floor(box.xNorm * width));
+  const top = Math.max(0, Math.floor(box.yNorm * height));
+  const cropWidth = Math.min(width - left, Math.max(1, Math.ceil(box.widthNorm * width)));
+  const cropHeight = Math.min(height - top, Math.max(1, Math.ceil(box.heightNorm * height)));
+  if (cropWidth < 3 || cropHeight < 3) return null;
+  try {
+    const raw = await sharp(buffer).grayscale().extract({ left, top, width: cropWidth, height: cropHeight }).raw().toBuffer({ resolveWithObject: true });
+    let ink = 0;
+    let dark = 0;
+    let edges = 0;
+    let pixels = 0;
+    for (let y = 0; y < raw.info.height; y++) {
+      for (let x = 0; x < raw.info.width; x++) {
+        const value = raw.data[y * raw.info.width + x];
+        pixels++;
+        if (value < 220) ink++;
+        if (value < 185) dark += 255 - value;
+        if (y > 0) edges += Math.abs(value - raw.data[(y - 1) * raw.info.width + x]);
+      }
+    }
+    return {
+      inkRatio: pixels ? ink / pixels : 0,
+      darkness: pixels ? dark / pixels : 0,
+      edgeDensity: pixels ? edges / pixels : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function buildReferenceTemplateProfile(bank) {
+  const normalizedBank = normalizeBank(bank);
+  if (!normalizedBank) return null;
+  if (referenceTemplateProfileCache.has(normalizedBank)) return referenceTemplateProfileCache.get(normalizedBank);
+  const referencePath = getReferenceFile(normalizedBank);
+  if (!referencePath) return null;
+  try {
+    const buffer = await fs.readFile(referencePath);
+    if (!buffer?.length) return null;
+    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    const fields = {};
+    const renderedPages = new Map();
+    for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 5); pageNumber++) {
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1 });
+      const textContent = await page.getTextContent();
+      const items = textContent.items.map((item) => {
+        const tr = Array.isArray(item?.transform) ? item.transform : [];
+        const x = Number(tr[4]);
+        const y = Number(tr[5]);
+        const height = Math.abs(Number(tr[3])) || Number(item?.height) || 0;
+        return { str: String(item?.str || "").trim(), x, y, width: Number(item?.width) || 0, height };
+      }).filter((x) => x.str && Number.isFinite(x.x) && Number.isFinite(x.y));
+      const rows = groupPdfTextLines(items, viewport);
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        const row = rows[rowIndex];
+        const rule = referenceFieldRuleForText(row.text);
+        if (!rule) continue;
+        const labelItemIndex = row.items.findIndex((item) => referenceFieldRuleForText(item.str)?.key === rule.key);
+        const labelItem = labelItemIndex >= 0 ? row.items[labelItemIndex] : row.items[0];
+        let valueItems = row.items.slice(Math.max(0, labelItemIndex + 1));
+        if (!valueItems.length) {
+          const next = rows[rowIndex + 1];
+          if (next && next.top - row.top <= Math.max(55, row.y2 - row.y1 + 30)) valueItems = next.items.slice(0, 10);
+        }
+        valueItems = valueItems.filter((item) => !referenceFieldRuleForText(item.str));
+        if (!valueItems.length) continue;
+        const x1 = Math.min(...valueItems.map((x) => x.x));
+        const x2 = Math.max(...valueItems.map((x) => x.x + x.width));
+        const y1 = Math.min(...valueItems.map((x) => viewport.height - x.y - x.height));
+        const y2 = Math.max(...valueItems.map((x) => viewport.height - x.y));
+        const box = {
+          xNorm: x1 / viewport.width,
+          yNorm: y1 / viewport.height,
+          widthNorm: Math.max(0.001, (x2 - x1) / viewport.width),
+          heightNorm: Math.max(0.001, (y2 - y1) / viewport.height),
+          pageNumber,
+          labelKey: rule.key,
+          labelPresent: Boolean(labelItem),
+        };
+        if (!renderedPages.has(pageNumber)) renderedPages.set(pageNumber, await renderPdfPagePng(pdf, pageNumber, 1));
+        box.style = await calculateReferenceStyleMetrics(renderedPages.get(pageNumber).buffer, box, renderedPages.get(pageNumber).width, renderedPages.get(pageNumber).height);
+        const existing = fields[rule.key];
+        if (!existing || box.widthNorm * box.heightNorm > existing.widthNorm * existing.heightNorm) fields[rule.key] = box;
+      }
+    }
+    const profile = { bank: normalizedBank, fields, fieldCount: Object.keys(fields).length };
+    referenceTemplateProfileCache.set(normalizedBank, profile);
+    console.log("REFERENCE TEMPLATE PROFILE:", JSON.stringify(profile));
+    return profile;
+  } catch (error) {
+    console.warn("REFERENCE TEMPLATE PROFILE HATASI:", normalizedBank, error?.message || error);
+    referenceTemplateProfileCache.set(normalizedBank, null);
+    return null;
+  }
+}
+
+async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocrResult) {
+  const profile = await buildReferenceTemplateProfile(bank);
+  if (!profile || !Object.keys(profile.fields || {}).length || !ocrResult?.success) return null;
+  const regions = Array.isArray(ocrResult.regions) ? ocrResult.regions.filter((x) => x?.region && String(x.text || "").trim()) : [];
+  if (!regions.length) return null;
+  let pageSizes = new Map();
+  let pageBuffers = new Map();
+  if (mime && mime.startsWith("image/")) {
+    const meta = await sharp(filePath).metadata();
+    pageSizes.set(0, { width: Number(meta.width) || 0, height: Number(meta.height) || 0 });
+    pageBuffers.set(0, { buffer: await fs.readFile(filePath), width: Number(meta.width) || 0, height: Number(meta.height) || 0 });
+  } else if (mime === "application/pdf" || String(filePath).toLowerCase().endsWith(".pdf")) {
+    const pdfBuffer = await fs.readFile(filePath);
+    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(pdfBuffer) }).promise;
+    for (const pageNumber of new Set(regions.map((x) => Number(x.pageIndex) + 1))) {
+      if (!Number.isFinite(pageNumber) || pageNumber < 1 || pageNumber > pdf.numPages) continue;
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1 });
+      pageSizes.set(pageNumber - 1, { width: viewport.width, height: viewport.height });
+    }
+  }
+  const matches = [];
+  for (const [field, ref] of Object.entries(profile.fields)) {
+    let best = null;
+    for (const labelRegion of regions) {
+      const rule = REFERENCE_FIELD_RULES.find((r) => r.key === field);
+      if (!rule || !rule.patterns.some((p) => p.test(String(labelRegion.text || "")))) continue;
+      const lr = labelRegion.region;
+      const candidates = regions.filter((item) => {
+        if (item === labelRegion) return false;
+        const r = item.region;
+        const sameLine = Math.abs(Number(r.y1) - Number(lr.y1)) <= Math.max(14, (Number(lr.y2) - Number(lr.y1)) * 0.9);
+        const right = Number(r.x1) >= Number(lr.x2) - 4;
+        const below = Number(r.y1) >= Number(lr.y2) - 3 && Number(r.y1) - Number(lr.y2) <= Math.max(55, (Number(lr.y2) - Number(lr.y1)) * 3.5);
+        return (sameLine && right) || below;
+      }).filter((item) => !referenceFieldRuleForText(item.text));
+      candidates.sort((a, b) => {
+        const ar = a.region, br = b.region;
+        const ad = Math.abs(Number(ar.y1) - Number(lr.y1)) + Math.max(0, Number(ar.x1) - Number(lr.x2));
+        const bd = Math.abs(Number(br.y1) - Number(lr.y1)) + Math.max(0, Number(br.x1) - Number(lr.x2));
+        return ad - bd;
+      });
+      if (candidates[0]) {
+        const r = candidates[0].region;
+        best = { pageIndex: Number(candidates[0].pageIndex) || 0, x1: Number(r.x1), y1: Number(r.y1), x2: Number(r.x2), y2: Number(r.y2), label: String(labelRegion.text || "") };
+        break;
+      }
+    }
+    if (!best) continue;
+    const size = pageSizes.get(best.pageIndex);
+    if (!size?.width || !size?.height) continue;
+    const targetBox = { xNorm: best.x1 / size.width, yNorm: best.y1 / size.height, widthNorm: Math.max(0.001, (best.x2 - best.x1) / size.width), heightNorm: Math.max(0.001, (best.y2 - best.y1) / size.height) };
+    if (!pageBuffers.has(best.pageIndex) && (mime === "application/pdf" || String(filePath).toLowerCase().endsWith(".pdf"))) {
+      const pdfBuffer = await fs.readFile(filePath);
+      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(pdfBuffer) }).promise;
+      pageBuffers.set(best.pageIndex, await renderPdfPagePng(pdf, best.pageIndex + 1, 1));
+    }
+    const targetStyle = await calculateReferenceStyleMetrics(pageBuffers.get(best.pageIndex)?.buffer, targetBox, pageBuffers.get(best.pageIndex)?.width, pageBuffers.get(best.pageIndex)?.height);
+    const dx = Math.abs((targetBox.xNorm + targetBox.widthNorm / 2) - (ref.xNorm + ref.widthNorm / 2));
+    const dy = Math.abs((targetBox.yNorm + targetBox.heightNorm / 2) - (ref.yNorm + ref.heightNorm / 2));
+    const dw = Math.abs(Math.log(Math.max(0.001, targetBox.widthNorm) / Math.max(0.001, ref.widthNorm)));
+    const dh = Math.abs(Math.log(Math.max(0.001, targetBox.heightNorm) / Math.max(0.001, ref.heightNorm)));
+    const styleDiff = ref.style && targetStyle ? {
+      inkRatio: Math.abs(targetStyle.inkRatio - ref.style.inkRatio),
+      darkness: Math.abs(targetStyle.darkness - ref.style.darkness),
+      edgeDensity: Math.abs(targetStyle.edgeDensity - ref.style.edgeDensity),
+    } : null;
+    const geometryScore = Math.min(100, Math.round((dx / 0.03) * 35 + (dy / 0.03) * 35 + dw * 20 + dh * 10));
+    const styleScore = styleDiff ? Math.min(100, Math.round(styleDiff.inkRatio * 180 + styleDiff.darkness * 0.65 + styleDiff.edgeDensity * 0.35)) : 0;
+    matches.push({ field, reference: { xNorm: ref.xNorm, yNorm: ref.yNorm, widthNorm: ref.widthNorm, heightNorm: ref.heightNorm, pageNumber: ref.pageNumber, style: ref.style }, target: { ...targetBox, pageIndex: best.pageIndex, style: targetStyle }, geometryScore, styleScore });
+  }
+  if (!matches.length) return null;
+  const strongGeometry = matches.filter((x) => x.geometryScore >= 60);
+  const strongStyle = matches.filter((x) => x.styleScore >= 60);
+  return {
+    bank: profile.bank,
+    referenceFieldCount: profile.fieldCount,
+    matchedFieldCount: matches.length,
+    strongGeometryCount: strongGeometry.length,
+    strongStyleCount: strongStyle.length,
+    fields: matches,
+    evidence: strongGeometry.length || strongStyle.length
+      ? `Referans şablonuyla ${matches.length} alan eşleştirildi; ${strongGeometry.length} alanda belirgin konum/geometri, ${strongStyle.length} alanda belirgin render yoğunluğu farkı bulundu.`
+      : "Referans şablonuyla eşleşen alanlarda belirgin konum veya render yoğunluğu farkı bulunmadı.",
+  };
+}
+
 // =====================================================
 // TUTAR FORENSICS V4 — ŞABLON + ETİKET + PİKSEL KONTROLÜ
 // =====================================================
@@ -5980,6 +6237,7 @@ buffer.toString(
 
 let paddleImageOCR = null;
 let amountForensics = null;
+let referenceTemplateAnalysis = null;
 
 if (
 type === "image" ||
@@ -6023,6 +6281,28 @@ JSON.stringify(amountForensics)
 
 }
 
+}
+
+// =====================================================
+// REFERANS ŞABLON KALİBRASYONU
+// =====================================================
+if (
+  (type === "image" || type === "pdf") &&
+  bank &&
+  reference &&
+  paddleImageOCR?.success
+) {
+  try {
+    referenceTemplateAnalysis = await analyzeReferenceTemplateAgainstDocument(
+      filePath,
+      mime,
+      bank,
+      paddleImageOCR
+    );
+    console.log("REFERENCE TEMPLATE ANALYSIS:", JSON.stringify(referenceTemplateAnalysis));
+  } catch (error) {
+    console.warn("REFERENCE TEMPLATE ANALYSIS HATASI:", error?.message || error);
+  }
 }
 
 // =================================================
@@ -6814,6 +7094,37 @@ Bu sonucu görsel belgeyle birlikte değerlendir.
 =====================================================
 `,
 });
+}
+
+// -------------------------------------------------
+// REFERANS ŞABLON PROFİLİ CONTEXT
+// -------------------------------------------------
+if (referenceTemplateAnalysis) {
+  content.unshift({
+    type: "input_text",
+    text: `
+=====================================================
+DETERMINISTIK REFERANS ŞABLON KALİBRASYONU
+=====================================================
+
+Bu veri, banka referans PDF'sinden çıkarılan ŞABLON bilgisidir.
+Referans PDF'deki gerçek işlem değerleri kullanılmaz ve gerçek dekonta aktarılmaz.
+
+Referans alan sayısı: ${referenceTemplateAnalysis.referenceFieldCount}
+Eşleşen alan sayısı: ${referenceTemplateAnalysis.matchedFieldCount}
+Belirgin geometri farkı: ${referenceTemplateAnalysis.strongGeometryCount}
+Belirgin render/font yoğunluğu farkı: ${referenceTemplateAnalysis.strongStyleCount}
+
+Alanlar:
+${JSON.stringify(referenceTemplateAnalysis.fields || [], null, 2)}
+
+ÖZELLİKLE GÖNDEREN/ALICI ADRES ALANLARINI KONTROL ET.
+Referansın konumu, alan ölçüsü ve render yoğunluğu gerçek dekonttaki karşılığıyla birlikte değerlendirilsin.
+
+Konum veya font/render farkı tek başına sahtecilik kanıtı değildir; başka bağımsız bulgularla birlikte değerlendirilmelidir.
+=====================================================
+`,
+  });
 }
 
 // -------------------------------------------------
