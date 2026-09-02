@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static";
 import sharp from "sharp";
 import { createWorker } from "tesseract.js";
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk";
-import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs";
+import * as pdfjslib from "pdfjs-dist/build/pdf.mjs";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
 import {
@@ -192,7 +192,6 @@ result.pages
 const allTexts = [];
 
 const allScores = [];
-const allBoxes = [];
 
 
 for (
@@ -225,34 +224,22 @@ pruned.rec_scores
 :
 [];
 
-const boxes =
-Array.isArray(pruned?.rec_boxes)
-? pruned.rec_boxes
-: Array.isArray(pruned?.dt_polys)
-? pruned.dt_polys
-: [];
 
+for (
+const text
+of texts
+) {
 
-for (let i = 0; i < texts.length; i++) {
+if (
+text !== null &&
+text !== undefined &&
+String(text).trim()
+) {
 
-const cleanText =
-String(texts[i] ?? "").trim();
+allTexts.push(
+String(text).trim()
+);
 
-if (!cleanText) {
-continue;
-}
-
-allTexts.push(cleanText);
-
-const box = boxes[i];
-
-if (box) {
-allBoxes.push({
-text: cleanText,
-box,
-score:
-Number(scores[i]) || 0,
-});
 }
 
 }
@@ -337,14 +324,11 @@ text,
 
 confidence,
 
-
 success:
 true,
 
 pages:
 pages.length,
-
-boxes: allBoxes,
 
 };
 
@@ -853,201 +837,8 @@ apiKey:
 process.env.OPENAI_API_KEY,
 });
  
-async function analyzeAmountRegion(
-imagePath,
-box
-) {
-
-if (
-!imagePath ||
-!Array.isArray(box) ||
-box.length < 4
-) {
-
-return {
-available: false,
-reason: "Tutar bölgesi belirlenemedi.",
-};
-
-}
-
-try {
-
-const xs =
-box.map(point => Number(point[0]));
-
-const ys =
-box.map(point => Number(point[1]));
-
-const left =
-Math.max(0, Math.floor(Math.min(...xs)));
-
-const top =
-Math.max(0, Math.floor(Math.min(...ys)));
-
-const right =
-Math.ceil(Math.max(...xs));
-
-const bottom =
-Math.ceil(Math.max(...ys));
-
-const width =
-right - left;
-
-const height =
-bottom - top;
-
-if (
-width <= 0 ||
-height <= 0
-) {
-
-return {
-available: false,
-reason: "Geçerli tutar bölgesi bulunamadı.",
-};
-
-}
-
-const { data, info } =
-await sharp(imagePath)
-.extract({
-left,
-top,
-width,
-height,
-})
-.grayscale()
-.raw()
-.toBuffer({
-resolveWithObject: true,
-});
-
-let darkPixels = 0;
-let totalIntensity = 0;
-
-for (
-let i = 0;
-i < data.length;
-i++
-) {
-
-const value =
-Number(data[i]);
-
-totalIntensity += value;
-
-if (value < 150) {
-darkPixels++;
-}
-
-}
-
-const pixelCount =
-data.length;
-
-const averageIntensity =
-pixelCount
-? totalIntensity / pixelCount
-: null;
-
-const darkRatio =
-pixelCount
-? darkPixels / pixelCount
-: null;
-
-return {
-
-available: true,
-
-left,
-top,
-width,
-height,
-
-averageIntensity,
-
-darkRatio,
-
-};
-
-}
-catch (error) {
-
-console.error(
-"AMOUNT REGION ANALYSIS ERROR:",
-error
-);
-
-return {
-
-available: false,
-
-reason:
-error?.message ||
-"Tutar bölgesi analiz edilemedi.",
-
-};
-
-}
-
-} 
-
-// =====================================================
-// OCR SONUÇLARINDAN TUTAR KUTUSUNU BUL
-// =====================================================
-
-function findAmountBoxFromOCR(paddleResult) {
-
-const boxes =
-Array.isArray(paddleResult?.boxes)
-? paddleResult.boxes
-: [];
-
-if (!boxes.length) {
-return null;
-}
-
-// Para/tutar görünümünü yakalamaya çalış
-const amountRegex =
-/(?:₺|TL|TRY|EUR|USD|\$|€)?\s*\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*(?:₺|TL|TRY|EUR|USD|\$|€)?/i;
-
-const candidates = [];
-
-for (const item of boxes) {
-
-const text =
-String(item?.text || "").trim();
-
-if (!text) {
-continue;
-}
-
-if (amountRegex.test(text)) {
-
-candidates.push({
-text,
-box: item.box,
-score:
-Number(item.score) || 0,
-});
-
-}
-
-}
-
-if (!candidates.length) {
-return null;
-}
-
-// En yüksek OCR confidence olan adayı seç
-candidates.sort(
-(a, b) =>
-b.score - a.score
-);
-
-return candidates[0];
-}
+ 
+ 
 // =====================================================
 // CHECKLER
 // =====================================================
@@ -1910,70 +1701,8 @@ false,
  
 },
  
-
-amountForensics: {
-type: "object",
-properties: {
-
-status: {
-type: "string",
-enum: [
-"pass",
-"fail",
-"unknown"
-],
 },
-
-amountText: {
-type: ["string", "null"],
-},
-
-visualConsistency: {
-type: "string",
-enum: [
-"consistent",
-"inconsistent",
-"uncertain"
-],
-},
-
-localizedDifference: {
-type: "boolean",
-},
-
-strokeDifference: {
-type: "boolean",
-},
-
-darknessDifference: {
-type: "boolean",
-},
-
-renderingDifference: {
-type: "boolean",
-},
-
-evidence: {
-type: "string",
-},
-
-},
-
-required: [
-"status",
-"amountText",
-"visualConsistency",
-"localizedDifference",
-"strokeDifference",
-"darknessDifference",
-"renderingDifference",
-"evidence",
-],
-
-additionalProperties: false,
-},
-
-  
+ 
 required: [
  
 "overallRisk",
@@ -1985,7 +1714,6 @@ required: [
 "checks",
 "limitations",
 "amountAnalysis",
-"amountForensics",
  
 ],
  
@@ -3424,35 +3152,16 @@ As part of the amountConsistency check, also verify whether
 the main transaction amount matches any written statement such as
 "... TL has been sent".
 
-PaddleOCR ana işlem tutarını farklı bir değer olarak
-okuyorsa bunu otomatik olarak gerçek kabul etme.
-
-Görüntüdeki rakamları doğrudan kontrol et.
-
-OCR ve görüntü arasında tutar farkı varsa bunu
-amountConsistency incelemesinde dikkate al.
-
-Özellikle OCR'ın:
-
-- 1 / 7
-- 0 / 6 / 8
-- 1 / I
-- 0 / O
-- , / .
-- rakam atlama
-- fazla rakam
-
-hataları yapabileceğini unutma.
-
 If the visible numeric amount and the written transaction amount
 do not match, report this as a fail under amountConsistency.
 Only report this when both values are actually visible and readable.
 For each check:
  
 status:
-- pass = sorun görülmedi
-- fail = somut bir sorun veya tutarsızlık görüldü
-- unknown = güvenilir şekilde değerlendirilemedi
+- pass
+- review
+- suspicious
+- unknown
  
 score:
 0 = no suspicious evidence detected
@@ -3461,186 +3170,6 @@ score:
 Evidence must be concise and written in Turkish.
  
 Do not invent evidence.
-
-=====================================================
-CRITICAL — ANA İŞLEM TUTARI FORENSİK İNCELEMESİ
-=====================================================
-
-ANA İŞLEM TUTARI, BELGENİN EN YÜKSEK ÖNCELİKLİ
-ALANLARINDAN BİRİDİR.
-
-Tutarın yalnızca doğru okunup okunmadığını kontrol etme.
-
-Tutarın GÖRSEL OLARAK BELGENİN DOĞAL BİR PARÇASI OLUP
-OLMADIĞINI ayrıca incele.
-
-Özellikle ana işlem tutarındaki HER RAKAMI ayrı ayrı incele.
-
-Örneğin:
-
-1.700,00 TL
-
-gibi bir tutar görülüyorsa:
-
-1
-7
-0
-0
-0
-0
-
-rakamlarının her birini çevredeki aynı veya benzer
-rakamlarla görsel olarak karşılaştır.
-
-ŞUNLARI KONTROL ET:
-
-- rakam yüksekliği
-- rakam genişliği
-- stroke kalınlığı
-- font ağırlığı
-- karakter aralığı
-- baseline
-- üst/alt hizalama
-- kenar keskinliği
-- anti-aliasing
-- piksel yapısı
-- JPEG sıkıştırma davranışı
-- rakamın arka planla birleşimi
-- rakamın çevresindeki lokal görüntü kalitesi
-- rakamın diğer metinlerle aynı render yapısına sahip olup olmadığı
-
-=====================================================
-AYNI RAKAMLARI KARŞILAŞTIR
-=====================================================
-
-Belgenin başka bölgelerinde aynı rakamlar bulunuyorsa,
-ana işlem tutarındaki rakamlarla karşılaştır.
-
-Örneğin ana tutarda "1", "7" veya "0" bulunuyorsa,
-belgenin diğer alanlarında görülen aynı karakterlerle:
-
-- şekil
-- genişlik
-- yükseklik
-- kalınlık
-- kenar yapısı
-- baseline
-- render kalitesi
-
-açısından karşılaştır.
-
-Aynı belge içerisinde aynı yazı stilindeki karakterler
-belirgin şekilde farklı görünüyorsa bunu dikkate al.
-
-=====================================================
-LOKAL MANİPÜLASYON KONTROLÜ
-=====================================================
-
-Ana işlem tutarının çevresinde özellikle şunları ara:
-
-- silme izi
-- beyazlatılmış veya kapatılmış alan
-- farklı arka plan dokusu
-- dikdörtgen maskeleme
-- farklı JPEG sıkıştırması
-- farklı keskinlik
-- farklı noise yapısı
-- karakter çevresinde halo
-- yapıştırılmış gibi duran karakter
-- diğer metinden farklı anti-aliasing
-- karakterlerin doğal olmayan hizalanması
-- karakterler arasında anormal boşluk
-- yalnızca tutar bölgesinde görülen görüntü bozulması
-
-Bunlardan biri açıkça görülüyorsa:
-
-amountConsistency = fail
-
-veya
-
-editingTraces = fail
-
-olarak değerlendir.
-
-Ancak yalnızca küçük görüntü kalitesi farklılıkları
-veya JPEG sıkıştırması nedeniyle FAIL verme.
-
-=====================================================
-TUTARIN OKUNMASI ≠ TUTARIN DOĞALLIĞI
-=====================================================
-
-ÇOK ÖNEMLİ:
-
-Bir tutarın net şekilde okunabiliyor olması,
-tutarın değiştirilmediğini göstermez.
-
-Örneğin:
-
-"1.700,00 TL"
-
-net şekilde okunuyor olsa bile, rakamların sonradan
-eklenmiş veya değiştirilmiş olup olmadığı ayrıca
-incelenmelidir.
-
-Bu nedenle:
-
-"tutar okunuyor"
-
-tek başına amountConsistency = pass sebebi değildir.
-
-Hem:
-
-1. TUTARIN NE OLDUĞUNU OKU
-
-hem:
-
-2. TUTARIN GÖRSEL OLARAK BELGEYLE UYUMLU OLUP
- OLMADIĞINI İNCELE.
-
-=====================================================
-KARŞILAŞTIRMA ÖNCELİĞİ
-=====================================================
-
-Ana tutar ile ilgili birden fazla bilgi varsa aşağıdaki
-öncelik sırasını kullan:
-
-1. Belgede görünen rakamsal ana işlem tutarı
-2. "Yalnız ...", "..." TL gönderildi vb. yazılı tutar
-3. "Hesabınızdan ...", "İşlem tutarı ..." gibi tekrar eden tutarlar
-4. Toplam / masraf / komisyon ilişkisi
-5. Kullanıcı tarafından ayrıca verilen beklenen tutar
-6. Yardımcı OCR sonuçları
-
-Birbirleriyle uyuşmayan iki açık ve okunabilir tutar
-varsa bunu amountConsistency altında açıkça belirt.
-
-OCR ile görüntü çelişirse GÖRÜNTÜYÜ esas al.
-
-=====================================================
-KULLANICI TARAFINDAN BEKLENEN TUTAR VERİLDİYSE
-=====================================================
-
-Backend tarafından kullanıcıya ait beklenen işlem tutarı
-sağlanmışsa, bunu ayrıca karşılaştır.
-
-Beklenen tutar ile belgede görünen ana işlem tutarı
-arasında fark varsa:
-
-amountConsistency = fail
-
-olarak değerlendir.
-
-Farkı açıkça evidence alanında belirt.
-
-Örneğin:
-
-"Beklenen işlem tutarı ile dekont üzerinde görünen ana
-işlem tutarı uyuşmamaktadır."
-
-Ancak kullanıcı tarafından beklenen tutar verilmemişse
-tahmin yapma.
-
-Belgede görünmeyen bir gerçek tutarı varsayma.
  
 =====================================================
 TURKISH CHARACTER RISK
@@ -3728,423 +3257,36 @@ Matematiksel tutarsızlık varsa bunun nedenini amountAnalysis.evidence
 alanında açıkça belirt.
  
 =====================================================
-ANA TUTAR KARAKTER / FONT / STROKE KONTROLÜ
+ANA TUTAR KARAKTER / FONT KONTROLÜ
 =====================================================
-
-Ana işlem tutarı üzerinde özel ve ayrıntılı görsel inceleme yap.
-
-Bu kontrol yalnızca tutarın doğru okunmasına değil,
-tutarın gerçekten aynı görsel/metinsel üretimden çıkmış
-olup olmadığına yönelik görsel tutarlılığa odaklanmalıdır.
-
-Özellikle ana işlem tutarındaki HER RAKAMI ayrı ayrı incele.
-
-Kontrol et:
-
+ 
+Ana işlem tutarının karakterlerini görsel olarak incele.
+ 
+Özellikle:
+ 
 - karakter yüksekliği
 - karakter genişliği
-- font görünümü
-- font ağırlığı
-- stroke / çizgi kalınlığı
-- rakamların koyuluk seviyesi
-- piksel yoğunluğu
-- kenar keskinliği
-- anti-aliasing
-- karakter içi doluluk
-- karakter aralıkları
-- baseline
-- dikey hizalama
-- yatay hizalama
-- rakamların çevresindeki boşluk
-- rakamların diğer aynı tür metinlerle görsel uyumu
-
-=====================================================
-AYNI TUTAR İÇİN RAKAM-RİCAM KARŞILAŞTIRMASI
-=====================================================
-
-Ana işlem tutarı birden fazla rakam içeriyorsa,
-rakamları yalnızca bütün olarak değil, tek tek karşılaştır.
-
-Örneğin:
-
-1.700,00 TL
-
-ifadesinde:
-
-1
-.
-7
-0
-0
-,
-0
-0
-
-karakterlerinin görsel özelliklerini ayrı ayrı incele.
-
-Özellikle aynı tutar içerisindeki aynı karakterlerin
-birbirleriyle tutarlı olup olmadığını kontrol et.
-
-Örneğin:
-
-1.700,00
-
-ifadesindeki "0" karakterlerinden biri diğerlerinden
-belirgin şekilde daha koyu, daha kalın, daha keskin,
-daha büyük veya farklı render edilmiş görünüyorsa
-bunu ayrıca belirt.
-
-Ancak küçük ve kamera/sıkıştırma kaynaklı farklılıkları
-tek başına manipülasyon olarak değerlendirme.
-
-=====================================================
-KOYULUK / STROKE FARKI
-=====================================================
-
-ÖZELLİKLE kontrol et:
-
-Ana işlem tutarının bir bölümü diğer bölümüne göre
-belirgin şekilde daha koyu veya daha kalın mı?
-
-Örneğin:
-
-"1.700" bölümü daha silik,
-",00" bölümü daha koyu/kalın
-
-gibi bir fark varsa bunu tespit et.
-
-Benzer şekilde:
-
-- ilk rakamların daha silik olması
-- son rakamların daha koyu olması
-- belirli bir rakamın daha kalın olması
-- belirli bir rakamın daha keskin olması
-- bir grup rakamın farklı piksel yoğunluğuna sahip olması
-- aynı tutar içerisinde farklı render kalitesi bulunması
-
-gibi durumları incele.
-
-Belirgin ve lokalize bir fark varsa bunu
-amountConsistency ve fontConsistency kontrollerinde
-kanıt olarak değerlendir.
-
-=====================================================
-LOKAL BÖLGE ANALİZİ
-=====================================================
-
-Tutar alanındaki farklılık tüm belgeye yayılmış mı,
-yoksa yalnızca belirli rakamlarda mı görülüyor
-bunu ayırt et.
-
-Tüm belge genelinde aynı koyuluk/kalınlık değişimi
-varsa bunu öncelikle:
-
-- fotoğraf ışığı
-- perspektif
-- kamera odağı
-- JPEG sıkıştırması
-- ekran görüntüsü
-- tarama koşulları
-
-gibi doğal görüntüleme koşullarıyla açıklamaya çalış.
-
-Buna karşılık fark yalnızca ana işlem tutarının
-belirli rakamlarında veya belirli bir bölümünde
-lokalize ise daha dikkatli incele.
-
-Özellikle:
-
-- tutarın ilk kısmı
-- tutarın son kısmı
-- ondalık kısmı
-- binlik kısmı
-
-arasında belirgin render farkı olup olmadığını kontrol et.
-
-=====================================================
-FONT FARKI İLE GÖRÜNTÜ KALİTESİNİ AYIR
-=====================================================
-
-Bir rakamın daha silik görünmesi tek başına
-farklı font anlamına gelmez.
-
-Aşağıdakileri birbirinden ayır:
-
-1. doğal fotoğraf/sıkıştırma farkı
-2. odak veya ışık farkı
-3. ekran fotoğrafı kaynaklı görüntü farkı
-4. tarama/render farkı
-5. gerçek font/stroke farkı
-6. olası sonradan ekleme veya değiştirme
-
-Bir farkın kaynağı güvenilir şekilde belirlenemiyorsa
-"Belirlenemedi — yeterli görsel kanıt yok."
-ifadesini kullan.
-
-=====================================================
-TUTARDA SONRADAN EKLENMİŞ GÖRÜNÜM
-=====================================================
-
-Ana işlem tutarındaki belirli rakamlar çevresindeki
-metinden farklı görünüyorsa şu özellikleri birlikte
-değerlendir:
-
 - font ağırlığı
 - stroke kalınlığı
-- karakter genişliği
-- karakter yüksekliği
+- karakter aralığı
 - baseline
-- spacing
-- kenar keskinliği
-- anti-aliasing
-- piksel yoğunluğu
-- çevredeki arka planla birleşme şekli
-
-Birden fazla bağımsız görsel farklılık aynı bölgede
-birlikte görülüyorsa bunu önemli bir görsel tutarsızlık
-olarak raporla.
-
-Tek bir küçük farklılığı kesin manipülasyon olarak
-yorumlama.
-
-=====================================================
-TUTAR KONTROLÜ SONUCU
-=====================================================
-
-Tutar görsel olarak okunabiliyorsa tutarın kendisini
-açıkça belirt.
-
-Örneğin:
-
-"Görüntüde ana işlem tutarı 1.700,00 TL olarak
-okunmaktadır. Ancak tutarın '1.700' bölümü ile
-',00' bölümü arasında belirgin koyuluk ve stroke
-kalınlığı farkı görülmektedir. Fark lokalize olduğu
-için olası sonradan düzenleme açısından inceleme
-gerektiren bir görsel tutarsızlık olarak
-değerlendirilmiştir."
-
-Ancak fark yeterince belirgin değilse:
-
-"1.700,00 TL tutarı okunabilmektedir. Rakamlar
-arasında küçük görsel yoğunluk farklılıkları
-bulunmakla birlikte bunların manipülasyon olduğunu
-gösterecek yeterli görsel kanıt bulunmamaktadır."
-
-şeklinde değerlendir.
-
-=====================================================
-KRİTİK KURAL
-=====================================================
-
-Ana işlem tutarını değerlendirirken:
-
-OCR sonucu ≠ otomatik gerçek
-
-OCR sonucu yalnızca yardımcı veridir.
-
-GERÇEK GÖRÜNTÜ ÖNCELİKLİDİR.
-
-Görüntüdeki rakamlar ile OCR sonucu çelişirse
-görüntüyü tekrar incele.
-
-OCR'ın yanlış okumasını gerçek belge değeri olarak
-kabul etme.
-
-Özellikle:
-
-1 ↔ 7
-0 ↔ 6
-0 ↔ 8
-1 ↔ I
-0 ↔ O
-, ↔ .
-eksik rakam
-fazla rakam
-binlik ayırıcı
-ondalık ayırıcı
-
-hatalarına dikkat et.
-
-=====================================================
-=====================================================
-ANA TUTAR — MİKRO GÖRSEL FORENSİK KONTROL
-=====================================================
-
-İşlem tutarı belgenin en kritik alanlarından biridir.
-
-Ana işlem tutarını yalnızca okunabilir bir metin olarak değerlendirme.
-
-Tutar alanını ayrıca görsel olarak incele.
-
-Özellikle:
-
-- rakamların karakter yüksekliği
-- karakter genişliği
-- stroke / çizgi kalınlığı
-- font ağırlığı
-- rakamların iç boşlukları
-- rakamların kenar keskinliği
-- anti-aliasing yapısı
-- piksel / raster yapısı
-- karakterler arası boşluk
-- baseline
-- üst ve alt hizalama
-- virgül ve nokta karakterlerinin yapısı
-- TL sembolü veya TL yazısının yapısı
-- aynı belgede bulunan benzer rakamlarla görsel uyum
-
-kontrol edilmelidir.
-
-Özellikle ana işlem tutarındaki rakamları,
-belgenin başka bölgelerinde bulunan aynı veya benzer
-rakam karakterleriyle karşılaştır.
-
-Örneğin belgede başka bir "1", "7", "0", "0" veya
-benzer fontta rakam bulunuyorsa bunların:
-
-- şekli
-- genişliği
-- kalınlığı
+- hizalama
 - kenar yapısı
-- render kalitesi
-
-açısından tutar alanıyla uyumlu olup olmadığını incele.
-
-Tutar alanının çevresindeki arka plan ile rakamların
-kenarlarını ayrıca incele.
-
-Şunlardan biri gerçekten görülüyorsa amountConsistency
-ve/veya editingTraces kontrolünde FAIL ver:
-
-- rakam çevresinde belirgin silme izi
-- farklı keskinlikte rakam
-- farklı sıkıştırma / raster yapısı
-- rakamın çevresinde dikdörtgen veya maskeleme izi
-- karakterin arka planla birleşiminde anormallik
-- diğer aynı font karakterlerinden belirgin farklı render
-- baseline veya hizalama anomalisi
-- sonradan yerleştirilmiş gibi görünen karakter
-- karakterler arasında doğal olmayan spacing
-- tutar alanında lokal görüntü kalitesi değişikliği
-
-Ancak yalnızca görüntü kalitesi, perspektif,
-JPEG sıkıştırması veya fotoğraf çekim koşulları nedeniyle
-oluşan küçük farklılıkları manipülasyon kabul etme.
-
-Somut görsel kanıt yoksa FAIL verme.
-
-Yeterli çözünürlük yoksa UNKNOWN kullan.
-
-ÖNEMLİ:
-
-Ana işlem tutarı yalnızca "okunuyor mu?" diye kontrol edilmemelidir.
-
-"Tutar 1.700,00 TL olarak okunuyor" demek,
-tutarın görsel olarak değiştirilmediğini kanıtlamaz.
-
-Okunabilirlik ve görsel bütünlük iki ayrı kontroldür.
-
-
-=====================================================
-AMOUNT FORENSICS — ZORUNLU GÖRSEL KARŞILAŞTIRMA
-=====================================================
-
-amountForensics alanı yalnızca ana işlem tutarının
-görsel bütünlüğünü değerlendirmek içindir.
-
-Bu alan OCR sonucundan üretilemez.
-
-ASIL KAYNAK yalnızca belge görüntüsüdür.
-
-Ana işlem tutarı okunabiliyorsa, tutarın içindeki
-karakterleri birbirleriyle ve belgede bulunan aynı
-veya benzer karakterlerle karşılaştır.
-
-Özellikle tutarın farklı bölümleri arasında:
-
-- koyuluk
-- stroke kalınlığı
-- karakter yoğunluğu
-- kenar keskinliği
 - anti-aliasing
-- piksel yoğunluğu
-- render kalitesi
-
-farkı olup olmadığını incele.
-
-ÖRNEK:
-
-1.700,00 TL
-
-ifadesinde:
-
-"1.700"
-
-ile
-
-",00"
-
-bölümlerinin görsel üretim özelliklerini karşılaştır.
-
-Eğer ",00" bölümü "1.700" bölümünden belirgin şekilde
-daha koyu veya kalın görünüyorsa bunu yalnızca
-"okunabilirlik farkı" olarak geçme.
-
-Önce bunun:
-
-1. ışık,
-2. odak,
-3. perspektif,
-4. JPEG sıkıştırması
-
-gibi tüm belgeyi etkileyen doğal bir neden olup
-olmadığını değerlendir.
-
-Fark yalnızca tutarın belirli karakterlerinde veya
-belirli bir bölümünde lokalizeyse bunu özellikle belirt.
-
-Aynı tutar içerisinde aynı karakterlerden birinin
-diğerlerinden belirgin şekilde farklı görünmesi
-özellikle önemlidir.
-
-Örneğin:
-
-1.700,00
-
-içindeki "0" karakterlerinden biri diğerlerinden
-belirgin şekilde daha koyu, kalın, keskin veya farklı
-render edilmiş görünüyorsa bunu evidence alanında
-açıkça belirt.
-
-Küçük veya belirsiz farklılıkları FAIL yapma.
-
-Fark açık, lokalize ve birden fazla görsel özellikle
-destekleniyorsa:
-
-status = "fail"
-
-kullan.
-
-Yeterli çözünürlük olmadığı için güvenilir karar
-verilemiyorsa:
-
-status = "unknown"
-
-kullan.
-
-Hiçbir anlamlı görsel tutarsızlık yoksa:
-
-status = "pass"
-
-kullan.
-
-ÖNEMLİ:
-
-Tutarın okunabilmesi amountForensics = pass anlamına
-gelmez.
-
-Okunabilirlik ve görsel bütünlük ayrı kontrollerdir.
+- genel render görünümü
+ 
+açısından çevresindeki aynı tip metinlerle tutarlılığını değerlendir.
+ 
+Farklı rakamların doğal olarak farklı şekillere sahip olduğunu unutma.
+ 
+Tek başına bir karakterin diğer rakamlardan farklı görünmesi
+şüpheli değildir.
+ 
+Fotoğraf açısı, perspektif, ışık, JPEG sıkıştırması veya görüntü
+kalitesi kaynaklı küçük farklılıkları sahtecilik olarak değerlendirme.
+ 
+Yeterli görsel kanıt yoksa şüpheli sonuç üretme.
+ 
 ==================================================
 RISK CALCULATION
 ==================================================
@@ -4588,157 +3730,91 @@ Return ONLY the JSON object matching the supplied schema.
 SABİT ANALİZ SONUCU FORMATI
 ============================================================
  
-
+ANALİZ SONUCUNU HER ZAMAN AŞAĞIDAKİ 5 BAŞLIKLA VE TAM OLARAK BU SIRAYLA VER.
  
 JPEG VE PDF İÇİN AYNI FORMAT KULLANILACAKTIR.
 DOSYA TÜRÜNE GÖRE BAŞLIK, SIRA VE YAPI DEĞİŞTİRME.
  
-=====================================================
-YORUM / SUMMARY FORMATI
-=====================================================
-
-summary alanı kullanıcıya gösterilecek ana yorumdur.
-
-ÇOK ÖNEMLİ:
-
-summary yalnızca gerçekten tespit edilen önemli bulguları
-içermelidir.
-
-TEMİZ / SORUNSUZ KONTROLLERİ TEK TEK YAZMA.
-
-Örneğin:
-
-Tutar sorunsuzsa:
-"1. TUTAR KONTROLÜ: Sorun tespit edilmedi."
-
-şeklinde ayrı ayrı yazma.
-
-Bunun yerine yalnızca önemli bir sorun varsa belirt.
-
-=====================================================
-KULLANILACAK KONTROL SIRASI
-=====================================================
-
-Analiz mantıksal olarak aşağıdaki 5 alanı kontrol etmelidir:
-
 1. TUTAR KONTROLÜ
+- İşlem tutarının doğru görünüp görünmediğini kontrol et.
+- Tutar alanında görünür bir oynama veya sonradan eklenmiş/değiştirilmiş görünüm var mı kontrol et.
+- Tutarın fontu, karakter yapısı, boyutu, hizası ve çevresindeki metinle görsel tutarlılığını kontrol et.
+- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
+ 
 2. ALICI BİLGİLERİ
+- Alıcı adını kontrol et.
+- Alıcı IBAN'ını kontrol et.
+- Alıcı adı ve IBAN'ın dekont içindeki diğer bilgilerle tutarlı olup olmadığını kontrol et.
+- Bu alanlarda font, karakter, hizalama veya görsel oynama belirtisi olup olmadığını kontrol et.
+- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
+ 
 3. TOPLAM / YAZILI TUTAR UYUMU
+ÖZELLİKLE KONTROL ET:
+- "Yalnız ..." şeklinde yazıyla belirtilen tutar
+- "Hesabınızdan ..." şeklinde belirtilen işlem tutarı
+- Dekonttaki rakamsal ana işlem tutarı
+- Toplam tutar / masraf / işlem tutarı ilişkisi
+ 
+Bu değerlerin matematiksel ve metinsel olarak birbiriyle uyumlu olup olmadığını kontrol et.
+ 
+Birbirleriyle uyuşmayan tutarlar varsa bunu açıkça belirt ve hangi tutarların uyuşmadığını yaz.
+ 
 4. OYNAMA / KIRPMA / KESME KONTROLÜ
+- Görsel olarak tespit edilebilen kesme
+- kırpma
+- silme
+- ekleme
+- birleştirme
+- font değişikliği
+- farklı bölgenin sonradan yerleştirilmiş görünmesi
+- hizalama veya karakter yapısında belirgin anormallik
+ 
+var mı kontrol et.
+ 
+SADECE GÖRSEL OLARAK DESTEKLENEN BULGULARI RAPORLA.
+Görünmeyen veya kanıtlanamayan bir düzenleme olduğunu iddia etme.
+ 
 5. TARİH / SAAT KONTROLÜ
-
-Ancak summary içerisinde yalnızca sorun veya dikkat edilmesi
-gereken somut bir bulgu bulunan alanları göster.
-
-Sorunsuz alanları tekrar tekrar yazma.
-
-=====================================================
-YORUM YAZIM KURALI
-=====================================================
-
-Eğer önemli bir sorun / tutarsızlık / görsel anormallik varsa:
-
-summary içerisinde kısa maddeler halinde belirt.
-
-Örnek:
-
-"• İşlem tutarı ile yazılı tutar arasında uyumsuzluk tespit edildi.
-• Alıcı IBAN'ında belge içerisindeki diğer bilgilerle tutarsızlık görüldü."
-
-Her madde en fazla 1 kısa cümle olsun.
-
-Gereksiz açıklama yapma.
-
-Kare kare anlatma.
-
-OCR sürecini anlatma.
-
-Teknik analiz sürecini anlatma.
-
-Model veya algoritmadan bahsetme.
-
-=====================================================
-SORUN YOKSA
-=====================================================
-
-Eğer anlamlı hiçbir tutarsızlık veya manipülasyon göstergesi
-tespit edilmemişse summary yalnızca şu anlama gelen kısa bir
-cümle olmalıdır:
-
-"Belgede belirgin bir tutarsızlık veya manipülasyon göstergesi
-tespit edilmedi."
-
-Bu cümleyi gereksiz şekilde uzatma.
-
-=====================================================
-BELİRSİZ DURUMLAR
-=====================================================
-
-Bir alan okunamıyorsa veya güvenilir şekilde değerlendirilemiyorsa
-bunu yalnızca gerçekten önemliyse belirt.
-
-Örneğin:
-
-"• Görüntü kalitesi nedeniyle alıcı IBAN'ının tamamı güvenilir
-şekilde doğrulanamadı."
-
-Belirsizliği sahtecilik olarak değerlendirme.
-
-=====================================================
-ÖNCELİK
-=====================================================
-
-Bulgu varsa öncelik sırası:
-
-1. Tutar uyumsuzluğu
-2. Yazılı tutar / rakamsal tutar uyumsuzluğu
-3. Alıcı adı / IBAN uyumsuzluğu
-4. Tarih / saat tutarsızlığı
-5. Görsel oynama / ekleme / silme / kesme
-6. Diğer önemli finansal tutarsızlıklar
-
-Önemsiz veya normal görsel farklılıkları summary'ye yazma.
-
-=====================================================
-KANIT KURALI
-=====================================================
-
-"Şüpheli",
-"uyumsuz",
-"oynama var",
-"değiştirilmiş",
-"manipüle edilmiş"
-
-gibi ifadeleri yalnızca gözlemlenebilir ve açıklanabilir
-kanıt varsa kullan.
-
-Tek başına:
-
-- farklı font görünümü
-- fotoğraf açısı
-- JPEG sıkıştırması
-- görüntü kalitesi
-- tarama kalitesi
-- normal karakter farklılığı
-
-sahtecilik kanıtı değildir.
-
-Görsel veya veri kanıtı yoksa sorun üretme.
-
-=====================================================
-SUMMARY ÇIKTI KURALI
-=====================================================
-
-summary:
-
-- Türkçe olmalıdır.
-- Kısa olmalıdır.
-- Yalnızca önemli bulguları içermelidir.
-- Temiz kontrolleri tek tek listelememelidir.
-- En fazla 3-5 kısa madde kullanılmalıdır.
-- Sorun yoksa tek kısa cümle kullanılmalıdır.
-- Aynı bulguyu tekrar etmemelidir.
-- Kesin "sahte" veya "gerçek" sonucu vermemelidir.
+- Tarih formatını kontrol et.
+- Saat formatını kontrol et.
+- Tarih ve saatin dekontun diğer görünen bilgileriyle tutarlı olup olmadığını kontrol et.
+- Tarih/saat alanında font, karakter, hizalama veya görsel farklılık olup olmadığını kontrol et.
+- Gerçekten görülen kanıt yoksa "Belirlenemedi" de.
+ 
+ 
+============================================================
+CEVAP YAZIM KURALI
+============================================================
+ 
+Yukarıdaki 5 başlığı HER ANALİZDE MUTLAKA KULLAN.
+ 
+Başlıkları değiştirme.
+Başlıkların sırasını değiştirme.
+Yeni ana başlık ekleme.
+Bu 5 kontrolü birleştirme.
+Aynı bulguyu farklı başlıklarda tekrar tekrar anlatma.
+ 
+Cevap kısa, net ve dekont üzerinde görülen kanıtlara dayalı olsun.
+ 
+Her başlık altında en fazla 1-2 kısa cümle kullan.
+ 
+FORMAT:
+ 
+1. TUTAR KONTROLÜ:
+[bulgu]
+ 
+2. ALICI BİLGİLERİ:
+[bulgu]
+ 
+3. TOPLAM / YAZILI TUTAR UYUMU:
+[bulgu]
+ 
+4. OYNAMA / KIRPMA / KESME KONTROLÜ:
+[bulgu]
+ 
+5. TARİH / SAAT KONTROLÜ:
+[bulgu]
+ 
  
 ============================================================
 KANIT KURALI
@@ -6263,109 +5339,44 @@ buffer.toString(
 "base64"
 );
  
-// =================================================
+// =====================================================
 // PADDLEOCR IMAGE OCR
-// =================================================
+// =====================================================
 
 let paddleImageOCR = null;
 
-let amountRegionAnalysis = null;
-
 if (
- type === "image" ||
- type === "statement"
+type === "image" ||
+type === "statement"
 ) {
 
- console.log(
- "PADDLEOCR IMAGE ANALİZİ BAŞLIYOR..."
- );
+console.log(
+"PADDLEOCR IMAGE ANALİZİ BAŞLIYOR..."
+);
 
- paddleImageOCR =
- await runPaddleOCR(
- filePath
- );
 
- if (
- paddleImageOCR.success
- ) {
+paddleImageOCR =
+await runPaddleOCR(
+filePath
+);
 
- console.log(
- "PADDLEOCR IMAGE OCR BAŞARILI"
- );
 
- console.log(
- "PADDLEOCR IMAGE CONFIDENCE:",
- paddleImageOCR.confidence
- );
+if (
+paddleImageOCR.success
+) {
 
- // =================================================
- // ANA TUTAR KUTUSUNU BUL
- // =================================================
+console.log(
+"PADDLEOCR IMAGE OCR BAŞARILI"
+);
 
- const amountCandidate =
- findAmountBoxFromOCR(
- paddleImageOCR
- );
-
- if (
- amountCandidate
- ) {
-
- console.log(
- "===== AMOUNT REGION BULUNDU ====="
- );
-
- console.log(
- "AMOUNT OCR TEXT:",
- amountCandidate.text
- );
-
- console.log(
- "AMOUNT OCR SCORE:",
- amountCandidate.score
- );
-
- console.log(
- "AMOUNT BOX:",
- JSON.stringify(
- amountCandidate.box
- )
- );
-
- // =================================================
- // GÖRSEL TUTAR ANALİZİ
- // =================================================
-
- amountRegionAnalysis =
- await analyzeAmountRegion(
- filePath,
- amountCandidate.box
- );
-
- console.log(
- "===== AMOUNT REGION ANALYSIS ====="
- );
-
- console.log(
- JSON.stringify(
- amountRegionAnalysis,
- null,
- 2
- )
- );
-
- }
- else {
-
- console.log(
- "AMOUNT REGION BULUNAMADI"
- );
-
- }
-
- }
+console.log(
+"PADDLEOCR IMAGE CONFIDENCE:",
+paddleImageOCR.confidence
+);
 
 }
+
+} 
  
  
 // =================================================
@@ -6635,67 +5646,7 @@ console.log(
 reference?.fileName ||
 "YOK"
 );
-
-// =====================================================
-// AMOUNT FORENSICS CONTEXT
-// =====================================================
-
-let amountForensicsContext = "";
-
-if (
-amountRegionAnalysis?.available
-) {
-
-amountForensicsContext = `
-
-=====================================================
-OTOMATİK LOKAL TUTAR BÖLGESİ ÖLÇÜMÜ
-=====================================================
-
-Bu ölçüm gerçek belge görüntüsünden çıkarılmıştır.
-
-OCR tarafından bulunan tutar bölgesi:
-
-${findAmountBoxFromOCR(paddleImageOCR)?.text || "Bilinmiyor"}
-
-Bölge koordinatları:
-
-left:
-${amountRegionAnalysis.left}
-
-top:
-${amountRegionAnalysis.top}
-
-width:
-${amountRegionAnalysis.width}
-
-height:
-${amountRegionAnalysis.height}
-
-Ortalama piksel yoğunluğu:
-
-${amountRegionAnalysis.averageIntensity}
-
-Koyu piksel oranı:
-
-${amountRegionAnalysis.darkRatio}
-
-ÇOK ÖNEMLİ:
-
-Bu ölçüm tek başına manipülasyon kanıtı değildir.
-
-Kamera, ışık, perspektif, JPEG sıkıştırması,
-ekran fotoğrafı ve odak farklılıklarını dikkate al.
-
-Bu veriyi yalnızca görüntüdeki tutar bölgesini
-değerlendirirken yardımcı kanıt olarak kullan.
-
-ASIL KAYNAK BELGE GÖRÜNTÜSÜDÜR.
-
-=====================================================
-`;
-
-}
+ 
  
 // -------------------------------------------------
 // OPENAI INPUT
@@ -6723,11 +5674,10 @@ content = [
 // =================================================
  
 {
- type: "input_text",
-
- text: `${PROMPT}
-
-${amountForensicsContext}
+type:
+"input_text",
+ 
+text: `${PROMPT}
 
 =====================================================
 PADDLEOCR EK OCR SONUCU
@@ -6753,35 +5703,36 @@ PaddleOCR confidence:
 
 ${paddleImageOCR?.confidence ?? 0}
 
+ 
 =====================================================
 JPG / JPEG — ANALİZ EDİLECEK ASIL BELGE
 =====================================================
-
+ 
 ÇOK ÖNEMLİ:
-
+ 
 Bu analizde ASIL ANALİZ EDİLECEK BELGE,
 aşağıda gönderilen input_image olarak verilen
 JPG / JPEG dosyasıdır.
-
+ 
 TÜM GERÇEK DEKONT BİLGİLERİNİ YALNIZCA
 JPG / JPEG GÖRÜNTÜSÜNDEN ÇIKAR.
-
+ 
 JPG / JPEG üzerinde gerçekten görünmeyen hiçbir
 bilgiyi yazma.
-
+ 
 JPG / JPEG üzerinde bir bilgi okunamıyorsa:
 null kullan.
-
+ 
 =====================================================
 REFERANS PDF — SADECE GÖRSEL / ŞABLON REFERANSI
 =====================================================
-
+ 
 Aşağıda ayrıca bir banka referans PDF'i verilebilir.
-
+ 
 REFERANS PDF:
-
+ 
 SADECE şu amaçlarla kullanılabilir:
-
+ 
 - belge şablonu
 - sayfa düzeni
 - alanların konumu
@@ -6799,16 +5750,16 @@ SADECE şu amaçlarla kullanılabilir:
 - gönderen/alıcı alanlarının görsel yerleşimi
 - genel görsel yapı
 - belge üzerindeki olası düzenleme izlerinin karşılaştırılması
-
+ 
 =====================================================
 KESİN KURAL — VERİ AKTARMA YASAK
 =====================================================
-
+ 
 REFERANS PDF'DEKİ HİÇBİR GERÇEK İŞLEM BİLGİSİNİ
 JPG / JPEG'E AKTARMA.
-
+ 
 Özellikle REFERANS PDF'den:
-
+ 
 - isim
 - soyisim
 - gönderen adı
@@ -6825,38 +5776,38 @@ JPG / JPEG'E AKTARMA.
 - vergi numarası
 - müşteri numarası
 - diğer herhangi bir rakam veya metin
-
+ 
 ALMA.
-
+ 
 JPG / JPEG'DE YOKSA BU BİLGİLERİ
 REFERANS PDF'DEN TAMAMLAMA.
-
+ 
 JPG / JPEG'DEKİ BİR ALAN REFERANS PDF'DEKİ
 DEĞERDEN FARKLIYSA REFERANS PDF'Yİ DOĞRU
 KABUL ETME.
-
+ 
 GERÇEK DEĞER HER ZAMAN JPG / JPEG ÜZERİNDE
 GERÇEKTEN GÖRÜLEN DEĞERDİR.
-
+ 
 JPG / JPEG'DE OKUNAMAYAN BİR DEĞER İÇİN
 TAHMİN YAPMA VE REFERANS PDF'DEN DEĞER
 KOPYALAMA.
-
+ 
 =====================================================
 DOCUMENT DATA
 =====================================================
-
+ 
 Aşağıdaki alanları YALNIZCA JPG / JPEG
 görüntüsünden çıkar:
-
+ 
 documentData.senderName
 documentData.recipientName
 documentData.amount
 documentData.currency
 documentData.iban
-
+ 
 Kurallar:
-
+ 
 - Yalnızca JPG / JPEG üzerinde gerçekten görülen bilgileri yaz.
 - Güvenilir şekilde okunamıyorsa null kullan.
 - IBAN'ı mümkünse standart biçimde yaz.
@@ -6872,11 +5823,11 @@ yerine kullanma.
 - REFERANS PDF'dEKİ DEĞERLERİ documentData'YA
 KOPYALAMA.
 - JPG / JPEG'de yoksa null döndür.
-
+ 
 =====================================================
 ANALİZ SIRASI
 =====================================================
-
+ 
 1. Önce JPG / JPEG görüntüsünü baştan sona analiz et.
 2. JPG / JPEG'de görülen tüm bilgileri belirle.
 3. documentData alanlarını yalnızca JPG / JPEG'den doldur.
@@ -6884,9 +5835,9 @@ ANALİZ SIRASI
 karşılaştırması için kullan.
 5. Referans PDF'deki gerçek işlem bilgilerini
 analiz edilen JPG / JPEG'in bilgileri olarak kullanma.
-
+ 
 Dosya adı:
-${fileName}`
+${fileName}`,
 },
  
 // =================================================
@@ -6952,12 +5903,9 @@ content = [
  {
  type: "input_text",
  
- text: `${PROMPT}
-
-
-${amountForensicsContext}`,
+ text: `${PROMPT}`
+ },
  
-},  
  
  // =================================================
  // GERÇEK DEKONT
@@ -7252,9 +6200,7 @@ console.log(
  
 }
 }
-
-
-  
+ 
 // -------------------------------------------------
 // OPENAI
 // -------------------------------------------------
@@ -7351,10 +6297,7 @@ return null;
 return text;
 }
  
-if (result?.documentData) {
-result.documentData.amount =
-preserveAmount(result.documentData.amount);
-}
+result.amount = preserveAmount(result.amount);
  
  
 // =====================================================
