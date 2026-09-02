@@ -7349,7 +7349,10 @@ return null;
 return text;
 }
  
-result.amount = preserveAmount(result.amount);
+if (result?.documentData) {
+result.documentData.amount =
+preserveAmount(result.documentData.amount);
+}
  
  
 // =====================================================
