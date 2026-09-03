@@ -39,6 +39,17 @@ async function renderReferencePdfToPng(pdfPath, workDir) {
     const canvasMod = await import('@napi-rs/canvas');
     const createCanvas = canvasMod.createCanvas || canvasMod.default?.createCanvas;
 
+    // pdfjs-dist 4.10.x Node render path expects browser-like
+    // ImageData to exist globally when painting inline PDF images.
+    // @napi-rs/canvas provides a compatible ImageData implementation.
+    const NapiImageData =
+      canvasMod.ImageData ||
+      canvasMod.default?.ImageData;
+
+    if (typeof NapiImageData === 'function' && typeof globalThis.ImageData === 'undefined') {
+      globalThis.ImageData = NapiImageData;
+    }
+
     if (typeof createCanvas !== 'function') {
       throw new Error('@napi-rs/canvas createCanvas bulunamadı');
     }
