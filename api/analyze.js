@@ -42,7 +42,6 @@ pathToFileURL(pdfWorkerPath).href;
 
 
 const execFileAsync = promisify(execFile);
-let currentFileFingerprint = null;
 const amountForensicsStrongCache = new Map();
 const referenceAmountAnchorCache = new Map();
 
@@ -1317,7 +1316,9 @@ console.log("difference:", difference);
 console.log("=======================");
 
 if (difference > 0.01) {
-score += 10;
+// AmountAnalysis is advisory; do not inject a hidden +10 risk bonus.
+// Financial inconsistency must be represented by an explicit check.
+console.log("TUTAR FARKI GÖZLENDİ; GİZLİ RİSK BONUSU UYGULANMADI:", difference);
 }
 }
 }
@@ -3832,7 +3833,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
 async function analyzeAmountForensics(
 filePath,
 ocrResult,
-fileFingerprint = currentFileFingerprint,
+fileFingerprint = null,
 bank = null
 ) {
 
@@ -4696,7 +4697,7 @@ if (!candidate) {
     status: "unknown",
     severity: "none",
     score: 0,
-    fileFingerprint: fileFingerprint || currentFileFingerprint,
+    fileFingerprint: fileFingerprint || null,
     amountText: null,
     region: null,
     characterCount: 0,
@@ -5284,7 +5285,7 @@ evidence =
 console.log(
 "AMOUNT FORENSICS V3 DETAIL:",
 JSON.stringify({
-fileFingerprint: fileFingerprint || currentFileFingerprint,
+fileFingerprint: fileFingerprint || null,
 amountText: candidate.text,
 templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
@@ -5306,7 +5307,7 @@ available: true,
 status,
 severity,
 score,
-fileFingerprint: fileFingerprint || currentFileFingerprint,
+fileFingerprint: fileFingerprint || null,
 amountText: candidate.text,
 region: {
 ...rawRegion,
@@ -7408,7 +7409,6 @@ createHash("sha256")
 .update(buffer)
 .digest("hex");
 
-currentFileFingerprint = fileFingerprint;
 
 console.log("FILE SHA256:", fileFingerprint);
 
@@ -7644,7 +7644,7 @@ amountForensics =
 await analyzeAmountForensics(
 filePath,
 paddleImageOCR,
-currentFileFingerprint,
+fileFingerprint,
 bank
 );
 
@@ -8337,7 +8337,7 @@ amountForensics =
 await analyzeAmountForensics(
 filePath,
 paddleResult,
-currentFileFingerprint,
+fileFingerprint,
 bank
 );
 }
@@ -8740,6 +8740,17 @@ if (hasMajorAmountMismatch || hasSevereAmountMismatch) {
     note: "amountAnalysis farkı tek başına nihai skoru 60/85'e zorlamıyor."
   }));
 }
+
+// FINAL SKORU SADECE GÜNCEL CHECK'LERDEN TÜRET.
+// Eski/AI skorunun veya amountAnalysis'in gizli katkısı olamaz.
+const finalDeterministicRisk = calculateOverallRisk(result);
+finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
+result.categories = finalDeterministicRisk.categories;
+console.log("FINAL RISK CONSISTENCY:", JSON.stringify({
+  overallRisk: finalRiskScore,
+  categories: result.categories,
+  source: "updated deterministic checks only"
+}));
 
 // 0-100 arasında tut
 finalRiskScore = Math.round(
