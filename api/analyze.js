@@ -1215,7 +1215,100 @@ return "VERY HIGH RISK"
 // NİHAİ RİSK HESAPLA
 // =====================================================
 
+function calculateDeterministicForensicRisk(result, forensic = {}) {
+  const visualScore = Number(forensic?.visualForensics?.score);
+  const layoutScore = Number(forensic?.layoutForensics?.score);
+  const ocrConfidence = Number(forensic?.paddleImageOCR?.confidence);
+  const amount = forensic?.amountForensics || null;
+  const doc = result?.documentData || {};
+  const template = forensic?.referenceTemplateAnalysis || null;
+
+  // These scores are derived only from deterministic/local evidence.
+  // AI-generated check scores are deliberately excluded from the final risk.
+  const visualRisk = Number.isFinite(visualScore)
+    ? Math.max(0, Math.min(100, Math.round(visualScore)))
+    : 0;
+
+  const layoutRisk = Number.isFinite(layoutScore)
+    ? Math.max(0, Math.min(100, Math.round(layoutScore)))
+    : 0;
+
+  let textRisk = 0;
+  if (Number.isFinite(ocrConfidence)) {
+    if (ocrConfidence < 50) textRisk = 80;
+    else if (ocrConfidence < 65) textRisk = 60;
+    else if (ocrConfidence < 75) textRisk = 40;
+    else if (ocrConfidence < 85) textRisk = 25;
+    else if (ocrConfidence < 92) textRisk = 10;
+  }
+
+  // Reference field geometry is a deterministic structural signal. Keep it
+  // capped here so a single OCR placement error cannot dominate the score.
+  if (template?.available) {
+    const strong = Number(template.strongGeometryCount) || 0;
+    const missing = Number(template.missingFieldCount) || 0;
+    textRisk = Math.max(textRisk, Math.min(45, strong * 6 + missing * 4));
+  }
+
+  let financialDataRisk = 0;
+  const amountText = String(amount?.amountText || doc.amount || '').trim();
+  if (!amountText) financialDataRisk = Math.max(financialDataRisk, 45);
+  if (amount?.status === 'warning') {
+    financialDataRisk = Math.max(
+      financialDataRisk,
+      amount?.severity === 'strong' ? 85 : 35
+    );
+  }
+
+  // Validate any visible IBAN deterministically. This does not prove that an
+  // IBAN belongs to the named recipient; it only detects checksum/format errors.
+  const ibanCandidates = [doc.recipientIban, doc.iban].filter(Boolean);
+  for (const candidate of ibanCandidates) {
+    try {
+      const check = validateIBANMod97(candidate);
+      if (check && check.valid === false) financialDataRisk = Math.max(financialDataRisk, 70);
+    } catch {}
+  }
+
+  // No AI editing score is trusted. Until an independent local edit detector
+  // reports a strong signal, editingRisk remains neutral rather than random.
+  const editingRisk = 0;
+
+  const categories = {
+    visualRisk,
+    textRisk,
+    layoutRisk,
+    financialDataRisk,
+    editingRisk,
+  };
+
+  const overallRisk = Math.round((
+    categories.visualRisk * RISK_CATEGORY_WEIGHTS.visualRisk +
+    categories.textRisk * RISK_CATEGORY_WEIGHTS.textRisk +
+    categories.layoutRisk * RISK_CATEGORY_WEIGHTS.layoutRisk +
+    categories.financialDataRisk * RISK_CATEGORY_WEIGHTS.financialDataRisk +
+    categories.editingRisk * RISK_CATEGORY_WEIGHTS.editingRisk
+  ) / 100);
+
+  return {
+    overallRisk: Math.max(0, Math.min(100, overallRisk)),
+    riskLabel: getRiskLabel(overallRisk),
+    categories,
+    source: 'deterministic-local-forensics',
+  };
+}
+
 function calculateOverallRisk(result) {
+  if (result?.deterministicRisk && typeof result.deterministicRisk === 'object') {
+    return {
+      overallRisk: Number(result.deterministicRisk.overallRisk) || 0,
+      riskLabel: result.deterministicRisk.riskLabel || getRiskLabel(Number(result.deterministicRisk.overallRisk) || 0),
+      categories: result.deterministicRisk.categories || {
+        visualRisk: 0, textRisk: 0, layoutRisk: 0, financialDataRisk: 0, editingRisk: 0,
+      },
+    };
+  }
+
 const checks = result?.checks || {};
 
 
@@ -2780,6 +2873,7 @@ async function getReferenceAmountAnchor(bank) {
 // Banka bazında alan konumları + alan geometrisi + render yoğunluğu kalibre edilir.
 // Referanstaki gerçek işlem değerleri hiçbir zaman gerçek dekont verisi olarak kullanılmaz.
 const referenceTemplateProfileCache = new Map();
+const referenceRasterOcrCache = new Map();
 
 const REFERENCE_FIELD_RULES = [
   { key: "senderName", patterns: [/gönderen\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /gönderici\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /gonderen\s*(?:adi|ad[ıi]\s*soyad[ıi]?)/i] },
@@ -3306,6 +3400,97 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         referenceFile: path.basename(referencePath),
       };
       (fields[rule.key] ||= []).push(box);
+    }
+  }
+
+  // Image-only/scanned reference PDFs (for example Enpara/Akbank) often have
+  // no PDF text layer. In that case, rasterize the reference once and run the
+  // same OCR engine used for targets. The result is cached per reference file
+  // and is used only for geometry/style calibration, never as document data.
+  if (Object.keys(fields).length === 0) {
+    try {
+      const stat = await fs.stat(referencePath);
+      const cacheKey = `ref-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
+      let ocr = referenceRasterOcrCache.get(cacheKey);
+      let rendered = null;
+      if (!ocr) {
+        rendered = await renderPdfPagePng(pdf, 1, 1.6);
+        if (rendered?.buffer) {
+          const tempPath = path.join('/tmp', `verifydoc-ref-${normalizedBank}-${Math.random().toString(36).slice(2)}.png`);
+          await fs.writeFile(tempPath, rendered.buffer);
+          ocr = await runPaddleOCR(tempPath);
+          try { await fs.unlink(tempPath); } catch {}
+          referenceRasterOcrCache.set(cacheKey, ocr || null);
+        }
+      }
+
+      if (!rendered) rendered = await renderPdfPagePng(pdf, 1, 1.6);
+      if (ocr?.success && Array.isArray(ocr.regions)) {
+        const regions = ocr.regions
+          .filter(x => x?.region && String(x.text || '').trim())
+          .map(x => ({
+            ...x,
+            text: String(x.text || '').trim(),
+            region: {
+              x1: Number(x.region.x1) || 0,
+              y1: Number(x.region.y1) || 0,
+              x2: Number(x.region.x2) || 0,
+              y2: Number(x.region.y2) || 0,
+            },
+          }));
+        const width = Number(rendered?.width) || 0;
+        const height = Number(rendered?.height) || 0;
+
+        function addRasterField(key, labelRegion, valueRegion, labelText) {
+          if (!width || !height || !valueRegion) return;
+          const r = valueRegion;
+          const box = {
+            xNorm: r.x1 / width,
+            yNorm: r.y1 / height,
+            widthNorm: Math.max(0.001, (r.x2-r.x1)/width),
+            heightNorm: Math.max(0.001, (r.y2-r.y1)/height),
+            pageNumber: 1,
+            labelKey: key,
+            labelPresent: true,
+            templateRole: classifyReferenceTemplateRole(key, labelText),
+            style: { source:'reference-raster-ocr', fontNames:[], avgFontHeight:Math.max(1,r.y2-r.y1), avgCharWidth:0, itemCount:1 },
+            referenceFile: path.basename(referencePath),
+          };
+          (fields[key] ||= []).push(box);
+        }
+
+        for (const label of regions) {
+          const rule = referenceFieldRuleForText(label.text);
+          if (!rule) continue;
+          const lr = label.region;
+          const lh = Math.max(8, lr.y2-lr.y1);
+          const candidates = regions.filter(v => v !== label).map(v => {
+            const vr=v.region;
+            const vh=Math.max(8,vr.y2-vr.y1);
+            const verticalOverlap=Math.min(lr.y2,vr.y2)-Math.max(lr.y1,vr.y1);
+            const rightGap=vr.x1-lr.x2;
+            const belowGap=vr.y1-lr.y2;
+            let cost=Infinity;
+            if (rightGap >= -lh*0.25 && rightGap <= Math.max(180,lh*8) && verticalOverlap >= -lh*0.55) {
+              cost = Math.abs(rightGap)/Math.max(1,lh) + Math.abs(((vr.y1+vr.y2)/2)-((lr.y1+lr.y2)/2))/Math.max(1,lh)*0.5;
+            } else if (belowGap >= -lh*0.25 && belowGap <= Math.max(120,lh*6) && Math.abs(((vr.x1+vr.x2)/2)-((lr.x1+lr.x2)/2)) <= Math.max(260,lh*10)) {
+              cost = 3 + Math.abs(belowGap)/Math.max(1,lh);
+            }
+            return { v, cost };
+          }).filter(x => Number.isFinite(x.cost));
+
+          candidates.sort((a,b)=>a.cost-b.cost);
+          const value = candidates[0]?.v;
+          if (!value) continue;
+
+          // Primary amount fields must contain a numeric/currency value. For
+          // other fields any nearby value is acceptable as a geometry anchor.
+          if (rule.key === 'amount' && !/(?:\d|TL|TRY|₺|EUR|USD|GBP)/i.test(String(value.text || ''))) continue;
+          addRasterField(rule.key, lr, value.region, label.text);
+        }
+      }
+    } catch (error) {
+      console.warn('REFERENCE RASTER OCR FALLBACK HATASI:', path.basename(referencePath), error?.message || error);
     }
   }
 
@@ -8667,6 +8852,18 @@ if (layoutForensics?.available && layoutForensics.severity === "strong") {
   result.summary = [result.summary, layoutForensics.evidence].filter(Boolean).join(" ");
 }
 
+// FINAL RISK IS NOW INDEPENDENT FROM AI-GENERATED CHECK SCORES.
+// GPT may still provide explanations/documentData, but it cannot change the
+// numerical risk result.
+result.deterministicRisk = calculateDeterministicForensicRisk(result, {
+  visualForensics,
+  layoutForensics,
+  amountForensics,
+  paddleImageOCR,
+  referenceTemplateAnalysis,
+});
+console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
+
 // Risk motorunu amount forensics değişikliğinden sonra tekrar hesapla.
 const deterministicRiskAfterForensics =
 calculateOverallRisk(
@@ -8777,7 +8974,7 @@ result.riskLabel =
 finalRiskLabel;
 
 result.categories =
-calculatedRisk.categories;
+finalDeterministicRisk.categories;
 
 // AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
