@@ -8721,20 +8721,18 @@ if (visualForensics?.available && visualForensics?.severity === "strong") {
 if (layoutForensics?.available && layoutForensics.severity === "strong") {
   finalRiskScore = Math.max(finalRiskScore, 70);
 }
-// Tutar farkı varsa riski ciddi şekilde yükselt
-if (hasMajorAmountMismatch) {
-finalRiskScore = Math.max(
-finalRiskScore,
-60
-);
-}
-
-// Çok büyük fark varsa VERY HIGH seviyesine zorla
-if (hasSevereAmountMismatch) {
-finalRiskScore = Math.max(
-finalRiskScore,
-85
-);
+// KRİTİK: amountAnalysis tek başına nihai risk tabanı oluşturmaz.
+// Bu alan AI tarafından çıkarılmış toplam/hesaplanan tutar verisidir;
+// tek başına 60/85 puan zorlamak, kullanıcı arayüzünde "tutar tutarsızlığı"
+// yok denirken HIGH RISK üretmesine neden olabilir.
+// Tutar farkı yalnızca güvenilir bir check üzerinden risk motoruna girer.
+if (hasMajorAmountMismatch || hasSevereAmountMismatch) {
+  console.log("AMOUNT DIFFERENCE OBSERVED (NO DIRECT RISK FLOOR):", JSON.stringify({
+    difference: amountDifference,
+    major: hasMajorAmountMismatch,
+    severe: hasSevereAmountMismatch,
+    note: "amountAnalysis farkı tek başına nihai skoru 60/85'e zorlamıyor."
+  }));
 }
 
 // 0-100 arasında tut
@@ -8804,6 +8802,7 @@ console.log(
 "FINAL SCORE:",
 finalScore
 );
+console.log("FINAL RISK SOURCE: deterministic checks only; amountAnalysis direct floor disabled");
 
 
 console.log(
