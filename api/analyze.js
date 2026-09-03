@@ -3124,49 +3124,124 @@ function normalizeFieldTextForMatch(text) {
     .trim();
 }
 
+// OCR kutusu bazen değeri değil, değerin etiketini yakalar.
+// Bu tür idari/alan başlığı metinlerinin herhangi bir gerçek alana
+// değer olarak atanmasını özellikle engelliyoruz.
+function isAdministrativeLabelText(text) {
+  const t = normalizeFieldTextForMatch(text);
+  if (!t) return true;
+
+  const labelOnly = [
+    "BELGE TARIHI", "ISLEM TARIHI", "ISLEM TARTHI", "TARIH", "SAAT", "TIME",
+    "ALICI BANKA", "GONDEREN BANKA", "BANKA", "SUBE", "ALICI SUBE",
+    "ACIKLAMA", "ETTN", "SORGU NO", "SIRA NO", "SIRA NO/ID",
+    "MUSTERI NO", "HESAP NO", "ALICI HESAP", "GONDEREN HESAP",
+    "ALICI", "GONDEREN", "GONDERICI", "ALICI ADI", "GONDEREN ADI",
+    "ALICI UNVAN", "GONDEREN UNVAN", "VERGI NO", "TCKN", "VKN",
+    "TUTAR", "ISLEM TUTARI", "GIDEN FAST TUTARI", "TOPLAM ISLEM TUTARI",
+    "TOPLAM TAHSILAT TUTARI", "MESAJ", "MESAJ TURU"
+  ];
+  if (labelOnly.includes(t)) return true;
+
+  // Etiket + değer içeren uzun satırlar: gerçek değer çıkarılmadan
+  // doğrudan başka alana atanmasın.
+  const labelWords = /(BELGE|ISLEM|TARIH|TARH|ALICI|GONDEREN|GONDERICI|BANKA|SUBE|HESAP|MUSTERI|TCKN|VKN|VERGI|SORGU|SIRA|ACIKLAMA|ETTN|TUTARI|TUTAR|MESAJ|FAST)/;
+  const labelHits = (t.match(new RegExp(labelWords.source, "g")) || []).length;
+  const digitCount = (t.match(/\d/g) || []).length;
+  const letters = (t.match(/[A-Z]/g) || []).length;
+  if (labelHits >= 2 && (digitCount > 0 || letters > 8)) return true;
+
+  return false;
+}
+
 function fieldLabelStrength(field, text) {
   const t = normalizeFieldTextForMatch(text);
   const labels = {
-    accountNo: /(HESAP|IBAN|GONDEREN HESAP|ALICI HESAP|MUSTERI NO)/,
+    accountNo: /(HESAP|IBAN|GONDEREN HESAP|ALICI HESAP)/,
     taxNo: /(TCKN|VKN|VERGI|VERGI NO|SIRA NO|SIRA NO\/ID)/,
     date: /(TARIH|ISLEM TARIHI|TARIHI|DATE)/,
     amount: /(TUTAR|TAHSILAT|FAST TUTARI|ISLEM TUTARI|GIDEN FAST|GONDERILEN.*TUTARI|TOPLAM.*TUTARI)/,
     senderName: /(GONDEREN|GONDERICI|GONDEREN AD|GONDEREN UNVAN)/,
     recipientName: /(ALICI|ALICI AD|ALICI UNVAN|ALACAKLI)/,
-    transactionNo: /(ISLEM NO|REFERANS|REF NO|ETTN|TRANSACTION|UUID)/,
+    transactionNo: /(ISLEM NO|REFERANS|REF NO|ETTN|TRANSACTION|UUID|SORGU NO)/,
     address: /(ADRES|ADDRESS)/,
-    description: /(ACIKLAMA|ACIKLAMA:|DESCRIPTION|NOT)/,
+    description: /(ACIKLAMA|DESCRIPTION|NOT)/,
   };
   const re = labels[field];
   return re && re.test(t) ? 100 : 0;
 }
 
-function referenceValueCompatible(field, text) {
+function nearbyFieldLabelScore(field, item, regions) {
+  const ir = item?.region;
+  if (!ir) return 0;
+  const wanted = {
+    accountNo: /(HESAP|IBAN)/,
+    taxNo: /(TCKN|VKN|VERGI|SIRA NO)/,
+    date: /(TARIH|TARIHI)/,
+    amount: /(TUTAR|TAHSILAT)/,
+    senderName: /(GONDEREN|GONDERICI)/,
+    recipientName: /(ALICI|ALACAKLI)/,
+    transactionNo: /(ISLEM NO|SORGU NO|REFERANS|ETTN|UUID)/,
+    address: /(ADRES)/,
+    description: /(ACIKLAMA|DESCRIPTION|NOT)/,
+  }[field];
+  if (!wanted) return 0;
+
+  const iy = (Number(ir.y1) + Number(ir.y2)) / 2;
+  const ih = Math.max(8, Number(ir.y2) - Number(ir.y1));
+  let best = 0;
+  for (const other of regions) {
+    if (other === item || !other?.region) continue;
+    const t = normalizeFieldTextForMatch(other.text);
+    if (!wanted.test(t)) continue;
+    const or = other.region;
+    const oy = (Number(or.y1) + Number(or.y2)) / 2;
+    const sameLine = Math.abs(oy - iy) <= Math.max(18, ih * 1.8);
+    const gapRight = Number(ir.x1) >= Number(or.x2) ? Number(ir.x1) - Number(or.x2) : Infinity;
+    const gapLeft = Number(or.x1) >= Number(ir.x2) ? Number(or.x1) - Number(ir.x2) : Infinity;
+    const near = Math.min(gapRight, gapLeft);
+    if (sameLine && near <= Math.max(260, ih * 14)) best = Math.max(best, 120);
+  }
+  return best;
+}
+
+function referenceValueCompatible(field, text, item = null, regions = []) {
   const t = normalizeFieldTextForMatch(text);
-  if (!t || referenceFieldRuleForText(text)) return false;
+  if (!t || referenceFieldRuleForText(text) || isAdministrativeLabelText(t)) return false;
 
   switch (field) {
-    case "accountNo":
-      return /\bTR\d{2}[0-9A-Z]{10,}\b/i.test(t) ||
-        /(\d[\d\s\/.-]{5,}\d)/.test(t) && /\d{6,}/.test(t);
+    case "accountNo": {
+      const hasIban = /\bTR\s*\d{2}(?:\s*\d){20,}\b/i.test(t) || /TR\d{2}[0-9A-Z]{10,}/i.test(t);
+      const hasAccountLabel = nearbyFieldLabelScore(field, item, regions) > 0 || /HESAP\s*NO/i.test(t);
+      // Çıplak 6-11 haneli sayı müşteri no/sıra no olabilir.
+      // Hesap no olarak ancak yanında açık hesap/IBAN bağlamı varsa kabul et.
+      const bareAccount = /^\d{6,11}$/.test(t.replace(/\s/g, ""));
+      return hasIban || (hasAccountLabel && !bareAccount) || (!bareAccount && /\d{6,}/.test(t));
+    }
     case "taxNo":
       return /\b\d{10,11}\b/.test(t) || /\b\d{3}[- ]\d{7,12}\b/.test(t);
     case "date":
-      return /\b\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4}\b/.test(t);
+      return /\b\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4}\b/.test(t) && !/^[A-Z ]+$/.test(t);
     case "amount":
-      return /[-+]?\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})?\s*(?:TL|TRY)?\b/i.test(t) ||
-        /[-+]?\d+(?:[.,]\d{1,2})\b/.test(t);
+      return /[-+]?\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})?\s*(?:TL|TRY)?\b/i.test(t) || /[-+]?\d+(?:[.,]\d{1,2})\b/.test(t);
     case "senderName":
-    case "recipientName":
-      return /[A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜ]{2,})+/.test(t) && !/\d{4,}/.test(t);
+    case "recipientName": {
+      if (isAdministrativeLabelText(t)) return false;
+      if (/(BANKA|TARIH|TARH|ACIKLAMA|HESAP|SUBE|TUTAR|SORGU|ETTN|MESAJ|FAST)/.test(t)) return false;
+      const words = t.split(/\s+/).filter(Boolean);
+      return words.length >= 2 && words.some(w => /[A-ZÇĞİÖŞÜ]{3,}/.test(w)) && !/\d{3,}/.test(t);
+    }
     case "transactionNo":
       return /[0-9a-f]{8}-[0-9a-f-]{20,}/i.test(t) ||
-        /(ETTN|ISLEM|REFERANS|REF)/i.test(t) && /[A-Z0-9]{6,}/i.test(t);
+        (/(REFERANS|REF|ETTN|ISLEM|SORGU)/i.test(t) && /[A-Z0-9]{6,}/i.test(t));
     case "address":
-      return /\b(MAH|MAHALLESI|CAD|CADDESI|SOK|SOKAK|NO[:.]|APT|APARTMANI|BLOK|PK|POSTA|IL|ILCE)\b/i.test(t) ||
-        /[A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜ]{2,}){2,}/.test(t);
+      return /\b(MAH|MAHALLESI|CAD|CADDESI|SOK|SOKAK|NO[:.]|APT|APARTMANI|BLOK|PK|POSTA|IL|ILCE)\b/i.test(t) && !/^(ALICI|GONDEREN)\s+(HESAP|BANKA|SUBE)/i.test(t);
     case "description":
-      return t.length >= 4 && !/^[A-ZÇĞİÖŞÜ ]+$/.test(t);
+      if (isAdministrativeLabelText(t)) return false;
+      if (/^TR\s*\d{2}[0-9\s]+$/i.test(t)) return false;
+      if (/^[-+]?\d[\d.,\s]*\s*(TL|TRY)?$/i.test(t)) return false;
+      if (/^\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4}/.test(t)) return false;
+      return t.length >= 4 && /[A-ZÇĞİÖŞÜ]/.test(t);
     default:
       return true;
   }
@@ -3180,12 +3255,13 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
     const text = String(item.text || "").trim();
     const box = normalizeRegionBox(item.region, size);
     if (!box) continue;
+    if (referenceFieldRuleForText(text)) continue;
 
-    const isLabel = !!referenceFieldRuleForText(text);
-    if (isLabel) continue;
+    const semantic = referenceValueCompatible(field, text, item, regions);
+    if (!semantic) continue;
 
-    const semantic = referenceValueCompatible(field, text);
     const labelStrength = fieldLabelStrength(field, text);
+    const nearbyLabel = nearbyFieldLabelScore(field, item, regions);
 
     const variantDistances = referenceVariants.map((rv) => {
       const rcx = Number(rv.xNorm || 0) + Number(rv.widthNorm || 0) / 2;
@@ -3200,21 +3276,16 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
     const nearestVariant = variantDistances[0];
     const positionDistance = nearestVariant?.distance ?? Infinity;
 
-    // Alan tipi ile içerik uyuşmuyorsa, koordinat yakınlığı tek başına aday üretmesin.
-    if (!semantic) continue;
+    // Etiketsiz semantik eşleşme çok uzaktaysa reddet.
+    if (labelStrength === 0 && nearbyLabel === 0 && positionDistance > 0.18) continue;
 
-    // Koordinat yalnızca ikincil sinyaldir. Çok uzak ve etiketsiz bir kutu,
-    // semantik olarak doğru görünse bile eşleşme olarak kabul edilmez.
-    if (labelStrength === 0 && positionDistance > 0.22) continue;
+    let score = Math.min(60, Number(item.score || 0) * 25);
+    score += Math.max(labelStrength, nearbyLabel);
+    score += Math.max(0, 120 - Math.min(120, positionDistance * 360));
+    score += 140; // semantik tip uyumu zorunlu
 
-    let score = 0;
-    score += Math.min(70, Number(item.score || 0) * 30);
-    score += labelStrength;
-    score += Math.max(0, 100 - Math.min(100, positionDistance * 300));
-
-    // İçeriğin beklenen tipe uygunluğu zorunlu olduğu için bu bonus artık
-    // koordinat hatasını maskeleyemez.
-    if (semantic) score += 120;
+    // Alan etiketi aynı satırda/yanında ise güçlü bonus.
+    if (nearbyLabel > 0) score += 80;
 
     candidates.push({
       item,
@@ -3222,7 +3293,7 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
       score,
       nearestReferenceDistance: positionDistance,
       semanticMatch: true,
-      labelScore: labelStrength,
+      labelScore: Math.max(labelStrength, nearbyLabel),
     });
   }
 
