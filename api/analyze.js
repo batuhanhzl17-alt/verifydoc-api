@@ -31,6 +31,24 @@ const createCanvas =
 const ImageData =
   napiCanvas?.ImageData ||
   napiCanvas?.default?.ImageData;
+const Path2D =
+  napiCanvas?.Path2D ||
+  napiCanvas?.default?.Path2D;
+const DOMMatrix =
+  napiCanvas?.DOMMatrix ||
+  napiCanvas?.default?.DOMMatrix;
+
+// pdfjs-dist 4.7.x, özellikle resim tabanlı PDF sayfalarını render ederken
+// bazı Canvas API sınıflarını global scope'tan bekleyebilir. Vercel Node
+// ortamında bunlar doğal olarak bulunmadığından @napi-rs/canvas üzerinden
+// güvenli polyfill sağlıyoruz. Mevcut global varsa üzerine yazmıyoruz.
+try {
+  if (typeof globalThis.ImageData === 'undefined' && ImageData) globalThis.ImageData = ImageData;
+  if (typeof globalThis.Path2D === 'undefined' && Path2D) globalThis.Path2D = Path2D;
+  if (typeof globalThis.DOMMatrix === 'undefined' && DOMMatrix) globalThis.DOMMatrix = DOMMatrix;
+} catch (error) {
+  console.warn('CANVAS GLOBAL POLYFILL HATASI:', error?.message || error);
+}
 
 const pdfWorkerPath = require.resolve(
 "pdfjs-dist/build/pdf.worker.mjs"
@@ -44,6 +62,9 @@ pathToFileURL(pdfWorkerPath).href;
 const execFileAsync = promisify(execFile);
 const amountForensicsStrongCache = new Map();
 const referenceAmountAnchorCache = new Map();
+// PaddleOCR pahalı bir uzak API çağrısıdır. Aynı dosya analiz hattında
+// birden fazla kez istendiğinde aynı OCR sonucunu yeniden üretme.
+const paddleOCRCache = new Map();
 
 // =====================================================
 // PADDLEOCR CLIENT
@@ -145,6 +166,20 @@ regions:
 };
 
 }
+
+// Dosya değişmediyse OCR sonucu deterministik olarak tekrar kullanılır.
+// Cache anahtarı içerik boyutu + mtime içerir; aynı isimle yeni dosya gelirse
+// normalde mtime/size değişeceği için eski sonuç kullanılmaz.
+let paddleCacheKey = null;
+try {
+  const st = await fs.stat(filePath);
+  paddleCacheKey = `paddle:${path.resolve(filePath)}:${st.size}:${st.mtimeMs}`;
+  const cached = paddleOCRCache.get(paddleCacheKey);
+  if (cached?.success) {
+    console.log("PADDLEOCR CACHE HIT:", filePath);
+    return JSON.parse(JSON.stringify(cached));
+  }
+} catch {}
 
 try {
 
@@ -429,7 +464,7 @@ console.log(
 allRegions.length
 );
 
-return {
+const output = {
 text,
 confidence,
 success:
@@ -438,9 +473,14 @@ pages:
 pages.length,
 regions:
 allRegions,
-raw:
-result,
 };
+
+if (paddleCacheKey) {
+  // raw Paddle response'u cache'e koymuyoruz; büyük ve gereksiz.
+  paddleOCRCache.set(paddleCacheKey, output);
+}
+
+return output;
 
 }
 
@@ -2946,10 +2986,47 @@ async function renderPdfPagePng(pdf, pageNumber, scale = 1) {
   try {
     const page = await pdf.getPage(pageNumber);
     const viewport = page.getViewport({ scale });
-    const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
-    const context = canvas.getContext("2d");
-    await page.render({ canvasContext: context, viewport }).promise;
-    return { buffer: canvas.toBuffer("image/png"), width: Math.ceil(viewport.width), height: Math.ceil(viewport.height) };
+    const width = Math.max(1, Math.ceil(viewport.width));
+    const height = Math.max(1, Math.ceil(viewport.height));
+
+    // page.render seviyesinde de açık factory veriyoruz. Bu, pdfjs'nin kendi
+    // NodeCanvasFactory yoluna düşmesini ve Vercel'de ImageData eksikliği
+    // nedeniyle patlamasını engeller.
+    const canvasFactory = {
+      create(w, h) {
+        const canvas = createCanvas(Math.max(1, Math.ceil(w)), Math.max(1, Math.ceil(h)));
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Canvas 2D context oluşturulamadı");
+        return { canvas, context };
+      },
+      reset(canvasAndContext, w, h) {
+        canvasAndContext.canvas.width = Math.max(1, Math.ceil(w));
+        canvasAndContext.canvas.height = Math.max(1, Math.ceil(h));
+      },
+      destroy(canvasAndContext) {
+        try {
+          if (canvasAndContext?.canvas) {
+            canvasAndContext.canvas.width = 0;
+            canvasAndContext.canvas.height = 0;
+          }
+        } catch {}
+        if (canvasAndContext) {
+          canvasAndContext.canvas = null;
+          canvasAndContext.context = null;
+        }
+      },
+    };
+
+    const canvasAndContext = canvasFactory.create(width, height);
+    await page.render({
+      canvasContext: canvasAndContext.context,
+      viewport,
+      canvasFactory,
+    }).promise;
+
+    const buffer = canvasAndContext.canvas.toBuffer("image/png");
+    canvasFactory.destroy(canvasAndContext);
+    return { buffer, width, height };
   } catch (error) {
     console.warn("REFERENCE PDF RENDER HATASI:", error?.message || error);
     return null;
@@ -3407,24 +3484,30 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
   // no PDF text layer. In that case, rasterize the reference once and run the
   // same OCR engine used for targets. The result is cached per reference file
   // and is used only for geometry/style calibration, never as document data.
-  if (Object.keys(fields).length === 0) {
+  if (Object.keys(fields).length === 0 || !fields.amount?.length || !fields.iban?.length) {
     try {
       const stat = await fs.stat(referencePath);
       const cacheKey = `ref-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
-      let ocr = referenceRasterOcrCache.get(cacheKey);
-      let rendered = null;
-      if (!ocr) {
+      const cached = referenceRasterOcrCache.get(cacheKey);
+      let ocr = cached?.ocr || cached || null;
+      let rendered = cached?.rendered || null;
+      if (!cached) {
         rendered = await renderPdfPagePng(pdf, 1, 1.6);
         if (rendered?.buffer) {
-          const tempPath = path.join('/tmp', `verifydoc-ref-${normalizedBank}-${Math.random().toString(36).slice(2)}.png`);
+          const stableRefId = createHash('sha256')
+            .update(cacheKey)
+            .digest('hex')
+            .slice(0, 16);
+          const tempPath = path.join('/tmp', `verifydoc-ref-${normalizedBank}-${stableRefId}.png`);
           await fs.writeFile(tempPath, rendered.buffer);
           ocr = await runPaddleOCR(tempPath);
           try { await fs.unlink(tempPath); } catch {}
-          referenceRasterOcrCache.set(cacheKey, ocr || null);
+          // OCR + raster boyutlarını birlikte cache'le; sonraki çağrıda
+          // aynı referansı tekrar render edip OCR etmeye gerek kalmasın.
+          referenceRasterOcrCache.set(cacheKey, { ocr: ocr || null, rendered: { width: rendered.width, height: rendered.height } });
         }
       }
 
-      if (!rendered) rendered = await renderPdfPagePng(pdf, 1, 1.6);
       if (ocr?.success && Array.isArray(ocr.regions)) {
         const regions = ocr.regions
           .filter(x => x?.region && String(x.text || '').trim())
@@ -3456,7 +3539,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
             style: { source:'reference-raster-ocr', fontNames:[], avgFontHeight:Math.max(1,r.y2-r.y1), avgCharWidth:0, itemCount:1 },
             referenceFile: path.basename(referencePath),
           };
-          (fields[key] ||= []).push(box);
+          if (!fields[key]?.length) (fields[key] ||= []).push(box);
         }
 
         for (const label of regions) {
@@ -3494,12 +3577,17 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
     }
   }
 
+  const hasRasterFields = Object.values(fields).some(list =>
+    Array.isArray(list) && list.some(item => item?.style?.source === 'reference-raster-ocr')
+  );
+
   return {
     bank: normalizedBank,
     referenceFile: path.basename(referencePath),
     fields,
     fieldCount: Object.keys(fields).length,
     referenceType: 'pdf',
+    styleSource: hasRasterFields ? 'reference-raster-ocr' : (Object.keys(fields).length ? 'pdf-text-metadata' : 'none'),
   };
 }
 
@@ -3590,7 +3678,9 @@ async function buildReferenceTemplateProfile(bank) {
       fields,
       fieldCount: Object.keys(fields).length,
       referenceMode: 'trusted-ensemble',
-      styleSource: 'pdf-text-metadata',
+      styleSource: extracted.some(x => x.styleSource === 'reference-raster-ocr')
+        ? 'mixed-pdf-text-and-reference-raster-ocr'
+        : 'pdf-text-metadata',
     };
 
     referenceTemplateProfileCache.set(cacheKey, profile);
@@ -3599,7 +3689,8 @@ async function buildReferenceTemplateProfile(bank) {
       referenceCount: profile.referenceCount,
       usablePdfReferenceCount: profile.usablePdfReferenceCount,
       files: profile.referenceFiles,
-      fields: Object.fromEntries(Object.entries(fields).map(([k,v])=>[k,{referenceCount:v.referenceCount,spread:v.spread}]))
+      styleSource: profile.styleSource,
+      fields: Object.fromEntries(Object.entries(fields).map(([k,v])=>[k,{referenceCount:v.referenceCount,spread:v.spread,source:v.style?.source || null}]))
     }));
     return profile;
   } catch (error) {
