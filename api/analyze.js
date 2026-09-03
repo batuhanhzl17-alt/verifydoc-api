@@ -3111,9 +3111,85 @@ function normalizeRegionBox(region, size) {
   };
 }
 
+
+function normalizeFieldTextForMatch(value) {
+  return String(value || "")
+    .toLocaleLowerCase("tr-TR")
+    .replace(/ı/g, "i")
+    .replace(/İ/g, "i")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function referenceValueCompatible(field, value) {
+  const text = normalizeFieldTextForMatch(value);
+  if (!text) return false;
+
+  const compact = text.replace(/\s+/g, "");
+  const digits = (text.match(/\d/g) || []).length;
+
+  switch (field) {
+    case "amount":
+      // Tutar için ondalık/binlik ayraç veya para birimi bekle.
+      // Düz uzun numaraları (müşteri/işlem/ref) tutar olarak kabul etme.
+      return (
+        /(?:₺|tl|try|eur|usd|gbp)/i.test(text) ||
+        /\d+[,.]\d{1,2}(?:\s|$)/i.test(text) ||
+        /\d{1,3}(?:[.\s]\d{3})+[,.]\d{1,2}/i.test(text)
+      );
+
+    case "iban":
+      return /\b(?:tr|de|gb|fr|nl|be|it|es|ro|ch)\d{2}[a-z0-9]{8,32}\b/i.test(compact) ||
+             /\biban\b/i.test(text);
+
+    case "date":
+      return /\b\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\b/.test(text) ||
+             /\b\d{1,2}\s+[a-zçğıöşü]+\s+\d{4}\b/i.test(text);
+
+    case "time":
+      return /\b\d{1,2}[:.]\d{2}(?::\d{2})?\b/.test(text);
+
+    case "taxNo":
+      return digits >= 10 && digits <= 11 && !/[,.]/.test(text);
+
+    case "accountNo":
+      return digits >= 5 && digits <= 16 && !/[,.]/.test(text) &&
+             !/iban|vergi|tckn|müşteri|musteri/i.test(text);
+
+    case "transactionNo":
+      return digits >= 4 && !/[,.]\d/.test(text) &&
+             !/iban|hesap|müşteri|musteri|vergi|tckn/i.test(text);
+
+    case "branch":
+      return digits >= 2 && digits <= 8 || /şube|sube/i.test(text);
+
+    case "senderName":
+    case "recipientName":
+      return /[a-zçğıöşü]{2,}/i.test(text) && digits <= 2;
+
+    case "senderAddress":
+    case "recipientAddress":
+    case "address":
+      return /[a-zçğıöşü]{3,}/i.test(text) && digits >= 0;
+
+    case "description":
+      return text.length >= 2;
+
+    default:
+      return true;
+  }
+}
+
+function fieldLabelStrength(field, text) {
+  const rule = REFERENCE_FIELD_RULES.find((r) => r.key === field);
+  if (!rule) return 0;
+  return rule.patterns.some((p) => p.test(String(text || ""))) ? 100 : 0;
+}
+
 function referenceFieldTargetCandidates(field, ref, regions, size) {
   const candidates = [];
-  const referenceVariants = Array.isArray(ref?.variants) && ref.variants.length ? ref.variants : [ref];
+  const referenceVariants =
+    Array.isArray(ref?.variants) && ref.variants.length ? ref.variants : [ref];
   const rule = REFERENCE_FIELD_RULES.find((r) => r.key === field);
 
   for (const item of regions) {
@@ -3121,68 +3197,117 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
     const box = normalizeRegionBox(item.region, size);
     if (!box) continue;
 
-    // Etiket eşleşmesi varsa en güçlü sinyal budur.
-    let labelScore = 0;
-    if (rule && rule.patterns.some((p) => p.test(text))) labelScore = 80;
+    const isLabel = Boolean(referenceFieldRuleForText(text));
+    const compatible = referenceValueCompatible(field, text);
+    const labelScore = fieldLabelStrength(field, text);
 
     const cx = box.xNorm + box.widthNorm / 2;
     const cy = box.yNorm + box.heightNorm / 2;
+
     const variantDistances = referenceVariants.map((rv) => {
       const rcx = Number(rv.xNorm || 0) + Number(rv.widthNorm || 0) / 2;
       const rcy = Number(rv.yNorm || 0) + Number(rv.heightNorm || 0) / 2;
       const dx = Math.abs(cx - rcx);
       const dy = Math.abs(cy - rcy);
-      return { dx, dy, distance: Math.sqrt(dx * dx + dy * dy), ref: rv };
-    }).sort((a,b)=>a.distance-b.distance);
-    const nearestVariant = variantDistances[0];
-    const dx = nearestVariant?.dx || 0;
-    const dy = nearestVariant?.dy || 0;
-    const positionDistance = nearestVariant?.distance || 0;
+      return {
+        dx,
+        dy,
+        distance: Math.sqrt(dx * dx + dy * dy),
+        ref: rv,
+      };
+    }).sort((a, b) => a.distance - b.distance);
 
-    // Etiketin kendisini değil, etiketin sağındaki/altındaki değeri seçmeye çalış.
+    const nearestVariant = variantDistances[0];
+    const positionDistance = nearestVariant?.distance ?? Infinity;
+
+    // Etiketin kendisini değil, etiketin sağındaki/altındaki SEMANTİK olarak
+    // uygun değeri aday yap.
     if (labelScore > 0) {
       const lr = item.region;
+
       for (const valueItem of regions) {
         if (valueItem === item) continue;
-        if (referenceFieldRuleForText(String(valueItem.text || ""))) continue;
+
+        const valueText = String(valueItem.text || "").trim();
+        if (!valueText || referenceFieldRuleForText(valueText)) continue;
+        if (!referenceValueCompatible(field, valueText)) continue;
+
         const vr = valueItem.region;
         const vbox = normalizeRegionBox(vr, size);
         if (!vbox) continue;
-        const sameLine = Math.abs(Number(vr.y1) - Number(lr.y1)) <= Math.max(16, (Number(lr.y2)-Number(lr.y1))*1.0);
-        const right = Number(vr.x1) >= Number(lr.x2) - 6;
-        const below = Number(vr.y1) >= Number(lr.y2) - 4 && Number(vr.y1) - Number(lr.y2) <= Math.max(70, (Number(lr.y2)-Number(lr.y1))*4);
+
+        const sameLine =
+          Math.abs(Number(vr.y1) - Number(lr.y1)) <=
+          Math.max(16, (Number(lr.y2) - Number(lr.y1)) * 1.2);
+
+        const right =
+          Number(vr.x1) >= Number(lr.x2) - Math.max(6, (Number(lr.y2) - Number(lr.y1)) * 0.5);
+
+        const below =
+          Number(vr.y1) >= Number(lr.y2) - 4 &&
+          Number(vr.y1) - Number(lr.y2) <=
+          Math.max(70, (Number(lr.y2) - Number(lr.y1)) * 4);
+
         if (!((sameLine && right) || below)) continue;
-        const variantDistances = referenceVariants.map((rv) => {
+
+        const vDistances = referenceVariants.map((rv) => {
           const rcx = Number(rv.xNorm || 0) + Number(rv.widthNorm || 0) / 2;
           const rcy = Number(rv.yNorm || 0) + Number(rv.heightNorm || 0) / 2;
           const vcx = vbox.xNorm + vbox.widthNorm / 2;
           const vcy = vbox.yNorm + vbox.heightNorm / 2;
-          return Math.sqrt(Math.pow(vcx-rcx,2)+Math.pow(vcy-rcy,2));
+          return Math.sqrt(
+            Math.pow(vcx - rcx, 2) + Math.pow(vcy - rcy, 2)
+          );
         });
-        const vdist = Math.min(...variantDistances);
-        candidates.push({ item:valueItem, box:vbox, score:labelScore + 50 - Math.min(45, vdist*250), nearestReferenceDistance:vdist });
+
+        const vdist = Math.min(...vDistances);
+        const proximity = Math.max(0, 70 - Math.min(70, vdist * 250));
+
+        candidates.push({
+          item: valueItem,
+          box: vbox,
+          score: 140 + proximity,
+          nearestReferenceDistance: vdist,
+          semanticMatch: true,
+          labelMatched: true,
+        });
       }
     }
 
-    // Her durumda referans koordinatına yakınlığı ikinci bağımsız sinyal olarak kullan.
-    if (!referenceFieldRuleForText(text)) {
-      candidates.push({
-        item,
-        box,
-        score: Math.max(0, 42 - Math.min(42, positionDistance * 220)),
-      });
+    // Koordinat tabanlı eşleşme yalnızca SEMANTİK olarak uygun değerlerde
+    // kullanılabilir. Böylece referansın "amount" kutusu gidip müşteri no,
+    // tarih veya işlem numarasını "matched" yapamaz.
+    if (!isLabel && compatible) {
+      const positionScore = Math.max(
+        0,
+        70 - Math.min(70, positionDistance * 260)
+      );
+
+      // Alan tipi için minimum pozisyon eşiği.
+      if (positionScore >= 18) {
+        candidates.push({
+          item,
+          box,
+          score: positionScore,
+          nearestReferenceDistance: positionDistance,
+          semanticMatch: true,
+          labelMatched: false,
+        });
+      }
     }
   }
 
-  // Aynı OCR kutusunu iki kez aday yapma.
   const seen = new Set();
-  return candidates.filter((x) => {
-    const key = `${x.item.pageIndex || 0}:${x.item.region?.x1}:${x.item.region?.y1}:${x.item.text}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).sort((a,b) => b.score-a.score);
+  return candidates
+    .filter((x) => {
+      const key = `${x.item.pageIndex || 0}:${x.item.region?.x1}:${x.item.region?.y1}:${x.item.text}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => b.score - a.score);
 }
+
 
 async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocrResult) {
   const profile = await buildReferenceTemplateProfile(bank);
@@ -3239,7 +3364,11 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
     const dw = Math.abs(Math.log(Math.max(.001,target.widthNorm)/Math.max(.001,nearestRef.widthNorm)));
     const dh = Math.abs(Math.log(Math.max(.001,target.heightNorm)/Math.max(.001,nearestRef.heightNorm)));
 
-    const geometryScore = Math.min(100, Math.round((dx/.03)*35 + (dy/.03)*35 + dw*20 + dh*10));
+    const geometryPenalty = Math.min(
+      100,
+      Math.round((dx / 0.03) * 35 + (dy / 0.03) * 35 + dw * 20 + dh * 10)
+    );
+    const geometryScore = Math.max(0, 100 - geometryPenalty);
     const targetText = String(best.item.text || "");
     const targetDigits = (targetText.match(/\d/g)||[]).length;
     const referenceLength = Number(ref.valueTextLength)||0;
@@ -3328,14 +3457,12 @@ bank = null
 ) {
 
 if (
-!filePath ||
-!ocrResult?.success ||
-!Array.isArray(ocrResult?.regions) ||
-!ocrResult.regions.length
+  !filePath ||
+  !ocrResult?.success ||
+  !Array.isArray(ocrResult?.regions) ||
+  !ocrResult.regions.length
 ) {
-if (!filePath || !ocrResult?.success || !Array.isArray(ocrResult?.regions) || !ocrResult.regions.length) {
-return null;
-}
+  return null;
 }
 
 if (fileFingerprint && amountForensicsStrongCache.has(fileFingerprint)) {
@@ -3380,7 +3507,71 @@ if (numericOnlyPattern.test(value)) return 3;
 return 0;
 }
 
-const rawCandidates =
+// -----------------------------------------------------
+  // AYNI OCR KUTUSUNDA ETİKET + TUTAR
+  // -----------------------------------------------------
+  // PaddleOCR bazı dekontlarda ana işlem etiketi ile tutarı aynı OCR
+  // kutusunda döndürebilir. Bu durumda açık etiket en güçlü sinyaldir.
+  function extractLabeledAmountCandidates() {
+    const candidates = [];
+    const strongPatterns = [
+      /giden\s+fast\s+tutar[ıi]?\s*[:\-]?\s*([+\-]?\s*(?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[,.]\d{1,2})?)/i,
+      /gönderilen\s+(?:fast\s+)?tutar[ıi]?\s*[:\-]?\s*([+\-]?\s*(?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[,.]\d{1,2})?)/i,
+      /transfer\s+tutar[ıi]?\s*[:\-]?\s*([+\-]?\s*(?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[,.]\d{1,2})?)/i,
+      /ana\s+tutar\s*[:\-]?\s*([+\-]?\s*(?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[,.]\d{1,2})?)/i,
+      /giden\s+tutar[ıi]?\s*[:\-]?\s*([+\-]?\s*(?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[,.]\d{1,2})?)/i,
+      /işlem\s+tutar[ıi]?\s*[:\-]?\s*([+\-]?\s*(?:\d{1,3}(?:[.\s]\d{3})+|\d+)(?:[,.]\d{1,2})?)/i,
+    ];
+
+    for (const item of ocrResult.regions) {
+      if (!validRegion(item?.region)) continue;
+      const sourceText = cleanAmountText(item.text);
+      if (!sourceText) continue;
+
+      for (const pattern of strongPatterns) {
+        const match = sourceText.match(pattern);
+        if (!match?.[1]) continue;
+
+        const amountText = cleanAmountText(match[1]).replace(/\s+/g, "");
+        if (!amountText || !/\d/.test(amountText)) continue;
+
+        const startIndex = match.index ?? 0;
+        const amountIndex = startIndex + match[0].lastIndexOf(match[1]);
+        const r = item.region;
+        const sourceLength = Math.max(1, sourceText.length);
+        const startRatio = Math.max(0, Math.min(1, amountIndex / sourceLength));
+        const endRatio = Math.max(
+          startRatio,
+          Math.min(1, (amountIndex + match[1].length) / sourceLength)
+        );
+
+        const x1 = Number(r.x1) || 0;
+        const x2 = Number(r.x2) || x1;
+        const estimatedX1 = x1 + (x2 - x1) * startRatio;
+        const estimatedX2 = x1 + (x2 - x1) * endRatio;
+
+        candidates.push({
+          ...item,
+          text: amountText,
+          score: Math.max(Number(item.score) || 0, 0.90),
+          sourceLabelText: sourceText,
+          labelDerived: true,
+          labelStrength: 320,
+          region: {
+            ...r,
+            x1: Math.max(x1, Math.floor(estimatedX1)),
+            x2: Math.min(x2, Math.ceil(estimatedX2)),
+          },
+        });
+        break;
+      }
+    }
+    return candidates;
+  }
+
+  const labeledAmountCandidates = extractLabeledAmountCandidates();
+
+  const rawCandidates =
 ocrResult.regions
 .filter((item) => validRegion(item?.region))
 .map((item) => ({
@@ -3389,6 +3580,17 @@ text: cleanAmountText(item.text),
 score: Number(item.score) || 0,
 }))
 .filter((item) => numericSignal(item.text) > 0);
+
+  const rawCandidateKeys = new Set(
+    rawCandidates.map((item) =>
+      `${item.pageIndex || 0}:${item.region?.x1}:${item.region?.y1}:${item.text}`
+    )
+  );
+
+  for (const item of labeledAmountCandidates) {
+    const key = `${item.pageIndex || 0}:${item.region?.x1}:${item.region?.y1}:${item.text}`;
+    if (!rawCandidateKeys.has(key)) rawCandidates.push(item);
+  }
 
 if (!rawCandidates.length) {
 return {
@@ -3949,7 +4151,9 @@ anchor.score +
 templateScore +
 labelEvidence.score +
 referencePositionScore +
-directLabelEvidence.score,
+directLabelEvidence.score +
+(reconstructedLabelEvidence.score || 0) +
+(group.labelDerived ? 500 : 0),
 context,
 anchor,
 templateScore,
@@ -3991,7 +4195,12 @@ if (referenceAmountField) {
     Number(item.reconstructedLabelEvidence?.score || 0) >= 220
   );
 
-  if (bothMatched.length) {
+  const labeledAmountMatched = allRankedCandidates.filter((item) => item.labelDerived === true);
+
+  if (labeledAmountMatched.length) {
+    candidatePool = labeledAmountMatched;
+    selectionMethod = "same-region-strong-amount-label";
+  } else if (bothMatched.length) {
     candidatePool = bothMatched;
     selectionMethod = "reference-roi-and-direct-label";
   } else if (referenceMatched.length) {
@@ -7858,7 +8067,17 @@ preserveAmount(result.documentData.amount);
 // Eksi işareti dekontta çıkış yönünü gösterir; documentData.amount
 // tutarın büyüklüğünü korur.
 if (
-  ["reference-roi-and-direct-label", "direct-amount-label-roi", "reference-roi", "reference-position-and-label", "reference-position", "reference-nearest", "amount-label", "reconstructed-amount-label"].includes(amountForensics?.selectionMethod) &&
+  [
+    "same-region-strong-amount-label",
+    "reference-roi-and-direct-label",
+    "direct-amount-label-roi",
+    "reference-roi",
+    "reference-position-and-label",
+    "reference-position",
+    "reference-nearest",
+    "amount-label",
+    "reconstructed-amount-label"
+  ].includes(amountForensics?.selectionMethod) &&
   amountForensics?.selectedAmountText
 ) {
   const selected = String(amountForensics.selectedAmountText)
