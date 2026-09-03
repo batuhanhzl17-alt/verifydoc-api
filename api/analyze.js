@@ -1144,10 +1144,8 @@ String(check.status || "")
 .trim()
 .toLowerCase();
 
-// Kontrolün kendi sayısal skoru varsa onu kullan.
-// Böylece küçük bir "fail" tek başına kategoriyi 100'e fırlatmaz.
-// Eski sürümde fail => 100 olduğu için farklı dekontlar yapay olarak
-// aynı nihai skora kilitlenebiliyordu.
+// Kontrolün kendi sayısal skorunu kullan. Böylece tek bir fail,
+// bütün kategoriyi otomatik 100'e kilitlemez.
 if (status !== "pass" && status !== "fail") {
 continue;
 }
@@ -2976,97 +2974,190 @@ async function runReferenceLayoutForensics(targetPath, bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath) return null;
   const cacheKey = `layout:${normalizedBank}`;
+
   try {
     const targetBuffer = await fs.readFile(targetPath);
     const targetFingerprint = await extractLongLineFingerprint(targetBuffer);
     if (!targetFingerprint) return null;
 
-    let referenceFingerprint = referenceLayoutForensicsCache.get(cacheKey);
-    if (!referenceFingerprint) {
+    let ensemble = referenceLayoutForensicsCache.get(cacheKey);
+    if (!ensemble) {
       const referencePaths = await getReferenceFiles(normalizedBank);
-      const pdfPath = referencePaths.find(x => path.extname(x).toLowerCase() === '.pdf');
-      if (!pdfPath) return null;
-      const buffer = await fs.readFile(pdfPath);
-      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
-      const rendered = await renderPdfPagePng(pdf, 1, 1.6);
-      if (!rendered?.buffer) return null;
-      referenceFingerprint = await extractLongLineFingerprint(rendered.buffer);
-      if (!referenceFingerprint) return null;
-      referenceLayoutForensicsCache.set(cacheKey, referenceFingerprint);
+      if (!referencePaths.length) return null;
+
+      const fingerprints = [];
+      for (const referencePath of referencePaths) {
+        try {
+          const ext = path.extname(referencePath).toLowerCase();
+          let refBuffer = await fs.readFile(referencePath);
+          if (ext === '.pdf') {
+            const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(refBuffer) }).promise;
+            const rendered = await renderPdfPagePng(pdf, 1, 1.6);
+            if (!rendered?.buffer) continue;
+            refBuffer = rendered.buffer;
+          }
+          const fp = await extractLongLineFingerprint(refBuffer);
+          if (fp) fingerprints.push({ file: path.basename(referencePath), fingerprint: fp });
+        } catch (error) {
+          console.warn('REFERENCE LAYOUT TEK DOSYA ATLANDI:', path.basename(referencePath), error?.message || error);
+        }
+      }
+      if (!fingerprints.length) return null;
+      ensemble = { fingerprints, referenceFiles: referencePaths.map(x => path.basename(x)) };
+      referenceLayoutForensicsCache.set(cacheKey, ensemble);
     }
 
-    const refH = referenceFingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
+    function clamp01(v) { return Math.max(0, Math.min(1, Number(v) || 0)); }
+    function median(values) {
+      const a = values.filter(Number.isFinite).sort((x,y)=>x-y);
+      if (!a.length) return null;
+      const m = Math.floor(a.length/2);
+      return a.length % 2 ? a[m] : (a[m-1]+a[m])/2;
+    }
+    function lineSimilarity(a,b) {
+      if (!a || !b) return 0;
+      const dy = Math.abs(a.yNorm-b.yNorm);
+      const dl = Math.abs(a.lengthNorm-b.lengthNorm);
+      return Math.max(0, 1 - (dy/0.035)*0.65 - (dl/0.10)*0.35);
+    }
+    function bestReferenceFingerprint() {
+      const targetLines = targetFingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
+      let best = null;
+      for (const entry of ensemble.fingerprints) {
+        const refLines = entry.fingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
+        if (!refLines.length) continue;
+        let score = 0;
+        for (const r of refLines) {
+          const nearest = targetLines.reduce((p,t) => !p || lineSimilarity(r,t) > lineSimilarity(r,p) ? t : p, null);
+          score += nearest ? lineSimilarity(r,nearest) : 0;
+        }
+        score /= Math.max(refLines.length, 1);
+        if (!best || score > best.score) best = { ...entry, score };
+      }
+      return best;
+    }
+
+    const best = bestReferenceFingerprint();
+    if (!best) return null;
+    const ref = best.fingerprint;
+    const refH = ref.horizontal.filter(x => x.lengthNorm >= 0.65);
     const tarH = targetFingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
 
-    // İlk dört uzun çizgi Yapı Kredi dekontundaki üst/alt ana kutuların
-    // sınırlarını temsil eder. Footer çizgileri ayrıca sayılır.
-    const refMain = refH.slice(0, 4);
-    const tarMain = tarH.slice(0, 4);
-
-    const pairMetrics = [];
-    for (let i=0;i<Math.min(refMain.length, tarMain.length);i++) {
-      pairMetrics.push({
-        index:i,
-        referenceY:refMain[i].yNorm,
-        targetY:tarMain[i].yNorm,
-        deltaY:Math.abs(refMain[i].yNorm-tarMain[i].yNorm),
-        referenceLength:refMain[i].lengthNorm,
-        targetLength:tarMain[i].lengthNorm,
-        deltaLength:Math.abs(refMain[i].lengthNorm-tarMain[i].lengthNorm),
-      });
+    // Sayısal çizgi adedi artık ana risk kriteri değildir. Önce tüm çizgiler
+    // y-konumu ve uzunluk açısından en yakın eşleşmelerle hizalanır.
+    const matched = [];
+    const used = new Set();
+    for (const r of refH) {
+      let bestIdx = -1, bestCost = Infinity;
+      for (let i=0;i<tarH.length;i++) {
+        if (used.has(i)) continue;
+        const t=tarH[i];
+        const cost = Math.abs(r.yNorm-t.yNorm)/0.045 + Math.abs(r.lengthNorm-t.lengthNorm)/0.14;
+        if (cost < bestCost) { bestCost=cost; bestIdx=i; }
+      }
+      if (bestIdx >= 0 && bestCost <= 2.0) {
+        used.add(bestIdx);
+        matched.push({reference:r,target:tarH[bestIdx],cost:bestCost});
+      }
     }
 
-    const topBox = refMain.length >= 2 && tarMain.length >= 2 ? {
-      referenceTop: refMain[0].yNorm,
-      referenceBottom: refMain[1].yNorm,
-      targetTop: tarMain[0].yNorm,
-      targetBottom: tarMain[1].yNorm,
-      referenceHeight: refMain[1].yNorm-refMain[0].yNorm,
-      targetHeight: tarMain[1].yNorm-tarMain[0].yNorm,
-      heightRatio: (tarMain[1].yNorm-tarMain[0].yNorm) / Math.max(0.001, refMain[1].yNorm-refMain[0].yNorm),
-    } : null;
+    const yDeltas = matched.map(x => x.target.yNorm-x.reference.yNorm);
+    const globalOffset = median(yDeltas) || 0;
+    const adjusted = matched.map(x => ({
+      ...x,
+      adjustedDy: Math.abs((x.target.yNorm-globalOffset)-x.reference.yNorm),
+      lengthDelta: Math.abs(x.target.lengthNorm-x.reference.lengthNorm),
+    }));
 
-    const lowerBox = refMain.length >= 4 && tarMain.length >= 4 ? {
-      referenceTop: refMain[2].yNorm,
-      referenceBottom: refMain[3].yNorm,
-      targetTop: tarMain[2].yNorm,
-      targetBottom: tarMain[3].yNorm,
-      referenceHeight: refMain[3].yNorm-refMain[2].yNorm,
-      targetHeight: tarMain[3].yNorm-tarMain[2].yNorm,
-      heightRatio: (tarMain[3].yNorm-tarMain[2].yNorm) / Math.max(0.001, refMain[3].yNorm-refMain[2].yNorm),
-    } : null;
+    const strongY = adjusted.filter(x => x.adjustedDy > 0.045).length;
+    const mediumY = adjusted.filter(x => x.adjustedDy > 0.025).length;
+    const strongLength = adjusted.filter(x => x.lengthDelta > 0.10).length;
+    const unmatchedRef = Math.max(0, refH.length-matched.length);
+    const unmatchedTarget = Math.max(0, tarH.length-matched.length);
 
-    const lineCountPenalty = Math.min(40, Math.abs(refH.length-tarH.length)*10);
-    const yPenalty = pairMetrics.reduce((sum,x) => sum + Math.min(20, x.deltaY*120), 0);
-    const topHeightPenalty = topBox ? Math.min(25, Math.abs(Math.log(Math.max(0.05, topBox.heightRatio)))*22) : 20;
-    const lowerHeightPenalty = lowerBox ? Math.min(25, Math.abs(Math.log(Math.max(0.05, lowerBox.heightRatio)))*22) : 20;
-    const score = Math.round(Math.max(0, Math.min(100, lineCountPenalty + yPenalty + topHeightPenalty + lowerHeightPenalty)));
+    // Ana kutu sınırlarını, çizgi sırasına körü körüne bağlamak yerine
+    // üst yarıdaki en güçlü eşleşmelerden çıkar.
+    const refMain = refH.slice(0, Math.min(6, refH.length));
+    const tarMain = tarH.slice(0, Math.min(6, tarH.length));
+    function boxMetrics(lines) {
+      if (lines.length < 2) return [];
+      const boxes=[];
+      for(let i=0;i+1<lines.length;i+=2){
+        const a=lines[i], b=lines[i+1];
+        if (b.yNorm <= a.yNorm) continue;
+        boxes.push({top:a.yNorm,bottom:b.yNorm,height:b.yNorm-a.yNorm,widthA:a.lengthNorm,widthB:b.lengthNorm,width:(a.lengthNorm+b.lengthNorm)/2});
+      }
+      return boxes;
+    }
+    const rb=boxMetrics(refMain), tb=boxMetrics(tarMain);
+    const boxPairs=[];
+    for(let i=0;i<Math.min(rb.length,tb.length);i++){
+      boxPairs.push({
+        reference:rb[i], target:tb[i],
+        heightRatio:tb[i].height/Math.max(.001,rb[i].height),
+        widthRatio:tb[i].width/Math.max(.001,rb[i].width),
+      });
+    }
+    const boxHeightOutliers = boxPairs.filter(x => Math.abs(x.heightRatio-1)>0.16).length;
+    const boxWidthOutliers = boxPairs.filter(x => Math.abs(x.widthRatio-1)>0.10).length;
 
-    const strong =
-      (topBox && (Math.abs(topBox.heightRatio-1) > 0.22 || Math.abs(topBox.targetTop-topBox.referenceTop) > 0.035)) ||
-      (lowerBox && (Math.abs(lowerBox.heightRatio-1) > 0.22 || Math.abs(lowerBox.targetTop-lowerBox.referenceTop) > 0.035)) ||
-      Math.abs(refH.length-tarH.length) >= 2;
+    // Referans kümesi içinde ortak şablon yoksa bile tek referansın çizgi sayısı
+    // yüzünden fail üretme; yalnızca bağımsız geometrik sinyaller birleşirse güçlü say.
+    const independentSignals = [
+      strongY >= 2,
+      strongLength >= 2,
+      boxHeightOutliers >= 1,
+      boxWidthOutliers >= 1,
+      unmatchedRef >= 3 || unmatchedTarget >= 3,
+    ].filter(Boolean).length;
+
+    let score = 0;
+    score += Math.min(28, strongY*9 + mediumY*3);
+    score += Math.min(24, strongLength*8);
+    score += Math.min(24, boxHeightOutliers*12 + boxWidthOutliers*10);
+    score += Math.min(14, Math.max(unmatchedRef,unmatchedTarget)*4);
+    score += Math.min(10, Math.abs(tarH.length-refH.length)*2);
+    score = Math.round(Math.max(0, Math.min(100, score)));
+
+    // Küçük fotoğraf/perspektif/render farklarını tolere et.
+    const strong = independentSignals >= 2 && score >= 55;
+    const medium = !strong && score >= 25;
 
     return {
       available:true,
       bank:normalizedBank,
+      referenceFiles:ensemble.referenceFiles,
+      referenceCount:ensemble.fingerprints.length,
+      selectedReference:best.file,
       referenceLineCount:refH.length,
       targetLineCount:tarH.length,
-      pairMetrics,
-      topBox,
-      lowerBox,
+      lineCountDelta:Math.abs(refH.length-tarH.length),
+      globalYOffset:globalOffset,
+      matchedLineCount:matched.length,
+      unmatchedReferenceLines:unmatchedRef,
+      unmatchedTargetLines:unmatchedTarget,
+      strongYDiscrepancies:strongY,
+      strongLengthDiscrepancies:strongLength,
+      boxHeightOutliers,
+      boxWidthOutliers,
+      independentSignals,
+      boxPairs,
       score,
-      severity: strong ? 'strong' : score >= 20 ? 'medium' : 'low',
+      severity: strong ? 'strong' : medium ? 'medium' : 'low',
       check: {
-        status: strong ? 'fail' : score >= 20 ? 'unknown' : 'pass',
-        score: strong ? Math.max(75, score) : Math.min(45, score),
+        status: strong ? 'fail' : medium ? 'unknown' : 'pass',
+        score,
         evidence: strong
-          ? `Referans ve hedef dekontun uzun yatay sınır çizgileri uyuşmuyor. Üst/alt kutu geometrisi ve/veya belge bölümleri referanstan belirgin biçimde sapıyor.`
-          : `Ana belge kutularının uzun yatay sınır geometrisi referansla büyük ölçüde uyumlu.`
+          ? `Referans kümesindeki ${ensemble.fingerprints.length} şablona göre bağımsız kutu/çizgi geometrisi sinyalleri birlikte sapma gösteriyor.`
+          : medium
+            ? `Referans kümesiyle karşılaştırmada bazı küçük/orta düzey geometrik farklar bulundu; tek başına manipülasyon kanıtı sayılmadı.`
+            : `Referans kümesindeki şablonlarla ana kutu geometrisi uyumlu; küçük çizgi/render farkları tolere edildi.`
       },
       evidence: strong
-        ? `Yapısal geometri karşılaştırmasında referansta ${refH.length}, hedefte ${tarH.length} uzun sınır çizgisi bulundu; ana kutu yerleşiminde belirgin sapma tespit edildi.`
-        : `Yapısal geometri karşılaştırması tamamlandı; belirgin kutu geometrisi sapması bulunmadı.`,
+        ? `Yapısal geometri, ${ensemble.fingerprints.length} referansın en uyumlu şablonuyla ve hizalama sonrası karşılaştırıldı; ${independentSignals} bağımsız sapma sinyali bulundu.`
+        : medium
+          ? `Yapısal geometri referans kümesiyle karşılaştırıldı; küçük/orta farklar perspektif ve render toleransı içinde değerlendirildi.`
+          : `Yapısal geometri referans kümesiyle karşılaştırıldı; belirgin bağımsız sapma bulunmadı.`,
     };
   } catch (error) {
     console.warn('REFERENCE LAYOUT FORENSICS HATASI:', error?.message || error);
@@ -7497,9 +7588,34 @@ let referenceTemplateAnalysis = null;
 let visualForensics = null;
 let layoutForensics = null;
 
+// PDF'yi de görüntü tabanlı forensic hattına sok.
+// OpenAI için orijinal PDF korunur; OCR/geometry/visual forensic için ilk sayfa
+// normalize PNG olarak kullanılır.
+let forensicTargetPath = filePath;
+let forensicTargetMime = mime;
+let forensicTargetIsTemporary = false;
+
+if (type === "pdf") {
+  try {
+    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    const rendered = await renderPdfPagePng(pdf, 1, 1.6);
+    if (rendered?.buffer) {
+      forensicTargetPath = `/tmp/verifydoc-forensic-${fileFingerprint}.png`;
+      await fs.writeFile(forensicTargetPath, rendered.buffer);
+      forensicTargetMime = "image/png";
+      forensicTargetIsTemporary = true;
+      console.log("PDF FORENSIC RASTER HAZIR:", forensicTargetPath);
+    } else {
+      console.warn("PDF FORENSIC RASTER OLUŞTURULAMADI");
+    }
+  } catch (error) {
+    console.warn("PDF FORENSIC RASTER HATASI:", error?.message || error);
+  }
+}
+
 if (
-type === "image" ||
-type === "statement"
+  (type === "image" || type === "pdf" || type === "statement") &&
+  forensicTargetPath
 ) {
 
 console.log(
@@ -7508,7 +7624,7 @@ console.log(
 
 paddleImageOCR =
 await runPaddleOCR(
-filePath
+forensicTargetPath
 );
 
 if (
@@ -7568,8 +7684,8 @@ if (
 ) {
   try {
     referenceTemplateAnalysis = await analyzeReferenceTemplateAgainstDocument(
-      filePath,
-      mime,
+      forensicTargetPath,
+      forensicTargetMime,
       bank,
       paddleImageOCR
     );
@@ -7586,7 +7702,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
   try {
     const trustedReferencePaths = await getReferenceFiles(bank);
     visualForensics = await runVisualForensics({
-      targetPath: filePath,
+      targetPath: forensicTargetPath,
       referencePaths: trustedReferencePaths,
       bank,
       tempDir: "/tmp",
@@ -7602,7 +7718,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
-    layoutForensics = await runReferenceLayoutForensics(filePath, bank);
+    layoutForensics = await runReferenceLayoutForensics(forensicTargetPath, bank);
     console.log("REFERENCE LAYOUT FORENSICS:", JSON.stringify(layoutForensics));
   } catch (error) {
     console.warn("REFERENCE LAYOUT FORENSICS HATASI:", error?.message || error);
@@ -8473,7 +8589,7 @@ if (
 ) {
   const selected = String(amountForensics.selectedAmountText)
     .trim()
-    .replace(/^[+\-(]+/, "")
+    .replace(/^[+]+/, "")
     .replace(/[)]+$/, "")
     .trim();
   if (selected) {
@@ -8537,7 +8653,6 @@ if (visualForensics?.available && visualForensics?.severity === "strong") {
     Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
     Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
   if (structuralSupport) {
-    result.overallRisk = Math.max(Number(result.overallRisk) || 0, 70);
     result.summary = [result.summary, visualForensics.evidence].filter(Boolean).join(" ");
   }
 }
@@ -8546,7 +8661,8 @@ if (visualForensics?.available && visualForensics?.severity === "strong") {
 // düşük skor vermesine izin verme. Bu hâlâ adli bir sinyaldir; kesin sahtecilik
 // hükmü değildir.
 if (layoutForensics?.available && layoutForensics.severity === "strong") {
-  result.overallRisk = Math.max(Number(result.overallRisk) || 0, 70);
+  // Layout sinyali artık kendi sayısal skoru üzerinden risk motoruna girer;
+  // tek başına sabit 70 tabanı uygulanmaz.
   result.summary = [result.summary, layoutForensics.evidence].filter(Boolean).join(" ");
 }
 
@@ -8702,7 +8818,7 @@ informationCheck
 );
 
 
-console.log("LAYOUT/RISK PATCH ACTIVE: numeric risk + conservative structural escalation");
+console.log("ENSEMBLE FORENSICS ACTIVE: all same-bank references + PDF raster + tolerant layout scoring");
 console.log(
 "ANALYSIS SUCCESS"
 );
