@@ -1259,25 +1259,26 @@ RISK_CHECK_MAP.editingRisk
 // AĞIRLIKLI ANA SKOR
 // -----------------------------------------------------
 
-let score =
+// Kategori skorları 0-100, kategori ağırlıkları toplam 100'dür.
+// Ağırlıklı ortalama için her kategori katkısı /100 ile normalize edilir.
+// Örn. layoutRisk=4 ve ağırlık=15 => toplam skora yalnızca 0.6 puan katkı yapar;
+// 4*15=60 şeklinde doğrudan çarpılması hatalıdır.
+let score = (
 calculatedCategories.visualRisk *
 RISK_CATEGORY_WEIGHTS.visualRisk
-
 +
-
 calculatedCategories.textRisk *
 RISK_CATEGORY_WEIGHTS.textRisk
 +
 calculatedCategories.layoutRisk *
 RISK_CATEGORY_WEIGHTS.layoutRisk
 +
-
 calculatedCategories.financialDataRisk *
 RISK_CATEGORY_WEIGHTS.financialDataRisk
-
 +
 calculatedCategories.editingRisk *
-RISK_CATEGORY_WEIGHTS.editingRisk;
+RISK_CATEGORY_WEIGHTS.editingRisk
+) / 100;
 
 // -----------------------------------------------------
 // MATEMATİKSEL TUTARSIZLIK BONUSU
