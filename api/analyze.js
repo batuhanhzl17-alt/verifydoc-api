@@ -2864,6 +2864,38 @@ count,
 // BANKA ŞABLONU — TUTAR ALANI KALİBRASYONU
 // Referans PDF, yalnızca OpenAI bağlamı olarak değil, bankaya özgü tutar
 // konumunu belirlemek için de kullanılır. Sabit piksel yerine normalize konum kullanılır.
+function isSaneReferenceAmountField(field) {
+  if (!field || typeof field !== "object") return false;
+  const x = Number(field.xNorm);
+  const y = Number(field.yNorm);
+  const w = Number(field.widthNorm);
+  const h = Number(field.heightNorm);
+  if (![x, y, w, h].every(Number.isFinite)) return false;
+  if (x < 0 || y < 0 || w <= 0 || h <= 0) return false;
+  // A normalized field cannot meaningfully extend far outside the page.
+  if (x > 0.98 || y > 0.98 || w > 0.72 || h > 0.20) return false;
+  if (x + w > 1.05 || y + h > 1.02) return false;
+  if (field.templateRole && field.templateRole !== "primaryAmount") return false;
+  return true;
+}
+
+function chooseBestReferenceAmountField(profile) {
+  const amount = profile?.fields?.amount;
+  if (!amount) return null;
+  const candidates = Array.isArray(amount) ? amount : [amount];
+  const sane = candidates.filter(isSaneReferenceAmountField);
+  if (!sane.length) return null;
+  sane.sort((a, b) => {
+    const ac = Number(a.referenceCount || 0);
+    const bc = Number(b.referenceCount || 0);
+    if (bc !== ac) return bc - ac;
+    const aw = Math.abs(0.18 - Number(a.widthNorm || 0));
+    const bw = Math.abs(0.18 - Number(b.widthNorm || 0));
+    return aw - bw;
+  });
+  return sane[0];
+}
+
 async function getReferenceAmountAnchor(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
@@ -2872,9 +2904,10 @@ async function getReferenceAmountAnchor(bank) {
 
   try {
     const profile = await buildReferenceTemplateProfile(normalizedBank);
-    const amountField = profile?.fields?.amount;
+    const amountField = chooseBestReferenceAmountField(profile);
     if (!amountField) {
       referenceAmountAnchorCache.set(cacheKey, null);
+      console.warn("REFERENCE AMOUNT ANCHOR REJECTED: geçersiz/şüpheli referans amount geometrisi", normalizedBank);
       return null;
     }
 
@@ -2922,7 +2955,21 @@ const REFERENCE_FIELD_RULES = [
   { key: "recipientAddress", patterns: [/alıcı\s*adres/i, /alici\s*adres/i, /alacaklı\s*adres/i, /alacakli\s*adres/i] },
   { key: "address", patterns: [/\badres\b/i] },
   { key: "iban", patterns: [/\biban\b/i] },
-  { key: "amount", patterns: [/giden\s*fast\s*tutar/i, /gönderilen\s*(?:fast\s*)?tutar/i, /transfer\s*tutar/i, /işlem\s*tutar/i, /ana\s*tutar/i, /\btutar\b/i, /\bamount\b/i] },
+  { key: "amount", patterns: [
+    /giden\s*fast\s*tutar/i,
+    /giden\s*eft\s*tutar/i,
+    /giden\s*havale\s*tutar/i,
+    /gönderilen\s*(?:fast|eft|havale)?\s*tutar/i,
+    /transfer\s*tutar/i,
+    /işlem\s*tutar/i,
+    /havale\s*tutar/i,
+    /eft\s*tutar/i,
+    /fast\s*tutar/i,
+    /ödeme\s*tutar/i,
+    /ana\s*tutar/i,
+    /\btutar\b/i,
+    /\bamount\b/i
+  ] },
   { key: "date", patterns: [/işlem\s*tarihi/i, /islem\s*tarihi/i, /tarih/i, /date/i] },
   { key: "time", patterns: [/saat/i, /time/i] },
   { key: "transactionNo", patterns: [/işlem\s*(?:no|numarası|numarasi)/i, /islem\s*(?:no|numarasi)/i, /fiş\s*no/i, /fis\s*no/i, /referans\s*(?:no|numarası|numarasi)/i, /sorgu\s*no/i] },
@@ -2935,7 +2982,18 @@ const REFERENCE_FIELD_RULES = [
 function classifyReferenceTemplateRole(field, text) {
   const t = String(text || "").toLocaleLowerCase("tr-TR");
   if (field === "amount") {
-    if (/giden\s*fast\s*tutar[ıi]?/.test(t) || /gönderilen\s*(?:fast\s*)?tutar/.test(t) || /transfer\s*tutar/.test(t) || /işlem\s*tutar/.test(t) || /ana\s*tutar/.test(t) || /giden\s*tutar/.test(t)) return "primaryAmount";
+    if (/giden\s*fast\s*tutar[ıi]?/.test(t) ||
+        /giden\s*eft\s*tutar/.test(t) ||
+        /giden\s*havale\s*tutar/.test(t) ||
+        /gönderilen\s*(?:fast|eft|havale)?\s*tutar/.test(t) ||
+        /transfer\s*tutar/.test(t) ||
+        /işlem\s*tutar/.test(t) ||
+        /havale\s*tutar/.test(t) ||
+        /eft\s*tutar/.test(t) ||
+        /fast\s*tutar/.test(t) ||
+        /ödeme\s*tutar/.test(t) ||
+        /ana\s*tutar/.test(t) ||
+        /giden\s*tutar/.test(t)) return "primaryAmount";
     if (/vergi|komisyon|ücret|masraf|toplam\s*(?:işlem|tahsilat)|tahsilat\s*tutar/.test(t)) return "secondaryAmount";
     return "amountOther";
   }
@@ -3480,11 +3538,21 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
     }
   }
 
+  // PDF text katmanındaki amount kutusu bazı bankalarda yanlış baseline/width
+  // üretebilir. Böyle bir geometriyi güvenilir anchor olarak saklamıyoruz;
+  // raster OCR fallback gerçek "İşlem Tutarı / Havale Tutarı / EFT Tutarı"
+  // etiketinden yeniden kalibrasyon yapacak.
+  if (Array.isArray(fields.amount)) {
+    fields.amount = fields.amount.filter(isSaneReferenceAmountField);
+    if (!fields.amount.length) delete fields.amount;
+  }
+
   // Image-only/scanned reference PDFs (for example Enpara/Akbank) often have
   // no PDF text layer. In that case, rasterize the reference once and run the
   // same OCR engine used for targets. The result is cached per reference file
   // and is used only for geometry/style calibration, never as document data.
-  if (Object.keys(fields).length === 0 || !fields.amount?.length || !fields.iban?.length) {
+  const existingAmountIsSane = Array.isArray(fields.amount) && fields.amount.some(isSaneReferenceAmountField);
+  if (Object.keys(fields).length === 0 || !existingAmountIsSane || !fields.iban?.length) {
     try {
       const stat = await fs.stat(referencePath);
       const cacheKey = `ref-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
@@ -3568,7 +3636,13 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
 
           // Primary amount fields must contain a numeric/currency value. For
           // other fields any nearby value is acceptable as a geometry anchor.
-          if (rule.key === 'amount' && !/(?:\d|TL|TRY|₺|EUR|USD|GBP)/i.test(String(value.text || ''))) continue;
+          if (rule.key === 'amount') {
+            const labelText = String(label.text || '');
+            const valueText = String(value.text || '');
+            const isPrimary = classifyReferenceTemplateRole('amount', labelText) === 'primaryAmount';
+            const isNumericValue = /(?:\d|TL|TRY|₺|EUR|USD|GBP)/i.test(valueText);
+            if (!isPrimary || !isNumericValue) continue;
+          }
           addRasterField(rule.key, lr, value.region, label.text);
         }
       }
@@ -3637,7 +3711,7 @@ async function buildReferenceTemplateProfile(bank) {
         // açıklama satırları amount alanına kesinlikle giremez.
         const primary = usableEntries.filter(x =>
           x?.templateRole === "primaryAmount" ||
-          /giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar/i.test(String(x?.label || ""))
+          /giden\s*fast\s*tutar|giden\s*eft\s*tutar|giden\s*havale\s*tutar|gönderilen\s*(?:fast|eft|havale)?\s*tutar|transfer\s*tutar|işlem\s*tutar|havale\s*tutar|eft\s*tutar|fast\s*tutar|ödeme\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar/i.test(String(x?.label || ""))
         );
         if (primary.length) {
           usableEntries = primary;
