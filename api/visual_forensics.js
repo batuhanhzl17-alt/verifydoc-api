@@ -50,6 +50,15 @@ async function renderReferencePdfToPng(pdfPath, workDir) {
       globalThis.ImageData = NapiImageData;
     }
 
+    // PDF.js 4.10.x font/path çiziminde Path2D'yi global olarak bekleyebilir.
+    const NapiPath2D =
+      canvasMod.Path2D ||
+      canvasMod.default?.Path2D;
+
+    if (typeof NapiPath2D === 'function' && typeof globalThis.Path2D === 'undefined') {
+      globalThis.Path2D = NapiPath2D;
+    }
+
     if (typeof createCanvas !== 'function') {
       throw new Error('@napi-rs/canvas createCanvas bulunamadı');
     }
