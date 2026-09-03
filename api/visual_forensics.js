@@ -3,7 +3,7 @@ import path from 'path';
 import sharp from 'sharp';
 
 // =====================================================
-// VERIFYDOC VISUAL FORENSICS HELPER v3 - PDFJS CANVAS FACTORY
+// VERIFYDOC VISUAL FORENSICS HELPER v1
 // =====================================================
 // Amaç: Güvenilen referans GÖRSELLERİ ile yeni JPG/PNG'yi
 // bütün sayfa seviyesinde karşılaştırmak.
@@ -19,14 +19,25 @@ const PDF_EXT = '.pdf';
 
 function clamp(v, lo=0, hi=1){ return Math.max(lo, Math.min(hi, v)); }
 
-async function renderPdfWithCanvas(pdfPath, outPath) {
-  console.log('PDF RENDER PDFJS BAŞLADI:', path.basename(pdfPath));
+async function renderReferencePdfToPng(pdfPath, workDir) {
+  const base = path.basename(pdfPath, path.extname(pdfPath)).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const outPrefix = path.join(workDir, `__vf_${base}`);
+  const outPng = `${outPrefix}-1.png`;
 
+  // =====================================================
+  // PDF.JS + @napi-rs/canvas
+  // =====================================================
+  // pdfjs-dist 4.7.x'in NodeCanvasFactory'si kendi ic canvas
+  // baglantisini kullanir. Vercel bundle'inda bu baglanti bos
+  // kalabildigi icin page.render() seviyesinde canvas vermek
+  // yeterli degildir. Kendi CanvasFactory'mizi getDocument()
+  // seviyesinde veriyoruz; boylece PDF icindeki resimler de ayni
+  // factory uzerinden olusturulur.
   try {
+    console.log('PDF RENDER PDFJS BAŞLADI:', path.basename(pdfPath));
+
     const canvasMod = await import('@napi-rs/canvas');
-    const createCanvas =
-      canvasMod.createCanvas ||
-      canvasMod.default?.createCanvas;
+    const createCanvas = canvasMod.createCanvas || canvasMod.default?.createCanvas;
 
     if (typeof createCanvas !== 'function') {
       throw new Error('@napi-rs/canvas createCanvas bulunamadı');
@@ -35,61 +46,43 @@ async function renderPdfWithCanvas(pdfPath, outPath) {
     const pdfjs = await import('pdfjs-dist/build/pdf.mjs');
     const buffer = await fs.readFile(pdfPath);
 
-    const pdf = await pdfjs.getDocument({
-      data: new Uint8Array(buffer),
-      useWorkerFetch: false,
-      isEvalSupported: false
-    }).promise;
-
-    const page = await pdf.getPage(1);
-    const baseViewport = page.getViewport({ scale: 1 });
-
-    const scale = Math.min(
-      1200 / baseViewport.width,
-      1600 / baseViewport.height
-    );
-
-    const viewport = page.getViewport({ scale });
-
     const canvasFactory = {
       create(width, height) {
-        const canvas = createCanvas(width, height);
+        const w = Math.max(1, Math.ceil(width));
+        const h = Math.max(1, Math.ceil(height));
+        const canvas = createCanvas(w, h);
         const context = canvas.getContext('2d');
-
-        if (!context) {
-          throw new Error('Canvas 2D context oluşturulamadı');
-        }
-
+        if (!context) throw new Error('Canvas 2D context oluşturulamadı');
         return { canvas, context };
       },
-
-      reset(data, width, height) {
-        data.canvas.width = width;
-        data.canvas.height = height;
-        data.context = data.canvas.getContext('2d');
-
-        if (!data.context) {
-          throw new Error('Canvas 2D context reset edilemedi');
-        }
+      reset(canvasAndContext, width, height) {
+        canvasAndContext.canvas.width = Math.max(1, Math.ceil(width));
+        canvasAndContext.canvas.height = Math.max(1, Math.ceil(height));
       },
-
-      destroy(data) {
-        if (data?.canvas) {
-          data.canvas.width = 1;
-          data.canvas.height = 1;
+      destroy(canvasAndContext) {
+        if (canvasAndContext?.canvas) {
+          canvasAndContext.canvas.width = 0;
+          canvasAndContext.canvas.height = 0;
         }
-
-        if (data) {
-          data.canvas = null;
-          data.context = null;
+        if (canvasAndContext) {
+          canvasAndContext.canvas = null;
+          canvasAndContext.context = null;
         }
       }
     };
 
-    const canvasAndContext = canvasFactory.create(
-      Math.ceil(viewport.width),
-      Math.ceil(viewport.height)
-    );
+    // 4.7.x'te option adi canvasFactory'dir.
+    const pdf = await pdfjs.getDocument({
+      data: new Uint8Array(buffer),
+      canvasFactory
+    }).promise;
+
+    const page = await pdf.getPage(1);
+    const baseViewport = page.getViewport({ scale: 1 });
+    const scale = Math.min(1200 / baseViewport.width, 1600 / baseViewport.height);
+    const viewport = page.getViewport({ scale });
+
+    const canvasAndContext = canvasFactory.create(viewport.width, viewport.height);
 
     await page.render({
       canvasContext: canvasAndContext.context,
@@ -98,98 +91,55 @@ async function renderPdfWithCanvas(pdfPath, outPath) {
     }).promise;
 
     const png = canvasAndContext.canvas.toBuffer('image/png');
+    await fs.writeFile(outPng, png);
+    await fs.access(outPng);
 
-    await fs.writeFile(outPath, png);
-    await fs.access(outPath);
+    canvasFactory.destroy(canvasAndContext);
 
     console.log('PDF RENDER PDFJS BAŞARILI:', JSON.stringify({
       file: path.basename(pdfPath),
-      method: 'pdfjs-napi-canvas-factory',
+      method: 'pdfjs-custom-napi-canvas-factory',
       width: Math.ceil(viewport.width),
       height: Math.ceil(viewport.height)
     }));
 
-    return outPath;
+    return outPng;
   } catch (e) {
     console.warn('PDF RENDER PDFJS HATASI:', JSON.stringify({
       file: path.basename(pdfPath),
       error: e?.message || String(e),
       name: e?.name || null,
-      stack: e?.stack
-        ? String(e.stack).split('\n').slice(0, 6).join('\n')
-        : null
+      stack: e?.stack ? String(e.stack).split('\n').slice(0, 5).join('\n') : null
     }));
-
-    return null;
   }
-}
 
-async function renderReferencePdfToPng(pdfPath, workDir) {
-  const base = path.basename(pdfPath, path.extname(pdfPath))
-    .replace(/[^a-zA-Z0-9_-]/g, '_');
-
-  const outPrefix = path.join(workDir, `__vf_${base}`);
-  const outPng = `${outPrefix}-1.png`;
-
-  // 1) Vercel uyumlu PDF.js + @napi-rs/canvas
-  const canvasRendered = await renderPdfWithCanvas(pdfPath, outPng);
-  if (canvasRendered) return canvasRendered;
-
-  // 2) pdftoppm fallback
+  // =====================================================
+  // SYSTEM FALLBACKS
+  // =====================================================
   try {
     const { execFile } = await import('child_process');
     const { promisify } = await import('util');
     const execFileAsync = promisify(execFile);
-
-    console.log('PDF RENDER PDftoppm BAŞLADI:', path.basename(pdfPath));
-
-    await execFileAsync(
-      'pdftoppm',
-      ['-f', '1', '-singlefile', '-png', '-r', '110', pdfPath, outPrefix],
-      { timeout: 20000 }
-    );
-
+    await execFileAsync('pdftoppm', ['-f','1','-singlefile','-png','-r','110',pdfPath,outPrefix], { timeout: 20000 });
     await fs.access(outPng);
-
     console.log('PDF RENDER PDftoppm BAŞARILI:', path.basename(pdfPath));
     return outPng;
   } catch (e) {
-    console.warn('PDF RENDER PDftoppm HATASI:', JSON.stringify({
-      file: path.basename(pdfPath),
-      error: e?.message || String(e),
-      code: e?.code || null,
-      stderr: e?.stderr ? String(e.stderr).slice(0, 1000) : null
-    }));
+    console.warn('PDF RENDER PDftoppm YOK/HATA:', e?.message || String(e));
   }
 
-  // 3) ImageMagick fallback
   try {
     const { execFile } = await import('child_process');
     const { promisify } = await import('util');
     const execFileAsync = promisify(execFile);
-
-    console.log('PDF RENDER MAGICK BAŞLADI:', path.basename(pdfPath));
-
-    await execFileAsync(
-      'magick',
-      ['-density', '110', `${pdfPath}[0]`, outPng],
-      { timeout: 20000 }
-    );
-
+    await execFileAsync('magick', ['-density','110',`${pdfPath}[0]`,outPng], { timeout: 20000 });
     await fs.access(outPng);
-
     console.log('PDF RENDER MAGICK BAŞARILI:', path.basename(pdfPath));
     return outPng;
   } catch (e) {
-    console.warn('PDF RENDER MAGICK HATASI:', JSON.stringify({
-      file: path.basename(pdfPath),
-      error: e?.message || String(e),
-      code: e?.code || null,
-      stderr: e?.stderr ? String(e.stderr).slice(0, 1000) : null
-    }));
+    console.warn('PDF RENDER MAGICK YOK/HATA:', e?.message || String(e));
   }
 
-  console.warn('PDF RENDER TAMAMEN BAŞARISIZ:', path.basename(pdfPath));
   return null;
 }
 
