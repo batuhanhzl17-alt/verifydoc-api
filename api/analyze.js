@@ -1144,17 +1144,18 @@ String(check.status || "")
 .trim()
 .toLowerCase();
 
-const STATUS_SCORE = {
-pass: 0,
-fail: 100
-};
-
-if (!(status in STATUS_SCORE)) {
+// Kontrolün kendi sayısal skoru varsa onu kullan.
+// Böylece küçük bir "fail" tek başına kategoriyi 100'e fırlatmaz.
+// Eski sürümde fail => 100 olduğu için farklı dekontlar yapay olarak
+// aynı nihai skora kilitlenebiliyordu.
+if (status !== "pass" && status !== "fail") {
 continue;
 }
 
-const safeScore =
-STATUS_SCORE[status];
+const rawCheckScore = Number(check.score);
+const safeScore = Number.isFinite(rawCheckScore)
+? Math.max(0, Math.min(100, rawCheckScore))
+: (status === "fail" ? 60 : 0);
 
 
 weightedTotal +=
@@ -8701,6 +8702,7 @@ informationCheck
 );
 
 
+console.log("LAYOUT/RISK PATCH ACTIVE: numeric risk + conservative structural escalation");
 console.log(
 "ANALYSIS SUCCESS"
 );
