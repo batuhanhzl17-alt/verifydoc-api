@@ -2797,6 +2797,16 @@ const REFERENCE_FIELD_RULES = [
   { key: "description", patterns: [/açıklama/i, /aciklama/i, /description/i] },
 ];
 
+function classifyReferenceTemplateRole(field, text) {
+  const t = String(text || "").toLocaleLowerCase("tr-TR");
+  if (field === "amount") {
+    if (/giden\s*fast\s*tutar[ıi]?/.test(t) || /gönderilen\s*(?:fast\s*)?tutar/.test(t) || /transfer\s*tutar/.test(t) || /işlem\s*tutar/.test(t) || /ana\s*tutar/.test(t) || /giden\s*tutar/.test(t)) return "primaryAmount";
+    if (/vergi|komisyon|ücret|masraf|toplam\s*(?:işlem|tahsilat)|tahsilat\s*tutar/.test(t)) return "secondaryAmount";
+    return "amountOther";
+  }
+  return "fieldValue";
+}
+
 function referenceFieldRuleForText(text) {
   const value = String(text || "").toLocaleLowerCase("tr-TR");
   for (const rule of REFERENCE_FIELD_RULES) {
@@ -2879,6 +2889,186 @@ async function calculateReferenceStyleMetrics(buffer, box, width, height) {
       edgeDensity: pixels ? edges / pixels : 0,
     };
   } catch {
+    return null;
+  }
+}
+
+
+// =====================================================
+// REFERANS / HEDEF YAPISAL GEOMETRİ FORENSICS
+// =====================================================
+// Referansın gerçek değerleri kullanılmaz. Sadece PDF'nin çizgisel/layout
+// fingerprint'i ile hedef görüntünün fiziksel yerleşimi karşılaştırılır.
+const referenceLayoutForensicsCache = new Map();
+
+async function extractLongLineFingerprint(buffer) {
+  if (!buffer) return null;
+  try {
+    const raw = await sharp(buffer).grayscale().raw().toBuffer({ resolveWithObject: true });
+    const { width, height } = raw.info;
+    const threshold = 180;
+    const rowCounts = new Array(height).fill(0);
+    const colCounts = new Array(width).fill(0);
+
+    for (let y = 0; y < height; y++) {
+      let rc = 0;
+      const off = y * width;
+      for (let x = 0; x < width; x++) {
+        if (raw.data[off + x] < threshold) {
+          rc++;
+          colCounts[x]++;
+        }
+      }
+      rowCounts[y] = rc;
+    }
+
+    function clusterIndices(indices) {
+      const out = [];
+      let start = null;
+      let prev = null;
+      for (const idx of indices) {
+        if (start === null) start = idx;
+        if (prev !== null && idx > prev + 1) {
+          out.push([start, prev]);
+          start = idx;
+        }
+        prev = idx;
+      }
+      if (start !== null) out.push([start, prev]);
+      return out;
+    }
+
+    const horizontalRuns = clusterIndices(
+      rowCounts.map((v, i) => v >= width * 0.65 ? i : -1).filter(i => i >= 0)
+    );
+    const verticalRuns = clusterIndices(
+      colCounts.map((v, i) => v >= height * 0.50 ? i : -1).filter(i => i >= 0)
+    );
+
+    const horizontal = horizontalRuns.map(([a,b]) => {
+      const y = Math.round((a+b)/2);
+      const darkXs = [];
+      for (let x=0;x<width;x++) {
+        if (raw.data[y*width+x] < threshold) darkXs.push(x);
+      }
+      if (!darkXs.length) return null;
+      return {
+        yNorm: y/height,
+        x1Norm: darkXs[0]/width,
+        x2Norm: darkXs[darkXs.length-1]/width,
+        lengthNorm: (darkXs[darkXs.length-1]-darkXs[0]+1)/width,
+      };
+    }).filter(Boolean);
+
+    const vertical = verticalRuns.map(([a,b]) => ({
+      xNorm: ((a+b)/2)/width,
+      lengthNorm: Math.max(...colCounts.slice(a,b+1))/height,
+    }));
+
+    return { width, height, horizontal, vertical };
+  } catch (error) {
+    return null;
+  }
+}
+
+async function runReferenceLayoutForensics(targetPath, bank) {
+  const normalizedBank = normalizeBank(bank);
+  if (!normalizedBank || !targetPath) return null;
+  const cacheKey = `layout:${normalizedBank}`;
+  try {
+    const targetBuffer = await fs.readFile(targetPath);
+    const targetFingerprint = await extractLongLineFingerprint(targetBuffer);
+    if (!targetFingerprint) return null;
+
+    let referenceFingerprint = referenceLayoutForensicsCache.get(cacheKey);
+    if (!referenceFingerprint) {
+      const referencePaths = await getReferenceFiles(normalizedBank);
+      const pdfPath = referencePaths.find(x => path.extname(x).toLowerCase() === '.pdf');
+      if (!pdfPath) return null;
+      const buffer = await fs.readFile(pdfPath);
+      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+      const rendered = await renderPdfPagePng(pdf, 1, 1.6);
+      if (!rendered?.buffer) return null;
+      referenceFingerprint = await extractLongLineFingerprint(rendered.buffer);
+      if (!referenceFingerprint) return null;
+      referenceLayoutForensicsCache.set(cacheKey, referenceFingerprint);
+    }
+
+    const refH = referenceFingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
+    const tarH = targetFingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
+
+    // İlk dört uzun çizgi Yapı Kredi dekontundaki üst/alt ana kutuların
+    // sınırlarını temsil eder. Footer çizgileri ayrıca sayılır.
+    const refMain = refH.slice(0, 4);
+    const tarMain = tarH.slice(0, 4);
+
+    const pairMetrics = [];
+    for (let i=0;i<Math.min(refMain.length, tarMain.length);i++) {
+      pairMetrics.push({
+        index:i,
+        referenceY:refMain[i].yNorm,
+        targetY:tarMain[i].yNorm,
+        deltaY:Math.abs(refMain[i].yNorm-tarMain[i].yNorm),
+        referenceLength:refMain[i].lengthNorm,
+        targetLength:tarMain[i].lengthNorm,
+        deltaLength:Math.abs(refMain[i].lengthNorm-tarMain[i].lengthNorm),
+      });
+    }
+
+    const topBox = refMain.length >= 2 && tarMain.length >= 2 ? {
+      referenceTop: refMain[0].yNorm,
+      referenceBottom: refMain[1].yNorm,
+      targetTop: tarMain[0].yNorm,
+      targetBottom: tarMain[1].yNorm,
+      referenceHeight: refMain[1].yNorm-refMain[0].yNorm,
+      targetHeight: tarMain[1].yNorm-tarMain[0].yNorm,
+      heightRatio: (tarMain[1].yNorm-tarMain[0].yNorm) / Math.max(0.001, refMain[1].yNorm-refMain[0].yNorm),
+    } : null;
+
+    const lowerBox = refMain.length >= 4 && tarMain.length >= 4 ? {
+      referenceTop: refMain[2].yNorm,
+      referenceBottom: refMain[3].yNorm,
+      targetTop: tarMain[2].yNorm,
+      targetBottom: tarMain[3].yNorm,
+      referenceHeight: refMain[3].yNorm-refMain[2].yNorm,
+      targetHeight: tarMain[3].yNorm-tarMain[2].yNorm,
+      heightRatio: (tarMain[3].yNorm-tarMain[2].yNorm) / Math.max(0.001, refMain[3].yNorm-refMain[2].yNorm),
+    } : null;
+
+    const lineCountPenalty = Math.min(40, Math.abs(refH.length-tarH.length)*10);
+    const yPenalty = pairMetrics.reduce((sum,x) => sum + Math.min(20, x.deltaY*120), 0);
+    const topHeightPenalty = topBox ? Math.min(25, Math.abs(Math.log(Math.max(0.05, topBox.heightRatio)))*22) : 20;
+    const lowerHeightPenalty = lowerBox ? Math.min(25, Math.abs(Math.log(Math.max(0.05, lowerBox.heightRatio)))*22) : 20;
+    const score = Math.round(Math.max(0, Math.min(100, lineCountPenalty + yPenalty + topHeightPenalty + lowerHeightPenalty)));
+
+    const strong =
+      (topBox && (Math.abs(topBox.heightRatio-1) > 0.22 || Math.abs(topBox.targetTop-topBox.referenceTop) > 0.035)) ||
+      (lowerBox && (Math.abs(lowerBox.heightRatio-1) > 0.22 || Math.abs(lowerBox.targetTop-lowerBox.referenceTop) > 0.035)) ||
+      Math.abs(refH.length-tarH.length) >= 2;
+
+    return {
+      available:true,
+      bank:normalizedBank,
+      referenceLineCount:refH.length,
+      targetLineCount:tarH.length,
+      pairMetrics,
+      topBox,
+      lowerBox,
+      score,
+      severity: strong ? 'strong' : score >= 20 ? 'medium' : 'low',
+      check: {
+        status: strong ? 'fail' : score >= 20 ? 'unknown' : 'pass',
+        score: strong ? Math.max(75, score) : Math.min(45, score),
+        evidence: strong
+          ? `Referans ve hedef dekontun uzun yatay sınır çizgileri uyuşmuyor. Üst/alt kutu geometrisi ve/veya belge bölümleri referanstan belirgin biçimde sapıyor.`
+          : `Ana belge kutularının uzun yatay sınır geometrisi referansla büyük ölçüde uyumlu.`
+      },
+      evidence: strong
+        ? `Yapısal geometri karşılaştırmasında referansta ${refH.length}, hedefte ${tarH.length} uzun sınır çizgisi bulundu; ana kutu yerleşiminde belirgin sapma tespit edildi.`
+        : `Yapısal geometri karşılaştırması tamamlandı; belirgin kutu geometrisi sapması bulunmadı.`,
+    };
+  } catch (error) {
+    console.warn('REFERENCE LAYOUT FORENSICS HATASI:', error?.message || error);
     return null;
   }
 }
@@ -3017,6 +3207,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         label: String(row.text || ''),
         labelPresent: Boolean(labelItem),
         valueTextLength: chars,
+        templateRole: classifyReferenceTemplateRole(rule.key, row.text),
         style: { source:'pdf-text-metadata', fontNames, avgFontHeight, avgCharWidth, itemCount:valueItems.length },
         referenceFile: path.basename(referencePath),
       };
@@ -3071,10 +3262,27 @@ async function buildReferenceTemplateProfile(bank) {
 
     const fields = {};
     for (const [field, entries] of Object.entries(fieldBuckets)) {
-      // Aynı PDF içinde farklı sayfalarda aynı alan bulunabilir. Sayfa 1'i tercih
-      // ediyoruz; ardından en sık görülen normalize konum kümesini temsilci olarak seçiyoruz.
       const pageOne = entries.filter(x => Number(x.pageNumber) === 1);
-      fields[field] = aggregateReferenceField(pageOne.length ? pageOne : entries);
+      let usableEntries = pageOne.length ? pageOne : entries;
+      if (field === "amount") {
+        // ANA TUTAR = yalnızca "GİDEN FAST TUTARI" / eşdeğer açık ana
+        // işlem tutarı etiketi. Vergi, komisyon, toplam tahsilat ve
+        // açıklama satırları amount alanına kesinlikle giremez.
+        const primary = usableEntries.filter(x =>
+          x?.templateRole === "primaryAmount" ||
+          /giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar/i.test(String(x?.label || ""))
+        );
+        if (primary.length) {
+          usableEntries = primary;
+        } else {
+          // Açık ana tutar etiketi yoksa referans tutar anchor'ı üretme.
+          // Böylece komisyon/toplam gibi sayılar ana tutar konumu olarak
+          // yanlış kalibre edilmez.
+          usableEntries = [];
+        }
+      }
+      if (!usableEntries.length) continue;
+      fields[field] = aggregateReferenceField(usableEntries);
     }
 
     // SECURITY BOUNDARY: extracted reference PDF text is used only while
@@ -3300,7 +3508,7 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
     const positionDistance = nearestVariant?.distance ?? Infinity;
 
     // Etiketsiz semantik eşleşme çok uzaktaysa reddet.
-    if (labelStrength === 0 && nearbyLabel === 0 && positionDistance > 0.18) continue;
+    if (labelStrength === 0 && nearbyLabel === 0 && positionDistance > 0.11) continue;
 
     let score = Math.min(60, Number(item.score || 0) * 25);
     score += Math.max(labelStrength, nearbyLabel);
@@ -4140,6 +4348,134 @@ function reconstructedAmountLabelEvidence(group) {
   return { score: 0, label: null, distance: Infinity, hard: false };
 }
 
+function extractStrongAmountFromText(text) {
+  const raw = cleanAmountText(text || "");
+  if (!raw) return null;
+  const patterns = [
+    /giden\s*fast\s*tutar[ıi]?\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /gönderilen\s*(?:fast\s*)?tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /transfer\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /işlem\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /ana\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /giden\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+  ];
+  for (const re of patterns) {
+    const m = raw.match(re);
+    if (m?.[1]) return m[1];
+  }
+  return null;
+}
+
+function normalizePrimaryAmountOCRText(text) {
+  return cleanAmountText(text || "")
+    .toLocaleUpperCase("tr-TR")
+    .replace(/[İIı]/g, "I")
+    // PaddleOCR bazı fontlarda T harfini I/J/L gibi okuyabiliyor.
+    .replace(/GIDEN\s+FAST\s+IUTARI/g, "GIDEN FAST TUTARI")
+    .replace(/GIDEN\s+FAST\s+TUTARL/g, "GIDEN FAST TUTARI")
+    .replace(/GIDEN\s+FAST\s+TUTAR1/g, "GIDEN FAST TUTARI")
+    .replace(/GONDERILEN\s+FAST\s+IUTARI/g, "GONDERILEN FAST TUTARI")
+    .replace(/GONDERILEN\s+FAST\s+TUTARL/g, "GONDERILEN FAST TUTARI")
+    .replace(/GONDERIM\s+IUTARI/g, "GONDERIM TUTARI")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractPrimaryAmountFromLine(text) {
+  const raw = normalizePrimaryAmountOCRText(text);
+  if (!raw) return null;
+  const patterns = [
+    /GIDEN\s+FAST\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /GONDERILEN\s+FAST\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /TRANSFER\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /ISLEM\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /ANA\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+  ];
+  for (const re of patterns) {
+    const m = raw.match(re);
+    if (m?.[1]) return { value: m[1], normalized: raw };
+  }
+  return null;
+}
+
+// Etiket ve rakam aynı OCR kutusunda olmayabilir. Aynı satırdaki yakın
+// kutuları birleştirerek GİDEN FAST TUTARI -> değer ilişkisini yeniden kur.
+function buildPrimaryAmountLabelDerivedCandidates() {
+  const regions = ocrResult.regions
+    .filter((item) => item?.text && validRegion(item.region))
+    .map((item) => ({
+      item,
+      text: cleanAmountText(item.text),
+      x1: Number(item.region.x1) || 0,
+      y1: Number(item.region.y1) || 0,
+      x2: Number(item.region.x2) || 0,
+      y2: Number(item.region.y2) || 0,
+    }))
+    .sort((a,b) => a.y1 - b.y1 || a.x1 - b.x1);
+
+  const lines = [];
+  for (const r of regions) {
+    const cy = (r.y1 + r.y2) / 2;
+    let line = lines.find(l => Math.abs(l.cy - cy) <= Math.max(14, Math.min(r.y2-r.y1, 30) * 1.25));
+    if (!line) { line = { cy, items: [] }; lines.push(line); }
+    line.items.push(r);
+  }
+
+  const candidates = [];
+  for (const line of lines) {
+    line.items.sort((a,b) => a.x1 - b.x1);
+    // Hem tam satırı hem de kayan pencereleri dene; böylece araya OCR
+    // ile bölünmüş VERGİ/KOMİSYON kutuları girmesi sorun olmaz.
+    for (let i=0; i<line.items.length; i++) {
+      let combined = "";
+      let first = null;
+      let last = null;
+      for (let j=i; j<Math.min(line.items.length, i+10); j++) {
+        const cur = line.items[j];
+        if (last && cur.x1 - last.x2 > 180) break;
+        combined = `${combined} ${cur.text}`.trim();
+        first = first || cur;
+        last = cur;
+        const parsed = extractPrimaryAmountFromLine(combined);
+        if (!parsed) continue;
+
+        // Sayısal değerin OCR kutusunu mümkün olduğunca sağdaki son kutuya
+        // bağla; amountForensics bu kutuyu sonraki piksel analizinde kullanır.
+        const source = last?.item || first.item;
+        const sourceRegion = source.region;
+        candidates.push({
+          ...source,
+          text: parsed.value,
+          labelDerived: true,
+          labelDerivedScore: 1200,
+          amountCandidateScore: 1200,
+          referencePositionScore: 0,
+          directLabelEvidence: { score: 1200, label: parsed.normalized, distance: 0, hard: true },
+          reconstructedLabelEvidence: { score: 1200, label: parsed.normalized, distance: 0, hard: true },
+          labelEvidence: { score: 1200, positive: [parsed.normalized], negative: [] },
+          context: { score: 0, positive: [], negative: [] },
+          anchor: { score: 0, anchors: [] },
+          templateScore: 0,
+          signal: 1,
+          region: sourceRegion,
+        });
+        break;
+      }
+    }
+  }
+
+  // Aynı OCR kutusundan üretilen tekrarları temizle.
+  const seen = new Set();
+  return candidates.filter(c => {
+    const key = `${c.region?.x1}:${c.region?.y1}:${c.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+const labelDerivedCandidates = buildPrimaryAmountLabelDerivedCandidates();
+
 const allRankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
 const context = nearbyContextScore(group);
@@ -4181,6 +4517,10 @@ let candidatePool = allRankedCandidates;
 let selectionMethod = "legacy-scoring";
 
 if (referenceAmountField) {
+  if (labelDerivedCandidates.length) {
+    candidatePool = labelDerivedCandidates;
+    selectionMethod = "same-region-strong-amount-label";
+  } else {
   const referenceMatched = allRankedCandidates.filter((item) =>
     Number(item.referencePositionScore || 0) >= 180
   );
@@ -4221,6 +4561,7 @@ if (referenceAmountField) {
     // Aksi halde müşteri no / sorgu no tekrar tutar seçilebilir.
     candidatePool = [];
     selectionMethod = "reference-unmatched";
+  }
   }
 }
 
@@ -4302,7 +4643,7 @@ negativeContext: [...(item.context?.negative || []), ...(item.labelEvidence?.neg
 console.log(
 "REFERENCE GUIDED AMOUNT:",
 JSON.stringify({
-referenceAmountField,
+referenceAmountField: referenceAmountField ? { xNorm: referenceAmountField.xNorm, yNorm: referenceAmountField.yNorm, widthNorm: referenceAmountField.widthNorm, heightNorm: referenceAmountField.heightNorm, pageNumber: referenceAmountField.pageNumber, referenceCount: referenceAmountField.referenceCount, templateRole: referenceAmountField.templateRole || null } : null,
 selectedText: candidate.text,
 selectionMethod
 })
@@ -7153,6 +7494,7 @@ let paddleImageOCR = null;
 let amountForensics = null;
 let referenceTemplateAnalysis = null;
 let visualForensics = null;
+let layoutForensics = null;
 
 if (
 type === "image" ||
@@ -7251,6 +7593,18 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
     console.log("VISUAL FORENSICS:", JSON.stringify(visualForensics));
   } catch (error) {
     console.warn("VISUAL FORENSICS HATASI:", error?.message || error);
+  }
+}
+
+// =====================================================
+// YAPISAL KUTU / ÇİZGİ GEOMETRİSİ FORENSICS
+// =====================================================
+if ((type === "image" || type === "pdf") && bank && reference) {
+  try {
+    layoutForensics = await runReferenceLayoutForensics(filePath, bank);
+    console.log("REFERENCE LAYOUT FORENSICS:", JSON.stringify(layoutForensics));
+  } catch (error) {
+    console.warn("REFERENCE LAYOUT FORENSICS HATASI:", error?.message || error);
   }
 }
 
@@ -7985,6 +8339,38 @@ Konum veya font/render farkı tek başına sahtecilik kanıtı değildir; başka
 }
 
 // -------------------------------------------------
+// YAPISAL GEOMETRİ FORENSICS CONTEXT
+// -------------------------------------------------
+if (layoutForensics?.available) {
+  content.unshift({
+    type: "input_text",
+    text: `
+=====================================================
+DETERMINISTIK YAPISAL GEOMETRİ FORENSICS
+=====================================================
+
+Referans dekontun gerçek işlem değerleri kullanılmaz.
+Bu bölüm yalnızca çizgi/kutu yerleşimi geometrisini karşılaştırır.
+
+${JSON.stringify({
+  bank: layoutForensics.bank,
+  referenceLineCount: layoutForensics.referenceLineCount,
+  targetLineCount: layoutForensics.targetLineCount,
+  topBox: layoutForensics.topBox,
+  lowerBox: layoutForensics.lowerBox,
+  score: layoutForensics.score,
+  severity: layoutForensics.severity,
+  evidence: layoutForensics.evidence
+}, null, 2)}
+
+Bu bulguyu layoutIntegrity ve editingRisk değerlendirmesinde dikkate al;
+ancak tek başına sahtecilik kanıtı olarak kabul etme.
+=====================================================
+`,
+  });
+}
+
+// -------------------------------------------------
 // OPENAI
 // -------------------------------------------------
 console.log(
@@ -8048,6 +8434,12 @@ result =
 parseAIResponse(
 response.output_text
 );
+
+// Deterministik yapısal geometri sinyali AI çıktısından bağımsızdır.
+if (layoutForensics?.available && result?.checks) {
+  result.checks.layoutIntegrity = layoutForensics.check;
+}
+
 function preserveAmount(value) {
 if (value === null || value === undefined) {
 return null;
@@ -8092,6 +8484,9 @@ if (
 
 if (visualForensics) {
   result.visualForensics = visualForensics;
+}
+if (layoutForensics) {
+  result.layoutForensics = layoutForensics;
 }
 
 if (amountForensics) {
@@ -8146,6 +8541,14 @@ if (visualForensics?.available && visualForensics?.severity === "strong") {
   }
 }
 
+// Yapısal geometri çok güçlü biçimde referanstan sapıyorsa, yalnızca AI'ın
+// düşük skor vermesine izin verme. Bu hâlâ adli bir sinyaldir; kesin sahtecilik
+// hükmü değildir.
+if (layoutForensics?.available && layoutForensics.severity === "strong") {
+  result.overallRisk = Math.max(Number(result.overallRisk) || 0, 70);
+  result.summary = [result.summary, layoutForensics.evidence].filter(Boolean).join(" ");
+}
+
 // Risk motorunu amount forensics değişikliğinden sonra tekrar hesapla.
 const deterministicRiskAfterForensics =
 calculateOverallRisk(
@@ -8197,6 +8600,9 @@ if (visualForensics?.available && visualForensics?.severity === "strong") {
     Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
     Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
   if (structuralSupport) finalRiskScore = Math.max(finalRiskScore, 70);
+}
+if (layoutForensics?.available && layoutForensics.severity === "strong") {
+  finalRiskScore = Math.max(finalRiskScore, 70);
 }
 // Tutar farkı varsa riski ciddi şekilde yükselt
 if (hasMajorAmountMismatch) {
