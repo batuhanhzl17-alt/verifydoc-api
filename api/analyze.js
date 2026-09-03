@@ -2751,14 +2751,19 @@ async function getReferenceAmountAnchor(bank) {
       yNorm: Number(amountField.yNorm) || null,
       widthNorm: Number(amountField.widthNorm) || null,
       heightNorm: Number(amountField.heightNorm) || null,
-      label: amountField.label || 'tutar',
-      amountText: null,
+      // SECURITY: Referansın gerçek metni/tutarı kesinlikle taşınmaz.
+      // Yalnızca şablon koordinatı kullanılır.
       referenceCount: Number(amountField.referenceCount) || 1,
       spread: amountField.spread || null,
       source: 'trusted-reference-ensemble',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
-    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE:', JSON.stringify(anchor));
+    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE (SAFE):', JSON.stringify({
+      bank: anchor.bank, pageNumber: anchor.pageNumber,
+      xNorm: anchor.xNorm, yNorm: anchor.yNorm,
+      widthNorm: anchor.widthNorm, heightNorm: anchor.heightNorm,
+      referenceCount: anchor.referenceCount, source: anchor.source
+    }));
     return anchor;
   } catch (error) {
     console.warn('REFERENCE AMOUNT ANCHOR ENSEMBLE HATASI:', normalizedBank, error?.message || error);
@@ -3070,6 +3075,24 @@ async function buildReferenceTemplateProfile(bank) {
       // ediyoruz; ardından en sık görülen normalize konum kümesini temsilci olarak seçiyoruz.
       const pageOne = entries.filter(x => Number(x.pageNumber) === 1);
       fields[field] = aggregateReferenceField(pageOne.length ? pageOne : entries);
+    }
+
+    // SECURITY BOUNDARY: extracted reference PDF text is used only while
+    // constructing geometry/style. Do not retain reference document values
+    // (names, IBANs, amounts, account/ref numbers) in the final profile.
+    for (const field of Object.keys(fields)) {
+      const f = fields[field];
+      if (!f || typeof f !== 'object') continue;
+      delete f.label;
+      delete f.valueTextLength;
+      if (Array.isArray(f.variants)) {
+        f.variants = f.variants.map(v => {
+          const safe = { ...v };
+          delete safe.label;
+          delete safe.valueTextLength;
+          return safe;
+        });
+      }
     }
 
     const profile = {
@@ -4222,7 +4245,14 @@ if (!candidate) {
   console.warn(
     "REFERENCE GUIDED AMOUNT: GÜVENİLİR TUTAR ADAYI BULUNAMADI",
     JSON.stringify({
-      referenceAmountField,
+      referenceAmountField: referenceAmountField ? {
+        xNorm: referenceAmountField.xNorm,
+        yNorm: referenceAmountField.yNorm,
+        widthNorm: referenceAmountField.widthNorm,
+        heightNorm: referenceAmountField.heightNorm,
+        pageNumber: referenceAmountField.pageNumber,
+        referenceCount: referenceAmountField.referenceCount
+      } : null,
       selectionMethod,
       candidateCount: allRankedCandidates.length,
     })
@@ -7937,6 +7967,7 @@ Bu veri, banka referans PDF'sinden çıkarılan ŞABLON bilgisidir.
 Referans PDF'deki gerçek işlem değerleri kullanılmaz ve gerçek dekonta aktarılmaz.
 
 Referans alan sayısı: ${referenceTemplateAnalysis.referenceFieldCount}
+REFERANS DEĞERLERİ: GİZLENDİ — yalnızca koordinat/geometri/stil kullanılır.
 Eşleşen alan sayısı: ${referenceTemplateAnalysis.matchedFieldCount}
 Belirgin geometri farkı: ${referenceTemplateAnalysis.strongGeometryCount}
 Belirgin render/font yoğunluğu farkı: ${referenceTemplateAnalysis.strongStyleCount}
