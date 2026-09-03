@@ -3306,6 +3306,67 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
   }).sort((a,b) => b.score - a.score);
 }
 
+// =====================================================
+// REFERANS DEĞER İZOLASYONU
+// =====================================================
+// Referans dekont yalnızca şablon/geometri/stil sinyali sağlar.
+// Gerçek isim, IBAN, tutar, müşteri no, sorgu no vb. referans değerleri
+// model context'ine veya API sonucuna taşınmaz.
+function sanitizeReferenceTemplateForOutput(analysis) {
+  if (!analysis || typeof analysis !== "object") return analysis;
+  const safeFields = Array.isArray(analysis.fields) ? analysis.fields.map((f) => ({
+    field: f.field,
+    status: f.status,
+    reference: f.reference ? {
+      xNorm: f.reference.xNorm,
+      yNorm: f.reference.yNorm,
+      widthNorm: f.reference.widthNorm,
+      heightNorm: f.reference.heightNorm,
+      pageNumber: f.reference.pageNumber,
+      style: f.reference.style ? {
+        source: f.reference.style.source,
+        fontNames: Array.isArray(f.reference.style.fontNames) ? f.reference.style.fontNames : [],
+        avgFontHeight: f.reference.style.avgFontHeight,
+        avgCharWidth: f.reference.style.avgCharWidth,
+        itemCount: f.reference.style.itemCount,
+      } : undefined,
+      referenceCount: f.reference.referenceCount,
+      spread: f.reference.spread,
+    } : undefined,
+    target: f.target ? {
+      xNorm: f.target.xNorm,
+      yNorm: f.target.yNorm,
+      widthNorm: f.target.widthNorm,
+      heightNorm: f.target.heightNorm,
+      pageIndex: f.target.pageIndex,
+      text: f.target.text,
+      ocrScore: f.target.ocrScore,
+    } : undefined,
+    matchScore: f.matchScore,
+    geometryScore: f.geometryScore,
+    styleSignals: f.styleSignals,
+  })).map((f) => {
+    if (f.reference && "label" in f.reference) delete f.reference.label;
+    return f;
+  }) : [];
+
+  return {
+    bank: analysis.bank,
+    referenceFile: analysis.referenceFile,
+    referenceFiles: analysis.referenceFiles,
+    referenceCount: analysis.referenceCount,
+    referenceFieldCount: analysis.referenceFieldCount,
+    matchedFieldCount: analysis.matchedFieldCount,
+    missingFieldCount: analysis.missingFieldCount,
+    strongGeometryCount: analysis.strongGeometryCount,
+    weakPlacementCount: analysis.weakPlacementCount,
+    strongStyleCount: analysis.strongStyleCount,
+    styleComparisonNote: analysis.styleComparisonNote,
+    fields: safeFields,
+    evidence: analysis.evidence,
+  };
+}
+
 async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocrResult) {
   const profile = await buildReferenceTemplateProfile(bank);
   if (!profile || !Object.keys(profile.fields || {}).length || !ocrResult?.success) return null;
@@ -3416,7 +3477,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
   const strongGeometry = matched.filter(x=>x.geometryScore>=60);
   const weakPlacement = matched.filter(x=>x.geometryScore>=35);
 
-  return {
+  const referenceTemplateResult = {
     bank:profile.bank,
     referenceFile:profile.referenceFiles?.[0] || null,
     referenceFiles:profile.referenceFiles || [],
@@ -3433,6 +3494,8 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
       ? `Referans şablonuyla ${matched.length} alan eşleştirildi; ${strongGeometry.length} alanda belirgin geometri farkı, ${missing.length} alanda beklenen alan bulunamadı.`
       : `Referans şablonuyla ${matched.length} alan eşleştirildi; belirgin geometri farkı bulunmadı.`,
   };
+
+  return sanitizeReferenceTemplateForOutput(referenceTemplateResult);
 }
 
 // =====================================================
@@ -3758,7 +3821,7 @@ return {available: false, status: "unknown", severity: "none", score: 0, amountT
 }
 
 const referenceAnchor = await getReferenceAmountAnchor(bank);
-console.log("AMOUNT TEMPLATE ANCHOR:", JSON.stringify(referenceAnchor));
+console.log("AMOUNT TEMPLATE ANCHOR:", JSON.stringify(referenceAnchor ? { bank: referenceAnchor.bank, pageNumber: referenceAnchor.pageNumber, xNorm: referenceAnchor.xNorm, yNorm: referenceAnchor.yNorm, widthNorm: referenceAnchor.widthNorm, heightNorm: referenceAnchor.heightNorm, referenceCount: referenceAnchor.referenceCount, source: referenceAnchor.source } : null));
 
 function templatePositionScore(group) {
 if (!referenceAnchor || !image?.width || !image?.height) return 0;
@@ -4761,7 +4824,7 @@ JSON.stringify({
 fileFingerprint: fileFingerprint || currentFileFingerprint,
 amountText: candidate.text,
 templateBank: referenceAnchor?.bank || null,
-templateAmountText: referenceAnchor?.amountText || null,
+templateAmountText: null,
 templatePositionScore: candidate.templateScore || 0,
 characterCount: features.length,
 maxScore,
@@ -4805,7 +4868,7 @@ repeatedCharacterMaxDifference: Number((repeatedCharacterAnalysis.maxDifference 
 repeatedCharacterGroups: repeatedCharacterAnalysis.strongGroups.slice(0, 8),
 maxFeatureVotes: maxScore,
 templateBank: referenceAnchor?.bank || null,
-templateAmountText: referenceAnchor?.amountText || null,
+templateAmountText: null,
 templatePositionScore: Number(candidate.templateScore || 0),
 referenceGuided: Boolean(referenceAmountField),
 referenceGuidedSelection: selectionMethod,
@@ -4817,7 +4880,7 @@ directAmountLabel: candidate.directLabelEvidence?.label || null,
 },
 selectionMethod,
 selectedAmountText: candidate.text,
-referenceAmountText: referenceAmountField?.label || null,
+referenceAmountText: null,
 segmentFeatures: features.map((feature, index) => ({
 index,
 width: Number(feature.width.toFixed(2)),
@@ -7137,7 +7200,7 @@ if (
       bank,
       paddleImageOCR
     );
-    console.log("REFERENCE TEMPLATE ANALYSIS:", JSON.stringify(referenceTemplateAnalysis));
+    console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(referenceTemplateAnalysis));
   } catch (error) {
     console.warn("REFERENCE TEMPLATE ANALYSIS HATASI:", error?.message || error);
   }
