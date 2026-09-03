@@ -8672,14 +8672,20 @@ calculateOverallRisk(
 result
 );
 
+// IMPORTANT: İlk calculateOverallRisk çağrısının skorunu koruma.
+// O çağrı, amount/layout forensics sonradan check'leri güncellemeden önce
+// yapılır ve AI'ın eski bir check skorunu nihai skora taşıyabilir.
+// Nihai skor yalnızca güncellenmiş deterministik check setinden hesaplanmalı.
 calculatedRisk.overallRisk =
-Math.max(
-Number(calculatedRisk.overallRisk) || 0,
-Number(deterministicRiskAfterForensics.overallRisk) || 0
-);
+Number(deterministicRiskAfterForensics.overallRisk) || 0;
 
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
+
+console.log("FINAL RISK RECOMPUTED FROM UPDATED CHECKS:", JSON.stringify({
+  overallRisk: calculatedRisk.overallRisk,
+  categories: calculatedRisk.categories
+}));
 
 // ==========================================
 // KRİTİK TUTAR TUTARSIZLIĞI
