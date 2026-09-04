@@ -3917,7 +3917,70 @@ function rfMatchLabel(refLabel, targetLabels, targetSize, refSize) {
     const score = textDistance * 2.8 + Math.min(1, posDistance / 0.35);
     if (!best || score < best.score) best = { target: tl, score, textDistance, posDistance };
   }
-  return best && best.score <= 3.2 ? best : null;
+  if (!best) return null;
+  // Exact/canonical labels remain strict. For short bank labels such as
+  // "IBAN NO" / "IBAN" or OCR'd "ISLEM TARIHI" variants, allow a slightly
+  // wider semantic match; the later affine-position gate prevents a random
+  // same-field occurrence from being accepted.
+  const key = refLabel.rule.key;
+  const limit = ['iban','date','amount','transactionNo'].includes(key) ? 6.5 : 3.2;
+  return best.score <= limit ? best : null;
+}
+
+// İlk etiket eşleşmeleri OCR yazım farkı nedeniyle eksik kalabilir. Önce
+// güvenilir eşleşmelerden affine dönüşüm kurulur, sonra eksik aynı-semantic
+// alanlar referanstaki beklenen konumlarına göre geri kazanılır. Bu özellikle
+// IBAN NO -> İŞLEM TARİHİ gibi spacing çiftlerinin tamamen kaybolmasını
+// engeller; değerlerin içeriğiyle hiçbir ilgisi yoktur.
+function rfRecoverUnmatchedLabels(refLabels, targetLabels, matches, affine, targetSize, refSize) {
+  if (!affine || !refLabels?.length || !targetLabels?.length) return matches || [];
+  const out = [...(matches || [])];
+  const usedTargets = new Set(out.map(m => m.tl));
+  const matchedRefs = new Set(out.map(m => m.rl));
+
+  for (const rl of refLabels) {
+    if (matchedRefs.has(rl)) continue;
+    const rc = {
+      x:(rl.region.x1+rl.region.x2)/2/refSize.width,
+      y:(rl.region.y1+rl.region.y2)/2/refSize.height
+    };
+    const projected = rfApplyAffine(affine, rc);
+    let best = null;
+    for (const tl of targetLabels) {
+      if (usedTargets.has(tl) || tl.rule.key !== rl.rule.key) continue;
+      const tc = {
+        x:(tl.region.x1+tl.region.x2)/2/targetSize.width,
+        y:(tl.region.y1+tl.region.y2)/2/targetSize.height
+      };
+      const d = Math.hypot(projected.x-tc.x, projected.y-tc.y);
+      const dx = Math.abs(projected.x-tc.x);
+      const dy = Math.abs(projected.y-tc.y);
+      const textDistance = rfLevenshtein(rl.labelText, tl.labelText);
+      const canonical = Math.max(Number(rl.canonicalScore)||0, Number(tl.canonicalScore)||0);
+      // IBAN/date için Y mesafesini sert bir kapı yapmıyoruz. Çünkü bu motorun
+      // yakalaması gereken tam vaka, iki alan arasındaki boşluğun büyümesiyle
+      // alanın referans konumundan aşağı kaymasıdır. Aynı semantic etiket ve
+      // aynı sütun korunuyorsa büyük Y farkı spacing anomalisi olarak daha sonra
+      // ölçülmelidir.
+      const structuralField = ['iban','date'].includes(rl.rule.key);
+      const radius = structuralField ? 0.30 : 0.045;
+      const xRadius = structuralField ? 0.085 : radius;
+      const textOk = textDistance <= (structuralField ? 12 : 10) || canonical >= 70;
+      const positionOk = structuralField ? (dx <= xRadius && dy <= radius) : d <= radius;
+      if (positionOk && textOk && (!best || d < best.posDistance)) {
+        best = { target:tl, score:d, textDistance, posDistance:d, recoveredBy:structuralField ? 'semantic-column-recovery' : 'affine-semantic-position' };
+      }
+    }
+    if (best) {
+      out.push({ rl, tl:best.target, rc, tc:{
+        x:(best.target.region.x1+best.target.region.x2)/2/targetSize.width,
+        y:(best.target.region.y1+best.target.region.y2)/2/targetSize.height
+      }, recoveredBy:best.recoveredBy });
+      usedTargets.add(best.target);
+      matchedRefs.add(rl);
+    }
+  }
+  return out;
 }
 
 
@@ -4170,7 +4233,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         const refLabels=rfExtractLabelCandidates(refOCR);
         const targetLabels=rfExtractLabelCandidates(targetOCR);
         const refRegions=rfPrepareRegions(refOCR), targetRegions=rfPrepareRegions(targetOCR);
-        const matches=[];
+        let matches=[];
         for(const rl of refLabels){
           const m=rfMatchLabel(rl,targetLabels,targetSize,refSize);
           if(!m)continue;
@@ -4180,9 +4243,24 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         }
         if(matches.length<2)continue;
 
-        const anchors=matches.filter(m=>m.rl.canonicalScore>=100 && m.tl.canonicalScore>=100);
-        const affine=rfFitAffine((anchors.length>=2?anchors:matches).map(m=>({ref:m.rc,tar:m.tc})));
+        let anchors=matches.filter(m=>m.rl.canonicalScore>=100 && m.tl.canonicalScore>=100);
+        let affine=rfFitAffine((anchors.length>=2?anchors:matches).map(m=>({ref:m.rc,tar:m.tc})));
         if(!affine)continue;
+
+        // İkinci geçiş: ilk eşleşmede OCR yazım farkı nedeniyle kaçan aynı
+        // semantik alanları affine konum üzerinden geri kazan. Böylece bir
+        // alanın kaybolması, onunla komşu alanlar arasındaki spacing ölçümünü
+        // otomatik olarak yok etmez.
+        const recovered=rfRecoverUnmatchedLabels(refLabels,targetLabels,matches,affine,targetSize,refSize);
+        if(recovered.length>matches.length){
+          matches=recovered;
+          anchors=matches.filter(m=>m.rl.canonicalScore>=100 && m.tl.canonicalScore>=100);
+          affine=rfFitAffine((anchors.length>=2?anchors:matches).map(m=>({ref:m.rc,tar:m.tc}))) || affine;
+          console.log('REFERENCE FORENSIC LABEL RECOVERY:', JSON.stringify({
+            recoveredCount:matches.filter(m=>m.recoveredBy).length,
+            recoveredFields:matches.filter(m=>m.recoveredBy).map(m=>m.rl.rule.key)
+          }));
+        }
 
         const anchorResiduals=(anchors.length>=2?anchors:matches).map(m=>{
           const q=rfApplyAffine(affine,m.rc); return Math.hypot(q.x-m.tc.x,q.y-m.tc.y);
@@ -4274,6 +4352,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             targetLabelYNorm:Number(targetPos.y.toFixed(5)),
             referenceValueRegionFound:Boolean(refValue),
             targetValueRegionFound:Boolean(tarValue),
+            labelMatchMethod:m.recoveredBy || 'semantic-label-match',
+            labelTextDistance:rfLevenshtein(refLabelText,tarLabelText),
             suspicious,
             evidence:suspicious
               ? `Alan bazında render/geometri sapması: stil ${styleScore}, değer-stil ${valueStyleScore}, konum ${positionScore}.`
