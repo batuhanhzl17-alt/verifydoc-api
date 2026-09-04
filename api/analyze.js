@@ -3397,6 +3397,10 @@ function rfLooksLikeValue(text) {
 
 function rfFindValueRegion(regions, label) {
   if (!label?.region) return null;
+  // OCR frequently returns `LABEL : VALUE` as one region. In that case the
+  // safest value source is the same OCR region; searching nearby can attach a
+  // completely unrelated number (IBAN, Sorgu No, etc.) to the field.
+  if (/[:：]/.test(String(label.text || ''))) return label;
   const lr = label.region;
   const lh = Math.max(6, lr.y2 - lr.y1);
   const lx = (lr.x1 + lr.x2) / 2;
@@ -3486,16 +3490,23 @@ async function rfRasterMetrics(imageBuffer, region, imageSize) {
 
 function rfMetricDistance(a, b) {
   if (!a || !b) return null;
-  const rel = (x, y, scale) => Math.min(1, Math.abs(Number(x || 0) - Number(y || 0)) / Math.max(scale, 1e-6));
+  const rel = (x, y, scale) => {
+    const av = Number(x), bv = Number(y);
+    if (!Number.isFinite(av) || !Number.isFinite(bv)) return null;
+    return Math.min(1, Math.abs(av - bv) / Math.max(Number(scale) || 1e-6, 1e-6));
+  };
+  // Prefer local, scale-normalized ink/style measurements. Raw mean luminance
+  // is intentionally excluded because PDF text and camera/JPEG backgrounds
+  // have very different absolute luminance distributions.
   const parts = [
-    rel(a.darkRatio, b.darkRatio, 0.16),
-    rel(a.edgeRatio, b.edgeRatio, 0.14),
-    rel(a.lumaStd, b.lumaStd, 35),
-    rel(a.rowVariance, b.rowVariance, 0.025),
-    rel(a.colVariance, b.colVariance, 0.025),
-    rel(a.aspect, b.aspect, Math.max(0.5, a.aspect * 0.55)),
-  ];
-  return parts.reduce((s, v) => s + v, 0) / parts.length;
+    rel(a.tightInkDarkRatio, b.tightInkDarkRatio, 0.16),
+    rel(a.edgeRatio, b.edgeRatio, 0.10),
+    rel(a.lumaStd, b.lumaStd, 28),
+    rel(a.rowVariance, b.rowVariance, 0.022),
+    rel(a.colVariance, b.colVariance, 0.022),
+    rel(a.aspect, b.aspect, 0.35),
+  ].filter(Number.isFinite);
+  return parts.length ? parts.reduce((sum, v) => sum + v, 0) / parts.length : null;
 }
 
 
@@ -3523,8 +3534,13 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
     const h = Math.max(3, Math.min(imageSize.height - y, Math.ceil(Number(region.y2) - Number(region.y1))));
     if (w < 3 || h < 3) return null;
 
-    const marginX = Math.max(1, Math.round(w * 0.04));
-    const marginY = Math.max(1, Math.round(h * 0.18));
+    // IMPORTANT: Never compare raw pixels from a PDF raster with raw pixels from
+    // a camera/JPEG image. Both are first reduced to a common coordinate system,
+    // then all character measurements are expressed relative to the local text
+    // geometry. This makes the fingerprint much less sensitive to resolution,
+    // crop and camera distance.
+    const marginX = Math.max(1, Math.round(w * 0.06));
+    const marginY = Math.max(1, Math.round(h * 0.22));
     const left = Math.max(0, x - marginX);
     const top = Math.max(0, y - marginY);
     const width = Math.min(imageSize.width - left, w + marginX * 2);
@@ -3532,7 +3548,7 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
 
     const { data, info } = await sharp(imageBuffer)
       .extract({ left, top, width, height })
-      .resize({ width: 160, height: 80, fit: 'fill' })
+      .resize({ width: 240, height: 96, fit: 'fill' })
       .grayscale()
       .raw()
       .toBuffer({ resolveWithObject: true });
@@ -3545,8 +3561,8 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
       if (data[i] < threshold) { mask[i] = 1; dark++; }
     }
 
-    // 8-komşuluk bağlı bileşenleri. Çok küçük gürültüleri atıyoruz; uzun
-    // yatay/dikey çizgileri de karakter istatistiğine sokmuyoruz.
+    // Connected components. Border/box artifacts are discarded before the
+    // character statistics are calculated.
     const seen = new Uint8Array(W * H);
     const comps = [];
     const qx = new Int32Array(W * H);
@@ -3561,8 +3577,10 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
         while (head < tail) {
           const cx = qx[head], cy = qy[head]; head++;
           area++;
-          if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
-          if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
+          if (cx < minX) minX = cx;
+          if (cx > maxX) maxX = cx;
+          if (cy < minY) minY = cy;
+          if (cy > maxY) maxY = cy;
           for (let dy = -1; dy <= 1; dy++) {
             for (let dx = -1; dx <= 1; dx++) {
               if (!dx && !dy) continue;
@@ -3578,64 +3596,157 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
         }
         const cw = maxX - minX + 1;
         const ch = maxY - minY + 1;
-        if (area >= 3 && cw <= W * 0.65 && ch <= H * 0.8) {
+        // Very long components are usually borders/lines, not glyphs.
+        if (area >= 3 && cw <= W * 0.45 && ch <= H * 0.72) {
           comps.push({ minX, maxX, minY, maxY, width: cw, height: ch, area });
         }
       }
     }
 
-    // En büyük bileşenler harf gövdelerinin temsilcisi olarak kullanılır.
-    const body = comps.filter(c => c.height >= 5 && c.area >= 8).sort((a,b) => b.area - a.area);
-    const bodyHeights = body.slice(0, 40).map(c => c.height);
-    const bodyWidths = body.slice(0, 40).map(c => c.width);
-    const bodyAreas = body.slice(0, 40).map(c => c.area);
+    const body = comps.filter(c => c.height >= 6 && c.area >= 8).sort((a,b) => b.area - a.area).slice(0, 60);
+    const bodyHeights = body.map(c => c.height);
+    const bodyWidths = body.map(c => c.width);
+    const bodyAreas = body.map(c => c.area);
     const medianBodyHeight = rfMedian(bodyHeights);
     const medianBodyWidth = rfMedian(bodyWidths);
     const medianBodyArea = rfMedian(bodyAreas);
 
-    // Küçük üst bileşenler: ö/ü/ä/ç/ş gibi işaretlerin ve benzeri küçük
-    // üst parçaların render davranışını yakalamak için kullanılır. Tek başına
-    // sahtecilik kanıtı değildir; yalnızca bağımsız bir render sinyalidir.
-    const upperSmall = comps.filter(c =>
-      medianBodyHeight >= 5 &&
-      c.height >= 2 &&
-      c.height <= medianBodyHeight * 0.58 &&
-      c.area <= Math.max(8, medianBodyArea * 0.55) &&
-      c.minY < H * 0.48
-    );
-    const upperArea = upperSmall.reduce((s,c) => s + c.area, 0);
-    const upperDarkRatio = upperArea / Math.max(1, W * H);
+    // Tight ink box = robust density measurement independent of OCR-box padding.
+    const ink = body.length ? {
+      minX: Math.min(...body.map(c => c.minX)),
+      maxX: Math.max(...body.map(c => c.maxX)),
+      minY: Math.min(...body.map(c => c.minY)),
+      maxY: Math.max(...body.map(c => c.maxY)),
+    } : null;
+    const inkW = ink ? Math.max(1, ink.maxX - ink.minX + 1) : 1;
+    const inkH = ink ? Math.max(1, ink.maxY - ink.minY + 1) : 1;
+    const tightInkArea = inkW * inkH;
+    const tightInkDarkRatio = body.length ? body.reduce((s,c)=>s+c.area,0) / tightInkArea : 0;
 
-    // Satırın karakter gövdelerinin dikey yayılımı ve yatay ritmi.
-    const bodyMinY = body.length ? Math.min(...body.map(c => c.minY)) : 0;
-    const bodyMaxY = body.length ? Math.max(...body.map(c => c.maxY)) : 0;
-    const bodyHeight = body.length ? bodyMaxY - bodyMinY + 1 : 0;
-    const sortedX = body.map(c => (c.minX + c.maxX) / 2).sort((a,b) => a-b);
+    // Stroke proxy: average component fill ratio. It is not a font renderer;
+    // it is a stable raster proxy for relative stroke weight.
+    const fillRatios = body.map(c => c.area / Math.max(1, c.width * c.height));
+    const medianFillRatio = rfMedian(fillRatios);
+
+    // Horizontal rhythm normalized by local character height.
+    const sortedX = body.map(c => (c.minX + c.maxX) / 2).sort((a,b)=>a-b);
     const gaps = [];
     for (let i = 1; i < sortedX.length; i++) {
       const g = sortedX[i] - sortedX[i - 1];
-      if (g > 0 && g < 35) gaps.push(g);
+      if (g > 0 && g < Math.max(45, medianBodyHeight * 3.2)) gaps.push(g / Math.max(1, medianBodyHeight));
     }
+
+    // Diacritic candidate = a small component above a nearby body component.
+    // We require horizontal overlap so random JPEG noise above the text is not
+    // counted as a diacritic.
+    const diacriticCandidates = comps.filter(c => {
+      if (c.height < 2 || c.height > Math.max(4, medianBodyHeight * 0.42)) return false;
+      if (c.area > Math.max(10, medianBodyArea * 0.45)) return false;
+      const hasBodyBelow = body.some(b => {
+        const overlapX = Math.min(c.maxX, b.maxX) - Math.max(c.minX, b.minX);
+        const verticalGap = b.minY - c.maxY;
+        return overlapX >= -1 && verticalGap >= -Math.max(2, medianBodyHeight * 0.10) && verticalGap <= Math.max(18, medianBodyHeight * 0.9);
+      });
+      return hasBodyBelow && c.minY < H * 0.55;
+    });
+    const diaArea = diacriticCandidates.reduce((s,c)=>s+c.area,0);
+    const diaFill = diacriticCandidates.length
+      ? rfMedian(diacriticCandidates.map(c=>c.area / Math.max(1,c.width*c.height)))
+      : 0;
+    const diaHeightNorm = diacriticCandidates.length
+      ? rfMedian(diacriticCandidates.map(c=>c.height / Math.max(1, medianBodyHeight)))
+      : 0;
+    const diaGapNorm = diacriticCandidates.length
+      ? rfMedian(diacriticCandidates.map(c => {
+          const nearest = body.filter(b => Math.min(c.maxX,b.maxX)-Math.max(c.minX,b.minX) >= -1)
+            .sort((a,b)=>Math.abs(a.minY-c.maxY)-Math.abs(b.minY-c.maxY))[0];
+          return nearest ? Math.max(0, nearest.minY-c.maxY)/Math.max(1,medianBodyHeight) : 0;
+        }))
+      : 0;
 
     return {
       componentCount: comps.length,
       bodyComponentCount: body.length,
       darkRatio: dark / Math.max(1, W * H),
+      tightInkDarkRatio,
       medianCharacterHeight: medianBodyHeight,
       medianCharacterWidth: medianBodyWidth,
       medianCharacterArea: medianBodyArea,
-      characterHeightSpread: bodyHeights.length ? Math.sqrt(bodyHeights.reduce((s,v)=>s+(v-medianBodyHeight)**2,0)/bodyHeights.length) : 0,
-      characterWidthSpread: bodyWidths.length ? Math.sqrt(bodyWidths.reduce((s,v)=>s+(v-medianBodyWidth)**2,0)/bodyWidths.length) : 0,
-      characterAreaSpread: bodyAreas.length ? Math.sqrt(bodyAreas.reduce((s,v)=>s+(v-medianBodyArea)**2,0)/bodyAreas.length) : 0,
-      bodyHeightNorm: bodyHeight / H,
-      medianCharacterGap: rfMedian(gaps),
-      upperSmallComponentCount: upperSmall.length,
-      upperSmallDarkRatio: upperDarkRatio,
-      upperSmallAreaMedian: rfMedian(upperSmall.map(c=>c.area)),
+      medianCharacterAspect: medianBodyHeight ? medianBodyWidth / medianBodyHeight : 0,
+      medianCharacterFillRatio: medianFillRatio,
+      characterHeightNorm: medianBodyHeight / H,
+      characterWidthNorm: medianBodyWidth / W,
+      characterHeightSpreadNorm: medianBodyHeight ? (bodyHeights.length ? Math.sqrt(bodyHeights.reduce((s,v)=>s+(v-medianBodyHeight)**2,0)/bodyHeights.length)/medianBodyHeight : 0) : 0,
+      characterWidthSpreadNorm: medianBodyWidth ? (bodyWidths.length ? Math.sqrt(bodyWidths.reduce((s,v)=>s+(v-medianBodyWidth)**2,0)/bodyWidths.length)/medianBodyWidth : 0) : 0,
+      characterAreaSpreadNorm: medianBodyArea ? (bodyAreas.length ? Math.sqrt(bodyAreas.reduce((s,v)=>s+(v-medianBodyArea)**2,0)/bodyAreas.length)/medianBodyArea : 0) : 0,
+      bodyHeightNorm: inkH / H,
+      medianCharacterGapNorm: rfMedian(gaps),
+      diacriticCount: diacriticCandidates.length,
+      diacriticAreaNorm: diaArea / Math.max(1, W * H),
+      diacriticFillRatio: diaFill,
+      diacriticHeightNorm: diaHeightNorm,
+      diacriticGapNorm: diaGapNorm,
+      inkWidthNorm: inkW / W,
+      inkHeightNorm: inkH / H,
     };
   } catch {
     return null;
   }
+}
+
+function rfCharacterDistance(a, b) {
+  if (!a || !b) return null;
+  const parts = [
+    rfSafeRel(a.medianCharacterAspect, b.medianCharacterAspect, 0.18),
+    rfSafeRel(a.medianCharacterFillRatio, b.medianCharacterFillRatio, 0.12),
+    rfSafeRel(a.tightInkDarkRatio, b.tightInkDarkRatio, 0.16),
+    rfSafeRel(a.characterHeightNorm, b.characterHeightNorm, 0.06),
+    rfSafeRel(a.characterWidthNorm, b.characterWidthNorm, 0.06),
+    rfSafeRel(a.characterHeightSpreadNorm, b.characterHeightSpreadNorm, 0.10),
+    rfSafeRel(a.characterWidthSpreadNorm, b.characterWidthSpreadNorm, 0.10),
+    rfSafeRel(a.medianCharacterGapNorm, b.medianCharacterGapNorm, 0.18),
+    rfSafeRel(a.inkWidthNorm, b.inkWidthNorm, 0.12),
+    rfSafeRel(a.inkHeightNorm, b.inkHeightNorm, 0.08),
+  ].filter(Number.isFinite);
+  return parts.length ? parts.reduce((s,v)=>s+v,0)/parts.length : null;
+}
+
+function rfDiacriticDistance(a, b) {
+  if (!a || !b) return null;
+  const countA = Number(a.diacriticCount) || 0;
+  const countB = Number(b.diacriticCount) || 0;
+  const countDelta = Math.min(1, Math.abs(countA - countB) / Math.max(1, Math.max(countA, countB)));
+  const areaDelta = rfSafeRel(a.diacriticAreaNorm, b.diacriticAreaNorm, 0.018);
+  const fillDelta = rfSafeRel(a.diacriticFillRatio, b.diacriticFillRatio, 0.12);
+  const heightDelta = rfSafeRel(a.diacriticHeightNorm, b.diacriticHeightNorm, 0.12);
+  const gapDelta = rfSafeRel(a.diacriticGapNorm, b.diacriticGapNorm, 0.12);
+  const parts = [countDelta, areaDelta, fillDelta, heightDelta, gapDelta].filter(Number.isFinite);
+  return parts.length ? parts.reduce((s,v)=>s+v,0)/parts.length : null;
+}
+
+function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance, text = '') {
+  if (!refChar || !targetChar) return null;
+  const cd = Number(characterDistance);
+  const dd = Number(diacriticDistance);
+  const hasDia = /[öÖüÜşŞçÇğĞıİ]/.test(String(text || ''));
+  // Diacritic evidence is only considered when the actual field text contains
+  // a Turkish diacritic. This prevents normal fields such as transactionNo or
+  // date from being flagged merely because a random small component exists.
+  const strongChar = Number.isFinite(cd) && cd >= 0.52;
+  const strongDia = hasDia && Number.isFinite(dd) && dd >= 0.58;
+  if (!strongChar && !strongDia) return null;
+  const reasons = [];
+  if (strongChar) reasons.push('karakter geometrisi/stroke/raster profili referanstan belirgin ayrılıyor');
+  if (strongDia) reasons.push('Türkçe diakritik karakter bileşenleri (ö/ü/ş/ç/ğ/ı/İ) referans render profilinden ayrılıyor');
+  return {
+    field,
+    type: strongDia ? 'character-diacritic-render-mismatch' : 'character-render-mismatch',
+    severity: (strongChar && strongDia) ? 'strong' : 'medium',
+    characterDistance: Number(cd.toFixed(4)),
+    diacriticDistance: Number.isFinite(dd) ? Number(dd.toFixed(4)) : null,
+    text: String(text || ''),
+    evidence: reasons.join('; '),
+  };
 }
 
 function rfCharacterDistance(a, b) {
@@ -3691,6 +3802,24 @@ function rfPrepareRegions(ocr) {
   return (ocr?.regions || [])
     .filter(x => x?.region && String(x.text || '').trim())
     .map(x => ({ ...x, text: String(x.text || '').trim() }));
+}
+
+function rfFocusLabelRegion(region, fullText) {
+  if (!region) return null;
+  const s = String(fullText || '');
+  if (!/[:：]/.test(s)) return region;
+  const left = String(s.split(/[:：]/)[0] || '').trim();
+  const total = s.replace(/[:：]/g, '').trim();
+  if (!left || !total) return region;
+  const ratio = Math.max(0.12, Math.min(0.78, left.length / total.length));
+  const x1 = Number(region.x1), x2 = Number(region.x2);
+  const pad = Math.min(0.04, Math.max(0.01, ratio * 0.08));
+  return {
+    x1,
+    y1: Number(region.y1),
+    x2: x1 + (x2 - x1) * Math.min(0.82, ratio + pad),
+    y2: Number(region.y2),
+  };
 }
 
 function rfFocusValueRegion(region, fullText, field) {
@@ -3861,16 +3990,18 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           if (!match) continue;
           const refValue = rfFindValueRegion(rfPrepareRegions(refOCR), refLabel);
           const targetValue = rfFindValueRegion(rfPrepareRegions(targetOCR), match.target);
-          const labelRefMetrics = await rfRasterMetrics(refBuffer, refLabel.region, refSize);
-          const labelTargetMetrics = await rfRasterMetrics(targetBuffer, match.target.region, targetSize);
+          const refLabelRegion = rfFocusLabelRegion(refLabel.region, refLabel.text);
+          const targetLabelRegion = rfFocusLabelRegion(match.target.region, match.target.text);
+          const labelRefMetrics = await rfRasterMetrics(refBuffer, refLabelRegion || refLabel.region, refSize);
+          const labelTargetMetrics = await rfRasterMetrics(targetBuffer, targetLabelRegion || match.target.region, targetSize);
           const refValueRegion = refValue ? rfFocusValueRegion(refValue.region, refValue.text, refLabel.rule.key) : null;
           const targetValueRegion = targetValue ? rfFocusValueRegion(targetValue.region, targetValue.text, match.target.rule.key) : null;
           const valueRefMetrics = refValueRegion ? await rfRasterMetrics(refBuffer, refValueRegion, refSize) : null;
           const valueTargetMetrics = targetValueRegion ? await rfRasterMetrics(targetBuffer, targetValueRegion, targetSize) : null;
           const labelDistance = rfMetricDistance(labelRefMetrics, labelTargetMetrics);
           const valueDistance = rfMetricDistance(valueRefMetrics, valueTargetMetrics);
-          const labelCharacterRef = await rfCharacterMetrics(refBuffer, refLabel.region, refSize);
-          const labelCharacterTarget = await rfCharacterMetrics(targetBuffer, match.target.region, targetSize);
+          const labelCharacterRef = await rfCharacterMetrics(refBuffer, refLabelRegion || refLabel.region, refSize);
+          const labelCharacterTarget = await rfCharacterMetrics(targetBuffer, targetLabelRegion || match.target.region, targetSize);
           const valueCharacterRef = refValueRegion ? await rfCharacterMetrics(refBuffer, refValueRegion, refSize) : null;
           const valueCharacterTarget = targetValueRegion ? await rfCharacterMetrics(targetBuffer, targetValueRegion, targetSize) : null;
           const labelCharacterDistance = rfCharacterDistance(labelCharacterRef, labelCharacterTarget);
@@ -3895,12 +4026,14 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           const targetTextForRender = `${match.target.labelText || ''} ${targetValue?.text || ''}`;
           const hasTurkishDiacritic = /[öÖüÜşŞçÇğĞıİ]/.test(refTextForRender) || /[öÖüÜşŞçÇğĞıİ]/.test(targetTextForRender);
           const effectiveDiacriticDistance = hasTurkishDiacritic ? diacriticDistance : null;
+          const characterFindingText = `${match.target.labelText || ''} ${targetValue?.text || ''}`;
           const characterFinding = rfCharacterFinding(
             refLabel.rule.key,
             valueCharacterRef || labelCharacterRef,
             valueCharacterTarget || labelCharacterTarget,
             characterDistance,
-            effectiveDiacriticDistance
+            effectiveDiacriticDistance,
+            characterFindingText
           );
           const refRegion = refValue?.region || refLabel.region;
           const tarRegion = targetValue?.region || match.target.region;
@@ -3920,7 +4053,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             targetLabel: match.target.labelText,
             styleScore,
             positionScore,
-            combinedScore: rfClamp100(styleScore * 0.82 + positionScore * 0.18),
+            combinedScore: rfClamp100(styleScore * 0.90 + positionScore * 0.10),
             styleDistance: Number(styleDistance.toFixed(4)),
             positionDistance: Number(positionDistance.toFixed(4)),
             strongStyle,
@@ -3943,8 +4076,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
 
         if (fieldResults.length) {
           const spacingAnomalies = rfComputeSpacingAnomalies(fieldResults);
-          const strong = fieldResults.filter(x => x.styleScore >= 65);
-          const medium = fieldResults.filter(x => x.styleScore >= 45);
+          const strong = fieldResults.filter(x => x.styleScore >= 70);
+          const medium = fieldResults.filter(x => x.styleScore >= 52);
           const suspiciousKeys = [...new Set(strong.map(x => x.field))];
           const characterFindings = fieldResults.map(x => x.characterFinding).filter(Boolean);
           const styleScore = rfClamp100(rfMedian(fieldResults.map(x => x.styleScore)) + Math.min(35, strong.length * 9));
@@ -3980,48 +4113,142 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
       const old = spacingBest.get(key);
       if (!old || anomaly.score > old.score) spacingBest.set(key, anomaly);
     }
-    const representativeSpacingAnomalies = [...spacingBest.values()];
-    const fieldBest = new Map();
+    // TRUSTED ENSEMBLE AGGREGATION
+    // A target must disagree with the bank's reference ensemble, not merely
+    // with one PDF raster. This is critical for phone photos/JPEGs and for
+    // references that have different data lengths.
+    const fieldGroups = new Map();
     for (const field of allFields) {
-      const old = fieldBest.get(field.field);
-      if (!old || field.combinedScore < old.combinedScore) fieldBest.set(field.field, field);
+      if (!fieldGroups.has(field.field)) fieldGroups.set(field.field, []);
+      fieldGroups.get(field.field).push(field);
     }
-    const representativeFields = [...fieldBest.values()];
-    const suspicious = representativeFields.filter(x => x.styleScore >= 65 || x.characterFinding);
-    const strongSpacing = representativeSpacingAnomalies.filter(x => x.score >= 55);
-    const characterFindingBest = new Map();
-    for (const finding of allCharacterFindings) {
-      const old = characterFindingBest.get(finding.field);
-      const score = Math.max(Number(finding.characterDistance) || 0, Number(finding.diacriticDistance) || 0);
-      const oldScore = old ? Math.max(Number(old.characterDistance) || 0, Number(old.diacriticDistance) || 0) : -1;
-      if (!old || score > oldScore) characterFindingBest.set(finding.field, finding);
+
+    const representativeFields = [];
+    const suspicious = [];
+    const representativeCharacterFindings = [];
+    const fieldObservations = [];
+
+    for (const [fieldKey, rows] of fieldGroups.entries()) {
+      const ordered = [...rows].sort((a,b) => (a.combinedScore ?? 999) - (b.combinedScore ?? 999));
+      const best = ordered[0];
+      const styleValues = rows.map(x => Number(x.styleScore)).filter(Number.isFinite);
+      const charValues = rows.map(x => Number(x.characterDistance)).filter(Number.isFinite);
+      const diaValues = rows.map(x => Number(x.diacriticDistance)).filter(Number.isFinite);
+      const medianStyle = rfMedian(styleValues);
+      const worstStyle = Math.max(...styleValues, 0);
+      const bestStyle = Math.min(...styleValues, 100);
+      const medianChar = rfMedian(charValues);
+      const medianDia = rfMedian(diaValues);
+      const highStyleCount = rows.filter(x => Number(x.styleScore) >= 70).length;
+      const highCharCount = rows.filter(x => Number(x.characterDistance) >= 0.52).length;
+      const hasDiaText = rows.some(x => /[öÖüÜşŞçÇğĞıİ]/.test(`${x.referenceLabel || ''} ${x.targetLabel || ''}`));
+      const highDiaCount = hasDiaText ? rows.filter(x => Number(x.diacriticDistance) >= 0.58).length : 0;
+      const consensusRatio = rows.length ? highStyleCount / rows.length : 0;
+      const independentCount = [
+        medianStyle >= 62,
+        medianChar >= 0.52,
+        hasDiaText && medianDia >= 0.58,
+        worstStyle - bestStyle >= 24,
+      ].filter(Boolean).length;
+
+      const aggregate = {
+        ...best,
+        referenceCountForField: rows.length,
+        ensembleBestStyleScore: rfClamp100(bestStyle),
+        ensembleMedianStyleScore: rfClamp100(medianStyle),
+        ensembleWorstStyleScore: rfClamp100(worstStyle),
+        ensembleConsensusRatio: Number(consensusRatio.toFixed(3)),
+        ensembleMedianCharacterDistance: Number.isFinite(medianChar) ? Number(medianChar.toFixed(4)) : null,
+        ensembleMedianDiacriticDistance: Number.isFinite(medianDia) ? Number(medianDia.toFixed(4)) : null,
+        ensembleHighCharacterCount: highCharCount,
+        ensembleHighDiacriticCount: highDiaCount,
+        independentSignalCount: independentCount,
+      };
+      representativeFields.push(aggregate);
+
+      // A single reference can describe a template, but it is not enough to
+      // call a JPEG/camera difference suspicious on its own. With 2+ trusted
+      // references, require consensus across references OR two independent
+      // normalized render signals. This sharply reduces false positives on
+      // Enpara/Yapi Kredi phone photos.
+      const multiRef = rows.length >= 2;
+      const ensembleSuspicious = multiRef
+        ? ((consensusRatio >= 0.50 && medianStyle >= 62) ||
+           (highCharCount >= Math.ceil(rows.length * 0.50) && medianChar >= 0.52) ||
+           (hasDiaText && highDiaCount >= Math.ceil(rows.length * 0.50) && medianDia >= 0.58))
+        : (independentCount >= 2 && bestStyle >= 72);
+
+      fieldObservations.push({
+        field: fieldKey,
+        referenceCount: rows.length,
+        suspicious: Boolean(ensembleSuspicious),
+        medianStyleScore: rfClamp100(medianStyle),
+        bestStyleScore: rfClamp100(bestStyle),
+        medianCharacterDistance: Number.isFinite(medianChar) ? Number(medianChar.toFixed(4)) : null,
+        medianDiacriticDistance: Number.isFinite(medianDia) ? Number(medianDia.toFixed(4)) : null,
+        independentSignalCount: independentCount,
+      });
+
+      if (ensembleSuspicious) {
+        suspicious.push(aggregate);
+        // Only expose a character finding when the field itself passed the
+        // ensemble gate. An isolated noisy OCR component is not enough.
+        const diaFinding = rows
+          .filter(x => x.characterFinding && /diacritic/.test(String(x.characterFinding.type || '')))
+          .sort((a,b) => (Number(b.diacriticDistance)||0) - (Number(a.diacriticDistance)||0))[0];
+        const charFinding = rows
+          .filter(x => x.characterFinding)
+          .sort((a,b) => Math.max(Number(b.characterDistance)||0, Number(b.diacriticDistance)||0) - Math.max(Number(a.characterDistance)||0, Number(a.diacriticDistance)||0))[0];
+        if (diaFinding?.characterFinding) representativeCharacterFindings.push(diaFinding.characterFinding);
+        else if (charFinding?.characterFinding) representativeCharacterFindings.push(charFinding.characterFinding);
+      }
     }
-    const representativeCharacterFindings = [...characterFindingBest.values()];
-    const multiFieldStrong = suspicious.length >= 2;
-    const styleMedian = rfMedian(representativeFields.map(x => x.styleScore));
-    const styleOutlierCount = representativeFields.filter(x => x.styleScore >= 55).length;
+
+    // Spacing is also ensemble-gated. A camera photo/crop can move the whole
+    // page; what matters is an abnormal change between two matched fields.
+    const spacingByPair = new Map();
+    for (const anomaly of allSpacingAnomalies) {
+      const key = `${anomaly.beforeField}->${anomaly.afterField}`;
+      if (!spacingByPair.has(key)) spacingByPair.set(key, []);
+      spacingByPair.get(key).push(anomaly);
+    }
+    const representativeSpacingAnomalies = [];
+    for (const [key, rows] of spacingByPair.entries()) {
+      const scores = rows.map(x => Number(x.score)).filter(Number.isFinite);
+      const medianScore = rfMedian(scores);
+      const highCount = rows.filter(x => Number(x.score) >= 60).length;
+      if (rows.length >= 2 ? (medianScore >= 42 && highCount >= Math.ceil(rows.length * 0.5)) : medianScore >= 68) {
+        const best = [...rows].sort((a,b)=>Number(b.score)-Number(a.score))[0];
+        representativeSpacingAnomalies.push({
+          ...best,
+          referenceCountForPair: rows.length,
+          ensembleMedianScore: rfClamp100(medianScore),
+          ensembleHighCount: highCount,
+        });
+      }
+    }
+
+    const strongSpacing = representativeSpacingAnomalies.filter(x => x.score >= 65);
     const localized = [...new Set([
       ...suspicious.map(x => x.field),
       ...representativeCharacterFindings.map(x => x.field),
       ...strongSpacing.flatMap(x => [x.beforeField, x.afterField]),
     ])];
-    const spacingScore = representativeSpacingAnomalies.length
-      ? rfMedian(representativeSpacingAnomalies.map(x => x.score))
-      : 0;
+    const styleMedian = rfMedian(representativeFields.map(x => x.ensembleMedianStyleScore));
+    const consensusFields = representativeFields.filter(x => x.referenceCountForField >= 2 && x.ensembleConsensusRatio >= 0.5).length;
     const score = rfClamp100(
-      styleMedian * 0.50 +
-      Math.min(25, styleOutlierCount * 4) +
-      Math.min(25, spacingScore * 0.25) +
-      (multiFieldStrong ? 15 : 0) +
-      (strongSpacing.length >= 1 ? 15 : 0)
+      styleMedian * 0.30 +
+      Math.min(28, suspicious.length * 9) +
+      Math.min(18, consensusFields * 3) +
+      Math.min(18, strongSpacing.length * 7) +
+      Math.min(16, representativeCharacterFindings.length * 5)
     );
-    const severity = (multiFieldStrong || strongSpacing.length >= 2) && score >= 65
+    const severity = suspicious.length >= 2 && score >= 65
       ? 'strong'
-      : score >= 38 ? 'medium' : 'low';
-
+      : suspicious.length >= 1 && score >= 45 ? 'medium' : 'low';
     return {
       available: true,
-      engine: 'reference-forensic-engine-v2-character-render',
+      engine: 'reference-forensic-engine-v3-normalized-ensemble-character-render',
       bank: normalizedBank,
       referenceCount: referenceResults.length,
       referenceFiles: referenceResults.map(x => x.file),
@@ -4051,9 +4278,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         spacingAnomalies: x.spacingAnomalies,
       })),
       fields: representativeFields,
+      fieldObservations,
       evidence: (suspicious.length || representativeSpacingAnomalies.length || representativeCharacterFindings.length)
-        ? `Referans dekont(lar)ıyla alan bazlı görüntü/tipografi/geometri/karakter-render karşılaştırmasında ${suspicious.length} belirgin alan, ${representativeCharacterFindings.length} karakter-render bulgusu ve ${representativeSpacingAnomalies.length} dikey alan-aralığı sapması bulundu: ${localized.join(', ')}.`
-        : `Referans dekont(lar)ıyla alan bazlı görüntü/tipografi/geometri/karakter-render karşılaştırmasında belirgin yerel uyumsuzluk bulunmadı.`,
+        ? `Referans dekont(lar)ıyla normalize edilmiş alan bazlı görüntü/tipografi/geometri/karakter-render karşılaştırmasında ensemble eşiğini geçen ${suspicious.length} alan, ${representativeCharacterFindings.length} doğrulanmış karakter-render bulgusu ve ${representativeSpacingAnomalies.length} doğrulanmış dikey alan-aralığı sapması bulundu: ${localized.join(', ')}.`
+        : `Referans dekont(lar)ıyla normalize edilmiş alan bazlı görüntü/tipografi/geometri/karakter-render karşılaştırmasında ensemble eşiğini geçen belirgin yerel uyumsuzluk bulunmadı.`,
     };
   } catch (error) {
     console.warn('REFERENCE FORENSIC ENGINE HATASI:', error?.message || error);
