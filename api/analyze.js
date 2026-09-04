@@ -3771,13 +3771,18 @@ function rfValueRenderComparable(refText, targetText) {
   return lenRatio >= 0.45;
 }
 
-function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance, text = '') {
+function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance, text = '', comparable = false, labelSimilarity = 1) {
   if (!refChar || !targetChar) return null;
   const cd = Number(characterDistance);
   const dd = Number(diacriticDistance);
   const hasDia = /[öÖüÜşŞçÇğĞıİ]/.test(String(text || ''));
-  const strongChar = Number.isFinite(cd) && cd >= 0.42;
-  const strongDia = hasDia && Number.isFinite(dd) && dd >= 0.48;
+  // Character geometry is only meaningful when the compared label/value is
+  // structurally comparable. Different strings naturally produce different
+  // connected-component distributions and must not be called "render" fraud.
+  const structureComparable = Boolean(comparable) || Number(labelSimilarity) >= 0.88;
+  if (!structureComparable) return null;
+  const strongChar = Number.isFinite(cd) && cd >= 0.52;
+  const strongDia = hasDia && Number.isFinite(dd) && dd >= 0.62;
   if (!strongChar && !strongDia) return null;
   const reasons = [];
   if (strongChar) reasons.push('karakter geometri/raster özellikleri referanstan belirgin ayrılıyor');
@@ -3841,11 +3846,59 @@ function rfFocusValueRegion(region, fullText, field) {
   };
 }
 
+function rfCanonicalLabelScore(field, text) {
+  const s = String(text || '').toLocaleLowerCase('tr-TR').trim();
+  const label = rfLabelPart(s);
+  if (!label) return 0;
+  const exact = {
+    branch: [/^şube\s*adı$/i, /^sube\s*adi$/i, /^şube$/i, /^sube$/i],
+    date: [/^işlem\s*tarihi(?:\s*ve\s*saati)?$/i, /^islem\s*tarihi(?:\s*ve\s*saati)?$/i, /^tarih$/i],
+    description: [/^açıklama$/i, /^aciklama$/i],
+    transactionNo: [/^fiş\s*no$/i, /^fis\s*no$/i, /^işlem\s*no$/i, /^islem\s*no$/i, /^sorgu\s*no$/i, /^referans\s*no$/i],
+    accountNo: [/^müşteri\s*no$/i, /^musteri\s*no$/i, /^hesap\s*no$/i, /^hesap\s*numarası$/i, /^hesap\s*numarasi$/i],
+    taxNo: [/^vergi\s*no$/i, /^vergi\s*numarası$/i, /^vergi\s*numarasi$/i, /^tckn$/i],
+    amount: [/^giden\s*fast\s*tutar[ıi]?$/i, /^giden\s*eft\s*tutar[ıi]?$/i, /^işlem\s*tutar[ıi]?$/i, /^islem\s*tutar[ıi]?$/i, /^eft\s*tutar[ıi]?$/i, /^tutar$/i],
+    iban: [/^iban(?:\s*no)?$/i, /^iban\/kart\s*no$/i],
+    senderName: [/^gönderen$/i, /^gönderen\s*adı$/i, /^gonderen$/i, /^gonderen\s*adi$/i],
+    recipientName: [/^alıcı\s*(?:adı|ünvanı)$/i, /^alici\s*(?:adi|unvani)$/i],
+    address: [/^adres$/i],
+  };
+  const patterns = exact[field] || [];
+  let score = 0;
+  if (patterns.some(re => re.test(label))) score += 100;
+  else if (label.length <= 42) score += 25;
+  if (/[:：]/.test(s)) score += 30;
+  // A field label followed by a value is more useful than a generic word
+  // appearing inside another field such as BANKA ADI/SUBESİ or an address.
+  if (/[:：]/.test(s) && label.length <= 45) score += 20;
+  if (field === 'branch' && /banka\s*adı|banka\s*adi|merkez\s*şube|merkez\s*sube/i.test(label) && !/^şube(?:\s*adı)?$/i.test(label)) score -= 70;
+  if (field === 'transactionNo' && /sorgu\s*no/i.test(label)) score -= 5;
+  if (field === 'description' && /açıklama|aciklama/i.test(label)) score += 10;
+  return score;
+}
+
 function rfExtractLabelCandidates(ocr) {
-  return rfPrepareRegions(ocr).map(r => {
+  const candidates = rfPrepareRegions(ocr).map(r => {
     const rule = referenceFieldRuleForText(r.text);
-    return rule ? { ...r, rule, labelText: rfLabelPart(r.text) } : null;
+    if (!rule) return null;
+    const labelText = rfLabelPart(r.text);
+    const score = rfCanonicalLabelScore(rule.key, r.text);
+    return { ...r, rule, labelText, canonicalScore: score };
   }).filter(Boolean);
+
+  // One semantic field must not become four fake "references" merely because
+  // OCR also sees the word ŞUBE in BANKA ADI/SUBESİ, IBAN MERKEZ ŞUBE, etc.
+  // Keep the best structural occurrence per field for each actual reference.
+  const bestByField = new Map();
+  for (const c of candidates) {
+    const key = c.rule.key;
+    const old = bestByField.get(key);
+    if (!old || c.canonicalScore > old.canonicalScore ||
+        (c.canonicalScore === old.canonicalScore && String(c.text).length < String(old.text).length)) {
+      bestByField.set(key, c);
+    }
+  }
+  return [...bestByField.values()];
 }
 
 function rfMatchLabel(refLabel, targetLabels, targetSize, refSize) {
@@ -4031,23 +4084,29 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           // İçerik değişebilir; karakter geometrisi ve diakritik sinyalleri
           // içerikten bağımsız render özelliklerini tamamlar.
           const baseStyleDistance = valueDistance == null ? labelDistance : (labelDistance * 0.58 + valueDistance * 0.42);
+          const labelSimilarity = 1 - Number(match.textDistance || 1);
+          const renderCharacterDistance = (valueComparable || labelSimilarity >= 0.88) ? characterDistance : null;
+          const renderDiacriticDistance = (valueComparable || labelSimilarity >= 0.88) ? diacriticDistance : null;
           const styleDistance = rfClamp01(
-            (baseStyleDistance == null ? 0 : baseStyleDistance) * 0.68 +
-            (characterDistance == null ? 0 : characterDistance) * 0.22 +
-            (diacriticDistance == null ? 0 : diacriticDistance) * 0.10
+            (baseStyleDistance == null ? 0 : baseStyleDistance) * 0.82 +
+            (renderCharacterDistance == null ? 0 : renderCharacterDistance) * 0.13 +
+            (renderDiacriticDistance == null ? 0 : renderDiacriticDistance) * 0.05
           );
           const refTextForRender = `${refLabel.labelText || ''} ${refValue?.text || ''}`;
           const targetTextForRender = `${match.target.labelText || ''} ${targetValue?.text || ''}`;
           const hasTurkishDiacritic = /[öÖüÜşŞçÇğĞıİ]/.test(refTextForRender) || /[öÖüÜşŞçÇğĞıİ]/.test(targetTextForRender);
           const effectiveDiacriticDistance = hasTurkishDiacritic ? diacriticDistance : null;
           const characterFindingText = `${match.target.labelText || ''} ${targetValue?.text || ''}`;
+          const renderComparable = valueComparable || labelSimilarity >= 0.88;
           const characterFinding = rfCharacterFinding(
             refLabel.rule.key,
             valueCharacterRef || labelCharacterRef,
             valueCharacterTarget || labelCharacterTarget,
             characterDistance,
             effectiveDiacriticDistance,
-            characterFindingText
+            characterFindingText,
+            renderComparable,
+            labelSimilarity
           );
           const refRegion = refValue?.region || refLabel.region;
           const tarRegion = targetValue?.region || match.target.region;
@@ -4191,7 +4250,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         ? ((consensusRatio >= 0.50 && medianStyle >= 62) ||
            (highCharCount >= Math.ceil(rows.length * 0.50) && medianChar >= 0.52) ||
            (hasDiaText && highDiaCount >= Math.ceil(rows.length * 0.50) && medianDia >= 0.58))
-        : (independentCount >= 2 && bestStyle >= 72);
+        : (independentCount >= 2 && bestStyle >= 80);
 
       fieldObservations.push({
         field: fieldKey,
@@ -4269,7 +4328,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
       : suspicious.length >= 1 && score >= 45 ? 'medium' : 'low';
     return {
       available: true,
-      engine: 'reference-forensic-engine-v4-scale-normalized-character-render',
+      engine: 'reference-forensic-engine-v5-ensemble-normalized-render',
       bank: normalizedBank,
       referenceCount: referenceResults.length,
       referenceFiles: referenceResults.map(x => x.file),
