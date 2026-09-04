@@ -3991,380 +3991,407 @@ function rfComputeSpacingAnomalies(fieldResults) {
   return anomalies.sort((a,b) => b.score - a.score);
 }
 
+async function rfStableTextMetrics(imageBuffer, region, imageSize) {
+  if (!imageBuffer || !region || !imageSize?.width || !imageSize?.height) return null;
+  try {
+    const x1 = Math.max(0, Math.floor(Number(region.x1)));
+    const y1 = Math.max(0, Math.floor(Number(region.y1)));
+    const x2 = Math.min(imageSize.width, Math.ceil(Number(region.x2)));
+    const y2 = Math.min(imageSize.height, Math.ceil(Number(region.y2)));
+    const w = x2 - x1, h = y2 - y1;
+    if (w < 3 || h < 3) return null;
+
+    // OCR kutusunun çevresindeki kutu/çizgi etkisini minimuma indir.
+    const mx = Math.max(1, Math.round(w * 0.035));
+    const my = Math.max(1, Math.round(h * 0.12));
+    const left = Math.max(0, x1 - mx);
+    const top = Math.max(0, y1 - my);
+    const width = Math.min(imageSize.width - left, w + mx * 2);
+    const height = Math.min(imageSize.height - top, h + my * 2);
+
+    const { data, info } = await sharp(imageBuffer)
+      .extract({ left, top, width, height })
+      .resize({ width: 240, height: 72, fit: 'fill' })
+      .grayscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const W = info.width, H = info.height;
+    // Adaptif eşik: kamera/PDF genel parlaklık farkını absorbe eder.
+    let mean = 0;
+    for (const v of data) mean += v;
+    mean /= Math.max(1, data.length);
+    const threshold = Math.max(115, Math.min(205, mean - 28));
+    const mask = new Uint8Array(W * H);
+    let ink = 0;
+    let minX=W, minY=H, maxX=-1, maxY=-1;
+    for (let yy=0; yy<H; yy++) for (let xx=0; xx<W; xx++) {
+      const i=yy*W+xx;
+      if (data[i] < threshold) {
+        mask[i]=1; ink++;
+        if(xx<minX)minX=xx; if(xx>maxX)maxX=xx; if(yy<minY)minY=yy; if(yy>maxY)maxY=yy;
+      }
+    }
+    if (!ink) return null;
+
+    let edge=0;
+    for(let yy=1;yy<H;yy++) for(let xx=1;xx<W;xx++) {
+      const i=yy*W+xx;
+      if(Math.abs(data[i]-data[i-1])+Math.abs(data[i]-data[i-W])>55) edge++;
+    }
+    const inkW=Math.max(1,maxX-minX+1), inkH=Math.max(1,maxY-minY+1);
+    const row=new Array(H).fill(0);
+    for(let yy=0;yy<H;yy++) for(let xx=0;xx<W;xx++) if(mask[yy*W+xx]) row[yy]++;
+    let firstRow=0,lastRow=H-1;
+    while(firstRow<H && row[firstRow]===0) firstRow++;
+    while(lastRow>=0 && row[lastRow]===0) lastRow--;
+    const textH=Math.max(1,lastRow-firstRow+1);
+    const rowPeak=Math.max(...row)/W;
+    return {
+      inkRatio: ink/(W*H),
+      inkWidthNorm: inkW/W,
+      inkHeightNorm: inkH/H,
+      aspect: inkW/inkH,
+      edgeDensity: edge/(W*H),
+      textHeightNorm: textH/H,
+      rowPeak,
+      mean,
+    };
+  } catch { return null; }
+}
+
+function rfStyleResidual(a,b,baseline=null) {
+  if(!a||!b) return null;
+  const rel=(x,y,scale)=>Number.isFinite(Number(x))&&Number.isFinite(Number(y))
+    ? Math.min(1,Math.abs(Number(x)-Number(y))/Math.max(scale,1e-6)) : null;
+  const raw=[
+    rel(a.inkRatio,b.inkRatio,.08),
+    rel(a.inkWidthNorm,b.inkWidthNorm,.22),
+    rel(a.inkHeightNorm,b.inkHeightNorm,.18),
+    rel(a.aspect,b.aspect,.65),
+    rel(a.edgeDensity,b.edgeDensity,.08),
+    rel(a.textHeightNorm,b.textHeightNorm,.16),
+    rel(a.rowPeak,b.rowPeak,.22),
+  ].filter(Number.isFinite);
+  const rawScore=raw.length?raw.reduce((x,y)=>x+y,0)/raw.length:null;
+  if(rawScore==null) return null;
+  if(!baseline) return rawScore;
+  // Global render değişimini çıkar: PDF→JPEG, kamera blur'u, genel kontrast vb.
+  const deltas=[
+    Math.abs(Number(a.inkRatio)-Number(b.inkRatio)),
+    Math.abs(Number(a.inkWidthNorm)-Number(b.inkWidthNorm)),
+    Math.abs(Number(a.inkHeightNorm)-Number(b.inkHeightNorm)),
+    Math.abs(Number(a.aspect)-Number(b.aspect)),
+    Math.abs(Number(a.edgeDensity)-Number(b.edgeDensity)),
+    Math.abs(Number(a.textHeightNorm)-Number(b.textHeightNorm)),
+    Math.abs(Number(a.rowPeak)-Number(b.rowPeak)),
+  ];
+  const base=Number(baseline)||0;
+  return Math.max(0, rawScore-base*0.72);
+}
+
+function rfMedianSigned(values){
+  const a=values.filter(Number.isFinite).sort((x,y)=>x-y);
+  if(!a.length)return 0;
+  const m=Math.floor(a.length/2);
+  return a.length%2?a[m]:(a[m-1]+a[m])/2;
+}
+
+function rfFitAffine(points) {
+  // Separate x/y linear fit: target = scale * reference + offset.
+  if (!points || points.length < 2) return null;
+  const fit=(axis)=>{
+    const xs=points.map(p=>p.ref[axis]), ys=points.map(p=>p.tar[axis]);
+    const mx=rfMedianSigned(xs), my=rfMedianSigned(ys);
+    let num=0,den=0;
+    for(let i=0;i<xs.length;i++){num+=(xs[i]-mx)*(ys[i]-my);den+=(xs[i]-mx)**2;}
+    const scale=den>1e-8?num/den:1;
+    const offset=my-scale*mx;
+    return {scale:Math.max(.45,Math.min(2.5,scale)),offset};
+  };
+  return {x:fit('x'),y:fit('y')};
+}
+
+function rfApplyAffine(affine, point){
+  return {x:affine.x.scale*point.x+affine.x.offset,y:affine.y.scale*point.y+affine.y.offset};
+}
+
+function rfMedianAbsResidual(points, affine){
+  if(!affine||!points.length)return 0;
+  return rfMedianSigned(points.map(p=>{
+    const q=rfApplyAffine(affine,p.ref);
+    return Math.hypot(q.x-p.tar.x,q.y-p.tar.y);
+  }));
+}
+
+function rfFieldLabelText(label){
+  return String(label?.labelText || label?.text || '').toLocaleLowerCase('tr-TR').replace(/\s+/g,' ').trim();
+}
+
 async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath || !targetOCR?.success) return null;
   try {
     const targetBuffer = await fs.readFile(targetPath);
     const targetMeta = await sharp(targetBuffer).metadata();
-    const targetSize = { width: Number(targetMeta.width) || 0, height: Number(targetMeta.height) || 0 };
-    if (!targetSize.width || !targetSize.height) return null;
+    const targetSize={width:Number(targetMeta.width)||0,height:Number(targetMeta.height)||0};
+    if(!targetSize.width||!targetSize.height)return null;
 
-    const referencePaths = await getReferenceFiles(normalizedBank);
-    if (!referencePaths.length) return null;
+    const referencePaths=await getReferenceFiles(normalizedBank);
+    if(!referencePaths.length)return null;
 
-    const referenceResults = [];
-    for (const referencePath of referencePaths) {
-      let refBuffer = null;
-      let refTemp = null;
-      try {
-        const ext = path.extname(referencePath).toLowerCase();
-        const raw = await fs.readFile(referencePath);
-        if (ext === '.pdf') {
-          const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
-          const rendered = await renderPdfPagePng(pdf, 1, 1.6);
-          if (!rendered?.buffer) continue;
-          refBuffer = rendered.buffer;
-        } else {
-          refBuffer = raw;
+    const referenceResults=[];
+    for(const referencePath of referencePaths){
+      let refBuffer=null, refTemp=null;
+      try{
+        const ext=path.extname(referencePath).toLowerCase();
+        const raw=await fs.readFile(referencePath);
+        if(ext==='.pdf'){
+          const pdf=await pdfjsLib.getDocument({data:new Uint8Array(raw)}).promise;
+          const rendered=await renderPdfPagePng(pdf,1,1.8);
+          if(!rendered?.buffer)continue;
+          refBuffer=rendered.buffer;
+        }else refBuffer=raw;
+        const refMeta=await sharp(refBuffer).metadata();
+        const refSize={width:Number(refMeta.width)||0,height:Number(refMeta.height)||0};
+        if(!refSize.width||!refSize.height)continue;
+
+        const refId=createHash('sha256').update(raw).digest('hex').slice(0,16);
+        const cacheKey=`rfocr28:${normalizedBank}:${refId}`;
+        let refOCR=paddleOCRCache.get(cacheKey);
+        if(!refOCR?.success){
+          refTemp=path.join('/tmp',`verifydoc-rf28-${normalizedBank}-${refId}.png`);
+          await fs.writeFile(refTemp,refBuffer);
+          refOCR=await runPaddleOCR(refTemp);
+          if(refOCR?.success)paddleOCRCache.set(cacheKey,refOCR);
         }
-        const refMeta = await sharp(refBuffer).metadata();
-        const refSize = { width: Number(refMeta.width) || 0, height: Number(refMeta.height) || 0 };
-        if (!refSize.width || !refSize.height) continue;
+        if(!refOCR?.success)continue;
 
-        const refId = createHash('sha256').update(raw).digest('hex').slice(0, 16);
-        const cacheKey = `rfocr:${normalizedBank}:${refId}`;
-        let refOCR = paddleOCRCache.get(cacheKey);
-        if (!refOCR?.success) {
-          refTemp = path.join('/tmp', `verifydoc-rf-ref-${normalizedBank}-${refId}.png`);
-          await fs.writeFile(refTemp, refBuffer);
-          refOCR = await runPaddleOCR(refTemp);
-          if (refOCR?.success) paddleOCRCache.set(cacheKey, refOCR);
+        const refLabels=rfExtractLabelCandidates(refOCR);
+        const targetLabels=rfExtractLabelCandidates(targetOCR);
+        const refRegions=rfPrepareRegions(refOCR), targetRegions=rfPrepareRegions(targetOCR);
+        const matches=[];
+        for(const rl of refLabels){
+          const m=rfMatchLabel(rl,targetLabels,targetSize,refSize);
+          if(!m)continue;
+          const rc={x:(rl.region.x1+rl.region.x2)/2/refSize.width,y:(rl.region.y1+rl.region.y2)/2/refSize.height};
+          const tc={x:(m.target.region.x1+m.target.region.x2)/2/targetSize.width,y:(m.target.region.y1+m.target.region.y2)/2/targetSize.height};
+          matches.push({rl,tl:m.target,rc,tc});
         }
-        if (!refOCR?.success) continue;
+        if(matches.length<2)continue;
 
-        const refLabels = rfExtractLabelCandidates(refOCR);
-        const targetLabels = rfExtractLabelCandidates(targetOCR);
-        const fieldResults = [];
+        const anchors=matches.filter(m=>m.rl.canonicalScore>=100 && m.tl.canonicalScore>=100);
+        const affine=rfFitAffine((anchors.length>=2?anchors:matches).map(m=>({ref:m.rc,tar:m.tc})));
+        if(!affine)continue;
 
-        for (const refLabel of refLabels) {
-          const match = rfMatchLabel(refLabel, targetLabels, targetSize, refSize);
-          if (!match) continue;
-          const refValue = rfFindValueRegion(rfPrepareRegions(refOCR), refLabel);
-          const targetValue = rfFindValueRegion(rfPrepareRegions(targetOCR), match.target);
-          const refLabelRegion = rfFocusLabelRegion(refLabel.region, refLabel.text);
-          const targetLabelRegion = rfFocusLabelRegion(match.target.region, match.target.text);
-          const labelRefMetrics = await rfRasterMetrics(refBuffer, refLabelRegion || refLabel.region, refSize);
-          const labelTargetMetrics = await rfRasterMetrics(targetBuffer, targetLabelRegion || match.target.region, targetSize);
-          const refValueRegion = refValue ? rfFocusValueRegion(refValue.region, refValue.text, refLabel.rule.key) : null;
-          const targetValueRegion = targetValue ? rfFocusValueRegion(targetValue.region, targetValue.text, match.target.rule.key) : null;
-          const valueRefMetrics = refValueRegion ? await rfRasterMetrics(refBuffer, refValueRegion, refSize) : null;
-          const valueTargetMetrics = targetValueRegion ? await rfRasterMetrics(targetBuffer, targetValueRegion, targetSize) : null;
-          const labelDistance = rfMetricDistance(labelRefMetrics, labelTargetMetrics);
-          const valueDistance = rfMetricDistance(valueRefMetrics, valueTargetMetrics);
-          const labelCharacterRef = await rfCharacterMetrics(refBuffer, refLabelRegion || refLabel.region, refSize);
-          const labelCharacterTarget = await rfCharacterMetrics(targetBuffer, targetLabelRegion || match.target.region, targetSize);
-          const valueCharacterRef = refValueRegion ? await rfCharacterMetrics(refBuffer, refValueRegion, refSize) : null;
-          const valueCharacterTarget = targetValueRegion ? await rfCharacterMetrics(targetBuffer, targetValueRegion, targetSize) : null;
-          const labelCharacterDistance = rfCharacterDistance(labelCharacterRef, labelCharacterTarget);
-          const valueComparable = rfValueRenderComparable(refValue?.text, targetValue?.text);
-          const valueCharacterDistance = valueComparable
-            ? rfCharacterDistance(valueCharacterRef, valueCharacterTarget)
-            : null;
-          const labelDiacriticDistance = rfDiacriticDistance(
-            labelCharacterRef,
-            labelCharacterTarget,
-            refLabel.labelText,
-            match.target.labelText
-          );
-          const valueDiacriticDistance = valueComparable
-            ? rfDiacriticDistance(
-                valueCharacterRef,
-                valueCharacterTarget,
-                refValue?.text,
-                targetValue?.text
-              )
-            : null;
-          const characterDistance = valueCharacterDistance == null
-            ? labelCharacterDistance
-            : (labelCharacterDistance * 0.55 + valueCharacterDistance * 0.45);
-          const diacriticDistance = valueDiacriticDistance == null
-            ? labelDiacriticDistance
-            : (labelDiacriticDistance * 0.55 + valueDiacriticDistance * 0.45);
-          // İçerik değişebilir; karakter geometrisi ve diakritik sinyalleri
-          // içerikten bağımsız render özelliklerini tamamlar.
-          const baseStyleDistance = valueDistance == null ? labelDistance : (labelDistance * 0.58 + valueDistance * 0.42);
-          const labelSimilarity = 1 - Number(match.textDistance || 1);
-          const renderCharacterDistance = (valueComparable || labelSimilarity >= 0.88) ? characterDistance : null;
-          const renderDiacriticDistance = (valueComparable || labelSimilarity >= 0.88) ? diacriticDistance : null;
-          const styleDistance = rfClamp01(
-            (baseStyleDistance == null ? 0 : baseStyleDistance) * 0.82 +
-            (renderCharacterDistance == null ? 0 : renderCharacterDistance) * 0.13 +
-            (renderDiacriticDistance == null ? 0 : renderDiacriticDistance) * 0.05
-          );
-          const refTextForRender = `${refLabel.labelText || ''} ${refValue?.text || ''}`;
-          const targetTextForRender = `${match.target.labelText || ''} ${targetValue?.text || ''}`;
-          const hasTurkishDiacritic = /[öÖüÜşŞçÇğĞıİ]/.test(refTextForRender) || /[öÖüÜşŞçÇğĞıİ]/.test(targetTextForRender);
-          const effectiveDiacriticDistance = hasTurkishDiacritic ? diacriticDistance : null;
-          const characterFindingText = `${match.target.labelText || ''} ${targetValue?.text || ''}`;
-          const renderComparable = valueComparable || labelSimilarity >= 0.88;
-          const characterFinding = rfCharacterFinding(
-            refLabel.rule.key,
-            valueCharacterRef || labelCharacterRef,
-            valueCharacterTarget || labelCharacterTarget,
-            characterDistance,
-            effectiveDiacriticDistance,
-            characterFindingText,
-            renderComparable,
-            labelSimilarity
-          );
-          const refRegion = refValue?.region || refLabel.region;
-          const tarRegion = targetValue?.region || match.target.region;
-          const rx = ((refRegion.x1 + refRegion.x2) / 2) / refSize.width;
-          const ry = ((refRegion.y1 + refRegion.y2) / 2) / refSize.height;
-          const tx = ((tarRegion.x1 + tarRegion.x2) / 2) / targetSize.width;
-          const ty = ((tarRegion.y1 + tarRegion.y2) / 2) / targetSize.height;
-          const positionDistance = Math.hypot(rx - tx, ry - ty);
-          const styleScore = rfClamp100(styleDistance * 100);
-          const positionScore = rfClamp100(Math.min(100, positionDistance / 0.12 * 100));
-          const strongStyle = styleScore >= 55;
-          const strongPosition = positionScore >= 55;
-          const key = refLabel.rule.key;
-          fieldResults.push({
-            field: key,
-            referenceLabel: refLabel.labelText,
-            targetLabel: match.target.labelText,
-            styleScore,
-            positionScore,
-            combinedScore: rfClamp100(styleScore * 0.90 + positionScore * 0.10),
-            styleDistance: Number(styleDistance.toFixed(4)),
-            positionDistance: Number(positionDistance.toFixed(4)),
-            strongStyle,
-            strongPosition,
-            referenceValueRegionFound: Boolean(refValue),
-            targetValueRegionFound: Boolean(targetValue),
-            referenceLabelXNorm: Number((((refLabel.region.x1 + refLabel.region.x2) / 2) / refSize.width).toFixed(5)),
-            referenceLabelYNorm: Number((((refLabel.region.y1 + refLabel.region.y2) / 2) / refSize.height).toFixed(5)),
-            targetLabelXNorm: Number((((match.target.region.x1 + match.target.region.x2) / 2) / targetSize.width).toFixed(5)),
-            targetLabelYNorm: Number((((match.target.region.y1 + match.target.region.y2) / 2) / targetSize.height).toFixed(5)),
-            referenceMetrics: valueRefMetrics || labelRefMetrics,
-            targetMetrics: valueTargetMetrics || labelTargetMetrics,
-            referenceCharacterMetrics: valueCharacterRef || labelCharacterRef,
-            targetCharacterMetrics: valueCharacterTarget || labelCharacterTarget,
-            characterDistance: Number.isFinite(characterDistance) ? Number(characterDistance.toFixed(4)) : null,
-            valueRenderComparable: Boolean(valueComparable),
-            diacriticDistance: Number.isFinite(effectiveDiacriticDistance) ? Number(effectiveDiacriticDistance.toFixed(4)) : null,
-            characterFinding,
-          });
-        }
-
-        if (fieldResults.length) {
-          const spacingAnomalies = rfComputeSpacingAnomalies(fieldResults);
-          const strong = fieldResults.filter(x => x.styleScore >= 70);
-          const medium = fieldResults.filter(x => x.styleScore >= 52);
-          const suspiciousKeys = [...new Set(strong.map(x => x.field))];
-          const characterFindings = fieldResults.map(x => x.characterFinding).filter(Boolean);
-          const styleScore = rfClamp100(rfMedian(fieldResults.map(x => x.styleScore)) + Math.min(35, strong.length * 9));
-          const localAnomalyScore = rfClamp100((strong.length >= 2 ? 65 : 0) + Math.min(35, strong.length * 8) + (medium.length >= Math.max(3, fieldResults.length * 0.35) ? 12 : 0));
-          referenceResults.push({
-            file: path.basename(referencePath),
-            fieldCount: fieldResults.length,
-            styleScore,
-            localAnomalyScore,
-            suspiciousFieldCount: strong.length,
-            suspiciousFields: suspiciousKeys,
-            spacingAnomalyCount: spacingAnomalies.length,
-            spacingAnomalies,
-            characterFindingCount: characterFindings.length,
-            characterFindings,
-            fields: fieldResults,
-          });
-        }
-      } catch (error) {
-        console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:', path.basename(referencePath), error?.message || error);
-      } finally {
-        if (refTemp) { try { await fs.unlink(refTemp); } catch {} }
-      }
-    }
-
-    if (!referenceResults.length) return null;
-    const allFields = referenceResults.flatMap(x => x.fields || []);
-    const allSpacingAnomalies = referenceResults.flatMap(x => x.spacingAnomalies || []);
-    const allCharacterFindings = referenceResults.flatMap(x => x.characterFindings || []);
-    const spacingBest = new Map();
-    for (const anomaly of allSpacingAnomalies) {
-      const key = `${anomaly.beforeField}->${anomaly.afterField}`;
-      const old = spacingBest.get(key);
-      if (!old || anomaly.score > old.score) spacingBest.set(key, anomaly);
-    }
-    // TRUSTED ENSEMBLE AGGREGATION
-    // A target must disagree with the bank's reference ensemble, not merely
-    // with one PDF raster. This is critical for phone photos/JPEGs and for
-    // references that have different data lengths.
-    const fieldGroups = new Map();
-    for (const field of allFields) {
-      if (!fieldGroups.has(field.field)) fieldGroups.set(field.field, []);
-      fieldGroups.get(field.field).push(field);
-    }
-
-    const representativeFields = [];
-    const suspicious = [];
-    const representativeCharacterFindings = [];
-    const fieldObservations = [];
-
-    for (const [fieldKey, rows] of fieldGroups.entries()) {
-      const ordered = [...rows].sort((a,b) => (a.combinedScore ?? 999) - (b.combinedScore ?? 999));
-      const best = ordered[0];
-      const styleValues = rows.map(x => Number(x.styleScore)).filter(Number.isFinite);
-      const charValues = rows.map(x => Number(x.characterDistance)).filter(Number.isFinite);
-      const diaValues = rows.map(x => Number(x.diacriticDistance)).filter(Number.isFinite);
-      const medianStyle = rfMedian(styleValues);
-      const worstStyle = Math.max(...styleValues, 0);
-      const bestStyle = Math.min(...styleValues, 100);
-      const medianChar = rfMedian(charValues);
-      const medianDia = rfMedian(diaValues);
-      const highStyleCount = rows.filter(x => Number(x.styleScore) >= 70).length;
-      const highCharCount = rows.filter(x => Number(x.characterDistance) >= 0.52).length;
-      const hasDiaText = rows.some(x => /[öÖüÜşŞçÇğĞıİ]/.test(`${x.referenceLabel || ''} ${x.targetLabel || ''}`));
-      const highDiaCount = hasDiaText ? rows.filter(x => Number(x.diacriticDistance) >= 0.58).length : 0;
-      const consensusRatio = rows.length ? highStyleCount / rows.length : 0;
-      const independentCount = [
-        medianStyle >= 62,
-        medianChar >= 0.52,
-        hasDiaText && medianDia >= 0.58,
-        worstStyle - bestStyle >= 24,
-      ].filter(Boolean).length;
-
-      const aggregate = {
-        ...best,
-        referenceCountForField: rows.length,
-        ensembleBestStyleScore: rfClamp100(bestStyle),
-        ensembleMedianStyleScore: rfClamp100(medianStyle),
-        ensembleWorstStyleScore: rfClamp100(worstStyle),
-        ensembleConsensusRatio: Number(consensusRatio.toFixed(3)),
-        ensembleMedianCharacterDistance: Number.isFinite(medianChar) ? Number(medianChar.toFixed(4)) : null,
-        ensembleMedianDiacriticDistance: Number.isFinite(medianDia) ? Number(medianDia.toFixed(4)) : null,
-        ensembleHighCharacterCount: highCharCount,
-        ensembleHighDiacriticCount: highDiaCount,
-        independentSignalCount: independentCount,
-      };
-      representativeFields.push(aggregate);
-
-      // A single reference can describe a template, but it is not enough to
-      // call a JPEG/camera difference suspicious on its own. With 2+ trusted
-      // references, require consensus across references OR two independent
-      // normalized render signals. This sharply reduces false positives on
-      // Enpara/Yapi Kredi phone photos.
-      const multiRef = rows.length >= 2;
-      const ensembleSuspicious = multiRef
-        ? ((consensusRatio >= 0.50 && medianStyle >= 62) ||
-           (highCharCount >= Math.ceil(rows.length * 0.50) && medianChar >= 0.52) ||
-           (hasDiaText && highDiaCount >= Math.ceil(rows.length * 0.50) && medianDia >= 0.58))
-        : (independentCount >= 2 && bestStyle >= 80);
-
-      fieldObservations.push({
-        field: fieldKey,
-        referenceCount: rows.length,
-        suspicious: Boolean(ensembleSuspicious),
-        medianStyleScore: rfClamp100(medianStyle),
-        bestStyleScore: rfClamp100(bestStyle),
-        medianCharacterDistance: Number.isFinite(medianChar) ? Number(medianChar.toFixed(4)) : null,
-        medianDiacriticDistance: Number.isFinite(medianDia) ? Number(medianDia.toFixed(4)) : null,
-        independentSignalCount: independentCount,
-      });
-
-      if (ensembleSuspicious) {
-        suspicious.push(aggregate);
-        // Only expose a character finding when the field itself passed the
-        // ensemble gate. An isolated noisy OCR component is not enough.
-        const diaFinding = rows
-          .filter(x => x.characterFinding && /diacritic/.test(String(x.characterFinding.type || '')))
-          .sort((a,b) => (Number(b.diacriticDistance)||0) - (Number(a.diacriticDistance)||0))[0];
-        const charFinding = rows
-          .filter(x => x.characterFinding)
-          .sort((a,b) => Math.max(Number(b.characterDistance)||0, Number(b.diacriticDistance)||0) - Math.max(Number(a.characterDistance)||0, Number(a.diacriticDistance)||0))[0];
-        if (diaFinding?.characterFinding) representativeCharacterFindings.push(diaFinding.characterFinding);
-        else if (charFinding?.characterFinding) representativeCharacterFindings.push(charFinding.characterFinding);
-      }
-    }
-
-    // Spacing is also ensemble-gated. A camera photo/crop can move the whole
-    // page; what matters is an abnormal change between two matched fields.
-    const spacingByPair = new Map();
-    for (const anomaly of allSpacingAnomalies) {
-      const key = `${anomaly.beforeField}->${anomaly.afterField}`;
-      if (!spacingByPair.has(key)) spacingByPair.set(key, []);
-      spacingByPair.get(key).push(anomaly);
-    }
-    const representativeSpacingAnomalies = [];
-    for (const [key, rows] of spacingByPair.entries()) {
-      const scores = rows.map(x => Number(x.score)).filter(Number.isFinite);
-      const medianScore = rfMedian(scores);
-      const highCount = rows.filter(x => Number(x.score) >= 60).length;
-      if (rows.length >= 2 ? (medianScore >= 42 && highCount >= Math.ceil(rows.length * 0.5)) : medianScore >= 68) {
-        const best = [...rows].sort((a,b)=>Number(b.score)-Number(a.score))[0];
-        representativeSpacingAnomalies.push({
-          ...best,
-          referenceCountForPair: rows.length,
-          ensembleMedianScore: rfClamp100(medianScore),
-          ensembleHighCount: highCount,
+        const anchorResiduals=(anchors.length>=2?anchors:matches).map(m=>{
+          const q=rfApplyAffine(affine,m.rc); return Math.hypot(q.x-m.tc.x,q.y-m.tc.y);
         });
-      }
+        const anchorMedian=rfMedianSigned(anchorResiduals);
+        const anchorMad=rfMedianSigned(anchorResiduals.map(v=>Math.abs(v-anchorMedian)));
+
+        // Önce tüm alanlarda global PDF→JPEG/render farkını kalibre ediyoruz.
+        const stylePairs=[];
+        for(const m of matches){
+          const rr=rfFocusLabelRegion(m.rl.region,m.rl.text);
+          const tr=rfFocusLabelRegion(m.tl.region,m.tl.text);
+          const a=await rfStableTextMetrics(refBuffer,rr,refSize);
+          const b=await rfStableTextMetrics(targetBuffer,tr,targetSize);
+          if(a&&b)stylePairs.push({field:m.rl.rule.key,a,b});
+        }
+        const globalStyleBaseline=rfMedianSigned(stylePairs.map(p=>rfStyleResidual(p.a,p.b)));
+
+        const fieldResults=[];
+        for(const m of matches){
+          const key=m.rl.rule.key;
+          const refLabelText=rfFieldLabelText(m.rl), tarLabelText=rfFieldLabelText(m.tl);
+          const refLabelRegion=rfFocusLabelRegion(m.rl.region,m.rl.text);
+          const tarLabelRegion=rfFocusLabelRegion(m.tl.region,m.tl.text);
+          const refStyle=await rfStableTextMetrics(refBuffer,refLabelRegion,refSize);
+          const tarStyle=await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize);
+          const rawStyle=rfStyleResidual(refStyle,tarStyle);
+          const styleResidual=rfStyleResidual(refStyle,tarStyle,globalStyleBaseline);
+
+          const refValue=rfFindValueRegion(refRegions,m.rl);
+          const tarValue=rfFindValueRegion(targetRegions,m.tl);
+          let valueRenderResidual=null;
+          let valueGeometryResidual=null;
+          if(refValue&&tarValue){
+            const refKind=/\d/.test(refValue.text)?(/^[\d\s.,:+()\-\/]+(?:TL|TRY|EUR|USD)?$/i.test(String(refValue.text).trim())?'numeric':'mixed'):'text';
+            const tarKind=/\d/.test(tarValue.text)?(/^[\d\s.,:+()\-\/]+(?:TL|TRY|EUR|USD)?$/i.test(String(tarValue.text).trim())?'numeric':'mixed'):'text';
+            const sameKind=refKind===tarKind;
+            const lenRatio=Math.min(String(refValue.text).length,String(tarValue.text).length)/Math.max(String(refValue.text).length,String(tarValue.text).length,1);
+            // Dinamik değer farklıysa şekil karşılaştırmasını yalnızca benzer yapıdaki
+            // değerlerde yapıyoruz; aksi halde Ebru Köse/Yusuf Ezer gibi doğal değişimler alarm üretmez.
+            if(sameKind && lenRatio>=0.55){
+              const rs=await rfStableTextMetrics(refBuffer,refValue.region,refSize);
+              const ts=await rfStableTextMetrics(targetBuffer,tarValue.region,targetSize);
+              valueRenderResidual=rfStyleResidual(rs,ts,globalStyleBaseline);
+            }
+            const rc={x:(refValue.region.x1+refValue.region.x2)/2/refSize.width,y:(refValue.region.y1+refValue.region.y2)/2/refSize.height};
+            const tc={x:(tarValue.region.x1+tarValue.region.x2)/2/targetSize.width,y:(tarValue.region.y1+tarValue.region.y2)/2/targetSize.height};
+            const q=rfApplyAffine(affine,rc);
+            valueGeometryResidual=Math.hypot(q.x-tc.x,q.y-tc.y);
+          }
+
+          const labelPos={x:(m.rl.region.x1+m.rl.region.x2)/2/refSize.width,y:(m.rl.region.y1+m.rl.region.y2)/2/refSize.height};
+          const targetPos={x:(m.tl.region.x1+m.tl.region.x2)/2/targetSize.width,y:(m.tl.region.y1+m.tl.region.y2)/2/targetSize.height};
+          const projected=rfApplyAffine(affine,labelPos);
+          const positionResidual=Math.hypot(projected.x-targetPos.x,projected.y-targetPos.y);
+          const normalizedPosition=Math.max(0,positionResidual-Math.max(anchorMedian+3*anchorMad,0.006));
+
+          // Etiket aynı semantik alanın kendisi olduğu için metin eşleşmesi beklenir.
+          const labelExact=normalizeFieldTextForMatch(refLabelText)===normalizeFieldTextForMatch(tarLabelText);
+          const styleScore=rfClamp100((styleResidual||0)*100);
+          const valueStyleScore=rfClamp100((valueRenderResidual||0)*100);
+          const positionScore=rfClamp100(Math.min(1,normalizedPosition/0.035)*100);
+
+          // Çoklu bağımsız sinyal: tek başına kamera/render farkı alarm değildir.
+          const styleSignal=styleScore>=58;
+          const valueSignal=valueStyleScore>=62;
+          const geometrySignal=positionScore>=62;
+          const severeLabelSignal=styleScore>=82 && labelExact;
+          const suspicious=(severeLabelSignal && geometrySignal) ||
+            (styleSignal && geometrySignal) ||
+            (styleSignal && valueSignal && labelExact);
+
+          fieldResults.push({
+            field:key,
+            referenceLabel:m.rl.labelText,
+            targetLabel:m.tl.labelText,
+            labelExact,
+            styleScore,
+            rawStyleScore:rfClamp100((rawStyle||0)*100),
+            valueStyleScore,
+            positionScore,
+            combinedScore:rfClamp100(styleScore*.50+valueStyleScore*.20+positionScore*.30),
+            positionResidual:Number(positionResidual.toFixed(5)),
+            styleResidual:Number((styleResidual||0).toFixed(5)),
+            valueRenderResidual:Number.isFinite(valueRenderResidual)?Number(valueRenderResidual.toFixed(5)):null,
+            referenceLabelXNorm:Number(labelPos.x.toFixed(5)),
+            referenceLabelYNorm:Number(labelPos.y.toFixed(5)),
+            targetLabelXNorm:Number(targetPos.x.toFixed(5)),
+            targetLabelYNorm:Number(targetPos.y.toFixed(5)),
+            referenceValueRegionFound:Boolean(refValue),
+            targetValueRegionFound:Boolean(tarValue),
+            suspicious,
+            evidence:suspicious
+              ? `Alan bazında render/geometri sapması: stil ${styleScore}, değer-stil ${valueStyleScore}, konum ${positionScore}.`
+              : null,
+          });
+        }
+
+        // Dikey ritim: global affine çıkarıldıktan sonra ardışık alanların arası
+        // bozulmuşsa bunu doğrudan yakala. Crop/zoom artık bu ölçümü bozmaz.
+        const ordered=[...fieldResults].sort((a,b)=>a.targetLabelYNorm-b.targetLabelYNorm);
+        const spacingAnomalies=[];
+        for(let i=0;i<ordered.length-1;i++){
+          const a=ordered[i],b=ordered[i+1];
+          if(a.field===b.field)continue;
+          const refGap=b.referenceLabelYNorm-a.referenceLabelYNorm;
+          const tarGap=b.targetLabelYNorm-a.targetLabelYNorm;
+          if(refGap<=0||tarGap<=0)continue;
+          const delta=Math.abs(tarGap-refGap);
+          const score=rfClamp100(delta/Math.max(refGap,.015)*100);
+          // Ancak komşu alanların ikisi de global hizalamaya makul biçimde uyuyorsa
+          // spacing sinyaline izin veriyoruz.
+          const okA=a.positionScore<62, okB=b.positionScore<62;
+          if(score>=32 && okA && okB){
+            spacingAnomalies.push({
+              type:'vertical-field-spacing',beforeField:a.field,afterField:b.field,
+              referenceGapNorm:Number(refGap.toFixed(5)),targetGapNorm:Number(tarGap.toFixed(5)),
+              gapDeltaNorm:Number(delta.toFixed(5)),score,
+              severity:score>=70?'strong':score>=50?'medium':'low',
+              evidence:`${a.field} → ${b.field} dikey alan aralığı referansa göre belirgin değişti.`
+            });
+          }
+        }
+
+        const suspiciousFields=fieldResults.filter(x=>x.suspicious);
+        const styleOutliers=fieldResults.filter(x=>x.styleScore>=58);
+        const strongSpacing=spacingAnomalies.filter(x=>x.score>=55);
+        const referenceQuality={
+          matchedFields:fieldResults.length,
+          anchorCount:anchors.length,
+          anchorMedianResidual:Number(anchorMedian.toFixed(5)),
+          globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5)),
+        };
+        referenceResults.push({
+          file:path.basename(referencePath),fieldCount:fieldResults.length,
+          styleScore:rfClamp100(rfMedian(fieldResults.map(x=>x.styleScore))),
+          localAnomalyScore:rfClamp100(suspiciousFields.length*18+strongSpacing.length*12),
+          suspiciousFieldCount:suspiciousFields.length,
+          suspiciousFields:[...new Set(suspiciousFields.map(x=>x.field))],
+          spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,
+          characterFindingCount:0,characterFindings:[],fields:fieldResults,referenceQuality,
+        });
+      }catch(error){
+        console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:',path.basename(referencePath),error?.message||error);
+      }finally{if(refTemp){try{await fs.unlink(refTemp)}catch{}}}
     }
 
-    const strongSpacing = representativeSpacingAnomalies.filter(x => x.score >= 65);
-    const localized = [...new Set([
-      ...suspicious.map(x => x.field),
-      ...representativeCharacterFindings.map(x => x.field),
-      ...strongSpacing.flatMap(x => [x.beforeField, x.afterField]),
-    ])];
-    const styleMedian = rfMedian(representativeFields.map(x => x.ensembleMedianStyleScore));
-    // Count field-level style outliers for the final independent-signal summary.
-    // This must be derived from the already aggregated representative fields;
-    // it must never be referenced before initialization.
-    const styleOutlierCount = representativeFields.filter(
-      x => Number(x.ensembleMedianStyleScore) >= 70
-    ).length;
-    const consensusFields = representativeFields.filter(x => x.referenceCountForField >= 2 && x.ensembleConsensusRatio >= 0.5).length;
-    const score = rfClamp100(
-      styleMedian * 0.30 +
-      Math.min(28, suspicious.length * 9) +
-      Math.min(18, consensusFields * 3) +
-      Math.min(18, strongSpacing.length * 7) +
-      Math.min(16, representativeCharacterFindings.length * 5)
+    if(!referenceResults.length)return null;
+
+    // Referanslar arası consensus. Tek referansta bile iki bağımsız sinyal şart;
+    // çoklu referansta aynı alanın yarısından fazlası aynı yönde olmalı.
+    const groups=new Map();
+    for(const ref of referenceResults)for(const f of ref.fields||[]){
+      if(!groups.has(f.field))groups.set(f.field,[]);groups.get(f.field).push(f);
+    }
+    const fields=[],suspicious=[],fieldObservations=[];
+    for(const [field,rows] of groups){
+      const medStyle=rfMedianSigned(rows.map(x=>Number(x.styleScore)).filter(Number.isFinite));
+      const medValue=rfMedianSigned(rows.map(x=>Number(x.valueStyleScore)).filter(Number.isFinite));
+      const medPos=rfMedianSigned(rows.map(x=>Number(x.positionScore)).filter(Number.isFinite));
+      const styleHits=rows.filter(x=>x.styleScore>=58).length;
+      const valueHits=rows.filter(x=>x.valueStyleScore>=62).length;
+      const posHits=rows.filter(x=>x.positionScore>=62).length;
+      const multi=rows.length>=2;
+      const consensus=multi?(styleHits>=Math.ceil(rows.length*.5)&&medStyle>=58)||(posHits>=Math.ceil(rows.length*.5)&&medPos>=62&&styleHits>=Math.ceil(rows.length*.5)):(
+        (medStyle>=70&&medPos>=62)||(medStyle>=70&&medValue>=62)
+      );
+      const best=[...rows].sort((a,b)=>b.combinedScore-a.combinedScore)[0];
+      const aggregate={...best,referenceCountForField:rows.length,ensembleMedianStyleScore:rfClamp100(medStyle),ensembleMedianValueStyleScore:rfClamp100(medValue),ensembleMedianPositionScore:rfClamp100(medPos),ensembleStyleHitCount:styleHits,ensembleValueHitCount:valueHits,ensemblePositionHitCount:posHits,ensembleConsensusRatio:Number((styleHits/Math.max(1,rows.length)).toFixed(3))};
+      fields.push(aggregate);
+      fieldObservations.push({field,referenceCount:rows.length,suspicious:Boolean(consensus),medianStyleScore:rfClamp100(medStyle),medianValueStyleScore:rfClamp100(medValue),medianPositionScore:rfClamp100(medPos),styleHitCount:styleHits,positionHitCount:posHits});
+      if(consensus)suspicious.push(aggregate);
+    }
+
+    const spacingGroups=new Map();
+    for(const ref of referenceResults)for(const a of ref.spacingAnomalies||[]){
+      const k=`${a.beforeField}->${a.afterField}`;if(!spacingGroups.has(k))spacingGroups.set(k,[]);spacingGroups.get(k).push(a);
+    }
+    const spacingAnomalies=[];
+    for(const rows of spacingGroups.values()){
+      const med=rfMedianSigned(rows.map(x=>Number(x.score)).filter(Number.isFinite));
+      const hits=rows.filter(x=>x.score>=55).length;
+      if((rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45)||(rows.length===1&&med>=72))spacingAnomalies.push({...rows.sort((a,b)=>b.score-a.score)[0],ensembleMedianScore:rfClamp100(med),referenceCountForPair:rows.length});
+    }
+
+    const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
+    const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
+    const localized=[...new Set([...suspicious.map(x=>x.field),...strongSpacing.flatMap(x=>[x.beforeField,x.afterField])])];
+    const score=rfClamp100(
+      Math.min(45,styleMedian*.45)+
+      Math.min(35,suspicious.length*12)+
+      Math.min(20,strongSpacing.length*8)
     );
-    const severity = suspicious.length >= 2 && score >= 65
-      ? 'strong'
-      : suspicious.length >= 1 && score >= 45 ? 'medium' : 'low';
+    const severity=suspicious.length>=2&&score>=65?'strong':suspicious.length>=1&&score>=45?'medium':'low';
     return {
-      available: true,
-      engine: 'reference-forensic-engine-v5-ensemble-normalized-render',
-      bank: normalizedBank,
-      referenceCount: referenceResults.length,
-      referenceFiles: referenceResults.map(x => x.file),
-      comparedFieldCount: representativeFields.length,
-      suspiciousFieldCount: suspicious.length,
-      suspiciousFields: localized,
-      spacingAnomalyCount: representativeSpacingAnomalies.length,
-      spacingAnomalies: representativeSpacingAnomalies,
-      characterFindingCount: representativeCharacterFindings.length,
-      characterFindings: representativeCharacterFindings,
-      score,
-      severity,
-      independentSignals: [
-        suspicious.length >= 1,
-        suspicious.length >= 2,
-        styleOutlierCount >= 3,
-        referenceResults.length >= 2,
-      ].filter(Boolean).length,
-      references: referenceResults.map(x => ({
-        file: x.file,
-        fieldCount: x.fieldCount,
-        styleScore: x.styleScore,
-        localAnomalyScore: x.localAnomalyScore,
-        suspiciousFieldCount: x.suspiciousFieldCount,
-        suspiciousFields: x.suspiciousFields,
-        spacingAnomalyCount: x.spacingAnomalyCount,
-        spacingAnomalies: x.spacingAnomalies,
-      })),
-      fields: representativeFields,
-      fieldObservations,
-      evidence: (suspicious.length || representativeSpacingAnomalies.length || representativeCharacterFindings.length)
-        ? `Referans dekont(lar)ıyla normalize edilmiş alan bazlı görüntü/tipografi/geometri/karakter-render karşılaştırmasında ensemble eşiğini geçen ${suspicious.length} alan, ${representativeCharacterFindings.length} doğrulanmış karakter-render bulgusu ve ${representativeSpacingAnomalies.length} doğrulanmış dikey alan-aralığı sapması bulundu: ${localized.join(', ')}.`
-        : `Referans dekont(lar)ıyla normalize edilmiş alan bazlı görüntü/tipografi/geometri/karakter-render karşılaştırmasında ensemble eşiğini geçen belirgin yerel uyumsuzluk bulunmadı.`,
+      available:true,engine:'reference-forensic-engine-v8-affine-calibrated',bank:normalizedBank,
+      referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
+      comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
+      spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,characterFindingCount:0,characterFindings:[],
+      score,severity,
+      independentSignals:[suspicious.length>=1,strongSpacing.length>=1,referenceResults.length>=2,suspicious.length>=2].filter(Boolean).length,
+      references:referenceResults.map(x=>({file:x.file,fieldCount:x.fieldCount,styleScore:x.styleScore,localAnomalyScore:x.localAnomalyScore,suspiciousFieldCount:x.suspiciousFieldCount,suspiciousFields:x.suspiciousFields,spacingAnomalyCount:x.spacingAnomalyCount,spacingAnomalies:x.spacingAnomalies,referenceQuality:x.referenceQuality})),
+      fields,fieldObservations,
+      evidence:localized.length
+        ? `Referans ensemble + affine hizalama sonrasında ${suspicious.length} alan ve ${spacingAnomalies.length} yapısal aralık anomalisi eşik geçti: ${localized.join(', ')}.`
+        : `Referans ensemble + affine hizalama sonrasında belirgin yerel render, tipografi veya yapısal aralık anomalisi bulunmadı.`,
     };
-  } catch (error) {
-    console.warn('REFERENCE FORENSIC ENGINE HATASI:', error?.message || error);
+  }catch(error){
+    console.warn('REFERENCE FORENSIC ENGINE HATASI:',error?.message||error);
     return null;
   }
 }
