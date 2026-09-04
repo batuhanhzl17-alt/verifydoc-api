@@ -1272,6 +1272,10 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   const layoutRisk = Number.isFinite(layoutScore)
     ? Math.max(0, Math.min(100, Math.round(layoutScore)))
     : 0;
+  const referenceLayoutScore = Number(forensic?.layoutForensics?.score);
+  const structuralLayoutRisk = Number.isFinite(referenceLayoutScore)
+    ? Math.max(0, Math.min(100, Math.round(referenceLayoutScore)))
+    : 0;
 
   let textRisk = 0;
   if (Number.isFinite(ocrConfidence)) {
@@ -1321,7 +1325,7 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   const categories = {
     visualRisk,
     textRisk,
-    layoutRisk,
+    layoutRisk: Math.max(layoutRisk, structuralLayoutRisk),
     financialDataRisk,
     editingRisk,
   };
@@ -3150,7 +3154,7 @@ async function extractLongLineFingerprint(buffer) {
 async function runReferenceLayoutForensics(targetPath, bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath) return null;
-  const cacheKey = `layout:${normalizedBank}`;
+  const cacheKey = `layout:v2:${normalizedBank}`;
 
   try {
     const targetBuffer = await fs.readFile(targetPath);
@@ -3161,7 +3165,6 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     if (!ensemble) {
       const referencePaths = await getReferenceFiles(normalizedBank);
       if (!referencePaths.length) return null;
-
       const fingerprints = [];
       for (const referencePath of referencePaths) {
         try {
@@ -3184,160 +3187,170 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       referenceLayoutForensicsCache.set(cacheKey, ensemble);
     }
 
-    function clamp01(v) { return Math.max(0, Math.min(1, Number(v) || 0)); }
-    function median(values) {
-      const a = values.filter(Number.isFinite).sort((x,y)=>x-y);
-      if (!a.length) return null;
-      const m = Math.floor(a.length/2);
-      return a.length % 2 ? a[m] : (a[m-1]+a[m])/2;
-    }
-    function lineSimilarity(a,b) {
-      if (!a || !b) return 0;
-      const dy = Math.abs(a.yNorm-b.yNorm);
-      const dl = Math.abs(a.lengthNorm-b.lengthNorm);
-      return Math.max(0, 1 - (dy/0.035)*0.65 - (dl/0.10)*0.35);
-    }
-    function bestReferenceFingerprint() {
-      const targetLines = targetFingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
-      let best = null;
-      for (const entry of ensemble.fingerprints) {
-        const refLines = entry.fingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
-        if (!refLines.length) continue;
-        let score = 0;
-        for (const r of refLines) {
-          const nearest = targetLines.reduce((p,t) => !p || lineSimilarity(r,t) > lineSimilarity(r,p) ? t : p, null);
-          score += nearest ? lineSimilarity(r,nearest) : 0;
+    const median=(values)=>{
+      const a=values.filter(Number.isFinite).sort((x,y)=>x-y);
+      if(!a.length)return 0;
+      const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2;
+    };
+    const refLinesFor=(fp)=>fp.horizontal.filter(x=>x.lengthNorm>=0.65);
+    const tarLines=refLinesFor(targetFingerprint);
+
+    // Monotonic sequence matching. We first estimate an affine Y transform from
+    // obvious long borders, then compare LOCAL GAPs between neighbouring borders.
+    // This is intentionally independent of bank name or field names.
+    function matchLines(refLines) {
+      if(!refLines.length||!tarLines.length)return {pairs:[],affine:{scale:1,offset:0}};
+      const candidatePairs=[];
+      for(let i=0;i<refLines.length;i++){
+        for(let j=0;j<tarLines.length;j++){
+          const r=refLines[i],t=tarLines[j];
+          const lenCost=Math.abs(r.lengthNorm-t.lengthNorm)/0.16;
+          candidatePairs.push({i,j,cost:lenCost});
         }
-        score /= Math.max(refLines.length, 1);
-        if (!best || score > best.score) best = { ...entry, score };
       }
-      return best;
+      // Start with length-compatible anchors; if there are too few, use nearest
+      // monotonic pairs. The median/affine fit prevents a crop from becoming a
+      // local spacing alarm.
+      candidatePairs.sort((a,b)=>a.cost-b.cost);
+      const anchors=[]; const usedR=new Set(); const usedT=new Set();
+      for(const c of candidatePairs){
+        if(c.cost>1.4)break;
+        if(usedR.has(c.i)||usedT.has(c.j))continue;
+        anchors.push({ref:refLines[c.i].yNorm,tar:tarLines[c.j].yNorm});
+        usedR.add(c.i);usedT.add(c.j);
+        if(anchors.length>=Math.min(10,Math.max(4,Math.min(refLines.length,tarLines.length))))break;
+      }
+      let scale=1,offset=0;
+      if(anchors.length>=2){
+        const mx=median(anchors.map(p=>p.ref)), my=median(anchors.map(p=>p.tar));
+        let num=0,den=0;
+        for(const p of anchors){num+=(p.ref-mx)*(p.tar-my);den+=(p.ref-mx)**2;}
+        scale=den>1e-8?Math.max(.6,Math.min(1.8,num/den)):1;
+        offset=my-scale*mx;
+      } else if(anchors.length===1) offset=anchors[0].tar-anchors[0].ref;
+
+      // Greedy monotonic matching after affine projection. This handles missing
+      // sections/crops without reordering the document.
+      const pairs=[]; let lastJ=-1;
+      for(let i=0;i<refLines.length;i++){
+        const r=refLines[i]; const expected=scale*r.yNorm+offset;
+        let bestJ=-1,bestCost=Infinity;
+        for(let j=lastJ+1;j<tarLines.length;j++){
+          const t=tarLines[j];
+          const cost=Math.abs(t.yNorm-expected)/0.045 + Math.abs(t.lengthNorm-r.lengthNorm)/0.14;
+          if(cost<bestCost){bestCost=cost;bestJ=j;}
+          if(t.yNorm>expected+0.10 && bestJ>=0)break;
+        }
+        if(bestJ>=0 && bestCost<=2.1){
+          pairs.push({reference:r,target:tarLines[bestJ],cost:bestCost,indexR:i,indexT:bestJ});
+          lastJ=bestJ;
+        }
+      }
+      return {pairs,affine:{scale,offset}};
     }
 
-    const best = bestReferenceFingerprint();
-    if (!best) return null;
-    const ref = best.fingerprint;
-    const refH = ref.horizontal.filter(x => x.lengthNorm >= 0.65);
-    const tarH = targetFingerprint.horizontal.filter(x => x.lengthNorm >= 0.65);
+    let best=null;
+    for(const entry of ensemble.fingerprints){
+      const refLines=refLinesFor(entry.fingerprint);
+      const m=matchLines(refLines);
+      if(!m.pairs.length)continue;
+      const coverage=m.pairs.length/Math.max(1,refLines.length);
+      const meanCost=m.pairs.reduce((a,x)=>a+x.cost,0)/m.pairs.length;
+      const score=coverage*100-meanCost*8;
+      if(!best||score>best.score)best={...entry,...m,score,refLines};
+    }
+    if(!best)return null;
 
-    // Sayısal çizgi adedi artık ana risk kriteri değildir. Önce tüm çizgiler
-    // y-konumu ve uzunluk açısından en yakın eşleşmelerle hizalanır.
-    const matched = [];
-    const used = new Set();
-    for (const r of refH) {
-      let bestIdx = -1, bestCost = Infinity;
-      for (let i=0;i<tarH.length;i++) {
-        if (used.has(i)) continue;
-        const t=tarH[i];
-        const cost = Math.abs(r.yNorm-t.yNorm)/0.045 + Math.abs(r.lengthNorm-t.lengthNorm)/0.14;
-        if (cost < bestCost) { bestCost=cost; bestIdx=i; }
-      }
-      if (bestIdx >= 0 && bestCost <= 2.0) {
-        used.add(bestIdx);
-        matched.push({reference:r,target:tarH[bestIdx],cost:bestCost});
+    const refH=best.refLines, pairs=best.pairs;
+    const globalScale=best.affine.scale, globalOffset=best.affine.offset;
+    const localGapAnomalies=[];
+    for(let i=0;i<pairs.length-1;i++){
+      const a=pairs[i],b=pairs[i+1];
+      const refGap=b.reference.yNorm-a.reference.yNorm;
+      const targetGap=b.target.yNorm-a.target.yNorm;
+      if(refGap<=0||targetGap<=0)continue;
+      const expectedGap=refGap*globalScale;
+      const delta=Math.abs(targetGap-expectedGap);
+      const rel=delta/Math.max(expectedGap,.012);
+      const score=Math.max(0,Math.min(100,Math.round(rel*100)));
+      if(score>=25){
+        localGapAnomalies.push({
+          type:'local-border-spacing',
+          referenceBeforeY:Number(a.reference.yNorm.toFixed(5)),
+          referenceAfterY:Number(b.reference.yNorm.toFixed(5)),
+          targetBeforeY:Number(a.target.yNorm.toFixed(5)),
+          targetAfterY:Number(b.target.yNorm.toFixed(5)),
+          referenceGapNorm:Number(refGap.toFixed(5)),
+          targetGapNorm:Number(targetGap.toFixed(5)),
+          expectedTargetGapNorm:Number(expectedGap.toFixed(5)),
+          gapDeltaNorm:Number(delta.toFixed(5)),
+          relativeDelta:Number(rel.toFixed(3)),score,
+          severity:score>=65?'strong':score>=45?'medium':'low',
+          evidence:`Referans ve hedefte ardışık yatay sınırlar arasındaki lokal boşluk ${score}% düzeyinde değişti.`
+        });
       }
     }
 
-    const yDeltas = matched.map(x => x.target.yNorm-x.reference.yNorm);
-    const globalOffset = median(yDeltas) || 0;
-    const adjusted = matched.map(x => ({
-      ...x,
-      adjustedDy: Math.abs((x.target.yNorm-globalOffset)-x.reference.yNorm),
-      lengthDelta: Math.abs(x.target.lengthNorm-x.reference.lengthNorm),
-    }));
+    const strongLocal=localGapAnomalies.filter(x=>x.score>=60).length;
+    const mediumLocal=localGapAnomalies.filter(x=>x.score>=40).length;
+    const unmatchedRef=Math.max(0,refH.length-pairs.length);
+    const unmatchedTarget=Math.max(0,tarLines.length-pairs.length);
+    const lengthOutliers=pairs.filter(x=>Math.abs(x.reference.lengthNorm-x.target.lengthNorm)>0.08).length;
+    const coverage=pairs.length/Math.max(1,refH.length);
 
-    const strongY = adjusted.filter(x => x.adjustedDy > 0.045).length;
-    const mediumY = adjusted.filter(x => x.adjustedDy > 0.025).length;
-    const strongLength = adjusted.filter(x => x.lengthDelta > 0.10).length;
-    const unmatchedRef = Math.max(0, refH.length-matched.length);
-    const unmatchedTarget = Math.max(0, tarH.length-matched.length);
-
-    // Ana kutu sınırlarını, çizgi sırasına körü körüne bağlamak yerine
-    // üst yarıdaki en güçlü eşleşmelerden çıkar.
-    const refMain = refH.slice(0, Math.min(6, refH.length));
-    const tarMain = tarH.slice(0, Math.min(6, tarH.length));
-    function boxMetrics(lines) {
-      if (lines.length < 2) return [];
-      const boxes=[];
-      for(let i=0;i+1<lines.length;i+=2){
-        const a=lines[i], b=lines[i+1];
-        if (b.yNorm <= a.yNorm) continue;
-        boxes.push({top:a.yNorm,bottom:b.yNorm,height:b.yNorm-a.yNorm,widthA:a.lengthNorm,widthB:b.lengthNorm,width:(a.lengthNorm+b.lengthNorm)/2});
+    // Container-height signal: a reference top/bottom border pair can expand or
+    // shrink even when the entire page is globally aligned. This is the exact
+    // class of anomaly needed for edited blank space inside a form box.
+    const containerPairs=[];
+    for(let i=0;i<pairs.length-1;i++){
+      const a=pairs[i],b=pairs[i+1];
+      const rh=b.reference.yNorm-a.reference.yNorm;
+      const th=b.target.yNorm-a.target.yNorm;
+      if(rh<0.035||th<0.025)continue;
+      const ratio=th/Math.max(rh*globalScale,.001);
+      const deviation=Math.abs(ratio-1);
+      if(deviation>=0.16){
+        containerPairs.push({
+          type:'container-height-change',
+          referenceTopY:Number(a.reference.yNorm.toFixed(5)),referenceBottomY:Number(b.reference.yNorm.toFixed(5)),
+          targetTopY:Number(a.target.yNorm.toFixed(5)),targetBottomY:Number(b.target.yNorm.toFixed(5)),
+          referenceHeightNorm:Number(rh.toFixed(5)),targetHeightNorm:Number(th.toFixed(5)),
+          normalizedHeightRatio:Number(ratio.toFixed(3)),
+          score:Math.min(100,Math.round(deviation*100)),
+          severity:deviation>=.35?'strong':deviation>=.22?'medium':'low',
+          evidence:`Referans kutu/sınır aralığı hedefte ${Math.round(ratio*100)}% oranında değişti.`
+        });
       }
-      return boxes;
     }
-    const rb=boxMetrics(refMain), tb=boxMetrics(tarMain);
-    const boxPairs=[];
-    for(let i=0;i<Math.min(rb.length,tb.length);i++){
-      boxPairs.push({
-        reference:rb[i], target:tb[i],
-        heightRatio:tb[i].height/Math.max(.001,rb[i].height),
-        widthRatio:tb[i].width/Math.max(.001,rb[i].width),
-      });
-    }
-    const boxHeightOutliers = boxPairs.filter(x => Math.abs(x.heightRatio-1)>0.16).length;
-    const boxWidthOutliers = boxPairs.filter(x => Math.abs(x.widthRatio-1)>0.10).length;
 
-    // Referans kümesi içinde ortak şablon yoksa bile tek referansın çizgi sayısı
-    // yüzünden fail üretme; yalnızca bağımsız geometrik sinyaller birleşirse güçlü say.
-    const independentSignals = [
-      strongY >= 2,
-      strongLength >= 2,
-      boxHeightOutliers >= 1,
-      boxWidthOutliers >= 1,
-      unmatchedRef >= 3 || unmatchedTarget >= 3,
-    ].filter(Boolean).length;
-
-    let score = 0;
-    score += Math.min(28, strongY*9 + mediumY*3);
-    score += Math.min(24, strongLength*8);
-    score += Math.min(24, boxHeightOutliers*12 + boxWidthOutliers*10);
-    score += Math.min(14, Math.max(unmatchedRef,unmatchedTarget)*4);
-    score += Math.min(10, Math.abs(tarH.length-refH.length)*2);
-    score = Math.round(Math.max(0, Math.min(100, score)));
-
-    // Küçük fotoğraf/perspektif/render farklarını tolere et.
-    const strong = independentSignals >= 2 && score >= 55;
-    const medium = !strong && score >= 25;
+    const score=Math.round(Math.min(100,
+      Math.min(35,strongLocal*12+mediumLocal*4)+
+      Math.min(30,containerPairs.filter(x=>x.score>=35).length*15)+
+      Math.min(20,lengthOutliers*4)+
+      Math.min(15,Math.max(0,(1-coverage))*30)
+    ));
+    const independentSignals=[strongLocal>=1,containerPairs.some(x=>x.score>=35),lengthOutliers>=2,coverage<.70].filter(Boolean).length;
+    const severity=independentSignals>=2&&score>=55?'strong':score>=28?'medium':'low';
 
     return {
-      available:true,
-      bank:normalizedBank,
-      referenceFiles:ensemble.referenceFiles,
-      referenceCount:ensemble.fingerprints.length,
-      selectedReference:best.file,
-      referenceLineCount:refH.length,
-      targetLineCount:tarH.length,
-      lineCountDelta:Math.abs(refH.length-tarH.length),
-      globalYOffset:globalOffset,
-      matchedLineCount:matched.length,
-      unmatchedReferenceLines:unmatchedRef,
-      unmatchedTargetLines:unmatchedTarget,
-      strongYDiscrepancies:strongY,
-      strongLengthDiscrepancies:strongLength,
-      boxHeightOutliers,
-      boxWidthOutliers,
-      independentSignals,
-      boxPairs,
-      score,
-      severity: strong ? 'strong' : medium ? 'medium' : 'low',
-      check: {
-        status: strong ? 'fail' : medium ? 'unknown' : 'pass',
-        score,
-        evidence: strong
-          ? `Referans kümesindeki ${ensemble.fingerprints.length} şablona göre bağımsız kutu/çizgi geometrisi sinyalleri birlikte sapma gösteriyor.`
-          : medium
-            ? `Referans kümesiyle karşılaştırmada bazı küçük/orta düzey geometrik farklar bulundu; tek başına manipülasyon kanıtı sayılmadı.`
-            : `Referans kümesindeki şablonlarla ana kutu geometrisi uyumlu; küçük çizgi/render farkları tolere edildi.`
-      },
-      evidence: strong
-        ? `Yapısal geometri, ${ensemble.fingerprints.length} referansın en uyumlu şablonuyla ve hizalama sonrası karşılaştırıldı; ${independentSignals} bağımsız sapma sinyali bulundu.`
-        : medium
-          ? `Yapısal geometri referans kümesiyle karşılaştırıldı; küçük/orta farklar perspektif ve render toleransı içinde değerlendirildi.`
-          : `Yapısal geometri referans kümesiyle karşılaştırıldı; belirgin bağımsız sapma bulunmadı.`,
+      available:true,engine:'reference-layout-engine-v2-local-gap',bank:normalizedBank,
+      referenceFiles:ensemble.referenceFiles,referenceCount:ensemble.fingerprints.length,
+      selectedReference:best.file,referenceLineCount:refH.length,targetLineCount:tarLines.length,
+      matchedLineCount:pairs.length,unmatchedReferenceLines:unmatchedRef,unmatchedTargetLines:unmatchedTarget,
+      affineY:{scale:Number(globalScale.toFixed(5)),offset:Number(globalOffset.toFixed(5))},coverage:Number(coverage.toFixed(3)),
+      localGapAnomalies:localGapAnomalies.sort((a,b)=>b.score-a.score).slice(0,12),
+      containerPairs:containerPairs.sort((a,b)=>b.score-a.score).slice(0,12),
+      strongLocalGapCount:strongLocal,containerHeightChangeCount:containerPairs.length,lengthOutlierCount:lengthOutliers,
+      independentSignals,score,severity,
+      check:{status:severity==='strong'?'fail':severity==='medium'?'unknown':'pass',score,evidence:severity==='low'
+        ?'Referans şablonun ana yatay sınırları ve lokal aralıkları tolerans içinde.'
+        :`Referans şablonla karşılaştırmada ${strongLocal} güçlü lokal aralık ve ${containerPairs.length} kutu yüksekliği değişimi tespit edildi.`},
+      evidence:severity==='low'
+        ?'Referans şablonla lokal sınır/boşluk karşılaştırmasında belirgin bağımsız yapısal sapma bulunmadı.'
+        :`Referans şablonla lokal sınır/boşluk karşılaştırmasında belirgin yapısal sapma bulundu; ${strongLocal} güçlü lokal aralık ve ${containerPairs.length} kutu yüksekliği değişimi.`
     };
-  } catch (error) {
-    console.warn('REFERENCE LAYOUT FORENSICS HATASI:', error?.message || error);
+  } catch(error){
+    console.warn('REFERENCE LAYOUT FORENSICS HATASI:',error?.message||error);
     return null;
   }
 }
@@ -3858,7 +3871,7 @@ function rfCanonicalLabelScore(field, text) {
     accountNo: [/^müşteri\s*no$/i, /^musteri\s*no$/i, /^hesap\s*no$/i, /^hesap\s*numarası$/i, /^hesap\s*numarasi$/i],
     taxNo: [/^vergi\s*no$/i, /^vergi\s*numarası$/i, /^vergi\s*numarasi$/i, /^tckn$/i],
     amount: [/^giden\s*fast\s*tutar[ıi]?$/i, /^giden\s*eft\s*tutar[ıi]?$/i, /^işlem\s*tutar[ıi]?$/i, /^islem\s*tutar[ıi]?$/i, /^eft\s*tutar[ıi]?$/i, /^tutar$/i],
-    iban: [/^iban(?:\s*no)?$/i, /^iban\/kart\s*no$/i],
+    iban: [/^iban(?:\s*no)?$/i, /^iban\/kart\s*no$/i, /^gönderen\s+iban$/i, /^alıcı\s+iban$/i, /^alacaklı\s+iban$/i],
     senderName: [/^gönderen$/i, /^gönderen\s*adı$/i, /^gonderen$/i, /^gonderen\s*adi$/i],
     recipientName: [/^alıcı\s*(?:adı|ünvanı)$/i, /^alici\s*(?:adi|unvani)$/i],
     address: [/^adres$/i],
@@ -3875,6 +3888,39 @@ function rfCanonicalLabelScore(field, text) {
   if (field === 'transactionNo' && /sorgu\s*no/i.test(label)) score -= 5;
   if (field === 'description' && /açıklama|aciklama/i.test(label)) score += 10;
   return score;
+}
+
+function rfGenericFieldKey(labelText) {
+  const s=normalizeFieldTextForMatch(labelText).replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
+  if(!s || s.length<2 || s.length>80) return null;
+  // Generic labels are deliberately kept only when they look like a label,
+  // not prose/value text. This lets the engine compare bank-specific fields
+  // without hard-coding every bank's vocabulary.
+  if(/^(sayın|sayin|dekont|fast|e-dekont|açıklama|aciklama)$/i.test(s)) return null;
+  if(/\d{5,}/.test(s) && !/no|numara|tarih|iban|tutar/i.test(s)) return null;
+  return `generic:${s}`;
+}
+
+function rfExtractAllFieldCandidates(ocr) {
+  const regions=rfPrepareRegions(ocr);
+  const out=[];
+  for(const r of regions){
+    const raw=String(r.text||'').trim();
+    if(!raw)continue;
+    const canonical=referenceFieldRuleForText(raw);
+    const label=rfLabelPart(raw);
+    const key=canonical?.key || rfGenericFieldKey(label);
+    if(!key)continue;
+    const rule=canonical || {key,patterns:[]};
+    out.push({...r,rule,labelText:label,canonicalScore:canonical?rfCanonicalLabelScore(canonical.key,raw):35,generic:true});
+  }
+  const best=new Map();
+  for(const c of out){
+    const old=best.get(c.rule.key);
+    if(!old || c.canonicalScore>old.canonicalScore ||
+      (c.canonicalScore===old.canonicalScore && String(c.text).length<String(old.text).length)) best.set(c.rule.key,c);
+  }
+  return [...best.values()];
 }
 
 function rfExtractLabelCandidates(ocr) {
@@ -3923,7 +3969,8 @@ function rfMatchLabel(refLabel, targetLabels, targetSize, refSize) {
   // wider semantic match; the later affine-position gate prevents a random
   // same-field occurrence from being accepted.
   const key = refLabel.rule.key;
-  const limit = ['iban','date','amount','transactionNo'].includes(key) ? 6.5 : 3.2;
+  const isGeneric=String(key).startsWith('generic:');
+  const limit = isGeneric ? 2.6 : (['iban','date','amount','transactionNo'].includes(key) ? 6.5 : 3.2);
   return best.score <= limit ? best : null;
 }
 
@@ -3963,9 +4010,10 @@ function rfRecoverUnmatchedLabels(refLabels, targetLabels, matches, affine, targ
       // aynı sütun korunuyorsa büyük Y farkı spacing anomalisi olarak daha sonra
       // ölçülmelidir.
       const structuralField = ['iban','date'].includes(rl.rule.key);
-      const radius = structuralField ? 0.30 : 0.045;
-      const xRadius = structuralField ? 0.085 : radius;
-      const textOk = textDistance <= (structuralField ? 12 : 10) || canonical >= 70;
+      const genericField = String(rl.rule.key).startsWith('generic:');
+      const radius = structuralField ? 0.30 : genericField ? 0.08 : 0.045;
+      const xRadius = structuralField ? 0.085 : genericField ? 0.12 : radius;
+      const textOk = textDistance <= (structuralField ? 12 : genericField ? 5 : 10) || canonical >= 70;
       const positionOk = structuralField ? (dx <= xRadius && dy <= radius) : d <= radius;
       if (positionOk && textOk && (!best || d < best.posDistance)) {
         best = { target:tl, score:d, textDistance, posDistance:d, recoveredBy:structuralField ? 'semantic-column-recovery' : 'affine-semantic-position' };
@@ -4028,8 +4076,14 @@ function rfComputeSpacingAnomalies(fieldResults) {
       const targetGap = b.targetLabelYNorm - a.targetLabelYNorm;
       if (refGap <= 0 || targetGap <= 0) continue;
 
-      const absDelta = Math.abs(targetGap - refGap);
-      const relativeDelta = absDelta / Math.max(refGap, 0.012);
+      // Estimate the target gap expected from the same affine transform that
+      // aligned the field anchors. A global scale/offset is therefore removed,
+      // while a single enlarged local gap remains visible.
+      const projectedA = a.referenceLabelYNorm;
+      const projectedB = b.referenceLabelYNorm;
+      const expectedGap = Math.max(0.0001, projectedB - projectedA);
+      const absDelta = Math.abs(targetGap - expectedGap);
+      const relativeDelta = absDelta / Math.max(expectedGap, 0.012);
       const score = rfClamp100(Math.min(100, relativeDelta * 100));
 
       if (score >= 28) {
@@ -4230,8 +4284,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         }
         if(!refOCR?.success)continue;
 
-        const refLabels=rfExtractLabelCandidates(refOCR);
-        const targetLabels=rfExtractLabelCandidates(targetOCR);
+        const refLabels=rfExtractAllFieldCandidates(refOCR);
+        const targetLabels=rfExtractAllFieldCandidates(targetOCR);
         const refRegions=rfPrepareRegions(refOCR), targetRegions=rfPrepareRegions(targetOCR);
         let matches=[];
         for(const rl of refLabels){
@@ -4483,7 +4537,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
     );
     const severity=suspicious.length>=2&&score>=65?'strong':suspicious.length>=1&&score>=45?'medium':'low';
     return {
-      available:true,engine:'reference-forensic-engine-v8-affine-calibrated',bank:normalizedBank,
+      available:true,engine:'reference-forensic-engine-v9-generic-fields',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
       spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,characterFindingCount:0,characterFindings:[],
