@@ -3664,9 +3664,27 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
         }))
       : 0;
 
+    const inkAspect = inkH ? inkW / inkH : 0;
+    const characterHeightToInkHeight = medianBodyHeight / Math.max(1, inkH);
+    const characterWidthToHeight = medianBodyHeight ? medianBodyWidth / medianBodyHeight : 0;
+    const characterFillRatio = medianFillRatio;
+    const characterGapToHeight = medianBodyHeight ? rfMedian(gaps) : 0;
+    const characterAreaToInkArea = medianBodyArea / Math.max(1, tightInkArea);
+    const heightSpreadLocal = medianBodyHeight ? (bodyHeights.length ? Math.sqrt(bodyHeights.reduce((sum,v)=>sum+(v-medianBodyHeight)**2,0)/bodyHeights.length)/medianBodyHeight : 0) : 0;
+    const widthSpreadLocal = medianBodyWidth ? (bodyWidths.length ? Math.sqrt(bodyWidths.reduce((sum,v)=>sum+(v-medianBodyWidth)**2,0)/bodyWidths.length)/medianBodyWidth : 0) : 0;
+
     return {
       componentCount: comps.length,
       bodyComponentCount: body.length,
+      // Scale-free typography fingerprint used by v2 distance scoring.
+      characterHeightToInkHeight,
+      characterWidthToHeight,
+      characterFillRatio,
+      characterGapToHeight,
+      characterAreaToInkArea,
+      inkAspect,
+      heightSpreadLocal,
+      widthSpreadLocal,
       darkRatio: dark / Math.max(1, W * H),
       tightInkDarkRatio,
       medianCharacterHeight: medianBodyHeight,
@@ -3683,6 +3701,7 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
       medianCharacterGapNorm: rfMedian(gaps),
       diacriticCount: diacriticCandidates.length,
       diacriticAreaNorm: diaArea / Math.max(1, W * H),
+      diacriticAreaToInkArea: diaArea / Math.max(1, tightInkArea),
       diacriticFillRatio: diaFill,
       diacriticHeightNorm: diaHeightNorm,
       diacriticGapNorm: diaGapNorm,
@@ -3696,27 +3715,60 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
 
 function rfCharacterDistance(a, b) {
   if (!a || !b) return null;
+  // IMPORTANT: compare scale-free local typography, never absolute pixels.
+  // The ROI itself is resized to a common canvas, but PDF rasterization and
+  // camera/JPEG segmentation can still produce different absolute component
+  // sizes. The ratios below are relative to each ROI's own ink/text geometry.
   const parts = [
-    rfSafeRel(a.medianCharacterHeight, b.medianCharacterHeight, 3.5),
-    rfSafeRel(a.medianCharacterWidth, b.medianCharacterWidth, 3.5),
-    rfSafeRel(a.characterHeightSpread, b.characterHeightSpread, 2.5),
-    rfSafeRel(a.characterWidthSpread, b.characterWidthSpread, 2.5),
-    rfSafeRel(a.bodyHeightNorm, b.bodyHeightNorm, 0.10),
-    rfSafeRel(a.medianCharacterGap, b.medianCharacterGap, 3.0),
-    rfSafeRel(a.darkRatio, b.darkRatio, 0.14),
+    rfSafeRel(a.characterHeightToInkHeight, b.characterHeightToInkHeight, 0.16),
+    rfSafeRel(a.characterWidthToHeight, b.characterWidthToHeight, 0.42),
+    rfSafeRel(a.characterFillRatio, b.characterFillRatio, 0.16),
+    rfSafeRel(a.characterGapToHeight, b.characterGapToHeight, 0.55),
+    rfSafeRel(a.characterAreaToInkArea, b.characterAreaToInkArea, 0.22),
+    rfSafeRel(a.inkAspect, b.inkAspect, 0.55),
+    rfSafeRel(a.heightSpreadLocal, b.heightSpreadLocal, 0.22),
+    rfSafeRel(a.widthSpreadLocal, b.widthSpreadLocal, 0.30),
   ].filter(Number.isFinite);
-  return parts.length ? parts.reduce((s,v)=>s+v,0)/parts.length : null;
+  return parts.length ? parts.reduce((sum,v)=>sum+v,0)/parts.length : null;
 }
 
-function rfDiacriticDistance(a, b) {
+function rfDiacriticDistance(a, b, textA = '', textB = '') {
   if (!a || !b) return null;
-  const countA = Number(a.upperSmallComponentCount) || 0;
-  const countB = Number(b.upperSmallComponentCount) || 0;
+  const sa = String(textA || '');
+  const sb = String(textB || '');
+  const diaA = [...sa].filter(ch => /[öÖüÜşŞçÇğĞıİ]/.test(ch));
+  const diaB = [...sb].filter(ch => /[öÖüÜşŞçÇğĞıİ]/.test(ch));
+  if (!diaA.length || !diaB.length) return null;
+
+  // Only compare a diacritic when the same Turkish character is present on
+  // both sides. Otherwise there is no legitimate glyph-level reference.
+  const shared = [...new Set(diaA.map(c => c.toLocaleLowerCase('tr-TR')))]
+    .filter(c => diaB.some(x => x.toLocaleLowerCase('tr-TR') === c));
+  if (!shared.length) return null;
+
+  const countA = Number(a.diacriticCount) || 0;
+  const countB = Number(b.diacriticCount) || 0;
   const countDelta = Math.min(1, Math.abs(countA - countB) / Math.max(2, Math.max(countA, countB)));
-  const areaDelta = rfSafeRel(a.upperSmallAreaMedian, b.upperSmallAreaMedian, 5);
-  const darkDelta = rfSafeRel(a.upperSmallDarkRatio, b.upperSmallDarkRatio, 0.025);
-  const parts = [countDelta, areaDelta, darkDelta].filter(Number.isFinite);
-  return parts.length ? parts.reduce((s,v)=>s+v,0)/parts.length : null;
+  const areaDelta = rfSafeRel(a.diacriticAreaToInkArea, b.diacriticAreaToInkArea, 0.08);
+  const fillDelta = rfSafeRel(a.diacriticFillRatio, b.diacriticFillRatio, 0.18);
+  const heightDelta = rfSafeRel(a.diacriticHeightNorm, b.diacriticHeightNorm, 0.22);
+  const gapDelta = rfSafeRel(a.diacriticGapNorm, b.diacriticGapNorm, 0.35);
+  const parts = [countDelta, areaDelta, fillDelta, heightDelta, gapDelta].filter(Number.isFinite);
+  return parts.length ? parts.reduce((sum,v)=>sum+v,0)/parts.length : null;
+}
+
+function rfValueRenderComparable(refText, targetText) {
+  const a = String(refText || '').trim();
+  const b = String(targetText || '').trim();
+  if (!a || !b) return false;
+  const kind = (x) => {
+    const n = /\d/.test(x), l = /[A-Za-zÇĞİÖŞÜçğıöşü]/.test(x);
+    return n && l ? 'mixed' : n ? 'numeric' : l ? 'text' : 'other';
+  };
+  if (kind(a) !== kind(b)) return false;
+  const lenRatio = Math.min(a.length, b.length) / Math.max(a.length, b.length);
+  // Very different text lengths are poor glyph-distribution comparisons.
+  return lenRatio >= 0.45;
 }
 
 function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance, text = '') {
@@ -3952,9 +4004,24 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           const valueCharacterRef = refValueRegion ? await rfCharacterMetrics(refBuffer, refValueRegion, refSize) : null;
           const valueCharacterTarget = targetValueRegion ? await rfCharacterMetrics(targetBuffer, targetValueRegion, targetSize) : null;
           const labelCharacterDistance = rfCharacterDistance(labelCharacterRef, labelCharacterTarget);
-          const valueCharacterDistance = rfCharacterDistance(valueCharacterRef, valueCharacterTarget);
-          const labelDiacriticDistance = rfDiacriticDistance(labelCharacterRef, labelCharacterTarget);
-          const valueDiacriticDistance = rfDiacriticDistance(valueCharacterRef, valueCharacterTarget);
+          const valueComparable = rfValueRenderComparable(refValue?.text, targetValue?.text);
+          const valueCharacterDistance = valueComparable
+            ? rfCharacterDistance(valueCharacterRef, valueCharacterTarget)
+            : null;
+          const labelDiacriticDistance = rfDiacriticDistance(
+            labelCharacterRef,
+            labelCharacterTarget,
+            refLabel.labelText,
+            match.target.labelText
+          );
+          const valueDiacriticDistance = valueComparable
+            ? rfDiacriticDistance(
+                valueCharacterRef,
+                valueCharacterTarget,
+                refValue?.text,
+                targetValue?.text
+              )
+            : null;
           const characterDistance = valueCharacterDistance == null
             ? labelCharacterDistance
             : (labelCharacterDistance * 0.55 + valueCharacterDistance * 0.45);
@@ -3965,9 +4032,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           // içerikten bağımsız render özelliklerini tamamlar.
           const baseStyleDistance = valueDistance == null ? labelDistance : (labelDistance * 0.58 + valueDistance * 0.42);
           const styleDistance = rfClamp01(
-            (baseStyleDistance == null ? 0 : baseStyleDistance) * 0.55 +
-            (characterDistance == null ? 0 : characterDistance) * 0.30 +
-            (diacriticDistance == null ? 0 : diacriticDistance) * 0.15
+            (baseStyleDistance == null ? 0 : baseStyleDistance) * 0.68 +
+            (characterDistance == null ? 0 : characterDistance) * 0.22 +
+            (diacriticDistance == null ? 0 : diacriticDistance) * 0.10
           );
           const refTextForRender = `${refLabel.labelText || ''} ${refValue?.text || ''}`;
           const targetTextForRender = `${match.target.labelText || ''} ${targetValue?.text || ''}`;
@@ -4016,6 +4083,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             referenceCharacterMetrics: valueCharacterRef || labelCharacterRef,
             targetCharacterMetrics: valueCharacterTarget || labelCharacterTarget,
             characterDistance: Number.isFinite(characterDistance) ? Number(characterDistance.toFixed(4)) : null,
+            valueRenderComparable: Boolean(valueComparable),
             diacriticDistance: Number.isFinite(effectiveDiacriticDistance) ? Number(effectiveDiacriticDistance.toFixed(4)) : null,
             characterFinding,
           });
@@ -4201,7 +4269,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
       : suspicious.length >= 1 && score >= 45 ? 'medium' : 'low';
     return {
       available: true,
-      engine: 'reference-forensic-engine-v3-normalized-ensemble-character-render',
+      engine: 'reference-forensic-engine-v4-scale-normalized-character-render',
       bank: normalizedBank,
       referenceCount: referenceResults.length,
       referenceFiles: referenceResults.map(x => x.file),
