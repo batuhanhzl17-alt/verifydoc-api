@@ -6355,6 +6355,10 @@ if (ax !== bx) return ax - bx;
 return String(a.text).localeCompare(String(b.text));
 });
 
+// The ranked list is the single source of truth for the selected amount.
+// Analyze 30 accidentally referenced `candidate` without defining it, which
+// caused a Vercel ReferenceError before the amount result could be returned.
+const candidate = rankedCandidates[0] || null;
 
 if (!candidate) {
   console.warn(
