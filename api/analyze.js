@@ -3697,61 +3697,6 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
 function rfCharacterDistance(a, b) {
   if (!a || !b) return null;
   const parts = [
-    rfSafeRel(a.medianCharacterAspect, b.medianCharacterAspect, 0.18),
-    rfSafeRel(a.medianCharacterFillRatio, b.medianCharacterFillRatio, 0.12),
-    rfSafeRel(a.tightInkDarkRatio, b.tightInkDarkRatio, 0.16),
-    rfSafeRel(a.characterHeightNorm, b.characterHeightNorm, 0.06),
-    rfSafeRel(a.characterWidthNorm, b.characterWidthNorm, 0.06),
-    rfSafeRel(a.characterHeightSpreadNorm, b.characterHeightSpreadNorm, 0.10),
-    rfSafeRel(a.characterWidthSpreadNorm, b.characterWidthSpreadNorm, 0.10),
-    rfSafeRel(a.medianCharacterGapNorm, b.medianCharacterGapNorm, 0.18),
-    rfSafeRel(a.inkWidthNorm, b.inkWidthNorm, 0.12),
-    rfSafeRel(a.inkHeightNorm, b.inkHeightNorm, 0.08),
-  ].filter(Number.isFinite);
-  return parts.length ? parts.reduce((s,v)=>s+v,0)/parts.length : null;
-}
-
-function rfDiacriticDistance(a, b) {
-  if (!a || !b) return null;
-  const countA = Number(a.diacriticCount) || 0;
-  const countB = Number(b.diacriticCount) || 0;
-  const countDelta = Math.min(1, Math.abs(countA - countB) / Math.max(1, Math.max(countA, countB)));
-  const areaDelta = rfSafeRel(a.diacriticAreaNorm, b.diacriticAreaNorm, 0.018);
-  const fillDelta = rfSafeRel(a.diacriticFillRatio, b.diacriticFillRatio, 0.12);
-  const heightDelta = rfSafeRel(a.diacriticHeightNorm, b.diacriticHeightNorm, 0.12);
-  const gapDelta = rfSafeRel(a.diacriticGapNorm, b.diacriticGapNorm, 0.12);
-  const parts = [countDelta, areaDelta, fillDelta, heightDelta, gapDelta].filter(Number.isFinite);
-  return parts.length ? parts.reduce((s,v)=>s+v,0)/parts.length : null;
-}
-
-function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance, text = '') {
-  if (!refChar || !targetChar) return null;
-  const cd = Number(characterDistance);
-  const dd = Number(diacriticDistance);
-  const hasDia = /[öÖüÜşŞçÇğĞıİ]/.test(String(text || ''));
-  // Diacritic evidence is only considered when the actual field text contains
-  // a Turkish diacritic. This prevents normal fields such as transactionNo or
-  // date from being flagged merely because a random small component exists.
-  const strongChar = Number.isFinite(cd) && cd >= 0.52;
-  const strongDia = hasDia && Number.isFinite(dd) && dd >= 0.58;
-  if (!strongChar && !strongDia) return null;
-  const reasons = [];
-  if (strongChar) reasons.push('karakter geometrisi/stroke/raster profili referanstan belirgin ayrılıyor');
-  if (strongDia) reasons.push('Türkçe diakritik karakter bileşenleri (ö/ü/ş/ç/ğ/ı/İ) referans render profilinden ayrılıyor');
-  return {
-    field,
-    type: strongDia ? 'character-diacritic-render-mismatch' : 'character-render-mismatch',
-    severity: (strongChar && strongDia) ? 'strong' : 'medium',
-    characterDistance: Number(cd.toFixed(4)),
-    diacriticDistance: Number.isFinite(dd) ? Number(dd.toFixed(4)) : null,
-    text: String(text || ''),
-    evidence: reasons.join('; '),
-  };
-}
-
-function rfCharacterDistance(a, b) {
-  if (!a || !b) return null;
-  const parts = [
     rfSafeRel(a.medianCharacterHeight, b.medianCharacterHeight, 3.5),
     rfSafeRel(a.medianCharacterWidth, b.medianCharacterWidth, 3.5),
     rfSafeRel(a.characterHeightSpread, b.characterHeightSpread, 2.5),
@@ -3774,22 +3719,24 @@ function rfDiacriticDistance(a, b) {
   return parts.length ? parts.reduce((s,v)=>s+v,0)/parts.length : null;
 }
 
-function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance) {
+function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance, text = '') {
   if (!refChar || !targetChar) return null;
   const cd = Number(characterDistance);
   const dd = Number(diacriticDistance);
+  const hasDia = /[öÖüÜşŞçÇğĞıİ]/.test(String(text || ''));
   const strongChar = Number.isFinite(cd) && cd >= 0.42;
-  const strongDia = Number.isFinite(dd) && dd >= 0.48;
+  const strongDia = hasDia && Number.isFinite(dd) && dd >= 0.48;
   if (!strongChar && !strongDia) return null;
   const reasons = [];
   if (strongChar) reasons.push('karakter geometri/raster özellikleri referanstan belirgin ayrılıyor');
-  if (strongDia) reasons.push('küçük üst/diakritik bileşenlerin render özellikleri referanstan ayrılıyor');
+  if (strongDia) reasons.push('Türkçe diakritik karakter bileşenleri (ö/ü/ş/ç/ğ/ı/İ) referans render profilinden ayrılıyor');
   return {
     field,
     type: strongDia ? 'character-diacritic-render-mismatch' : 'character-render-mismatch',
     severity: (strongChar && strongDia) ? 'strong' : 'medium',
-    characterDistance: Number(cd.toFixed(4)),
+    characterDistance: Number.isFinite(cd) ? Number(cd.toFixed(4)) : null,
     diacriticDistance: Number.isFinite(dd) ? Number(dd.toFixed(4)) : null,
+    text: String(text || ''),
     evidence: reasons.join('; '),
   };
 }
