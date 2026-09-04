@@ -5315,8 +5315,8 @@ return String(value || "")
 function numericSignal(text) {
 const value = cleanAmountText(text);
 if (!value) return 0;
-const anchoredMoneyPattern = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?$/i;
-const anchoredDecimalPattern = /^(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
+const anchoredMoneyPattern = /^[+-]?\s*(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{1,2})?(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?$/i;
+const anchoredDecimalPattern = /^[+-]?\s*(?:₺|€|\$|£|TL|TRY|EUR|USD|GBP)?\s*\d+(?:[,\.]\d{1,2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
 if (anchoredDecimalPattern.test(value)) return 9;
 if (anchoredMoneyPattern.test(value) && /[,\.]\d{1,2}/.test(value)) return 8;
 if (anchoredMoneyPattern.test(value) && /\d/.test(value)) return 5;
@@ -5918,11 +5918,11 @@ function extractPrimaryAmountFromLine(text) {
   const raw = normalizePrimaryAmountOCRText(text);
   if (!raw) return null;
   const patterns = [
-    /GIDEN\s+FAST\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /GONDERILEN\s+FAST\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /TRANSFER\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /ISLEM\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /ANA\s+TUTARI\s*[:=\-]*\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /GIDEN\s+FAST\s+TUTARI\s*(?:[:=]\s*)?([-+]?(?:(?:\d{1,3}(?:[.,\s]\d{3})+)|\d+)(?:[.,]\d{1,2})?)/i,
+    /GONDERILEN\s+FAST\s+TUTARI\s*(?:[:=]\s*)?([-+]?(?:(?:\d{1,3}(?:[.,\s]\d{3})+)|\d+)(?:[.,]\d{1,2})?)/i,
+    /TRANSFER\s+TUTARI\s*(?:[:=]\s*)?([-+]?(?:(?:\d{1,3}(?:[.,\s]\d{3})+)|\d+)(?:[.,]\d{1,2})?)/i,
+    /ISLEM\s+TUTARI\s*(?:[:=]\s*)?([-+]?(?:(?:\d{1,3}(?:[.,\s]\d{3})+)|\d+)(?:[.,]\d{1,2})?)/i,
+    /ANA\s+TUTARI\s*(?:[:=]\s*)?([-+]?(?:(?:\d{1,3}(?:[.,\s]\d{3})+)|\d+)(?:[.,]\d{1,2})?)/i,
   ];
   for (const re of patterns) {
     const m = raw.match(re);
@@ -6122,8 +6122,9 @@ function buildInlineAmountCandidates() {
 
   for (const row of regions) {
     if (excluded.test(row.text)) continue;
-    const isTotal = totalLabel.test(row.text);
-    const isPrimary = !isTotal && primaryLabel.test(row.text);
+    const normalizedRowText = normalizePrimaryAmountOCRText(row.text);
+    const isTotal = totalLabel.test(normalizedRowText);
+    const isPrimary = !isTotal && primaryLabel.test(normalizedRowText);
     if (!isPrimary && !isTotal) continue;
 
     const match = row.text.match(amountToken);
@@ -6194,6 +6195,100 @@ function buildInlineAmountCandidates() {
 
 const inlineAmountCandidates = buildInlineAmountCandidates();
 
+// =====================================================
+// PRIMARY AMOUNT FALLBACK — FULL OCR TEXT + SIGNED VALUE
+// =====================================================
+// Bazı Yapı Kredi görüntülerinde PaddleOCR bölge kutuları tutar satırını
+// güvenilir şekilde etiket/değer olarak ayırmıyor. Buna rağmen OCR'nin
+// birleşik metni doğru biçimde: "GİDEN FAST TUTARI :-1000" şeklinde
+// gelebiliyor. Bu durumda bölge seviyesindeki adaylara bağlı kalmak
+// hatalı şekilde "reference-unmatched" üretir.
+//
+// Bu fallback yalnızca açık bir ANA TUTAR etiketi ile birlikte gelen
+// sayıyı kabul eder. Müşteri no / sorgu no / referans gibi çıplak sayılar
+// bu kapıdan geçemez.
+function buildFullTextPrimaryAmountCandidates() {
+  const text = normalizePrimaryAmountOCRText(ocrResult?.text || '');
+  const parsed = extractPrimaryAmountFromLine(text);
+  if (!parsed?.value) return [];
+
+  const normalizedValue = cleanAmountText(parsed.value);
+  const escapedValue = normalizedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const embeddedValueRe = new RegExp(`${escapedValue}(?:\\s*(?:TL|TRY))?`, 'i');
+
+  // Önce gerçek OCR kutularında aynı sayıyı ara. Değer kutunun içinde
+  // etiketle birlikte olsa bile kabul edilir; böylece
+  // "GİDEN FAST TUTARI :-1000" tek kutu olduğunda da yakalanır.
+  let sourceRecord = (ocrResult?.regions || [])
+    .filter((item) => item?.text && validRegion(item.region))
+    .map((item) => ({
+      item,
+      text: cleanAmountText(item.text),
+      y: (Number(item.region.y1) + Number(item.region.y2)) / 2,
+      x: Number(item.region.x1) || 0,
+    }))
+    .map((r) => ({ ...r, match: r.text.match(embeddedValueRe) }))
+    .filter((r) => r.match)
+    .sort((a, b) => a.y - b.y || a.x - b.x)[0] || null;
+
+  let source = sourceRecord?.item || null;
+  let sourceDerivedRegion = source?.region || null;
+
+  // Etiket + değer aynı OCR kutusundaysa kutunun yalnızca değer tarafını
+  // yaklaşık olarak çıkar.
+  if (sourceRecord?.match && source?.region) {
+    const start = Number(sourceRecord.match.index || 0);
+    const amountLen = Math.max(1, sourceRecord.match[0].length);
+    const totalLen = Math.max(1, sourceRecord.text.length);
+    const sx1 = Number(source.region.x1) || 0;
+    const sx2 = Number(source.region.x2) || sx1;
+    const span = Math.max(1, sx2 - sx1);
+    const vx1 = sx1 + span * (start / totalLen);
+    const vx2 = Math.min(sx2, vx1 + Math.max(12, span * (amountLen / totalLen)));
+    sourceDerivedRegion = { ...source.region, x1: Math.max(sx1, vx1), x2: Math.max(vx1 + 8, vx2) };
+  }
+
+  // OCR kutusu değeri tek başına vermediyse, referans amount ROI'ını
+  // hedef görüntü boyutuna taşıyarak güvenli bir yaklaşık bölge oluştur.
+  // Bu bölge seçim içindir; metnin gerçekten bulunup bulunmadığını
+  // semantic label zaten doğrulamış olur.
+  let region = sourceDerivedRegion || null;
+  if (!region && referenceAmountField && image?.width && image?.height) {
+    const x1 = Math.max(0, Math.round(Number(referenceAmountField.xNorm || 0) * image.width));
+    const y1 = Math.max(0, Math.round(Number(referenceAmountField.yNorm || 0) * image.height));
+    const x2 = Math.min(image.width, Math.round((Number(referenceAmountField.xNorm || 0) + Number(referenceAmountField.widthNorm || 0)) * image.width));
+    const y2 = Math.min(image.height, Math.round((Number(referenceAmountField.yNorm || 0) + Number(referenceAmountField.heightNorm || 0)) * image.height));
+    if (x2 > x1 && y2 > y1) region = { type: 'box', x1, y1, x2, y2, pageIndex: 0 };
+  }
+
+  if (!region) return [];
+
+  const score = 5000;
+  return [{
+    ...(source || {}),
+    text: normalizedValue,
+    region,
+    labelDerived: true,
+    inlineLabelDerived: true,
+    fullTextLabelDerived: true,
+    amountCandidateScore: score,
+    score,
+    signal: 1,
+    templateScore: 0,
+    referencePositionScore: 500,
+    context: { score: 0, positive: [parsed.normalized], negative: [] },
+    anchor: { score: 0, anchors: [] },
+    labelEvidence: { score, positive: [parsed.normalized], negative: [] },
+    directLabelEvidence: { score, label: parsed.normalized, distance: 0, hard: true },
+    reconstructedLabelEvidence: { score, label: parsed.normalized, distance: 0, hard: true },
+    inlineAmountLabel: parsed.normalized,
+    inlineAmountRole: 'primary-amount-label-full-text',
+    inlineAmountSourceRegion: sourceDerivedRegion || source?.region || null,
+  }];
+}
+
+const fullTextPrimaryAmountCandidates = buildFullTextPrimaryAmountCandidates();
+
 const labelDerivedCandidates = [
   ...inlineAmountCandidates,
   ...buildPrimaryAmountLabelDerivedCandidates(),
@@ -6207,9 +6302,17 @@ const labelDerivedCandidates = [
 // Ana tutar etiketi aynı OCR kutusunda bulunduysa bunu en üst öncelik yap.
 // Özellikle Yapı Kredi'deki "GİDEN FAST TUTARI :-1000" gibi satırlarda
 // artık referansın sayısal değerine eşleşme aramayacağız.
-const primaryInlineAmountCandidates = inlineAmountCandidates.filter((candidate) =>
-  candidate.inlineAmountRole === 'primary-amount-label-inline'
-);
+const primaryInlineAmountCandidates = [
+  ...inlineAmountCandidates.filter((candidate) =>
+    candidate.inlineAmountRole === 'primary-amount-label-inline'
+  ),
+  ...buildPrimaryAmountLabelDerivedCandidates().filter((candidate) =>
+    /giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|giden\s*tutar/i.test(
+      candidate.inlineAmountLabel || candidate.directLabelEvidence?.label || ''
+    )
+  ),
+  ...fullTextPrimaryAmountCandidates,
+];
 
 const allRankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
@@ -6254,7 +6357,9 @@ let selectionMethod = "legacy-scoring";
 if (referenceAmountField) {
   if (primaryInlineAmountCandidates.length) {
     candidatePool = primaryInlineAmountCandidates;
-    selectionMethod = "inline-primary-amount-label";
+    selectionMethod = primaryInlineAmountCandidates.some(c => c.fullTextLabelDerived)
+      ? "primary-amount-label-full-text-fallback"
+      : "inline-primary-amount-label";
   } else if (labelDerivedCandidates.length) {
     candidatePool = labelDerivedCandidates;
     selectionMethod = "same-region-strong-amount-label";
@@ -6338,6 +6443,18 @@ if (referenceAmountField) {
       selectionMethod = "reference-profile-no-anchor-no-label";
     }
   }
+}
+
+if (fullTextPrimaryAmountCandidates.length) {
+  console.log(
+    "PRIMARY AMOUNT FULL-TEXT FALLBACK:",
+    JSON.stringify({
+      selectedText: fullTextPrimaryAmountCandidates[0].text,
+      label: fullTextPrimaryAmountCandidates[0].inlineAmountLabel,
+      role: fullTextPrimaryAmountCandidates[0].inlineAmountRole,
+      region: fullTextPrimaryAmountCandidates[0].region,
+    })
+  );
 }
 
 const rankedCandidates = candidatePool.sort((a, b) => {
