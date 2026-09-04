@@ -4182,6 +4182,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
       ...strongSpacing.flatMap(x => [x.beforeField, x.afterField]),
     ])];
     const styleMedian = rfMedian(representativeFields.map(x => x.ensembleMedianStyleScore));
+    // Count field-level style outliers for the final independent-signal summary.
+    // This must be derived from the already aggregated representative fields;
+    // it must never be referenced before initialization.
+    const styleOutlierCount = representativeFields.filter(
+      x => Number(x.ensembleMedianStyleScore) >= 70
+    ).length;
     const consensusFields = representativeFields.filter(x => x.referenceCountForField >= 2 && x.ensembleConsensusRatio >= 0.5).length;
     const score = rfClamp100(
       styleMedian * 0.30 +
