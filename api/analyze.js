@@ -1310,9 +1310,13 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     } catch {}
   }
 
-  // No AI editing score is trusted. Until an independent local edit detector
-  // reports a strong signal, editingRisk remains neutral rather than random.
-  const editingRisk = 0;
+  // Reference Forensic Engine is an independent local editing signal. It
+  // compares localized typography/render characteristics against trusted
+  // reference documents; it does not compare the literal dynamic values.
+  const referenceForensicScore = Number(forensic?.referenceForensics?.score);
+  const editingRisk = Number.isFinite(referenceForensicScore)
+    ? Math.max(0, Math.min(100, Math.round(referenceForensicScore)))
+    : 0;
 
   const categories = {
     visualRisk,
@@ -3334,6 +3338,390 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     };
   } catch (error) {
     console.warn('REFERENCE LAYOUT FORENSICS HATASI:', error?.message || error);
+    return null;
+  }
+}
+
+
+// =====================================================
+// REFERENCE FORENSIC ENGINE v1
+// =====================================================
+// Amaç: Referans dekontu yalnızca "tutar nerede?" demek için değil,
+// hedef belgenin aynı şablon üzerindeki yerel render/tipografi özelliklerini
+// karşılaştırmak için kullanır. Dinamik değerlerin kendisini değil, değerlerin
+// görüntüsel özelliklerini ölçer.
+//
+// Bu motor kesin sahtecilik hükmü vermez. JPEG/crop/ölçek/perspektif farklarını
+// tolere eder ve yalnızca birden fazla bağımsız sinyal birleştiğinde güçlü
+// şüphe üretir.
+// =====================================================
+
+function rfClamp01(v) { return Math.max(0, Math.min(1, Number(v) || 0)); }
+function rfClamp100(v) { return Math.max(0, Math.min(100, Math.round(Number(v) || 0))); }
+
+function rfMedian(values) {
+  const a = values.filter(Number.isFinite).sort((x, y) => x - y);
+  if (!a.length) return 0;
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+function rfLevenshtein(a, b) {
+  const x = normalizeFieldTextForMatch(a).replace(/[:：]/g, '').trim();
+  const y = normalizeFieldTextForMatch(b).replace(/[:：]/g, '').trim();
+  if (!x || !y) return 1;
+  const prev = Array.from({ length: y.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= x.length; i++) {
+    let left = i;
+    for (let j = 1; j <= y.length; j++) {
+      const up = prev[j];
+      const cost = x[i - 1] === y[j - 1] ? 0 : 1;
+      prev[j] = Math.min(prev[j] + 1, left + 1, prev[j - 1] + cost);
+      left = prev[j];
+    }
+  }
+  return prev[y.length] / Math.max(x.length, y.length, 1);
+}
+
+function rfLabelPart(text) {
+  const s = String(text || '').trim();
+  const beforeColon = s.split(/[:：]/)[0].trim();
+  return beforeColon || s;
+}
+
+function rfLooksLikeValue(text) {
+  const s = String(text || '').trim();
+  if (!s) return false;
+  return /(?:\d|TR\d{2}|TL|TRY|EUR|USD|GBP|₺|@|\/)/i.test(s);
+}
+
+function rfFindValueRegion(regions, label) {
+  if (!label?.region) return null;
+  const lr = label.region;
+  const lh = Math.max(6, lr.y2 - lr.y1);
+  const lx = (lr.x1 + lr.x2) / 2;
+  const ly = (lr.y1 + lr.y2) / 2;
+  const candidates = regions.filter(x => x !== label && x?.region && String(x.text || '').trim()).map(v => {
+    const r = v.region;
+    const vh = Math.max(6, r.y2 - r.y1);
+    const vertical = Math.min(lr.y2, r.y2) - Math.max(lr.y1, r.y1);
+    const rightGap = r.x1 - lr.x2;
+    const sameLine = vertical >= -lh * 0.6;
+    const valueBonus = rfLooksLikeValue(v.text) ? -2.0 : 0;
+    let cost = Infinity;
+    if (sameLine && rightGap >= -lh * 0.5 && rightGap < Math.max(350, lh * 18)) {
+      cost = Math.abs(rightGap) / Math.max(1, lh) + Math.abs(((r.y1 + r.y2) / 2) - ly) / Math.max(1, lh) * 0.5 + valueBonus;
+    } else {
+      const belowGap = r.y1 - lr.y2;
+      const xGap = Math.abs(((r.x1 + r.x2) / 2) - lx);
+      if (belowGap >= -lh * 0.4 && belowGap < Math.max(220, lh * 10) && xGap < Math.max(350, lh * 18)) {
+        cost = 4 + Math.abs(belowGap) / Math.max(1, lh) + xGap / Math.max(1, lh) * 0.25 + valueBonus;
+      }
+    }
+    return { v, cost };
+  }).filter(x => Number.isFinite(x.cost));
+  candidates.sort((a, b) => a.cost - b.cost);
+  return candidates[0]?.v || null;
+}
+
+async function rfRasterMetrics(imageBuffer, region, imageSize) {
+  if (!imageBuffer || !region || !imageSize?.width || !imageSize?.height) return null;
+  const x = Math.max(0, Math.floor(Number(region.x1)));
+  const y = Math.max(0, Math.floor(Number(region.y1)));
+  const w = Math.max(2, Math.min(imageSize.width - x, Math.ceil(Number(region.x2) - Number(region.x1))));
+  const h = Math.max(2, Math.min(imageSize.height - y, Math.ceil(Number(region.y2) - Number(region.y1))));
+  if (w < 2 || h < 2) return null;
+  try {
+    const marginX = Math.max(2, Math.round(w * 0.12));
+    const marginY = Math.max(2, Math.round(h * 0.35));
+    const left = Math.max(0, x - marginX);
+    const top = Math.max(0, y - marginY);
+    const width = Math.min(imageSize.width - left, w + marginX * 2);
+    const height = Math.min(imageSize.height - top, h + marginY * 2);
+    const { data, info } = await sharp(imageBuffer)
+      .extract({ left, top, width, height })
+      .resize({ width: 160, height: 80, fit: 'fill' })
+      .grayscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const n = data.length;
+    let sum = 0, sum2 = 0, dark = 0, edge = 0;
+    const row = new Array(info.height).fill(0);
+    const col = new Array(info.width).fill(0);
+    for (let yy = 0; yy < info.height; yy++) {
+      for (let xx = 0; xx < info.width; xx++) {
+        const idx = yy * info.width + xx;
+        const v = data[idx];
+        sum += v; sum2 += v * v;
+        if (v < 205) { dark++; row[yy]++; col[xx]++; }
+        if (xx > 0 && yy > 0) {
+          const dx = Math.abs(v - data[idx - 1]);
+          const dy = Math.abs(v - data[idx - info.width]);
+          if (dx + dy > 65) edge++;
+        }
+      }
+    }
+    const mean = sum / Math.max(1, n);
+    const variance = Math.max(0, sum2 / Math.max(1, n) - mean * mean);
+    const rowMean = row.map(v => v / info.width);
+    const colMean = col.map(v => v / info.height);
+    const rowVar = rowMean.reduce((a,v)=>a+(v-rfMedian(rowMean))**2,0)/Math.max(1,rowMean.length);
+    const colVar = colMean.reduce((a,v)=>a+(v-rfMedian(colMean))**2,0)/Math.max(1,colMean.length);
+    const darkRatio = dark / Math.max(1, n);
+    return {
+      meanLuma: mean,
+      lumaStd: Math.sqrt(variance),
+      darkRatio,
+      edgeRatio: edge / Math.max(1, n),
+      rowVariance: rowVar,
+      colVariance: colVar,
+      cropWidth: width / imageSize.width,
+      cropHeight: height / imageSize.height,
+      aspect: width / Math.max(1, height),
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function rfMetricDistance(a, b) {
+  if (!a || !b) return null;
+  const rel = (x, y, scale) => Math.min(1, Math.abs(Number(x || 0) - Number(y || 0)) / Math.max(scale, 1e-6));
+  const parts = [
+    rel(a.darkRatio, b.darkRatio, 0.16),
+    rel(a.edgeRatio, b.edgeRatio, 0.14),
+    rel(a.lumaStd, b.lumaStd, 35),
+    rel(a.rowVariance, b.rowVariance, 0.025),
+    rel(a.colVariance, b.colVariance, 0.025),
+    rel(a.aspect, b.aspect, Math.max(0.5, a.aspect * 0.55)),
+  ];
+  return parts.reduce((s, v) => s + v, 0) / parts.length;
+}
+
+function rfPrepareRegions(ocr) {
+  // Burada idari etiketleri filtrelemiyoruz. Tam tersine MÜŞTERİ NO,
+  // SORGU NO, TUTAR, IBAN vb. başlıkların kendisi referans hizalama
+  // noktalarıdır. Bunları filtrelemek önceki semantik eşleştirme katmanında
+  // olduğu gibi referansın büyük kısmını görünmez hale getirirdi.
+  return (ocr?.regions || [])
+    .filter(x => x?.region && String(x.text || '').trim())
+    .map(x => ({ ...x, text: String(x.text || '').trim() }));
+}
+
+function rfFocusValueRegion(region, fullText, field) {
+  if (!region) return null;
+  const s = String(fullText || '');
+  if (!/[:：]/.test(s)) return region;
+  const parts = s.split(/[:：]/);
+  const left = String(parts[0] || '').trim();
+  const total = s.replace(/[:：]/g, '').trim();
+  const ratio = total.length ? left.length / total.length : 0.45;
+  // OCR kutusu etiket+değeri birlikte tuttuğunda sağdaki bölüm değer için
+  // yaklaşık bir ROI'dir. Aşırı küçük/büyük kesimleri engelliyoruz.
+  const startRatio = Math.max(0.22, Math.min(0.72, ratio + 0.06));
+  const x1 = Number(region.x1), x2 = Number(region.x2);
+  return {
+    x1: x1 + (x2 - x1) * startRatio,
+    y1: Number(region.y1),
+    x2: x2,
+    y2: Number(region.y2),
+  };
+}
+
+function rfExtractLabelCandidates(ocr) {
+  return rfPrepareRegions(ocr).map(r => {
+    const rule = referenceFieldRuleForText(r.text);
+    return rule ? { ...r, rule, labelText: rfLabelPart(r.text) } : null;
+  }).filter(Boolean);
+}
+
+function rfMatchLabel(refLabel, targetLabels, targetSize, refSize) {
+  if (!refLabel?.region || !targetLabels.length) return null;
+  const rr = refLabel.region;
+  const rx = (rr.x1 + rr.x2) / 2 / Math.max(1, refSize.width);
+  const ry = (rr.y1 + rr.y2) / 2 / Math.max(1, refSize.height);
+  let best = null;
+  for (const tl of targetLabels) {
+    if (tl.rule.key !== refLabel.rule.key) continue;
+    const tr = tl.region;
+    const tx = (tr.x1 + tr.x2) / 2 / Math.max(1, targetSize.width);
+    const ty = (tr.y1 + tr.y2) / 2 / Math.max(1, targetSize.height);
+    const textDistance = rfLevenshtein(refLabel.labelText, tl.labelText);
+    const posDistance = Math.hypot(rx - tx, ry - ty);
+    const score = textDistance * 2.8 + Math.min(1, posDistance / 0.35);
+    if (!best || score < best.score) best = { target: tl, score, textDistance, posDistance };
+  }
+  return best && best.score <= 3.2 ? best : null;
+}
+
+async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
+  const normalizedBank = normalizeBank(bank);
+  if (!normalizedBank || !targetPath || !targetOCR?.success) return null;
+  try {
+    const targetBuffer = await fs.readFile(targetPath);
+    const targetMeta = await sharp(targetBuffer).metadata();
+    const targetSize = { width: Number(targetMeta.width) || 0, height: Number(targetMeta.height) || 0 };
+    if (!targetSize.width || !targetSize.height) return null;
+
+    const referencePaths = await getReferenceFiles(normalizedBank);
+    if (!referencePaths.length) return null;
+
+    const referenceResults = [];
+    for (const referencePath of referencePaths) {
+      let refBuffer = null;
+      let refTemp = null;
+      try {
+        const ext = path.extname(referencePath).toLowerCase();
+        const raw = await fs.readFile(referencePath);
+        if (ext === '.pdf') {
+          const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+          const rendered = await renderPdfPagePng(pdf, 1, 1.6);
+          if (!rendered?.buffer) continue;
+          refBuffer = rendered.buffer;
+        } else {
+          refBuffer = raw;
+        }
+        const refMeta = await sharp(refBuffer).metadata();
+        const refSize = { width: Number(refMeta.width) || 0, height: Number(refMeta.height) || 0 };
+        if (!refSize.width || !refSize.height) continue;
+
+        const refId = createHash('sha256').update(raw).digest('hex').slice(0, 16);
+        const cacheKey = `rfocr:${normalizedBank}:${refId}`;
+        let refOCR = paddleOCRCache.get(cacheKey);
+        if (!refOCR?.success) {
+          refTemp = path.join('/tmp', `verifydoc-rf-ref-${normalizedBank}-${refId}.png`);
+          await fs.writeFile(refTemp, refBuffer);
+          refOCR = await runPaddleOCR(refTemp);
+          if (refOCR?.success) paddleOCRCache.set(cacheKey, refOCR);
+        }
+        if (!refOCR?.success) continue;
+
+        const refLabels = rfExtractLabelCandidates(refOCR);
+        const targetLabels = rfExtractLabelCandidates(targetOCR);
+        const fieldResults = [];
+
+        for (const refLabel of refLabels) {
+          const match = rfMatchLabel(refLabel, targetLabels, targetSize, refSize);
+          if (!match) continue;
+          const refValue = rfFindValueRegion(rfPrepareRegions(refOCR), refLabel);
+          const targetValue = rfFindValueRegion(rfPrepareRegions(targetOCR), match.target);
+          const labelRefMetrics = await rfRasterMetrics(refBuffer, refLabel.region, refSize);
+          const labelTargetMetrics = await rfRasterMetrics(targetBuffer, match.target.region, targetSize);
+          const refValueRegion = refValue ? rfFocusValueRegion(refValue.region, refValue.text, refLabel.rule.key) : null;
+          const targetValueRegion = targetValue ? rfFocusValueRegion(targetValue.region, targetValue.text, match.target.rule.key) : null;
+          const valueRefMetrics = refValueRegion ? await rfRasterMetrics(refBuffer, refValueRegion, refSize) : null;
+          const valueTargetMetrics = targetValueRegion ? await rfRasterMetrics(targetBuffer, targetValueRegion, targetSize) : null;
+          const labelDistance = rfMetricDistance(labelRefMetrics, labelTargetMetrics);
+          const valueDistance = rfMetricDistance(valueRefMetrics, valueTargetMetrics);
+          // Etiket aynı kaldığı için label stili güçlü bir kalibrasyon sinyalidir.
+          // Değer metni doğal olarak değişebildiğinden değer ROI'sine daha düşük
+          // ama yine de anlamlı bir ağırlık veriyoruz.
+          const styleDistance = valueDistance == null ? labelDistance : (labelDistance * 0.58 + valueDistance * 0.42);
+          const refRegion = refValue?.region || refLabel.region;
+          const tarRegion = targetValue?.region || match.target.region;
+          const rx = ((refRegion.x1 + refRegion.x2) / 2) / refSize.width;
+          const ry = ((refRegion.y1 + refRegion.y2) / 2) / refSize.height;
+          const tx = ((tarRegion.x1 + tarRegion.x2) / 2) / targetSize.width;
+          const ty = ((tarRegion.y1 + tarRegion.y2) / 2) / targetSize.height;
+          const positionDistance = Math.hypot(rx - tx, ry - ty);
+          const styleScore = rfClamp100(styleDistance * 100);
+          const positionScore = rfClamp100(Math.min(100, positionDistance / 0.12 * 100));
+          const strongStyle = styleScore >= 55;
+          const strongPosition = positionScore >= 55;
+          const key = refLabel.rule.key;
+          fieldResults.push({
+            field: key,
+            referenceLabel: refLabel.labelText,
+            targetLabel: match.target.labelText,
+            styleScore,
+            positionScore,
+            combinedScore: rfClamp100(styleScore * 0.82 + positionScore * 0.18),
+            styleDistance: Number(styleDistance.toFixed(4)),
+            positionDistance: Number(positionDistance.toFixed(4)),
+            strongStyle,
+            strongPosition,
+            referenceValueRegionFound: Boolean(refValue),
+            targetValueRegionFound: Boolean(targetValue),
+            referenceMetrics: valueRefMetrics || labelRefMetrics,
+            targetMetrics: valueTargetMetrics || labelTargetMetrics,
+          });
+        }
+
+        if (fieldResults.length) {
+          const strong = fieldResults.filter(x => x.styleScore >= 65);
+          const medium = fieldResults.filter(x => x.styleScore >= 45);
+          const suspiciousKeys = [...new Set(strong.map(x => x.field))];
+          const styleScore = rfClamp100(rfMedian(fieldResults.map(x => x.styleScore)) + Math.min(35, strong.length * 9));
+          const localAnomalyScore = rfClamp100((strong.length >= 2 ? 65 : 0) + Math.min(35, strong.length * 8) + (medium.length >= Math.max(3, fieldResults.length * 0.35) ? 12 : 0));
+          referenceResults.push({
+            file: path.basename(referencePath),
+            fieldCount: fieldResults.length,
+            styleScore,
+            localAnomalyScore,
+            suspiciousFieldCount: strong.length,
+            suspiciousFields: suspiciousKeys,
+            fields: fieldResults,
+          });
+        }
+      } catch (error) {
+        console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:', path.basename(referencePath), error?.message || error);
+      } finally {
+        if (refTemp) { try { await fs.unlink(refTemp); } catch {} }
+      }
+    }
+
+    if (!referenceResults.length) return null;
+    const allFields = referenceResults.flatMap(x => x.fields || []);
+    const fieldBest = new Map();
+    for (const field of allFields) {
+      const old = fieldBest.get(field.field);
+      if (!old || field.combinedScore < old.combinedScore) fieldBest.set(field.field, field);
+    }
+    const representativeFields = [...fieldBest.values()];
+    const suspicious = representativeFields.filter(x => x.styleScore >= 65);
+    const multiFieldStrong = suspicious.length >= 2;
+    const styleMedian = rfMedian(representativeFields.map(x => x.styleScore));
+    const styleOutlierCount = representativeFields.filter(x => x.styleScore >= 55).length;
+    const localized = suspicious.map(x => x.field);
+    const score = rfClamp100(
+      styleMedian * 0.55 +
+      Math.min(30, styleOutlierCount * 5) +
+      (multiFieldStrong ? 20 : 0)
+    );
+    const severity = multiFieldStrong && score >= 65 ? 'strong' : score >= 38 ? 'medium' : 'low';
+
+    return {
+      available: true,
+      engine: 'reference-forensic-engine-v1',
+      bank: normalizedBank,
+      referenceCount: referenceResults.length,
+      referenceFiles: referenceResults.map(x => x.file),
+      comparedFieldCount: representativeFields.length,
+      suspiciousFieldCount: suspicious.length,
+      suspiciousFields: localized,
+      score,
+      severity,
+      independentSignals: [
+        suspicious.length >= 1,
+        suspicious.length >= 2,
+        styleOutlierCount >= 3,
+        referenceResults.length >= 2,
+      ].filter(Boolean).length,
+      references: referenceResults.map(x => ({
+        file: x.file,
+        fieldCount: x.fieldCount,
+        styleScore: x.styleScore,
+        localAnomalyScore: x.localAnomalyScore,
+        suspiciousFieldCount: x.suspiciousFieldCount,
+        suspiciousFields: x.suspiciousFields,
+      })),
+      fields: representativeFields,
+      evidence: suspicious.length
+        ? `Referans dekont(lar)ıyla alan bazlı görüntü/tipografi karşılaştırmasında ${suspicious.length} alan belirgin render uyumsuzluğu gösterdi: ${localized.join(', ')}.`
+        : `Referans dekont(lar)ıyla alan bazlı görüntü/tipografi karşılaştırmasında belirgin yerel uyumsuzluk bulunmadı.`,
+    };
+  } catch (error) {
+    console.warn('REFERENCE FORENSIC ENGINE HATASI:', error?.message || error);
     return null;
   }
 }
@@ -8009,6 +8397,7 @@ let amountForensics = null;
 let referenceTemplateAnalysis = null;
 let visualForensics = null;
 let layoutForensics = null;
+let referenceForensics = null;
 
 // PDF'yi de görüntü tabanlı forensic hattına sok.
 // OpenAI için orijinal PDF korunur; OCR/geometry/visual forensic için ilk sayfa
@@ -8144,6 +8533,22 @@ if ((type === "image" || type === "pdf") && bank && reference) {
     console.log("REFERENCE LAYOUT FORENSICS:", JSON.stringify(layoutForensics));
   } catch (error) {
     console.warn("REFERENCE LAYOUT FORENSICS HATASI:", error?.message || error);
+  }
+}
+
+// =====================================================
+// REFERENCE FORENSIC ENGINE — ALAN BAZLI PİKSEL/TİPOGRAFİ
+// =====================================================
+if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+  try {
+    referenceForensics = await runReferenceForensicEngine(
+      forensicTargetPath,
+      bank,
+      paddleImageOCR
+    );
+    console.log("REFERENCE FORENSIC ENGINE:", JSON.stringify(referenceForensics));
+  } catch (error) {
+    console.warn("REFERENCE FORENSIC ENGINE HATASI:", error?.message || error);
   }
 }
 
@@ -9027,6 +9432,9 @@ if (visualForensics) {
 if (layoutForensics) {
   result.layoutForensics = layoutForensics;
 }
+if (referenceForensics) {
+  result.referenceForensics = referenceForensics;
+}
 
 if (amountForensics) {
 result.amountForensics = amountForensics;
@@ -9088,6 +9496,10 @@ if (layoutForensics?.available && layoutForensics.severity === "strong") {
   result.summary = [result.summary, layoutForensics.evidence].filter(Boolean).join(" ");
 }
 
+if (referenceForensics?.available && referenceForensics.severity !== "low") {
+  result.summary = [result.summary, referenceForensics.evidence].filter(Boolean).join(" ");
+}
+
 // FINAL RISK IS NOW INDEPENDENT FROM AI-GENERATED CHECK SCORES.
 // GPT may still provide explanations/documentData, but it cannot change the
 // numerical risk result.
@@ -9097,6 +9509,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   amountForensics,
   paddleImageOCR,
   referenceTemplateAnalysis,
+  referenceForensics,
 });
 console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
 
