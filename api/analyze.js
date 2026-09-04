@@ -4396,6 +4396,88 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
   }
 }
 
+
+// =====================================================
+// REFERENCE FORENSIC KARAR SENKRONİZASYONU
+// =====================================================
+// Engine'in ayrıntılı kanıtı ile üst seviye suspiciousFields birbirinden
+// kopmasın. Eski engine sürümlerinden kalan characterFindings gibi alanlar
+// nihai kararı belirlemez; karar yalnızca v8'in fields/fieldObservations ve
+// spacingAnomalies çıktılarından türetilir.
+function synchronizeReferenceForensicDecision(forensic) {
+  if (!forensic || forensic.available !== true) return forensic;
+
+  const fields = Array.isArray(forensic.fields) ? forensic.fields : [];
+  const observations = Array.isArray(forensic.fieldObservations)
+    ? forensic.fieldObservations
+    : [];
+  const spacing = Array.isArray(forensic.spacingAnomalies)
+    ? forensic.spacingAnomalies
+    : [];
+
+  const suspiciousFieldSet = new Set();
+
+  // fields ve fieldObservations aynı consensus kararını taşımalıdır. İkisinden
+  // biri true ise alanı üst seviye karara dahil et.
+  for (const row of fields) {
+    if (row?.suspicious === true && row?.field) suspiciousFieldSet.add(String(row.field));
+  }
+  for (const row of observations) {
+    if (row?.suspicious === true && row?.field) suspiciousFieldSet.add(String(row.field));
+  }
+
+  // Sadece güçlü yapısal aralık anomalileri ilgili alanları lokalize eder.
+  const strongSpacing = spacing.filter((x) => Number(x?.score) >= 60);
+  for (const row of strongSpacing) {
+    if (row?.beforeField) suspiciousFieldSet.add(String(row.beforeField));
+    if (row?.afterField) suspiciousFieldSet.add(String(row.afterField));
+  }
+
+  const suspiciousFields = [...suspiciousFieldSet];
+  const suspiciousFieldCount = suspiciousFields.length;
+
+  const styleValues = fields
+    .map((x) => Number(x?.ensembleMedianStyleScore ?? x?.styleScore))
+    .filter(Number.isFinite);
+  const styleMedian = styleValues.length
+    ? rfMedianSigned(styleValues)
+    : 0;
+
+  const score = rfClamp100(
+    Math.min(45, styleMedian * 0.45) +
+    Math.min(35, suspiciousFieldCount * 12) +
+    Math.min(20, strongSpacing.length * 8)
+  );
+
+  const severity =
+    suspiciousFieldCount >= 2 && score >= 65
+      ? 'strong'
+      : suspiciousFieldCount >= 1 && score >= 45
+        ? 'medium'
+        : 'low';
+
+  const localized = suspiciousFields;
+  const hasEvidence = localized.length > 0;
+
+  return {
+    ...forensic,
+    suspiciousFieldCount,
+    suspiciousFields: localized,
+    spacingAnomalyCount: spacing.length,
+    score,
+    severity,
+    independentSignals: [
+      suspiciousFieldCount >= 1,
+      strongSpacing.length >= 1,
+      Number(forensic.referenceCount) >= 2,
+      suspiciousFieldCount >= 2,
+    ].filter(Boolean).length,
+    evidence: hasEvidence
+      ? `Referans ensemble + affine hizalama sonrasında ${suspiciousFieldCount} alan ve ${spacing.length} yapısal aralık anomalisi eşik geçti: ${localized.join(', ')}.`
+      : `Referans ensemble + affine hizalama sonrasında belirgin yerel render, tipografi veya yapısal aralık anomalisi bulunmadı.`,
+  };
+}
+
 async function getReferenceFiles(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return [];
@@ -6006,7 +6088,114 @@ function buildDeterministicAmountLabelCandidates() {
   });
 }
 
+
+// =====================================================
+// INLINE AMOUNT EXTRACTION (OCR TEK KUTUDA ETİKET + DEĞER)
+// =====================================================
+// Bazı dekontlarda PaddleOCR satırı iki kutuya ayırmaz. Örneğin Yapı Kredi:
+//   "GİDEN FAST TUTARI :-1000"
+// tek OCR region olarak gelir. Eski mantık yalnızca tamamen sayısal ayrı
+// region aradığı için bu gerçek tutarı kaçırıp "reference-unmatched" diyordu.
+// Burada etiket ve tutar aynı OCR kutusundaysa tutarı doğrudan satır içinden
+// çıkarıyoruz. Bu değer referansın TUTARIN KAÇ OLDUĞU bilgisine değil,
+// ETİKETİN SEMANTİK ROLÜNE dayanır.
+function buildInlineAmountCandidates() {
+  const out = [];
+  const regions = (ocrResult?.regions || [])
+    .filter((item) => item?.text && validRegion(item.region))
+    .map((item) => ({
+      item,
+      text: cleanAmountText(item.text),
+      x1: Number(item.region.x1) || 0,
+      y1: Number(item.region.y1) || 0,
+      x2: Number(item.region.x2) || 0,
+      y2: Number(item.region.y2) || 0,
+    }));
+
+  // Öncelik özellikle "GİDEN FAST TUTARI" gibi ana işlem tutarı
+  // etiketlerindedir. "TOPLAM TAHSİLAT TUTARI" komisyon dahil toplamdır;
+  // ana tutar yerine otomatik seçilmemelidir.
+  const primaryLabel = /(?:giden\s*fast\s*tutar[ıi]?|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|havale\s*tutar|işlem\s*tutar[ıi]?|giden\s*tutar[ıi]?|ana\s*tutar[ıi]?)/i;
+  const totalLabel = /(?:toplam\s*(?:tahsilat|işlem|ödeme)\s*tutar[ıi]?|toplam\s*tutar[ıi]?)/i;
+  const amountToken = /[-+]?\s*(?:(?:\d{1,3}(?:[.,]\d{3})+)|\d+)(?:[.,]\d{1,2})?/;
+  const excluded = /(?:müşteri\s*no|musteri\s*no|işlem\s*ref|işlem\s*no|islem\s*no|sorgu\s*no|referans|seri\s*no|sıra\s*no|sira\s*no|hesap\s*no|iban|tckn|vergi\s*no|ettn|belge\s*(?:no|numarası|numarasi))/i;
+
+  for (const row of regions) {
+    if (excluded.test(row.text)) continue;
+    const isTotal = totalLabel.test(row.text);
+    const isPrimary = !isTotal && primaryLabel.test(row.text);
+    if (!isPrimary && !isTotal) continue;
+
+    const match = row.text.match(amountToken);
+    if (!match) continue;
+
+    const rawAmount = String(match[0]).replace(/\s+/g, ' ').trim();
+    const start = Number(match.index || 0);
+    const totalLen = Math.max(1, row.text.length);
+
+    // OCR kutusunun tamamı "etiket + değer" olduğunda değerin yaklaşık
+    // x koordinatını metin içindeki karakter konumundan tahmin ediyoruz.
+    // Y koordinatı aynı satırda kalır; bu, referans ROI ile birlikte
+    // kullanılınca ekran görüntüsü/kırpma farklarına dayanıklıdır.
+    const valueX1 = row.x1 + (row.x2 - row.x1) * (start / totalLen);
+    const valueX2 = Math.min(row.x2, valueX1 + Math.max(12, (row.x2 - row.x1) * (rawAmount.length / totalLen)));
+    const valueRegion = {
+      x1: Math.max(row.x1, valueX1),
+      y1: row.y1,
+      x2: Math.max(valueX1 + 8, valueX2),
+      y2: row.y2,
+    };
+
+    const labelName = isPrimary ? 'primary-amount-label-inline' : 'total-amount-label-inline';
+    const labelScore = isPrimary ? 2400 : 1100;
+
+    out.push({
+      ...row.item,
+      text: rawAmount,
+      region: valueRegion,
+      labelDerived: true,
+      inlineLabelDerived: true,
+      amountCandidateScore: labelScore,
+      score: labelScore,
+      signal: 1,
+      templateScore: 0,
+      referencePositionScore: 0,
+      context: { score: 0, positive: [row.text], negative: [] },
+      anchor: { score: 0, anchors: [] },
+      labelEvidence: { score: labelScore, positive: [row.text], negative: [] },
+      directLabelEvidence: {
+        score: labelScore,
+        label: row.text,
+        distance: 0,
+        hard: isPrimary,
+      },
+      reconstructedLabelEvidence: {
+        score: labelScore,
+        label: row.text,
+        distance: 0,
+        hard: isPrimary,
+      },
+      inlineAmountLabel: row.text,
+      inlineAmountRole: labelName,
+      inlineAmountSourceRegion: row.item.region,
+    });
+  }
+
+  // Aynı OCR kutusu birden fazla eşleşme üretirse aynı değeri tekilleştir.
+  const seen = new Set();
+  return out.filter((candidate) => {
+    const r = candidate.region || {};
+    const key = `${r.x1}:${r.y1}:${r.x2}:${r.y2}:${candidate.text}:${candidate.inlineAmountRole}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+const inlineAmountCandidates = buildInlineAmountCandidates();
+
 const labelDerivedCandidates = [
+  ...inlineAmountCandidates,
   ...buildPrimaryAmountLabelDerivedCandidates(),
   ...buildDeterministicAmountLabelCandidates(),
 ].filter((candidate, index, arr) => {
@@ -6014,6 +6203,13 @@ const labelDerivedCandidates = [
   const key=`${r.x1}:${r.y1}:${r.x2}:${r.y2}:${candidate.text}`;
   return index === arr.findIndex(x => { const rr=x.region || {}; return `${rr.x1}:${rr.y1}:${rr.x2}:${rr.y2}:${x.text}` === key; });
 });
+
+// Ana tutar etiketi aynı OCR kutusunda bulunduysa bunu en üst öncelik yap.
+// Özellikle Yapı Kredi'deki "GİDEN FAST TUTARI :-1000" gibi satırlarda
+// artık referansın sayısal değerine eşleşme aramayacağız.
+const primaryInlineAmountCandidates = inlineAmountCandidates.filter((candidate) =>
+  candidate.inlineAmountRole === 'primary-amount-label-inline'
+);
 
 const allRankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
@@ -6056,7 +6252,10 @@ let candidatePool = allRankedCandidates;
 let selectionMethod = "legacy-scoring";
 
 if (referenceAmountField) {
-  if (labelDerivedCandidates.length) {
+  if (primaryInlineAmountCandidates.length) {
+    candidatePool = primaryInlineAmountCandidates;
+    selectionMethod = "inline-primary-amount-label";
+  } else if (labelDerivedCandidates.length) {
     candidatePool = labelDerivedCandidates;
     selectionMethod = "same-region-strong-amount-label";
   } else {
@@ -6108,7 +6307,10 @@ if (referenceAmountField) {
   // anchor'ı üretilememişse LEGACY SCORING'e geri dönme. Legacy scoring
   // Sorgu No / Müşteri No / İşlem Ref gibi sayıları tekrar tutar seçebilir.
   // Bunun yerine yalnızca açık ana tutar etiketi taşıyan adaylara izin ver.
-  if (labelDerivedCandidates.length) {
+  if (primaryInlineAmountCandidates.length) {
+    candidatePool = primaryInlineAmountCandidates;
+    selectionMethod = "inline-primary-amount-label-no-anchor";
+  } else if (labelDerivedCandidates.length) {
     candidatePool = labelDerivedCandidates;
     selectionMethod = "same-region-strong-amount-label-no-anchor";
   } else {
@@ -6153,7 +6355,6 @@ if (ax !== bx) return ax - bx;
 return String(a.text).localeCompare(String(b.text));
 });
 
-const candidate = rankedCandidates[0];
 
 if (!candidate) {
   console.warn(
@@ -9216,6 +9417,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       bank,
       paddleImageOCR
     );
+    referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE:", JSON.stringify(referenceForensics));
   } catch (error) {
     console.warn("REFERENCE FORENSIC ENGINE HATASI:", error?.message || error);
@@ -10081,7 +10283,7 @@ preserveAmount(result.documentData.amount);
 // Eksi işareti dekontta çıkış yönünü gösterir; documentData.amount
 // tutarın büyüklüğünü korur.
 if (
-  ["reference-roi-and-direct-label", "direct-amount-label-roi", "reference-roi", "reference-position-and-label", "reference-position", "reference-nearest", "amount-label", "reconstructed-amount-label"].includes(amountForensics?.selectionMethod) &&
+  ["reference-roi-and-direct-label", "direct-amount-label-roi", "reference-roi", "reference-position-and-label", "reference-position", "reference-nearest", "amount-label", "reconstructed-amount-label", "inline-primary-amount-label", "inline-primary-amount-label-no-anchor", "same-region-strong-amount-label", "same-region-strong-amount-label-no-anchor", "direct-amount-label-no-anchor", "reconstructed-amount-label-no-anchor", "amount-label-no-anchor"].includes(amountForensics?.selectionMethod) &&
   amountForensics?.selectedAmountText
 ) {
   const selected = String(amountForensics.selectedAmountText)
@@ -10107,7 +10309,14 @@ if (referenceForensics) {
 }
 
 if (amountForensics) {
-result.amountForensics = amountForensics;
+  result.amountForensics = amountForensics;
+  if (amountForensics.selectedAmountText) {
+    console.log("AMOUNT FORENSICS FINAL SELECTION:", JSON.stringify({
+      selectedAmountText: amountForensics.selectedAmountText,
+      selectionMethod: amountForensics.selectionMethod,
+      status: amountForensics.status,
+    }));
+  }
 }
 
 // =====================================================
