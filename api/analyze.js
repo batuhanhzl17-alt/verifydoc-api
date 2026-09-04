@@ -4421,6 +4421,19 @@ image = {width: meta.width, height: meta.height};
 return {available: false, status: "unknown", severity: "none", score: 0, amountText: null, region: null, characterCount: 0, metrics: {}, evidence: "Görüntü boyutu alınamadı."};
 }
 
+// Referans profil değişkenleri LOG'dan önce hazırlanmalı.
+// Analyze 17'de log satırı bu değişkenleri initialize edilmeden önce okuyordu
+// ve Vercel'de TDZ (Temporal Dead Zone) ReferenceError oluşturuyordu.
+let referenceAmountField = null;
+let referenceTemplateAvailable = false;
+try {
+  const referenceProfile = await buildReferenceTemplateProfile(bank);
+  referenceTemplateAvailable = Boolean(referenceProfile);
+  referenceAmountField = referenceProfile?.fields?.amount || null;
+} catch (error) {
+  console.warn("REFERENCE GUIDED AMOUNT PROFILE HATASI:", error?.message || error);
+}
+
 const referenceAnchor = await getReferenceAmountAnchor(bank);
 console.log("AMOUNT TEMPLATE ANCHOR:", JSON.stringify(referenceAnchor ? { bank: referenceAnchor.bank, pageNumber: referenceAnchor.pageNumber, xNorm: referenceAnchor.xNorm, yNorm: referenceAnchor.yNorm, widthNorm: referenceAnchor.widthNorm, heightNorm: referenceAnchor.heightNorm, referenceCount: referenceAnchor.referenceCount, source: referenceAnchor.source } : null));
 console.log("AMOUNT REFERENCE PROFILE AVAILABLE:", referenceTemplateAvailable, "ANCHOR AVAILABLE:", Boolean(referenceAmountField));
@@ -4446,16 +4459,6 @@ return 0;
 // genel OCR puanına bırakma. Önce referansın normalize konumuna,
 // ardından aynı satırdaki tutar etiketine bak. Bu sayede müşteri no,
 // sorgu no, işlem ref gibi rakamlar tutarın önüne geçemez.
-let referenceAmountField = null;
-let referenceTemplateAvailable = false;
-try {
-  const referenceProfile = await buildReferenceTemplateProfile(bank);
-  referenceTemplateAvailable = Boolean(referenceProfile);
-  referenceAmountField = referenceProfile?.fields?.amount || null;
-} catch (error) {
-  console.warn("REFERENCE GUIDED AMOUNT PROFILE HATASI:", error?.message || error);
-}
-
 function amountLabelEvidence(group) {
   const gx1 = Number(group.region.x1) || 0;
   const gy1 = Number(group.region.y1) || 0;
