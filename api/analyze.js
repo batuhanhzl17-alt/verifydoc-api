@@ -4251,18 +4251,133 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
   try {
     const targetBuffer = await fs.readFile(targetPath);
     const targetMeta = await sharp(targetBuffer).metadata();
-    const targetSize={width:Number(targetMeta.width)||0,height:Number(targetMeta.height)||0};
-    if(!targetSize.width||!targetSize.height)return null;
+    const targetSize = { width:Number(targetMeta.width)||0, height:Number(targetMeta.height)||0 };
+    if (!targetSize.width || !targetSize.height) return null;
 
-    const referencePaths=await getReferenceFiles(normalizedBank);
-    if(!referencePaths.length)return null;
+    const referencePaths = await getReferenceFiles(normalizedBank);
+    if (!referencePaths.length) return null;
+
+    // IMPORTANT: preserve every semantic field occurrence. The previous engine
+    // collapsed all occurrences of the same key (e.g. multiple IBANs, dates,
+    // transaction numbers) into one item. That made local layout comparisons
+    // unreliable and could pair unrelated fields such as PRIMARY AMOUNT with
+    // TOTAL AMOUNT. This engine keeps occurrence order and uses semantic role
+    // + label text + affine position for one-to-one matching.
+    function extractOccurrences(ocr) {
+      const regions = rfPrepareRegions(ocr);
+      const out = [];
+      for (const r of regions) {
+        const raw = String(r.text || '').trim();
+        if (!raw) continue;
+        const canonical = referenceFieldRuleForText(raw);
+        const label = rfLabelPart(raw);
+        const key = canonical?.key || rfGenericFieldKey(label);
+        if (!key) continue;
+        const role = classifyReferenceTemplateRole(key, raw);
+        out.push({
+          ...r,
+          rule: canonical || { key, patterns: [] },
+          labelText: label,
+          canonicalScore: canonical ? rfCanonicalLabelScore(key, raw) : 35,
+          templateRole: role,
+        });
+      }
+      // Remove exact duplicate OCR boxes, but NEVER deduplicate by semantic key.
+      const seen = new Set();
+      const unique = [];
+      for (const c of out) {
+        const k = [c.rule.key, c.labelText, c.region.x1, c.region.y1, c.region.x2, c.region.y2].join('|');
+        if (seen.has(k)) continue;
+        seen.add(k); unique.push(c);
+      }
+      return unique.sort((a,b)=>{
+        const ay=(a.region.y1+a.region.y2)/2, by=(b.region.y1+b.region.y2)/2;
+        if (Math.abs(ay-by)>3) return ay-by;
+        return ((a.region.x1+a.region.x2)/2)-((b.region.x1+b.region.x2)/2);
+      });
+    }
+
+    function normPoint(label, size) {
+      return {
+        x:((label.region.x1+label.region.x2)/2)/Math.max(1,size.width),
+        y:((label.region.y1+label.region.y2)/2)/Math.max(1,size.height),
+      };
+    }
+
+    function normLabel(s) {
+      return normalizeFieldTextForMatch(String(s||'')).replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
+    }
+
+    function semanticCompatible(a,b) {
+      if (!a || !b || a.rule.key !== b.rule.key) return false;
+      if (a.rule.key === 'amount' && a.templateRole !== b.templateRole) return false;
+      // Generic labels must remain text-close; canonical labels may tolerate OCR
+      // spelling/diacritic differences.
+      const d=rfLevenshtein(normLabel(a.labelText),normLabel(b.labelText));
+      const exact=normLabel(a.labelText)===normLabel(b.labelText);
+      const limit=String(a.rule.key).startsWith('generic:')?3:10;
+      return exact || d<=limit || (a.canonicalScore>=100 && b.canonicalScore>=70);
+    }
+
+    function initialExactMatches(refLabels,targetLabels,refSize,targetSize) {
+      const used=new Set(), pairs=[];
+      for (const rl of refLabels) {
+        let best=null;
+        const rp=normPoint(rl,refSize);
+        for (const tl of targetLabels) {
+          if (used.has(tl) || !semanticCompatible(rl,tl)) continue;
+          const tp=normPoint(tl,targetSize);
+          const exact=normLabel(rl.labelText)===normLabel(tl.labelText);
+          const dx=Math.abs(rp.x-tp.x), dy=Math.abs(rp.y-tp.y);
+          const score=(exact?0:rfLevenshtein(normLabel(rl.labelText),normLabel(tl.labelText))*0.18)+dx*2+dy*1.25;
+          if (!best || score<best.score) best={target:tl,score,exact};
+        }
+        if (best && (best.exact || best.score<0.22)) {
+          used.add(best.target);
+          pairs.push({rl,tl:best.target,matchMethod:best.exact?'exact-label-bootstrap':'fuzzy-label-bootstrap'});
+        }
+      }
+      return pairs;
+    }
+
+    function matchAll(refLabels,targetLabels,affine,refSize,targetSize) {
+      const used=new Set(), matches=[];
+      const ordered=[...refLabels].sort((a,b)=>{
+        const ay=(a.region.y1+a.region.y2)/2,by=(b.region.y1+b.region.y2)/2;
+        if(Math.abs(ay-by)>3)return ay-by;
+        return a.region.x1-b.region.x1;
+      });
+      for (const rl of ordered) {
+        const rp=normPoint(rl,refSize);
+        const projected=affine?rfApplyAffine(affine,rp):rp;
+        let best=null;
+        for (const tl of targetLabels) {
+          if(used.has(tl)||!semanticCompatible(rl,tl))continue;
+          const tp=normPoint(tl,targetSize);
+          const dx=Math.abs(projected.x-tp.x),dy=Math.abs(projected.y-tp.y);
+          const textD=rfLevenshtein(normLabel(rl.labelText),normLabel(tl.labelText));
+          const exact=normLabel(rl.labelText)===normLabel(tl.labelText);
+          const xLimit=String(rl.rule.key).startsWith('generic:')?.10:.16;
+          const yLimit=['iban','date','time'].includes(rl.rule.key)?.34:.20;
+          if(dx>xLimit||dy>yLimit)continue;
+          const score=(exact?0:textD*.16)+dx*2.4+dy;
+          if(!best||score<best.score)best={target:tl,score,exact};
+        }
+        if(best){
+          used.add(best.target);
+          matches.push({rl,tl:best.target,matchMethod:best.exact?'semantic-exact':'semantic-affine'});
+        }
+      }
+      return matches;
+    }
 
     const referenceResults=[];
-    for(const referencePath of referencePaths){
-      let refBuffer=null, refTemp=null;
-      try{
+    for (const referencePath of referencePaths) {
+      let refTemp=null;
+      try {
         const ext=path.extname(referencePath).toLowerCase();
         const raw=await fs.readFile(referencePath);
+        let refBuffer=null;
         if(ext==='.pdf'){
           const pdf=await pdfjsLib.getDocument({data:new Uint8Array(raw)}).promise;
           const rendered=await renderPdfPagePng(pdf,1,1.8);
@@ -4274,61 +4389,62 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         if(!refSize.width||!refSize.height)continue;
 
         const refId=createHash('sha256').update(raw).digest('hex').slice(0,16);
-        const cacheKey=`rfocr28:${normalizedBank}:${refId}`;
+        const cacheKey=`rfocr39:${normalizedBank}:${refId}`;
         let refOCR=paddleOCRCache.get(cacheKey);
         if(!refOCR?.success){
-          refTemp=path.join('/tmp',`verifydoc-rf28-${normalizedBank}-${refId}.png`);
+          refTemp=path.join('/tmp',`verifydoc-rf39-${normalizedBank}-${refId}.png`);
           await fs.writeFile(refTemp,refBuffer);
           refOCR=await runPaddleOCR(refTemp);
           if(refOCR?.success)paddleOCRCache.set(cacheKey,refOCR);
         }
         if(!refOCR?.success)continue;
 
-        const refLabels=rfExtractAllFieldCandidates(refOCR);
-        const targetLabels=rfExtractAllFieldCandidates(targetOCR);
-        const refRegions=rfPrepareRegions(refOCR), targetRegions=rfPrepareRegions(targetOCR);
-        let matches=[];
-        for(const rl of refLabels){
-          const m=rfMatchLabel(rl,targetLabels,targetSize,refSize);
-          if(!m)continue;
-          const rc={x:(rl.region.x1+rl.region.x2)/2/refSize.width,y:(rl.region.y1+rl.region.y2)/2/refSize.height};
-          const tc={x:(m.target.region.x1+m.target.region.x2)/2/targetSize.width,y:(m.target.region.y1+m.target.region.y2)/2/targetSize.height};
-          matches.push({rl,tl:m.target,rc,tc});
+        const refLabels=extractOccurrences(refOCR);
+        const targetLabels=extractOccurrences(targetOCR);
+        if(refLabels.length<2||targetLabels.length<2)continue;
+
+        const bootstrap=initialExactMatches(refLabels,targetLabels,refSize,targetSize);
+        let affine=rfFitAffine(bootstrap.map(m=>({ref:normPoint(m.rl,refSize),tar:normPoint(m.tl,targetSize)})));
+        if(!affine){
+          // fallback from robust page geometry: same semantic fields without an
+          // affine are still useful, but do not invent a transform.
+          affine={x:{scale:1,offset:0},y:{scale:1,offset:0}};
         }
+
+        let matches=matchAll(refLabels,targetLabels,affine,refSize,targetSize);
+        if(matches.length<2)matches=bootstrap;
         if(matches.length<2)continue;
 
-        let anchors=matches.filter(m=>m.rl.canonicalScore>=100 && m.tl.canonicalScore>=100);
-        let affine=rfFitAffine((anchors.length>=2?anchors:matches).map(m=>({ref:m.rc,tar:m.tc})));
-        if(!affine)continue;
+        // Refit once using all high-confidence semantic matches. This reduces
+        // the influence of one OCR box and handles PDF->JPEG scale differences.
+        const fitPoints=matches.map(m=>({ref:normPoint(m.rl,refSize),tar:normPoint(m.tl,targetSize)}));
+        affine=rfFitAffine(fitPoints)||affine;
+        matches=matchAll(refLabels,targetLabels,affine,refSize,targetSize);
+        if(matches.length<2)matches=bootstrap;
 
-        // İkinci geçiş: ilk eşleşmede OCR yazım farkı nedeniyle kaçan aynı
-        // semantik alanları affine konum üzerinden geri kazan. Böylece bir
-        // alanın kaybolması, onunla komşu alanlar arasındaki spacing ölçümünü
-        // otomatik olarak yok etmez.
-        const recovered=rfRecoverUnmatchedLabels(refLabels,targetLabels,matches,affine,targetSize,refSize);
-        if(recovered.length>matches.length){
-          matches=recovered;
-          anchors=matches.filter(m=>m.rl.canonicalScore>=100 && m.tl.canonicalScore>=100);
-          affine=rfFitAffine((anchors.length>=2?anchors:matches).map(m=>({ref:m.rc,tar:m.tc}))) || affine;
-          console.log('REFERENCE FORENSIC LABEL RECOVERY:', JSON.stringify({
-            recoveredCount:matches.filter(m=>m.recoveredBy).length,
-            recoveredFields:matches.filter(m=>m.recoveredBy).map(m=>m.rl.rule.key)
-          }));
-        }
+        console.log('REFERENCE FORENSIC FIELD MATCHING:',JSON.stringify({
+          bank:normalizedBank,reference:path.basename(referencePath),
+          referenceFieldCount:refLabels.length,targetFieldCount:targetLabels.length,
+          matchedFieldCount:matches.length,
+          matchedFields:matches.map(m=>({field:m.rl.rule.key,reference:m.rl.labelText,target:m.tl.labelText,method:m.matchMethod}))
+        }));
 
-        const anchorResiduals=(anchors.length>=2?anchors:matches).map(m=>{
-          const q=rfApplyAffine(affine,m.rc); return Math.hypot(q.x-m.tc.x,q.y-m.tc.y);
+        const anchors=matches.filter(m=>m.rl.canonicalScore>=100&&m.tl.canonicalScore>=70);
+        const anchorPoints=(anchors.length>=2?anchors:matches).map(m=>({ref:normPoint(m.rl,refSize),tar:normPoint(m.tl,targetSize)}));
+        const anchorAffine=rfFitAffine(anchorPoints)||affine;
+        affine=anchorAffine;
+
+        const anchorResiduals=anchorPoints.map(p=>{
+          const q=rfApplyAffine(affine,p.ref);return Math.hypot(q.x-p.tar.x,q.y-p.tar.y);
         });
         const anchorMedian=rfMedianSigned(anchorResiduals);
         const anchorMad=rfMedianSigned(anchorResiduals.map(v=>Math.abs(v-anchorMedian)));
 
-        // Önce tüm alanlarda global PDF→JPEG/render farkını kalibre ediyoruz.
+        const refRegions=rfPrepareRegions(refOCR),targetRegions=rfPrepareRegions(targetOCR);
         const stylePairs=[];
         for(const m of matches){
-          const rr=rfFocusLabelRegion(m.rl.region,m.rl.text);
-          const tr=rfFocusLabelRegion(m.tl.region,m.tl.text);
-          const a=await rfStableTextMetrics(refBuffer,rr,refSize);
-          const b=await rfStableTextMetrics(targetBuffer,tr,targetSize);
+          const rr=rfFocusLabelRegion(m.rl.region,m.rl.text),tr=rfFocusLabelRegion(m.tl.region,m.tl.text);
+          const a=await rfStableTextMetrics(refBuffer,rr,refSize),b=await rfStableTextMetrics(targetBuffer,tr,targetSize);
           if(a&&b)stylePairs.push({field:m.rl.rule.key,a,b});
         }
         const globalStyleBaseline=rfMedianSigned(stylePairs.map(p=>rfStyleResidual(p.a,p.b)));
@@ -4336,152 +4452,105 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         const fieldResults=[];
         for(const m of matches){
           const key=m.rl.rule.key;
-          const refLabelText=rfFieldLabelText(m.rl), tarLabelText=rfFieldLabelText(m.tl);
           const refLabelRegion=rfFocusLabelRegion(m.rl.region,m.rl.text);
           const tarLabelRegion=rfFocusLabelRegion(m.tl.region,m.tl.text);
           const refStyle=await rfStableTextMetrics(refBuffer,refLabelRegion,refSize);
           const tarStyle=await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize);
           const rawStyle=rfStyleResidual(refStyle,tarStyle);
           const styleResidual=rfStyleResidual(refStyle,tarStyle,globalStyleBaseline);
-
-          const refValue=rfFindValueRegion(refRegions,m.rl);
-          const tarValue=rfFindValueRegion(targetRegions,m.tl);
+          const refValue=rfFindValueRegion(refRegions,m.rl),tarValue=rfFindValueRegion(targetRegions,m.tl);
           let valueRenderResidual=null;
           let valueGeometryResidual=null;
           if(refValue&&tarValue){
-            const refKind=/\d/.test(refValue.text)?(/^[\d\s.,:+()\-\/]+(?:TL|TRY|EUR|USD)?$/i.test(String(refValue.text).trim())?'numeric':'mixed'):'text';
-            const tarKind=/\d/.test(tarValue.text)?(/^[\d\s.,:+()\-\/]+(?:TL|TRY|EUR|USD)?$/i.test(String(tarValue.text).trim())?'numeric':'mixed'):'text';
-            const sameKind=refKind===tarKind;
-            const lenRatio=Math.min(String(refValue.text).length,String(tarValue.text).length)/Math.max(String(refValue.text).length,String(tarValue.text).length,1);
-            // Dinamik değer farklıysa şekil karşılaştırmasını yalnızca benzer yapıdaki
-            // değerlerde yapıyoruz; aksi halde Ebru Köse/Yusuf Ezer gibi doğal değişimler alarm üretmez.
-            if(sameKind && lenRatio>=0.55){
+            const comparable=rfValueRenderComparable(refValue.text,tarValue.text);
+            if(comparable){
               const rs=await rfStableTextMetrics(refBuffer,refValue.region,refSize);
               const ts=await rfStableTextMetrics(targetBuffer,tarValue.region,targetSize);
               valueRenderResidual=rfStyleResidual(rs,ts,globalStyleBaseline);
             }
-            const rc={x:(refValue.region.x1+refValue.region.x2)/2/refSize.width,y:(refValue.region.y1+refValue.region.y2)/2/refSize.height};
-            const tc={x:(tarValue.region.x1+tarValue.region.x2)/2/targetSize.width,y:(tarValue.region.y1+tarValue.region.y2)/2/targetSize.height};
-            const q=rfApplyAffine(affine,rc);
+            const rc=normPoint(refValue,refSize),tc=normPoint(tarValue,targetSize),q=rfApplyAffine(affine,rc);
             valueGeometryResidual=Math.hypot(q.x-tc.x,q.y-tc.y);
           }
-
-          const labelPos={x:(m.rl.region.x1+m.rl.region.x2)/2/refSize.width,y:(m.rl.region.y1+m.rl.region.y2)/2/refSize.height};
-          const targetPos={x:(m.tl.region.x1+m.tl.region.x2)/2/targetSize.width,y:(m.tl.region.y1+m.tl.region.y2)/2/targetSize.height};
-          const projected=rfApplyAffine(affine,labelPos);
-          const positionResidual=Math.hypot(projected.x-targetPos.x,projected.y-targetPos.y);
-          const normalizedPosition=Math.max(0,positionResidual-Math.max(anchorMedian+3*anchorMad,0.006));
-
-          // Etiket aynı semantik alanın kendisi olduğu için metin eşleşmesi beklenir.
-          const labelExact=normalizeFieldTextForMatch(refLabelText)===normalizeFieldTextForMatch(tarLabelText);
+          const rp=normPoint(m.rl,refSize),tp=normPoint(m.tl,targetSize),projected=rfApplyAffine(affine,rp);
+          const positionResidual=Math.hypot(projected.x-tp.x,projected.y-tp.y);
+          const normalizedPosition=Math.max(0,positionResidual-Math.max(anchorMedian+3*anchorMad,.006));
+          const labelExact=normLabel(m.rl.labelText)===normLabel(m.tl.labelText);
           const styleScore=rfClamp100((styleResidual||0)*100);
           const valueStyleScore=rfClamp100((valueRenderResidual||0)*100);
-          const positionScore=rfClamp100(Math.min(1,normalizedPosition/0.035)*100);
-
-          // Çoklu bağımsız sinyal: tek başına kamera/render farkı alarm değildir.
-          const styleSignal=styleScore>=58;
-          const valueSignal=valueStyleScore>=62;
-          const geometrySignal=positionScore>=62;
-          const severeLabelSignal=styleScore>=82 && labelExact;
-          const suspicious=(severeLabelSignal && geometrySignal) ||
-            (styleSignal && geometrySignal) ||
-            (styleSignal && valueSignal && labelExact);
-
+          const positionScore=rfClamp100(Math.min(1,normalizedPosition/.035)*100);
+          // A field alone is suspicious only when two independent render/geometry
+          // signals agree. Layout spacing is handled separately below.
+          const suspicious=(styleScore>=70&&positionScore>=62)||(styleScore>=76&&valueStyleScore>=62&&labelExact);
           fieldResults.push({
-            field:key,
-            referenceLabel:m.rl.labelText,
-            targetLabel:m.tl.labelText,
-            labelExact,
-            styleScore,
-            rawStyleScore:rfClamp100((rawStyle||0)*100),
-            valueStyleScore,
-            positionScore,
-            combinedScore:rfClamp100(styleScore*.50+valueStyleScore*.20+positionScore*.30),
-            positionResidual:Number(positionResidual.toFixed(5)),
-            styleResidual:Number((styleResidual||0).toFixed(5)),
+            field:key,referenceLabel:m.rl.labelText,targetLabel:m.tl.labelText,labelExact,
+            templateRole:m.rl.templateRole,styleScore,rawStyleScore:rfClamp100((rawStyle||0)*100),valueStyleScore,positionScore,
+            combinedScore:rfClamp100(styleScore*.5+valueStyleScore*.2+positionScore*.3),
+            positionResidual:Number(positionResidual.toFixed(5)),styleResidual:Number((styleResidual||0).toFixed(5)),
             valueRenderResidual:Number.isFinite(valueRenderResidual)?Number(valueRenderResidual.toFixed(5)):null,
-            referenceLabelXNorm:Number(labelPos.x.toFixed(5)),
-            referenceLabelYNorm:Number(labelPos.y.toFixed(5)),
-            targetLabelXNorm:Number(targetPos.x.toFixed(5)),
-            targetLabelYNorm:Number(targetPos.y.toFixed(5)),
-            referenceValueRegionFound:Boolean(refValue),
-            targetValueRegionFound:Boolean(tarValue),
-            labelMatchMethod:m.recoveredBy || 'semantic-label-match',
-            labelTextDistance:rfLevenshtein(refLabelText,tarLabelText),
-            suspicious,
-            evidence:suspicious
-              ? `Alan bazında render/geometri sapması: stil ${styleScore}, değer-stil ${valueStyleScore}, konum ${positionScore}.`
-              : null,
+            referenceLabelXNorm:Number(rp.x.toFixed(5)),referenceLabelYNorm:Number(rp.y.toFixed(5)),
+            targetLabelXNorm:Number(tp.x.toFixed(5)),targetLabelYNorm:Number(tp.y.toFixed(5)),
+            referenceValueRegionFound:Boolean(refValue),targetValueRegionFound:Boolean(tarValue),
+            labelMatchMethod:m.matchMethod,labelTextDistance:rfLevenshtein(m.rl.labelText,m.tl.labelText),suspicious,
+            evidence:suspicious?`Alan bazında bağımsız render/geometri sapması: stil ${styleScore}, değer-stil ${valueStyleScore}, konum ${positionScore}.`:null,
           });
         }
 
-        // Dikey ritim: burada ham refGap ile targetGap karşılaştırılmaz.
-        // Çünkü PDF ve JPG farklı ölçeklerde olabilir. Referans etiketinin
-        // AFFINE PROJECTION sonrası beklenen Y mesafesi ile hedefteki gerçek
-        // Y mesafesini karşılaştırıyoruz. Böylece global crop/zoom alarm üretmez;
-        // fakat şablon içindeki tek bir boşluğun büyümesi (ör. IBAN -> İŞLEM TARİHİ)
-        // yakalanır.
-        const ordered=[...fieldResults].sort((a,b)=>a.targetLabelYNorm-b.targetLabelYNorm);
+        // LOCAL SEMANTIC SPACING: compare only genuine neighbouring fields in
+        // the SAME normalized column. Cross-column pairs are forbidden. This is
+        // the key correction for cases such as IBAN -> İŞLEM TARİHİ in Yapı Kredi.
+        const matchedForSpacing=matches.map(m=>({
+          ...m,
+          rp:normPoint(m.rl,refSize),tp:normPoint(m.tl,targetSize),
+          field:m.rl.rule.key,label:m.rl.labelText,
+        }));
         const spacingAnomalies=[];
-        const labelHeights=ordered.map(x=>Math.max(.001, Math.abs(x.referenceLabelYNorm-x.targetLabelYNorm)*0 + .004));
-        const pairCandidates=[];
-        for(let i=0;i<ordered.length;i++){
-          for(let j=i+1;j<ordered.length;j++){
-            const a=ordered[i],b=ordered[j];
-            if(a.field===b.field)continue;
-            const tarGap=b.targetLabelYNorm-a.targetLabelYNorm;
-            if(tarGap<=0)continue;
-            const refPointA={x:a.referenceLabelXNorm,y:a.referenceLabelYNorm};
-            const refPointB={x:b.referenceLabelXNorm,y:b.referenceLabelYNorm};
-            const projA=rfApplyAffine(affine,refPointA);
-            const projB=rfApplyAffine(affine,refPointB);
-            const expectedGap=projB.y-projA.y;
-            if(expectedGap<=0)continue;
-            // Çok uzak ve farklı bölümlerdeki alan çiftleri layout sinyaline
-            // dahil edilmez; aynı kutu içindeki yakın alan aralıklarını hedefleriz.
-            if(expectedGap>0.18 || tarGap>0.24)continue;
-            const delta=Math.abs(tarGap-expectedGap);
-            const relative=delta/Math.max(expectedGap,.008);
+        const seenPairs=new Set();
+        for(const a of matchedForSpacing){
+          const projectedA=rfApplyAffine(affine,a.rp);
+          let best=null;
+          for(const b of matchedForSpacing){
+            if(a===b)continue;
+            if(b.rp.y<=a.rp.y)continue;
+            const projectedB=rfApplyAffine(affine,b.rp);
+            const refDx=Math.abs(b.rp.x-a.rp.x),tarDx=Math.abs(b.tp.x-a.tp.x);
+            // Same column in both reference and target. A wide cross-column
+            // relation (e.g. left IBAN to right-side reference number) is never
+            // considered a local vertical spacing pair.
+            if(refDx>.11||tarDx>.13)continue;
+            const refGap=b.rp.y-a.rp.y;
+            const tarGap=b.tp.y-a.tp.y;
+            const expectedGap=projectedB.y-projectedA.y;
+            if(refGap<=.008||tarGap<=.008||expectedGap<=.008)continue;
+            if(refGap>.16||tarGap>.30)continue;
+            const delta=Math.abs(tarGap-expectedGap),relative=delta/Math.max(expectedGap,.008);
             const score=rfClamp100(relative*100);
-            pairCandidates.push({a,b,expectedGap,tarGap,delta,score});
+            if(!best||Math.abs(refGap-.06)<Math.abs((best.b.rp.y-a.rp.y)-.06))best={b,refGap,tarGap,expectedGap,delta,relative,score};
           }
-        }
-        // Aynı alana ait çok sayıda çift oluşabileceğinden yalnızca en güçlü
-        // birkaç yapısal aralık tutulur; karar metin içeriğine bağlı değildir.
-        pairCandidates.sort((x,y)=>y.score-x.score);
-        const usedSpacingFields=new Set();
-        for(const p of pairCandidates){
-          const {a,b,expectedGap,tarGap,delta,score}=p;
-          if(score<45)break;
-          const pairKey=`${a.field}->${b.field}`;
-          if(usedSpacingFields.has(pairKey))continue;
-          usedSpacingFields.add(pairKey);
+          if(!best||best.score<45)continue;
+          const pairKey=`${a.field}:${a.rp.x.toFixed(3)}->${best.b.field}:${best.b.rp.x.toFixed(3)}`;
+          if(seenPairs.has(pairKey))continue;
+          seenPairs.add(pairKey);
           spacingAnomalies.push({
-            type:'vertical-field-spacing',beforeField:a.field,afterField:b.field,
-            referenceGapNorm:Number(expectedGap.toFixed(5)),targetGapNorm:Number(tarGap.toFixed(5)),
-            gapDeltaNorm:Number(delta.toFixed(5)),score,
-            severity:score>=70?'strong':score>=50?'medium':'low',
-            evidence:`${a.field} → ${b.field} dikey alan aralığı affine-normalize referansa göre belirgin değişti.`
+            type:'vertical-field-spacing',beforeField:a.field,afterField:best.b.field,
+            beforeLabel:a.label,afterLabel:best.b.label,
+            referenceGapNorm:Number(best.refGap.toFixed(5)),targetGapNorm:Number(best.tarGap.toFixed(5)),
+            expectedTargetGapNorm:Number(best.expectedGap.toFixed(5)),gapDeltaNorm:Number(best.delta.toFixed(5)),
+            relativeDelta:Number(best.relative.toFixed(3)),score:best.score,
+            severity:best.score>=70?'strong':best.score>=55?'medium':'low',
+            evidence:`Aynı kolon içindeki ${a.label} → ${best.b.label} dikey aralığı affine-normalize referansa göre değişti.`
           });
-          if(spacingAnomalies.length>=8)break;
         }
+        spacingAnomalies.sort((a,b)=>b.score-a.score);
 
         const suspiciousFields=fieldResults.filter(x=>x.suspicious);
-        const styleOutliers=fieldResults.filter(x=>x.styleScore>=58);
-        const strongSpacing=spacingAnomalies.filter(x=>x.score>=55);
-        const referenceQuality={
-          matchedFields:fieldResults.length,
-          anchorCount:anchors.length,
-          anchorMedianResidual:Number(anchorMedian.toFixed(5)),
-          globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5)),
-        };
+        const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
+        const referenceQuality={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
         referenceResults.push({
           file:path.basename(referencePath),fieldCount:fieldResults.length,
           styleScore:rfClamp100(rfMedian(fieldResults.map(x=>x.styleScore))),
-          localAnomalyScore:rfClamp100(suspiciousFields.length*18+strongSpacing.length*12),
-          suspiciousFieldCount:suspiciousFields.length,
-          suspiciousFields:[...new Set(suspiciousFields.map(x=>x.field))],
-          spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,
+          localAnomalyScore:rfClamp100(suspiciousFields.length*18+strongSpacing.length*18),
+          suspiciousFieldCount:suspiciousFields.length,suspiciousFields:[...new Set(suspiciousFields.map(x=>x.field))],
+          spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies:spacingAnomalies.slice(0,20),
           characterFindingCount:0,characterFindings:[],fields:fieldResults,referenceQuality,
         });
       }catch(error){
@@ -4491,53 +4560,55 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
 
     if(!referenceResults.length)return null;
 
-    // Referanslar arası consensus. Tek referansta bile iki bağımsız sinyal şart;
-    // çoklu referansta aynı alanın yarısından fazlası aynı yönde olmalı.
     const groups=new Map();
     for(const ref of referenceResults)for(const f of ref.fields||[]){
-      if(!groups.has(f.field))groups.set(f.field,[]);groups.get(f.field).push(f);
+      // Preserve repeated occurrences as separate observations by using label
+      // position in the reference, while still aggregating identical semantic
+      // labels across multiple reference documents.
+      const occurrenceKey=`${f.field}|${String(f.referenceLabel||'').toLocaleLowerCase('tr-TR')}|${Number(f.referenceLabelXNorm||0).toFixed(3)}`;
+      if(!groups.has(occurrenceKey))groups.set(occurrenceKey,[]);groups.get(occurrenceKey).push(f);
     }
     const fields=[],suspicious=[],fieldObservations=[];
-    for(const [field,rows] of groups){
+    for(const [occurrenceKey,rows] of groups){
       const medStyle=rfMedianSigned(rows.map(x=>Number(x.styleScore)).filter(Number.isFinite));
       const medValue=rfMedianSigned(rows.map(x=>Number(x.valueStyleScore)).filter(Number.isFinite));
       const medPos=rfMedianSigned(rows.map(x=>Number(x.positionScore)).filter(Number.isFinite));
-      const styleHits=rows.filter(x=>x.styleScore>=58).length;
-      const valueHits=rows.filter(x=>x.valueStyleScore>=62).length;
-      const posHits=rows.filter(x=>x.positionScore>=62).length;
+      const styleHits=rows.filter(x=>x.styleScore>=58).length,posHits=rows.filter(x=>x.positionScore>=62).length;
       const multi=rows.length>=2;
-      const consensus=multi?(styleHits>=Math.ceil(rows.length*.5)&&medStyle>=58)||(posHits>=Math.ceil(rows.length*.5)&&medPos>=62&&styleHits>=Math.ceil(rows.length*.5)):(
-        (medStyle>=70&&medPos>=62)||(medStyle>=70&&medValue>=62)
-      );
+      const consensus=multi
+        ? ((styleHits>=Math.ceil(rows.length*.5)&&medStyle>=58)||(posHits>=Math.ceil(rows.length*.5)&&medPos>=62&&styleHits>=Math.ceil(rows.length*.5)))
+        : ((medStyle>=70&&medPos>=62)||(medStyle>=70&&medValue>=62));
       const best=[...rows].sort((a,b)=>b.combinedScore-a.combinedScore)[0];
-      const aggregate={...best,referenceCountForField:rows.length,ensembleMedianStyleScore:rfClamp100(medStyle),ensembleMedianValueStyleScore:rfClamp100(medValue),ensembleMedianPositionScore:rfClamp100(medPos),ensembleStyleHitCount:styleHits,ensembleValueHitCount:valueHits,ensemblePositionHitCount:posHits,ensembleConsensusRatio:Number((styleHits/Math.max(1,rows.length)).toFixed(3))};
+      const aggregate={...best,occurrenceKey,referenceCountForField:rows.length,ensembleMedianStyleScore:rfClamp100(medStyle),ensembleMedianValueStyleScore:rfClamp100(medValue),ensembleMedianPositionScore:rfClamp100(medPos),ensembleStyleHitCount:styleHits,ensemblePositionHitCount:posHits,ensembleConsensusRatio:Number((styleHits/Math.max(1,rows.length)).toFixed(3))};
       fields.push(aggregate);
-      fieldObservations.push({field,referenceCount:rows.length,suspicious:Boolean(consensus),medianStyleScore:rfClamp100(medStyle),medianValueStyleScore:rfClamp100(medValue),medianPositionScore:rfClamp100(medPos),styleHitCount:styleHits,positionHitCount:posHits});
+      fieldObservations.push({field:best.field,occurrenceKey,referenceCount:rows.length,suspicious:Boolean(consensus),medianStyleScore:rfClamp100(medStyle),medianValueStyleScore:rfClamp100(medValue),medianPositionScore:rfClamp100(medPos),styleHitCount:styleHits,positionHitCount:posHits});
       if(consensus)suspicious.push(aggregate);
     }
 
     const spacingGroups=new Map();
     for(const ref of referenceResults)for(const a of ref.spacingAnomalies||[]){
-      const k=`${a.beforeField}->${a.afterField}`;if(!spacingGroups.has(k))spacingGroups.set(k,[]);spacingGroups.get(k).push(a);
+      const k=`${a.beforeField}|${a.afterField}|${String(a.beforeLabel||'').toLocaleLowerCase('tr-TR')}|${String(a.afterLabel||'').toLocaleLowerCase('tr-TR')}`;
+      if(!spacingGroups.has(k))spacingGroups.set(k,[]);spacingGroups.get(k).push(a);
     }
     const spacingAnomalies=[];
     for(const rows of spacingGroups.values()){
       const med=rfMedianSigned(rows.map(x=>Number(x.score)).filter(Number.isFinite));
       const hits=rows.filter(x=>x.score>=55).length;
-      if((rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45)||(rows.length===1&&med>=72))spacingAnomalies.push({...rows.sort((a,b)=>b.score-a.score)[0],ensembleMedianScore:rfClamp100(med),referenceCountForPair:rows.length});
+      const keep=(rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45)||(rows.length===1&&med>=60);
+      if(keep)spacingAnomalies.push({...rows.sort((a,b)=>b.score-a.score)[0],ensembleMedianScore:rfClamp100(med),referenceCountForPair:rows.length});
     }
 
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
     const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
     const localized=[...new Set([...suspicious.map(x=>x.field),...strongSpacing.flatMap(x=>[x.beforeField,x.afterField])])];
     const score=rfClamp100(
-      Math.min(45,styleMedian*.45)+
-      Math.min(35,suspicious.length*12)+
-      Math.min(20,strongSpacing.length*8)
+      Math.min(40,styleMedian*.40)+
+      Math.min(30,suspicious.length*10)+
+      Math.min(30,strongSpacing.length*15)
     );
-    const severity=suspicious.length>=2&&score>=65?'strong':suspicious.length>=1&&score>=45?'medium':'low';
+    const severity=strongSpacing.length>=1&&score>=45?'strong':suspicious.length>=1&&score>=45?'medium':'low';
     return {
-      available:true,engine:'reference-forensic-engine-v9-generic-fields',bank:normalizedBank,
+      available:true,engine:'reference-forensic-engine-v10-occurrence-semantic-spacing',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
       spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,characterFindingCount:0,characterFindings:[],
@@ -4546,8 +4617,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
       references:referenceResults.map(x=>({file:x.file,fieldCount:x.fieldCount,styleScore:x.styleScore,localAnomalyScore:x.localAnomalyScore,suspiciousFieldCount:x.suspiciousFieldCount,suspiciousFields:x.suspiciousFields,spacingAnomalyCount:x.spacingAnomalyCount,spacingAnomalies:x.spacingAnomalies,referenceQuality:x.referenceQuality})),
       fields,fieldObservations,
       evidence:localized.length
-        ? `Referans ensemble + affine hizalama sonrasında ${suspicious.length} alan ve ${spacingAnomalies.length} yapısal aralık anomalisi eşik geçti: ${localized.join(', ')}.`
-        : `Referans ensemble + affine hizalama sonrasında belirgin yerel render, tipografi veya yapısal aralık anomalisi bulunmadı.`,
+        ? `Referans ensemble + semantik occurrence eşleştirme + affine hizalama sonrasında ${suspicious.length} alan ve ${spacingAnomalies.length} yerel yapısal aralık anomalisi bulundu: ${localized.join(', ')}.`
+        : `Referans ensemble + semantik occurrence eşleştirme + affine hizalama sonrasında belirgin yerel render veya yapısal aralık anomalisi bulunmadı.`,
     };
   }catch(error){
     console.warn('REFERENCE FORENSIC ENGINE HATASI:',error?.message||error);
