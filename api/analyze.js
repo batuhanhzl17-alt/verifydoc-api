@@ -1318,9 +1318,22 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   // compares localized typography/render characteristics against trusted
   // reference documents; it does not compare the literal dynamic values.
   const referenceForensicScore = Number(forensic?.referenceForensics?.score);
-  const editingRisk = Number.isFinite(referenceForensicScore)
+  const referenceMaxSpacing = Number(forensic?.referenceForensics?.maxSpacingScore);
+  let editingRisk = Number.isFinite(referenceForensicScore)
     ? Math.max(0, Math.min(100, Math.round(referenceForensicScore)))
     : 0;
+  // If the reference engine has a high-confidence semantic local-gap anomaly,
+  // make it visible in the editing category even when the other visual signals
+  // are quiet. Require a strong anomaly score and a healthy reference match.
+  const anchorResidual = Number(forensic?.referenceForensics?.references?.[0]?.referenceQuality?.anchorMedianResidual);
+  if (
+    forensic?.referenceForensics?.available === true &&
+    forensic?.referenceForensics?.severity === 'strong' &&
+    Number.isFinite(referenceMaxSpacing) && referenceMaxSpacing >= 85 &&
+    (!Number.isFinite(anchorResidual) || anchorResidual <= 0.06)
+  ) {
+    editingRisk = Math.max(editingRisk, 85);
+  }
 
   const categories = {
     visualRisk,
@@ -2951,9 +2964,20 @@ function classifyReferenceTemplateRole(field, text) {
 }
 
 function referenceFieldRuleForText(text) {
-  const value = String(text || "").toLocaleLowerCase("tr-TR");
+  // OCR can mix Turkish dotted/dotless I (İ/I/ı), especially in JPEG input.
+  // Match rules against the same canonical alphabet used by the forensic
+  // matcher so labels such as İŞLEM TARİHİ are not silently lost.
+  const value = normalizeFieldTextForMatch(String(text || ""));
   for (const rule of REFERENCE_FIELD_RULES) {
-    if (rule.patterns.some((pattern) => pattern.test(value))) return rule;
+    if (rule.patterns.some((pattern) => {
+      try {
+        const flags = String(pattern.flags || "").replace(/i/g, "");
+        const normalizedSource = normalizeFieldTextForMatch(pattern.source);
+        return new RegExp(normalizedSource, flags).test(value);
+      } catch {
+        return pattern.test(String(text || ""));
+      }
+    })) return rule;
   }
   return null;
 }
@@ -3860,8 +3884,9 @@ function rfFocusValueRegion(region, fullText, field) {
 }
 
 function rfCanonicalLabelScore(field, text) {
-  const s = String(text || '').toLocaleLowerCase('tr-TR').trim();
-  const label = rfLabelPart(s);
+  const raw = String(text || '').trim();
+  const s = normalizeFieldTextForMatch(raw);
+  const label = normalizeFieldTextForMatch(rfLabelPart(raw));
   if (!label) return 0;
   const exact = {
     branch: [/^şube\s*adı$/i, /^sube\s*adi$/i, /^şube$/i, /^sube$/i],
@@ -3878,7 +3903,12 @@ function rfCanonicalLabelScore(field, text) {
   };
   const patterns = exact[field] || [];
   let score = 0;
-  if (patterns.some(re => re.test(label))) score += 100;
+  if (patterns.some(re => {
+    try {
+      const flags = String(re.flags || '').replace(/i/g, '');
+      return new RegExp(normalizeFieldTextForMatch(re.source), flags).test(label);
+    } catch { return re.test(label); }
+  })) score += 100;
   else if (label.length <= 42) score += 25;
   if (/[:：]/.test(s)) score += 30;
   // A field label followed by a value is more useful than a generic word
@@ -4422,6 +4452,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         matches=matchAll(refLabels,targetLabels,affine,refSize,targetSize);
         if(matches.length<2)matches=bootstrap;
 
+        console.log('REFERENCE FORENSIC CRITICAL SEMANTIC PAIRS:',JSON.stringify(
+          matches.filter(m=>['iban','date','amount'].includes(m.rl.rule.key) ||
+            ['IBAN NO','İŞLEM TARİHİ','GİDEN FAST TUTARI','TOPLAM TAHSİLAT TUTARI'].some(x=>normalizeFieldTextForMatch(m.rl.labelText).includes(normalizeFieldTextForMatch(x))))
+            .map(m=>({field:m.rl.rule.key,reference:m.rl.labelText,target:m.tl.labelText,xRef:normPoint(m.rl,refSize).x,yRef:normPoint(m.rl,refSize).y,xTarget:normPoint(m.tl,targetSize).x,yTarget:normPoint(m.tl,targetSize).y}))
+        ));
+
         console.log('REFERENCE FORENSIC FIELD MATCHING:',JSON.stringify({
           bank:normalizedBank,reference:path.basename(referencePath),
           referenceFieldCount:refLabels.length,targetFieldCount:targetLabels.length,
@@ -4495,49 +4531,96 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           });
         }
 
-        // LOCAL SEMANTIC SPACING: compare only genuine neighbouring fields in
-        // the SAME normalized column. Cross-column pairs are forbidden. This is
-        // the key correction for cases such as IBAN -> İŞLEM TARİHİ in Yapı Kredi.
-        const matchedForSpacing=matches.map(m=>({
+        // LOCAL SEMANTIC SPACING v2: determine neighbours from the REFERENCE
+        // order first, then compare that exact semantic pair in the target.
+        // The previous implementation selected an arbitrary future field whose
+        // gap happened to be closest to 0.06. That is precisely how IBAN NO could
+        // be paired with VALÖR instead of the actual next left-column field,
+        // İŞLEM TARİHİ.
+        const matchedForSpacing=matches.map((m,i)=>({
           ...m,
+          index:i,
           rp:normPoint(m.rl,refSize),tp:normPoint(m.tl,targetSize),
           field:m.rl.rule.key,label:m.rl.labelText,
         }));
+
+        // Cluster reference X positions into visual columns. We intentionally use
+        // the reference geometry, not target OCR geometry, to define who is a
+        // genuine vertical neighbour. This prevents cross-column false pairs.
+        const refXs=matchedForSpacing.map(m=>m.rp.x).sort((a,b)=>a-b);
+        const columnCenters=[];
+        for(const x of refXs){
+          let bestCol=null,bestDist=Infinity;
+          for(let i=0;i<columnCenters.length;i++){
+            const d=Math.abs(columnCenters[i]-x);
+            if(d<bestDist){bestDist=d;bestCol=i;}
+          }
+          if(bestCol===null || bestDist>.16){
+            columnCenters.push(x);
+          }else{
+            columnCenters[bestCol]=(columnCenters[bestCol]+x)/2;
+          }
+        }
+        // Merge nearby centers again so slightly different OCR label widths do not
+        // split one visual column.
+        columnCenters.sort((a,b)=>a-b);
+        const mergedCenters=[];
+        for(const x of columnCenters){
+          const last=mergedCenters[mergedCenters.length-1];
+          if(last!==undefined && Math.abs(last-x)<=.10) mergedCenters[mergedCenters.length-1]=(last+x)/2;
+          else mergedCenters.push(x);
+        }
+        const getColumn=(x)=>{
+          let bi=0,bd=Infinity;
+          for(let i=0;i<mergedCenters.length;i++){const d=Math.abs(mergedCenters[i]-x);if(d<bd){bd=d;bi=i;}}
+          return bi;
+        };
+        for(const m of matchedForSpacing)m.refColumn=getColumn(m.rp.x);
+
         const spacingAnomalies=[];
         const seenPairs=new Set();
-        for(const a of matchedForSpacing){
+        const ordered=[...matchedForSpacing].sort((a,b)=>a.rp.y-b.rp.y || a.rp.x-b.rp.x);
+        for(const a of ordered){
+          // Only compare to the immediate next matched semantic field in the SAME
+          // reference column. Never jump over an intervening field.
+          const candidates=ordered
+            .filter(b=>b!==a && b.refColumn===a.refColumn && b.rp.y>a.rp.y)
+            .sort((u,v)=>u.rp.y-v.rp.y);
+          const b=candidates[0];
+          if(!b)continue;
+
           const projectedA=rfApplyAffine(affine,a.rp);
-          let best=null;
-          for(const b of matchedForSpacing){
-            if(a===b)continue;
-            if(b.rp.y<=a.rp.y)continue;
-            const projectedB=rfApplyAffine(affine,b.rp);
-            const refDx=Math.abs(b.rp.x-a.rp.x),tarDx=Math.abs(b.tp.x-a.tp.x);
-            // Same column in both reference and target. A wide cross-column
-            // relation (e.g. left IBAN to right-side reference number) is never
-            // considered a local vertical spacing pair.
-            if(refDx>.11||tarDx>.13)continue;
-            const refGap=b.rp.y-a.rp.y;
-            const tarGap=b.tp.y-a.tp.y;
-            const expectedGap=projectedB.y-projectedA.y;
-            if(refGap<=.008||tarGap<=.008||expectedGap<=.008)continue;
-            if(refGap>.16||tarGap>.30)continue;
-            const delta=Math.abs(tarGap-expectedGap),relative=delta/Math.max(expectedGap,.008);
-            const score=rfClamp100(relative*100);
-            if(!best||Math.abs(refGap-.06)<Math.abs((best.b.rp.y-a.rp.y)-.06))best={b,refGap,tarGap,expectedGap,delta,relative,score};
-          }
-          if(!best||best.score<45)continue;
-          const pairKey=`${a.field}:${a.rp.x.toFixed(3)}->${best.b.field}:${best.b.rp.x.toFixed(3)}`;
+          const projectedB=rfApplyAffine(affine,b.rp);
+          const refGap=b.rp.y-a.rp.y;
+          const tarGap=b.tp.y-a.tp.y;
+          const expectedGap=projectedB.y-projectedA.y;
+          const targetDx=Math.abs(b.tp.x-a.tp.x);
+          if(refGap<=.008 || tarGap<=.008 || expectedGap<=.008)continue;
+          if(refGap>.20 || tarGap>.35 || targetDx>.20)continue;
+
+          const delta=Math.abs(tarGap-expectedGap);
+          const relative=delta/Math.max(Math.abs(expectedGap),.008);
+          // Require both an absolute normalized displacement and a relative
+          // change. This suppresses ordinary PDF/JPEG raster noise.
+          if(delta<.015 || relative<.25)continue;
+          const score=rfClamp100((relative*100)*.85 + Math.min(15,delta*180));
+          if(score<45)continue;
+
+          const pairKey=`${a.field}:${a.rp.x.toFixed(3)}:${a.rp.y.toFixed(3)}->${b.field}:${b.rp.x.toFixed(3)}:${b.rp.y.toFixed(3)}`;
           if(seenPairs.has(pairKey))continue;
           seenPairs.add(pairKey);
           spacingAnomalies.push({
-            type:'vertical-field-spacing',beforeField:a.field,afterField:best.b.field,
-            beforeLabel:a.label,afterLabel:best.b.label,
-            referenceGapNorm:Number(best.refGap.toFixed(5)),targetGapNorm:Number(best.tarGap.toFixed(5)),
-            expectedTargetGapNorm:Number(best.expectedGap.toFixed(5)),gapDeltaNorm:Number(best.delta.toFixed(5)),
-            relativeDelta:Number(best.relative.toFixed(3)),score:best.score,
-            severity:best.score>=70?'strong':best.score>=55?'medium':'low',
-            evidence:`Aynı kolon içindeki ${a.label} → ${best.b.label} dikey aralığı affine-normalize referansa göre değişti.`
+            type:'vertical-field-spacing',
+            beforeField:a.field,afterField:b.field,
+            beforeLabel:a.label,afterLabel:b.label,
+            referenceGapNorm:Number(refGap.toFixed(5)),
+            targetGapNorm:Number(tarGap.toFixed(5)),
+            expectedTargetGapNorm:Number(expectedGap.toFixed(5)),
+            gapDeltaNorm:Number(delta.toFixed(5)),
+            relativeDelta:Number(relative.toFixed(3)),
+            score:Number(score.toFixed(1)),
+            severity:score>=70?'strong':score>=55?'medium':'low',
+            evidence:`Referansın aynı görsel kolonundaki ardışık ${a.label} → ${b.label} alan aralığı affine-normalize hedefte değişti.`
           });
         }
         spacingAnomalies.sort((a,b)=>b.score-a.score);
@@ -4600,18 +4683,26 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
 
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
     const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
+    const maxSpacingScore=spacingAnomalies.length?Math.max(...spacingAnomalies.map(x=>Number(x.score)||0)):0;
     const localized=[...new Set([...suspicious.map(x=>x.field),...strongSpacing.flatMap(x=>[x.beforeField,x.afterField])])];
+    // A local geometric change is an independent forensic signal. Do not bury
+    // a very strong, semantically matched gap change merely because the document
+    // was rendered from PDF to JPEG. The score still requires actual semantic
+    // field pairing and affine residual quality, so ordinary raster noise does
+    // not get this floor.
     const score=rfClamp100(
-      Math.min(40,styleMedian*.40)+
-      Math.min(30,suspicious.length*10)+
-      Math.min(30,strongSpacing.length*15)
+      Math.min(35,styleMedian*.30)+
+      Math.min(30,suspicious.length*8)+
+      Math.min(35,Math.max(maxSpacingScore, strongSpacing.length*18)*.35)
     );
-    const severity=strongSpacing.length>=1&&score>=45?'strong':suspicious.length>=1&&score>=45?'medium':'low';
+    const severity=(maxSpacingScore>=85 && strongSpacing.length>=1)?'strong':(strongSpacing.length>=1&&score>=45?'medium':(suspicious.length>=1&&score>=45?'medium':'low'));
     return {
       available:true,engine:'reference-forensic-engine-v10-occurrence-semantic-spacing',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
       spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,characterFindingCount:0,characterFindings:[],
+      localStructuralEdit:strongSpacing.length>=1,
+      maxSpacingScore:Number(maxSpacingScore.toFixed(1)),
       score,severity,
       independentSignals:[suspicious.length>=1,strongSpacing.length>=1,referenceResults.length>=2,suspicious.length>=2].filter(Boolean).length,
       references:referenceResults.map(x=>({file:x.file,fieldCount:x.fieldCount,styleScore:x.styleScore,localAnomalyScore:x.localAnomalyScore,suspiciousFieldCount:x.suspiciousFieldCount,suspiciousFields:x.suspiciousFields,spacingAnomalyCount:x.spacingAnomalyCount,spacingAnomalies:x.spacingAnomalies,referenceQuality:x.referenceQuality})),
@@ -4673,18 +4764,24 @@ function synchronizeReferenceForensicDecision(forensic) {
     ? rfMedianSigned(styleValues)
     : 0;
 
+  const maxSpacingScore = spacing.length
+    ? Math.max(...spacing.map(x => Number(x?.score) || 0))
+    : 0;
+  const reliableLocalSpacing = strongSpacing.some(x => Number(x?.score) >= 85);
   const score = rfClamp100(
-    Math.min(45, styleMedian * 0.45) +
-    Math.min(35, suspiciousFieldCount * 12) +
-    Math.min(20, strongSpacing.length * 8)
+    Math.min(35, styleMedian * 0.35) +
+    Math.min(30, suspiciousFieldCount * 10) +
+    Math.min(35, maxSpacingScore * 0.35 + strongSpacing.length * 5)
   );
 
   const severity =
-    suspiciousFieldCount >= 2 && score >= 65
+    reliableLocalSpacing
       ? 'strong'
-      : suspiciousFieldCount >= 1 && score >= 45
-        ? 'medium'
-        : 'low';
+      : suspiciousFieldCount >= 2 && score >= 65
+        ? 'strong'
+        : suspiciousFieldCount >= 1 && score >= 45
+          ? 'medium'
+          : 'low';
 
   const localized = suspiciousFields;
   const hasEvidence = localized.length > 0;
@@ -4694,6 +4791,8 @@ function synchronizeReferenceForensicDecision(forensic) {
     suspiciousFieldCount,
     suspiciousFields: localized,
     spacingAnomalyCount: spacing.length,
+    maxSpacingScore: Number(maxSpacingScore.toFixed(1)),
+    localStructuralEdit: strongSpacing.length >= 1,
     score,
     severity,
     independentSignals: [
@@ -10937,6 +11036,18 @@ Number(deterministicRiskAfterForensics.overallRisk) || 0;
 
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
+
+// A very strong, semantically matched local geometry anomaly is a deterministic
+// forensic finding. Keep the user-facing suspicious threshold aligned with that
+// evidence instead of allowing a quiet visual/text category mix to dilute it.
+if (
+  referenceForensics?.available === true &&
+  referenceForensics?.severity === 'strong' &&
+  Number(referenceForensics?.maxSpacingScore) >= 85
+) {
+  calculatedRisk.overallRisk = Math.max(46, Number(calculatedRisk.overallRisk) || 0);
+  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
+}
 
 console.log("FINAL RISK RECOMPUTED FROM UPDATED CHECKS:", JSON.stringify({
   overallRisk: calculatedRisk.overallRisk,
