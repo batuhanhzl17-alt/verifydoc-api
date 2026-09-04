@@ -2935,7 +2935,7 @@ const REFERENCE_FIELD_RULES = [
 function classifyReferenceTemplateRole(field, text) {
   const t = String(text || "").toLocaleLowerCase("tr-TR");
   if (field === "amount") {
-    if (/giden\s*fast\s*tutar[ıi]?/.test(t) || /gönderilen\s*(?:fast\s*)?tutar/.test(t) || /transfer\s*tutar/.test(t) || /işlem\s*tutar/.test(t) || /ana\s*tutar/.test(t) || /giden\s*tutar/.test(t)) return "primaryAmount";
+    if (/giden\s*fast\s*tutar[ıi]?/.test(t) || /gönderilen\s*(?:fast\s*)?tutar/.test(t) || /transfer\s*tutar/.test(t) || /işlem\s*tutar/.test(t) || /ana\s*tutar/.test(t) || /giden\s*tutar/.test(t) || /b\s*\/\s*a\s*para\s*cinsi\s*tutar/.test(t)) return "primaryAmount";
     if (/vergi|komisyon|ücret|masraf|toplam\s*(?:işlem|tahsilat)|tahsilat\s*tutar/.test(t)) return "secondaryAmount";
     return "amountOther";
   }
@@ -3563,11 +3563,22 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
           }).filter(x => Number.isFinite(x.cost));
 
           candidates.sort((a,b)=>a.cost-b.cost);
-          const value = candidates[0]?.v;
+
+          // Tutar etiketlerinde en yakın metni körlemesine seçmek güvenli
+          // değildir: Enpara gibi şablonlarda etiket/header'ın yanında
+          // "Giden EFT" gibi başka bir metin de bulunabilir. Önce gerçekten
+          // sayısal/para değeri olan adayı seç. Diğer alanlarda eski yakınlık
+          // davranışı korunur.
+          let value = candidates[0]?.v;
+          if (rule.key === 'amount') {
+            const numericAmount = candidates
+              .filter(({v}) => /[-+]?(?:(?:\d{1,3}(?:[.,]\d{3})+)|\d+)(?:[.,]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i.test(String(v.text || '')))
+              .sort((a,b)=>a.cost-b.cost)[0]?.v;
+            value = numericAmount || null;
+          }
           if (!value) continue;
 
-          // Primary amount fields must contain a numeric/currency value. For
-          // other fields any nearby value is acceptable as a geometry anchor.
+          // Primary amount fields must contain a numeric/currency value.
           if (rule.key === 'amount' && !/(?:\d|TL|TRY|₺|EUR|USD|GBP)/i.test(String(value.text || ''))) continue;
           addRasterField(rule.key, lr, value.region, label.text);
         }
@@ -3817,10 +3828,16 @@ function referenceValueCompatible(field, text, item = null, regions = []) {
       // Çıplak 6-11 haneli sayı müşteri no/sıra no olabilir.
       // Hesap no olarak ancak yanında açık hesap/IBAN bağlamı varsa kabul et.
       const bareAccount = /^\d{6,11}$/.test(t.replace(/\s/g, ""));
-      return hasIban || (hasAccountLabel && !bareAccount) || (!bareAccount && /\d{6,}/.test(t));
+      // Hesap no için yalnızca IBAN veya açık HESAP/ALICI HESAP/GÖNDEREN
+      // HESAP etiketi yanında bulunan değer kabul edilir. "100.000,00 TRY"
+      // gibi tutarların hesap numarasına dönüşmesine izin verme.
+      return hasIban || (hasAccountLabel && !bareAccount);
     }
     case "taxNo":
-      return /\b\d{10,11}\b/.test(t) || /\b\d{3}[- ]\d{7,12}\b/.test(t);
+      // Vergi/TCKN alanında salt uzun bir sayı yeterli değil; aksi halde
+      // büyük tutarlar veya işlem referansları vergi no olarak eşleşebilir.
+      return nearbyFieldLabelScore(field, item, regions) > 0 &&
+        (/\b\d{10,11}\b/.test(t) || /\b\d{3}[- ]\d{7,12}\b/.test(t));
     case "date":
       return /\b\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4}\b/.test(t) && !/^[A-Z ]+$/.test(t);
     case "amount":
@@ -3878,7 +3895,7 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
     const positionDistance = nearestVariant?.distance ?? Infinity;
 
     // Etiketsiz semantik eşleşme çok uzaktaysa reddet.
-    if (labelStrength === 0 && nearbyLabel === 0 && positionDistance > 0.11) continue;
+    if (labelStrength === 0 && nearbyLabel === 0 && positionDistance > 0.065) continue;
 
     let score = Math.min(60, Number(item.score || 0) * 25);
     score += Math.max(labelStrength, nearbyLabel);
@@ -4100,7 +4117,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
 }
 
 // =====================================================
-// TUTAR FORENSICS V4 — ŞABLON + ETİKET + PİKSEL KONTROLÜ
+// TUTAR FORENSICS V5 — ŞABLON + ETİKET + PİKSEL KONTROLÜ (SAFE)
 // =====================================================
 
 // =====================================================
@@ -4422,7 +4439,7 @@ return {available: false, status: "unknown", severity: "none", score: 0, amountT
 }
 
 // Referans profil değişkenleri LOG'dan önce hazırlanmalı.
-// Analyze 17'de log satırı bu değişkenleri initialize edilmeden önce okuyordu
+// Analyze 17/18'de log satırı bu değişkenleri initialize edilmeden önce okuyordu
 // ve Vercel'de TDZ (Temporal Dead Zone) ReferenceError oluşturuyordu.
 let referenceAmountField = null;
 let referenceTemplateAvailable = false;
@@ -4850,7 +4867,95 @@ function buildPrimaryAmountLabelDerivedCandidates() {
   });
 }
 
-const labelDerivedCandidates = buildPrimaryAmountLabelDerivedCandidates();
+function buildDeterministicAmountLabelCandidates() {
+  const regions = ocrResult.regions
+    .filter((item) => item?.text && validRegion(item.region))
+    .map((item) => ({
+      item,
+      text: cleanAmountText(item.text),
+      x1: Number(item.region.x1) || 0,
+      y1: Number(item.region.y1) || 0,
+      x2: Number(item.region.x2) || 0,
+      y2: Number(item.region.y2) || 0,
+    }))
+    .sort((a,b) => a.y1 - b.y1 || a.x1 - b.x1);
+
+  const strong = /giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar|b\s*\/\s*a\s*para\s*cinsi\s*tutar/i;
+  const medium = /(?:para\s*cinsi\s*tutar|\btutar\b|amount)/i;
+  const negative = /müşteri\s*no|musteri\s*no|sorgu\s*no|fiş\s*no|fis\s*no|işlem\s*no|islem\s*no|referans|ettn|iban|hesap\s*no|vergi\s*no|sıra\s*no|sira\s*no/i;
+  const numeric = /^[-+]?\s*(?:₺|€|\$|£)?\s*(?:(?:\d{1,3}(?:[.,]\d{3})+)|\d+)(?:[.,]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
+  const candidates = [];
+
+  for (let i=0; i<regions.length; i++) {
+    const label = regions[i];
+    if (negative.test(label.text)) continue;
+    const labelIsStrong = strong.test(label.text);
+    const labelIsMedium = medium.test(label.text);
+    if (!labelIsStrong && !labelIsMedium) continue;
+
+    const lh = Math.max(8, label.y2-label.y1);
+    const lcy = (label.y1+label.y2)/2;
+    let best = null;
+
+    for (let j=0; j<regions.length; j++) {
+      if (i === j) continue;
+      const value = regions[j];
+      if (!numeric.test(value.text.replace(/\s+/g,' ').trim())) continue;
+      const vcy = (value.y1+value.y2)/2;
+      const sameLine = Math.abs(vcy-lcy) <= Math.max(18, lh*1.8);
+      const rightGap = value.x1 >= label.x2 ? value.x1-label.x2 : Infinity;
+      const belowGap = value.y1 >= label.y2 ? value.y1-label.y2 : Infinity;
+      let cost = Infinity;
+      let relation = null;
+      if (sameLine && rightGap <= Math.max(520, lh*18)) {
+        cost = rightGap/Math.max(1,lh);
+        relation = 'right';
+      } else if (belowGap <= Math.max(120, lh*7) && Math.abs(((value.x1+value.x2)/2)-((label.x1+label.x2)/2)) <= Math.max(300,lh*12)) {
+        cost = 5 + belowGap/Math.max(1,lh);
+        relation = 'below';
+      }
+      if (!Number.isFinite(cost)) continue;
+      if (!best || cost < best.cost) best = { value, cost, relation };
+    }
+
+    if (!best) continue;
+    const score = (labelIsStrong ? 1400 : 1000) + Math.max(0, 120 - Math.min(120, best.cost*8));
+    candidates.push({
+      ...best.value.item,
+      text: best.value.text,
+      labelDerived: true,
+      labelDerivedScore: score,
+      amountCandidateScore: score,
+      referencePositionScore: 0,
+      directLabelEvidence: { score, label: label.text, distance: best.cost, hard: labelIsStrong },
+      reconstructedLabelEvidence: { score, label: label.text, distance: best.cost, hard: labelIsStrong },
+      labelEvidence: { score, positive: [label.text], negative: [] },
+      context: { score: 0, positive: [label.text], negative: [] },
+      anchor: { score: 0, anchors: [] },
+      templateScore: 0,
+      signal: 1,
+      region: best.value.item.region,
+    });
+  }
+
+  const seen = new Set();
+  return candidates.filter(c => {
+    const r=c.region || {};
+    const key=`${r.x1}:${r.y1}:${r.x2}:${r.y2}:${c.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+const labelDerivedCandidates = [
+  ...buildPrimaryAmountLabelDerivedCandidates(),
+  ...buildDeterministicAmountLabelCandidates(),
+].filter((candidate, index, arr) => {
+  const r=candidate.region || {};
+  const key=`${r.x1}:${r.y1}:${r.x2}:${r.y2}:${candidate.text}`;
+  return index === arr.findIndex(x => { const rr=x.region || {}; return `${rr.x1}:${rr.y1}:${rr.x2}:${rr.y2}:${x.text}` === key; });
+});
 
 const allRankedCandidates = groups.map((group) => {
 const baseScore = candidateAmountScore(group);
@@ -4970,7 +5075,7 @@ if (referenceAmountField) {
       selectionMethod = "amount-label-no-anchor";
     } else {
       candidatePool = [];
-      selectionMethod = "reference-unavailable-no-label";
+      selectionMethod = "reference-profile-no-anchor-no-label";
     }
   }
 }
