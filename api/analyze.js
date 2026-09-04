@@ -4281,30 +4281,55 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           });
         }
 
-        // Dikey ritim: global affine çıkarıldıktan sonra ardışık alanların arası
-        // bozulmuşsa bunu doğrudan yakala. Crop/zoom artık bu ölçümü bozmaz.
+        // Dikey ritim: burada ham refGap ile targetGap karşılaştırılmaz.
+        // Çünkü PDF ve JPG farklı ölçeklerde olabilir. Referans etiketinin
+        // AFFINE PROJECTION sonrası beklenen Y mesafesi ile hedefteki gerçek
+        // Y mesafesini karşılaştırıyoruz. Böylece global crop/zoom alarm üretmez;
+        // fakat şablon içindeki tek bir boşluğun büyümesi (ör. IBAN -> İŞLEM TARİHİ)
+        // yakalanır.
         const ordered=[...fieldResults].sort((a,b)=>a.targetLabelYNorm-b.targetLabelYNorm);
         const spacingAnomalies=[];
-        for(let i=0;i<ordered.length-1;i++){
-          const a=ordered[i],b=ordered[i+1];
-          if(a.field===b.field)continue;
-          const refGap=b.referenceLabelYNorm-a.referenceLabelYNorm;
-          const tarGap=b.targetLabelYNorm-a.targetLabelYNorm;
-          if(refGap<=0||tarGap<=0)continue;
-          const delta=Math.abs(tarGap-refGap);
-          const score=rfClamp100(delta/Math.max(refGap,.015)*100);
-          // Ancak komşu alanların ikisi de global hizalamaya makul biçimde uyuyorsa
-          // spacing sinyaline izin veriyoruz.
-          const okA=a.positionScore<62, okB=b.positionScore<62;
-          if(score>=32 && okA && okB){
-            spacingAnomalies.push({
-              type:'vertical-field-spacing',beforeField:a.field,afterField:b.field,
-              referenceGapNorm:Number(refGap.toFixed(5)),targetGapNorm:Number(tarGap.toFixed(5)),
-              gapDeltaNorm:Number(delta.toFixed(5)),score,
-              severity:score>=70?'strong':score>=50?'medium':'low',
-              evidence:`${a.field} → ${b.field} dikey alan aralığı referansa göre belirgin değişti.`
-            });
+        const labelHeights=ordered.map(x=>Math.max(.001, Math.abs(x.referenceLabelYNorm-x.targetLabelYNorm)*0 + .004));
+        const pairCandidates=[];
+        for(let i=0;i<ordered.length;i++){
+          for(let j=i+1;j<ordered.length;j++){
+            const a=ordered[i],b=ordered[j];
+            if(a.field===b.field)continue;
+            const tarGap=b.targetLabelYNorm-a.targetLabelYNorm;
+            if(tarGap<=0)continue;
+            const refPointA={x:a.referenceLabelXNorm,y:a.referenceLabelYNorm};
+            const refPointB={x:b.referenceLabelXNorm,y:b.referenceLabelYNorm};
+            const projA=rfApplyAffine(affine,refPointA);
+            const projB=rfApplyAffine(affine,refPointB);
+            const expectedGap=projB.y-projA.y;
+            if(expectedGap<=0)continue;
+            // Çok uzak ve farklı bölümlerdeki alan çiftleri layout sinyaline
+            // dahil edilmez; aynı kutu içindeki yakın alan aralıklarını hedefleriz.
+            if(expectedGap>0.18 || tarGap>0.24)continue;
+            const delta=Math.abs(tarGap-expectedGap);
+            const relative=delta/Math.max(expectedGap,.008);
+            const score=rfClamp100(relative*100);
+            pairCandidates.push({a,b,expectedGap,tarGap,delta,score});
           }
+        }
+        // Aynı alana ait çok sayıda çift oluşabileceğinden yalnızca en güçlü
+        // birkaç yapısal aralık tutulur; karar metin içeriğine bağlı değildir.
+        pairCandidates.sort((x,y)=>y.score-x.score);
+        const usedSpacingFields=new Set();
+        for(const p of pairCandidates){
+          const {a,b,expectedGap,tarGap,delta,score}=p;
+          if(score<45)break;
+          const pairKey=`${a.field}->${b.field}`;
+          if(usedSpacingFields.has(pairKey))continue;
+          usedSpacingFields.add(pairKey);
+          spacingAnomalies.push({
+            type:'vertical-field-spacing',beforeField:a.field,afterField:b.field,
+            referenceGapNorm:Number(expectedGap.toFixed(5)),targetGapNorm:Number(tarGap.toFixed(5)),
+            gapDeltaNorm:Number(delta.toFixed(5)),score,
+            severity:score>=70?'strong':score>=50?'medium':'low',
+            evidence:`${a.field} → ${b.field} dikey alan aralığı affine-normalize referansa göre belirgin değişti.`
+          });
+          if(spacingAnomalies.length>=8)break;
         }
 
         const suspiciousFields=fieldResults.filter(x=>x.suspicious);
@@ -6287,6 +6312,184 @@ function buildFullTextPrimaryAmountCandidates() {
   }];
 }
 
+
+// =====================================================
+// YAPI KREDİ — FUZZY PRIMARY AMOUNT RECOVERY
+// =====================================================
+// PP-OCR bazı Yapı Kredi görüntülerinde "GİDEN FAST TUTARI" etiketini
+// TUTAR1/TUTARL/IUTARI gibi küçük OCR hatalarıyla okuyabiliyor. Bu durumda
+// önceki tam-regex kapısı çalışmıyor ve tek sayısal aday (ör. komisyon)
+// reference-unmatched sonucuna düşebiliyor.
+// Burada yalnızca Yapı Kredi'nin güçlü ana tutar etiketini fuzzy token
+// eşleşmeyle arıyoruz; müşteri/ref/sorgu numaralarını bu kapıdan geçirmiyoruz.
+function rfLevenshtein(a, b) {
+  a = String(a || '').toUpperCase();
+  b = String(b || '').toUpperCase();
+  const dp = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cur = dp[j];
+      dp[j] = Math.min(
+        dp[j] + 1,
+        dp[j - 1] + 1,
+        prev + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+      prev = cur;
+    }
+  }
+  return dp[b.length];
+}
+
+function rfYapiKrediPrimaryLabel(text) {
+  const normalized = normalizePrimaryAmountOCRText(text || '')
+    .replace(/[^A-Z0-9ĞÜŞİÖÇI\s]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const tokens = normalized.split(' ').filter(Boolean);
+  if (!tokens.length) return false;
+
+  // Strong phrase: GIDEN FAST TUTARI. Allow only small OCR errors.
+  for (let i = 0; i <= tokens.length - 3; i++) {
+    const a = tokens[i], b = tokens[i + 1], c = tokens[i + 2];
+    if (rfLevenshtein(a, 'GIDEN') <= 1 &&
+        rfLevenshtein(b, 'FAST') <= 1 &&
+        rfLevenshtein(c, 'TUTARI') <= 2) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildYapiKrediFuzzyAmountCandidates() {
+  const regions = (ocrResult?.regions || [])
+    .filter((item) => item?.text && validRegion(item.region))
+    .map((item) => ({
+      item,
+      text: cleanAmountText(item.text),
+      x1: Number(item.region.x1) || 0,
+      y1: Number(item.region.y1) || 0,
+      x2: Number(item.region.x2) || 0,
+      y2: Number(item.region.y2) || 0,
+    }))
+    .sort((a, b) => a.y1 - b.y1 || a.x1 - b.x1);
+
+  const numeric = /^[-+]?\s*(?:(?:\d{1,3}(?:[.,\s]\d{3})+)|\d+)(?:[.,]\d{1,2})?\s*(?:TL|TRY)?$/i;
+  const candidates = [];
+
+  // 1) Tek OCR kutusu: label + value.
+  for (const r of regions) {
+    if (!rfYapiKrediPrimaryLabel(r.text)) continue;
+    const matches = [...r.text.matchAll(/[-+]?\s*(?:(?:\d{1,3}(?:[.,\s]\d{3})+)|\d+)(?:[.,]\d{1,2})?/g)];
+    if (!matches.length) continue;
+    // Strong label satırında ilk makul sayı ana tutardır. Müşteri/ref
+    // numaraları excluded by the requirement that this same OCR box carries
+    // the strong GİDEN FAST TUTARI label.
+    const m = matches[0];
+    let value = String(m[0]).replace(/\s+/g, ' ').trim();
+    // Bu Yapı Kredi e-Dekont tipinde GİDEN FAST TUTARI borç/çıkış
+    // tutarıdır. OCR eksi işaretini düşürürse işaretini geri koy.
+    if (/^\d/.test(value)) value = '-' + value;
+    const start = Number(m.index || 0);
+    const span = Math.max(1, r.x2 - r.x1);
+    const totalLen = Math.max(1, r.text.length);
+    const x1 = r.x1 + span * (start / totalLen);
+    const x2 = Math.min(r.x2, x1 + Math.max(12, span * (value.length / totalLen)));
+    candidates.push({
+      ...r.item,
+      text: value,
+      region: { ...r.item.region, x1, x2 },
+      labelDerived: true,
+      inlineLabelDerived: true,
+      fuzzyYapiKrediAmount: true,
+      amountCandidateScore: 6000,
+      score: 6000,
+      signal: 1,
+      referencePositionScore: 700,
+      templateScore: 0,
+      context: { score: 0, positive: [r.text], negative: [] },
+      anchor: { score: 0, anchors: [] },
+      labelEvidence: { score: 6000, positive: [r.text], negative: [] },
+      directLabelEvidence: { score: 6000, label: r.text, distance: 0, hard: true },
+      reconstructedLabelEvidence: { score: 6000, label: r.text, distance: 0, hard: true },
+      inlineAmountLabel: r.text,
+      inlineAmountRole: 'primary-amount-label-fuzzy-yapikredi',
+      inlineAmountSourceRegion: r.item.region,
+    });
+  }
+
+  // 2) Label parçalıysa: aynı satırdaki 10 kutuya kadar birleştir.
+  const lines = [];
+  for (const r of regions) {
+    const cy = (r.y1 + r.y2) / 2;
+    let line = lines.find(l => Math.abs(l.cy - cy) <= Math.max(14, (r.y2-r.y1) * 1.5));
+    if (!line) { line = { cy, items: [] }; lines.push(line); }
+    line.items.push(r);
+  }
+  for (const line of lines) {
+    line.items.sort((a,b) => a.x1-b.x1);
+    for (let i=0; i<line.items.length; i++) {
+      let combined = '';
+      let first = null;
+      let last = null;
+      for (let j=i; j<Math.min(line.items.length, i+10); j++) {
+        const cur = line.items[j];
+        if (last && cur.x1-last.x2 > 220) break;
+        combined = `${combined} ${cur.text}`.trim();
+        first = first || cur;
+        last = cur;
+        if (!rfYapiKrediPrimaryLabel(combined)) continue;
+
+        // Prefer the first numeric token after the label tokens.
+        const labelEnd = combined.search(/(?:TUTARI|TUTARL|TUTAR1|IUTARI)/i);
+        const tail = labelEnd >= 0 ? combined.slice(labelEnd + 5) : combined;
+        const m = tail.match(/[-+]?\s*(?:(?:\d{1,3}(?:[.,\s]\d{3})+)|\d+)(?:[.,]\d{1,2})?/);
+        if (!m) continue;
+
+        let value = String(m[0]).replace(/\s+/g,' ').trim();
+        // If OCR omitted the negative sign, use the Yapı Kredi field role:
+        // GİDEN FAST TUTARI is a debit amount in this receipt layout.
+        if (/^\d/.test(value) && /GIDEN\s+FAST/i.test(combined)) value = '-' + value;
+
+        const source = last?.item || first.item;
+        candidates.push({
+          ...source,
+          text: value,
+          labelDerived: true,
+          inlineLabelDerived: true,
+          fuzzyYapiKrediAmount: true,
+          amountCandidateScore: 6000,
+          score: 6000,
+          signal: 1,
+          referencePositionScore: 700,
+          templateScore: 0,
+          context: { score: 0, positive: [combined], negative: [] },
+          anchor: { score: 0, anchors: [] },
+          labelEvidence: { score: 6000, positive: [combined], negative: [] },
+          directLabelEvidence: { score: 6000, label: combined, distance: 0, hard: true },
+          reconstructedLabelEvidence: { score: 6000, label: combined, distance: 0, hard: true },
+          inlineAmountLabel: combined,
+          inlineAmountRole: 'primary-amount-label-fuzzy-yapikredi',
+          inlineAmountSourceRegion: source.region,
+        });
+        break;
+      }
+    }
+  }
+
+  const seen = new Set();
+  return candidates.filter(c => {
+    const r = c.region || {};
+    const key = `${r.x1}:${r.y1}:${r.x2}:${r.y2}:${c.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+const fuzzyYapiKrediAmountCandidates = buildYapiKrediFuzzyAmountCandidates();
+
 const fullTextPrimaryAmountCandidates = buildFullTextPrimaryAmountCandidates();
 
 const labelDerivedCandidates = [
@@ -6303,6 +6506,7 @@ const labelDerivedCandidates = [
 // Özellikle Yapı Kredi'deki "GİDEN FAST TUTARI :-1000" gibi satırlarda
 // artık referansın sayısal değerine eşleşme aramayacağız.
 const primaryInlineAmountCandidates = [
+  ...fuzzyYapiKrediAmountCandidates,
   ...inlineAmountCandidates.filter((candidate) =>
     candidate.inlineAmountRole === 'primary-amount-label-inline'
   ),
