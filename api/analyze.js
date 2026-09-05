@@ -2290,13 +2290,45 @@ async function runPixelForensics(targetPath, referencePaths = []) {
 
     let referenceComparison = null;
     if (referencePaths.length) {
-      const projection = async (buffer) => {
-        const d = await sharp(buffer).rotate().resize({ width: 128, height: 128, fit: 'fill' }).grayscale().raw().toBuffer();
+      // IMPORTANT: `data` burada Sharp'ın ENCODED JPEG/PNG buffer'ı değil,
+      // `pfBuildRaster()` tarafından üretilen RAW grayscale piksel dizisidir.
+      // Önceki sürümde bu raw buffer doğrudan sharp(buffer) içine verilerek
+      // "Input buffer contains unsupported image format" hatasına yol açıyordu.
+      // Projection artık hem encoded buffer hem de raw raster kabul ediyor.
+      const projection = async (source) => {
+        let d;
+        if (source && source.data && source.width && source.height) {
+          const raw = Buffer.isBuffer(source.data) ? source.data : Buffer.from(source.data);
+          d = await sharp(raw, {
+            raw: { width: Number(source.width), height: Number(source.height), channels: 1 }
+          })
+            .resize({ width: 128, height: 128, fit: 'fill' })
+            .grayscale()
+            .raw()
+            .toBuffer();
+        } else {
+          d = await sharp(source)
+            .rotate()
+            .resize({ width: 128, height: 128, fit: 'fill' })
+            .grayscale()
+            .raw()
+            .toBuffer();
+        }
         const px = new Array(128).fill(0), py = new Array(128).fill(0);
-        for (let y = 0; y < 128; y++) for (let x = 0; x < 128; x++) { const i = y * 128 + x; if (x) px[x] += Math.abs(d[i] - d[i - 1]); if (y) py[y] += Math.abs(d[i] - d[i - 128]); }
+        for (let y = 0; y < 128; y++) {
+          for (let x = 0; x < 128; x++) {
+            const i = y * 128 + x;
+            if (x) px[x] += Math.abs(d[i] - d[i - 1]);
+            if (y) py[y] += Math.abs(d[i] - d[i - 128]);
+          }
+        }
         return { px, py };
       };
-      const targetProjection = await projection(data);
+      const targetProjection = await projection({
+        data,
+        width: info.width,
+        height: info.height
+      });
       const refs = [];
       for (const refPath of referencePaths.slice(0, 5)) {
         try {
