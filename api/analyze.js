@@ -5058,11 +5058,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
 function synchronizeReferenceForensicDecision(forensic) {
   if (!forensic || forensic.available !== true) return forensic;
 
-  const fields = Array.isArray(forensic.fields) ? forensic.fields : [];
+  const fields = Array.isArray(forensic?.fields) ? forensic.fields : [];
   const observations = Array.isArray(forensic.fieldObservations)
     ? forensic.fieldObservations
     : [];
-  const spacing = Array.isArray(forensic.spacingAnomalies)
+  const spacing = Array.isArray(forensic?.spacingAnomalies)
     ? forensic.spacingAnomalies
     : [];
 
@@ -11326,10 +11326,10 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
   // kaynağını kullanıcıya açıklamak zorundadır. Bu nedenle layout bulguları
   // ayrı ve insan okunabilir maddelere çevrilir.
 
-  const spacing = Array.isArray(forensic.spacingAnomalies)
+  const spacing = Array.isArray(forensic?.spacingAnomalies)
     ? forensic.spacingAnomalies
     : [];
-  const fields = Array.isArray(forensic.fields)
+  const fields = Array.isArray(forensic?.fields)
     ? forensic.fields.filter(x => x?.suspicious === true)
     : [];
 
