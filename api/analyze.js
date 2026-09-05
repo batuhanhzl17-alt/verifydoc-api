@@ -2167,9 +2167,39 @@ function pfMAD(values, median = pfMedian(values)) {
   return pfMedian(values.map(v => Math.abs(v - median)));
 }
 
-async function pfBuildRaster(filePath, width = 512, height = 512) {
+async function pfLoadVisualBuffer(filePath) {
+  if (!filePath) throw new Error('Pixel Forensics: hedef dosya yolu yok.');
   const input = await fs.readFile(filePath);
-  return sharp(input).rotate().resize({ width, height, fit: 'fill' }).removeAlpha().grayscale().raw().toBuffer({ resolveWithObject: true });
+  const ext = path.extname(filePath).toLowerCase();
+
+  // PDF'yi Sharp'a doğrudan vermek yerine PDF.js ile ilk sayfayı güvenli
+  // şekilde PNG'ye rasterize et. Böylece PDF hedeflerde
+  // "unsupported image format" hatası oluşmaz.
+  const looksLikePdf = ext === '.pdf' || input.subarray(0, 5).toString() === '%PDF-';
+  if (looksLikePdf) {
+    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(input) }).promise;
+    const rendered = await renderPdfPagePng(pdf, 1, 1.6);
+    if (!rendered?.buffer) throw new Error('Pixel Forensics: PDF ilk sayfası rasterize edilemedi.');
+    return { buffer: rendered.buffer, sourceType: 'pdf' };
+  }
+
+  return { buffer: input, sourceType: 'image' };
+}
+
+async function pfBuildRaster(filePath, width = 512, height = 512) {
+  const loaded = await pfLoadVisualBuffer(filePath);
+  try {
+    return await sharp(loaded.buffer)
+      .rotate()
+      .resize({ width, height, fit: 'fill' })
+      .removeAlpha()
+      .grayscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+  } catch (error) {
+    const ext = path.extname(filePath).toLowerCase() || 'unknown';
+    throw new Error(`Pixel Forensics: görüntü formatı Sharp tarafından çözülemedi (${ext}, ${loaded.sourceType}). ${error?.message || ''}`.trim());
+  }
 }
 
 function pfBlockMetrics(data, width, height, grid = 16) {
@@ -2301,8 +2331,18 @@ async function runPixelForensics(targetPath, referencePaths = []) {
     pixelForensicsCache.set(cacheKey, output);
     return JSON.parse(JSON.stringify(output));
   } catch (error) {
-    console.warn('PIXEL FORENSICS HATASI:', error?.message || error);
-    return { available:false, engine:'pixel-image-forensics-v1', score:0, severity:'none', status:'unknown', metrics:{}, evidence:'Piksel adli incelemesi teknik nedenle tamamlanamadı.' };
+    const message = error?.message || String(error);
+    console.warn('PIXEL FORENSICS HATASI:', message);
+    return {
+      available:false,
+      engine:'pixel-image-forensics-v1',
+      score:null,
+      severity:'unknown',
+      status:'unknown',
+      metrics:{},
+      error: message,
+      evidence:'Piksel/görüntü adli incelemesi teknik nedenle tamamlanamadı; bu nedenle piksel skoru olumlu/olumsuz kanıt olarak kullanılmadı.'
+    };
   }
 }
 
@@ -11119,8 +11159,12 @@ if (layoutForensics) {
 }
 if (referenceForensics) {
   result.referenceForensics = referenceForensics;
+}
 
-  const humanForensicReport = buildHumanReadableReferenceForensicReport(referenceForensics);
+// Referans alan motoru bulgu üretmese bile bağımsız layout motoru
+// "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
+if (referenceForensics || layoutForensics?.available) {
+  const humanForensicReport = buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics);
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     // Telegram/UI için teknik engine cümlesi yerine anlaşılır bulgu metnini kullan.
@@ -11133,7 +11177,9 @@ if (referenceForensics) {
 
 if (pixelForensics) {
   result.pixelForensics = pixelForensics;
-  if (pixelForensics.severity !== "none") result.summary = [result.summary, pixelForensics.evidence].filter(Boolean).join(" ");
+  if (pixelForensics.severity !== "none" || pixelForensics.available === false) {
+    result.summary = [result.summary, pixelForensics.evidence].filter(Boolean).join(" ");
+  }
 }
 
 if (amountForensics) {
@@ -11153,8 +11199,12 @@ if (amountForensics) {
 // Teknik engine çıktısını Telegram kullanıcısının anlayabileceği dile çevirir.
 // Teknik skorlar/loglar korunur; kullanıcıya ise alan + değişikliğin türü +
 // referansa göre yaklaşık büyüklüğü gösterilir.
-function buildHumanReadableReferenceForensicReport(forensic) {
-  if (!forensic?.available) return null;
+function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
+  if (!forensic?.available && !layout?.available) return null;
+
+  // Layout motoru alan adı çıkaramasa bile, "yapısal sapma" cümlesinin
+  // kaynağını kullanıcıya açıklamak zorundadır. Bu nedenle layout bulguları
+  // ayrı ve insan okunabilir maddelere çevrilir.
 
   const spacing = Array.isArray(forensic.spacingAnomalies)
     ? forensic.spacingAnomalies
@@ -11227,6 +11277,55 @@ function buildHumanReadableReferenceForensicReport(forensic) {
       detail: `Bu alanın yazı/görünüm veya yerleşim özellikleri referans dekonttan belirgin biçimde farklı. Değerlendirme: ${severity}.`,
       score,
     });
+  }
+
+  // Alan bazlı engine bir bulgu üretmediyse bile bağımsız layout engine'in
+  // tespit ettiği sınır/kutu değişimleri rapora dahil edilir.
+  if (layout?.available) {
+    const layoutRows = [];
+
+    for (const row of (Array.isArray(layout.localGapAnomalies) ? layout.localGapAnomalies : [])) {
+      const score = Number(row?.score || 0);
+      if (!Number.isFinite(score) || score < 40) continue;
+      const refGap = Number(row.referenceGapNorm);
+      const targetGap = Number(row.targetGapNorm);
+      const rel = Number(row.relativeDelta);
+      const direction = Number.isFinite(targetGap) && Number.isFinite(refGap)
+        ? (targetGap > refGap ? 'daha geniş' : 'daha dar')
+        : 'değişmiş';
+      const severity = score >= 65 ? 'GÜÇLÜ' : score >= 45 ? 'BELİRGİN' : 'ORTA';
+      let detail = `Sayfanın ${Math.round(Number(row.referenceBeforeY || 0) * 100)}–${Math.round(Number(row.referenceAfterY || 0) * 100)}% dikey bölgesindeki yatay sınırlar arasındaki boşluk referansa göre ${direction}.`;
+      if (Number.isFinite(rel)) detail += ` Yaklaşık %${Math.round(Math.abs(rel) * 100)} oranında fark var.`;
+      detail += ` Değerlendirme: ${severity} yapısal farklılık.`;
+      layoutRows.push({
+        type: 'layout-spacing', severity,
+        title: `Sayfa yapısında lokal sınır aralığı farklı`,
+        detail, score,
+      });
+    }
+
+    for (const row of (Array.isArray(layout.containerPairs) ? layout.containerPairs : [])) {
+      const score = Number(row?.score || 0);
+      if (!Number.isFinite(score) || score < 35) continue;
+      const ratio = Number(row.normalizedHeightRatio);
+      const direction = Number.isFinite(ratio) ? (ratio > 1 ? 'daha yüksek' : 'daha düşük') : 'değişmiş';
+      const severity = score >= 35 ? (score >= 65 ? 'GÜÇLÜ' : score >= 45 ? 'BELİRGİN' : 'ORTA') : 'ORTA';
+      let detail = `Sayfanın ${Math.round(Number(row.referenceTopY || 0) * 100)}–${Math.round(Number(row.referenceBottomY || 0) * 100)}% dikey bölgesindeki kutu/sınır yüksekliği referansa göre ${direction}.`;
+      if (Number.isFinite(ratio)) detail += ` Referansa göre yaklaşık %${Math.round(Math.abs(ratio - 1) * 100)} farklı.`;
+      detail += ` Değerlendirme: ${severity} yapısal farklılık.`;
+      layoutRows.push({
+        type: 'layout-container', severity,
+        title: `Sayfa yapısında kutu/sınır yüksekliği farklı`,
+        detail, score,
+      });
+    }
+
+    for (const row of layoutRows.sort((a,b) => b.score - a.score)) {
+      const key = `layout|${row.type}|${row.title}|${row.detail}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      findings.push(row);
+    }
   }
 
   const strongCount = findings.filter(x => x.severity === 'GÜÇLÜ').length;
