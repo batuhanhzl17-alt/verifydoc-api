@@ -1319,9 +1319,13 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   // reference documents; it does not compare the literal dynamic values.
   const referenceForensicScore = Number(forensic?.referenceForensics?.score);
   const referenceMaxSpacing = Number(forensic?.referenceForensics?.maxSpacingScore);
+  const pixelScore = Number(forensic?.pixelForensics?.score);
   let editingRisk = Number.isFinite(referenceForensicScore)
     ? Math.max(0, Math.min(100, Math.round(referenceForensicScore)))
     : 0;
+  if (Number.isFinite(pixelScore)) {
+    editingRisk = Math.max(editingRisk, Math.min(55, Math.round(pixelScore * 0.55)));
+  }
   // If the reference engine has a high-confidence semantic local-gap anomaly,
   // make it visible in the editing category even when the other visual signals
   // are quiet. Require a strong anomaly score and a healthy reference match.
@@ -2135,6 +2139,172 @@ false,
 
 };
 
+
+// =====================================================
+// ANALYZE44 — PIXEL / IMAGE FORENSICS ENGINE v1
+// =====================================================
+// OCR'dan bağımsız görüntü sinyalleri: local texture, edge/sharpness,
+// JPEG re-compression residual, uzak blok benzerliği ve referans projeksiyonu.
+// Bu motor tek başına sahtecilik hükmü vermez.
+// =====================================================
+const pixelForensicsCache = new Map();
+
+function pfClamp(v, min = 0, max = 100) {
+  return Math.max(min, Math.min(max, Number(v) || 0));
+}
+
+function pfMedian(values) {
+  const a = values.filter(Number.isFinite);
+  if (!a.length) return 0;
+  // Büyük piksel dizilerini sıralamak yerine deterministik örnek kullan.
+  const sample = a.length > 4096 ? a.filter((_, i) => i % Math.ceil(a.length / 4096) === 0) : a;
+  sample.sort((x, y) => x - y);
+  const m = Math.floor(sample.length / 2);
+  return sample.length % 2 ? sample[m] : (sample[m - 1] + sample[m]) / 2;
+}
+
+function pfMAD(values, median = pfMedian(values)) {
+  return pfMedian(values.map(v => Math.abs(v - median)));
+}
+
+async function pfBuildRaster(filePath, width = 512, height = 512) {
+  const input = await fs.readFile(filePath);
+  return sharp(input).rotate().resize({ width, height, fit: 'fill' }).removeAlpha().grayscale().raw().toBuffer({ resolveWithObject: true });
+}
+
+function pfBlockMetrics(data, width, height, grid = 16) {
+  const bw = Math.max(4, Math.floor(width / grid));
+  const bh = Math.max(4, Math.floor(height / grid));
+  const blocks = [];
+  for (let gy = 0; gy < grid; gy++) for (let gx = 0; gx < grid; gx++) {
+    const x0 = gx * bw, y0 = gy * bh, x1 = gx === grid - 1 ? width : Math.min(width, x0 + bw), y1 = gy === grid - 1 ? height : Math.min(height, y0 + bh);
+    let sum = 0, sum2 = 0, edge = 0, count = 0;
+    for (let y = y0; y < y1; y++) {
+      const row = y * width;
+      for (let x = x0; x < x1; x++) {
+        const v = data[row + x]; sum += v; sum2 += v * v; count++;
+        if (x + 1 < x1) edge += Math.abs(v - data[row + x + 1]);
+        if (y + 1 < y1) edge += Math.abs(v - data[row + width + x]);
+      }
+    }
+    const mean = count ? sum / count : 0;
+    const variance = count ? Math.max(0, sum2 / count - mean * mean) : 0;
+    blocks.push({ gx, gy, variance, std: Math.sqrt(variance), edgeDensity: count ? edge / (count * 2) : 0 });
+  }
+  return blocks;
+}
+
+function pfOutlierRate(values, z = 3.5) {
+  const median = pfMedian(values);
+  const mad = pfMAD(values, median);
+  const scale = Math.max(1e-6, mad * 1.4826);
+  const outliers = values.filter(v => Math.abs(v - median) / scale > z).length;
+  return values.length ? outliers / values.length : 0;
+}
+
+async function pfELA(filePath) {
+  const original = await pfBuildRaster(filePath);
+  const originalBuffer = Buffer.from(original.data);
+  const recompressed = await sharp(originalBuffer, { raw: { width: original.info.width, height: original.info.height, channels: 1 } }).jpeg({ quality: 88, chromaSubsampling: '4:4:4' }).toBuffer();
+  const reread = await sharp(recompressed).grayscale().raw().toBuffer({ resolveWithObject: true });
+  const diffs = new Array(original.data.length);
+  for (let i = 0; i < original.data.length; i++) diffs[i] = Math.abs(original.data[i] - reread.data[i]);
+  const median = pfMedian(diffs), mad = pfMAD(diffs, median), scale = Math.max(1, mad * 1.4826);
+  const threshold = median + 4 * scale;
+  const high = diffs.filter(v => v > threshold).length;
+  return { medianError: Number(median.toFixed(3)), mad: Number(mad.toFixed(3)), highResidualRate: Number((high / diffs.length).toFixed(5)) };
+}
+
+function pfCloneCandidate(data, width, height, grid = 16) {
+  const bw = Math.floor(width / grid), bh = Math.floor(height / grid), signatures = [];
+  for (let gy = 0; gy < grid; gy++) for (let gx = 0; gx < grid; gx++) {
+    const x0 = gx * bw, y0 = gy * bh, sig = [];
+    for (let sy = 0; sy < 4; sy++) for (let sx = 0; sx < 4; sx++) {
+      const x = Math.min(width - 2, x0 + Math.floor((sx + .5) * bw / 4));
+      const y = Math.min(height - 2, y0 + Math.floor((sy + .5) * bh / 4));
+      const i = y * width + x;
+      sig.push(Math.abs(data[i] - data[i + 1]) + Math.abs(data[i] - data[i + width]));
+    }
+    const m = pfMedian(sig); signatures.push({ gx, gy, sig: sig.map(v => v - m) });
+  }
+  let best = { similarity: 0 };
+  for (let i = 0; i < signatures.length; i++) for (let j = i + 1; j < signatures.length; j++) {
+    const a = signatures[i], b = signatures[j];
+    if (Math.abs(a.gx - b.gx) <= 1 && Math.abs(a.gy - b.gy) <= 1) continue;
+    let mse = 0; for (let k = 0; k < a.sig.length; k++) { const d = a.sig[k] - b.sig[k]; mse += d * d; }
+    const similarity = 1 / (1 + (mse / a.sig.length) / 40);
+    if (similarity > best.similarity) best = { similarity, blockA: [a.gx, a.gy], blockB: [b.gx, b.gy] };
+  }
+  return best;
+}
+
+async function runPixelForensics(targetPath, referencePaths = []) {
+  if (!targetPath) return null;
+  try {
+    const stat = await fs.stat(targetPath);
+    const cacheKey = `pf44:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}`;
+    const cached = pixelForensicsCache.get(cacheKey);
+    if (cached) return JSON.parse(JSON.stringify(cached));
+
+    const raster = await pfBuildRaster(targetPath);
+    const { data, info } = raster;
+    const blocks = pfBlockMetrics(data, info.width, info.height, 16);
+    const varianceRate = pfOutlierRate(blocks.map(b => b.variance));
+    const edgeRate = pfOutlierRate(blocks.map(b => b.edgeDensity));
+    const sharpnessRate = pfOutlierRate(blocks.map(b => b.std));
+    const ela = await pfELA(targetPath);
+    const clone = pfCloneCandidate(data, info.width, info.height, 16);
+    const elaScore = pfClamp(ela.highResidualRate * 700);
+    const textureScore = pfClamp((varianceRate + edgeRate + sharpnessRate) / 3 * 100);
+    const cloneScore = pfClamp(Math.max(0, clone.similarity - 0.94) * 1600);
+
+    let referenceComparison = null;
+    if (referencePaths.length) {
+      const projection = async (buffer) => {
+        const d = await sharp(buffer).rotate().resize({ width: 128, height: 128, fit: 'fill' }).grayscale().raw().toBuffer();
+        const px = new Array(128).fill(0), py = new Array(128).fill(0);
+        for (let y = 0; y < 128; y++) for (let x = 0; x < 128; x++) { const i = y * 128 + x; if (x) px[x] += Math.abs(d[i] - d[i - 1]); if (y) py[y] += Math.abs(d[i] - d[i - 128]); }
+        return { px, py };
+      };
+      const targetProjection = await projection(data);
+      const refs = [];
+      for (const refPath of referencePaths.slice(0, 5)) {
+        try {
+          let refBuffer = await fs.readFile(refPath);
+          if (path.extname(refPath).toLowerCase() === '.pdf') {
+            const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(refBuffer) }).promise;
+            const rendered = await renderPdfPagePng(pdf, 1, 1.0); if (!rendered?.buffer) continue; refBuffer = rendered.buffer;
+          }
+          const rp = await projection(refBuffer);
+          const corr = (a, b) => { const ma = pfMedian(a), mb = pfMedian(b); let n=0,da=0,db=0; for(let i=0;i<a.length;i++){const x=a[i]-ma,y=b[i]-mb;n+=x*y;da+=x*x;db+=y*y;} return n/Math.sqrt(Math.max(1e-9,da*db)); };
+          refs.push({ path: path.basename(refPath), xCorrelation: corr(targetProjection.px, rp.px), yCorrelation: corr(targetProjection.py, rp.py) });
+        } catch {}
+      }
+      if (refs.length) referenceComparison = { count: refs.length, medianXCorrelation: pfMedian(refs.map(r=>r.xCorrelation)), medianYCorrelation: pfMedian(refs.map(r=>r.yCorrelation)), references: refs };
+    }
+
+    const referenceMismatch = referenceComparison ? pfClamp((2 - referenceComparison.medianXCorrelation - referenceComparison.medianYCorrelation) * 35) : 0;
+    const score = Math.round(pfClamp(elaScore * 0.35 + textureScore * 0.25 + cloneScore * 0.10 + referenceMismatch * 0.30));
+    const severity = score >= 70 ? 'strong' : score >= 40 ? 'moderate' : score >= 18 ? 'low' : 'none';
+    const findings = [];
+    if (elaScore >= 55) findings.push('yerel yeniden-kodlama residual yoğunluğu');
+    if (textureScore >= 55) findings.push('bloklar arası doku/keskinlik farklılığı');
+    if (cloneScore >= 55) findings.push('uzak bölgelerde yüksek piksel blok benzerliği');
+    if (referenceMismatch >= 55) findings.push('referanslara göre sayfa içi görüntü/projeksiyon uyumsuzluğu');
+    const output = {
+      available: true, engine: 'pixel-image-forensics-v1', score, severity,
+      status: severity === 'none' ? 'pass' : 'warning',
+      metrics: { ela, elaScore: Math.round(elaScore), textureOutlierRate: Number(varianceRate.toFixed(4)), edgeOutlierRate: Number(edgeRate.toFixed(4)), sharpnessOutlierRate: Number(sharpnessRate.toFixed(4)), textureScore: Math.round(textureScore), cloneScore: Math.round(cloneScore), cloneCandidate: clone, referenceMismatchScore: Math.round(referenceMismatch) },
+      referenceComparison,
+      evidence: findings.length ? `Piksel/görüntü adli incelemesinde ${findings.join(', ')} açısından dikkat gerektiren sinyaller bulundu. Bu bulgular tek başına sahtecilik kanıtı değildir.` : 'Piksel/görüntü adli incelemesinde belirgin bir yerel tutarsızlık sinyali görülmedi. Bu sonuç belgenin kesin olarak gerçek olduğunu kanıtlamaz.'
+    };
+    pixelForensicsCache.set(cacheKey, output);
+    return JSON.parse(JSON.stringify(output));
+  } catch (error) {
+    console.warn('PIXEL FORENSICS HATASI:', error?.message || error);
+    return { available:false, engine:'pixel-image-forensics-v1', score:0, severity:'none', status:'unknown', metrics:{}, evidence:'Piksel adli incelemesi teknik nedenle tamamlanamadı.' };
+  }
+}
 
 // =====================================================
 // FORMIDABLE
@@ -9898,6 +10068,7 @@ let referenceTemplateAnalysis = null;
 let visualForensics = null;
 let layoutForensics = null;
 let referenceForensics = null;
+let pixelForensics = null;
 
 // PDF'yi de görüntü tabanlı forensic hattına sok.
 // OpenAI için orijinal PDF korunur; OCR/geometry/visual forensic için ilk sayfa
@@ -10050,6 +10221,19 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
     console.log("REFERENCE FORENSIC ENGINE:", JSON.stringify(referenceForensics));
   } catch (error) {
     console.warn("REFERENCE FORENSIC ENGINE HATASI:", error?.message || error);
+  }
+}
+
+// =====================================================
+// ANALYZE44 — PIXEL / IMAGE FORENSICS
+// =====================================================
+if ((type === "image" || type === "pdf") && bank && reference) {
+  try {
+    const trustedReferencePaths = await getReferenceFiles(bank);
+    pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
+    console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
+  } catch (error) {
+    console.warn("PIXEL FORENSICS HATASI:", error?.message || error);
   }
 }
 
@@ -10947,6 +11131,11 @@ if (referenceForensics) {
   }
 }
 
+if (pixelForensics) {
+  result.pixelForensics = pixelForensics;
+  if (pixelForensics.severity !== "none") result.summary = [result.summary, pixelForensics.evidence].filter(Boolean).join(" ");
+}
+
 if (amountForensics) {
   result.amountForensics = amountForensics;
   if (amountForensics.selectedAmountText) {
@@ -11134,6 +11323,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   paddleImageOCR,
   referenceTemplateAnalysis,
   referenceForensics,
+  pixelForensics,
 });
 console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
 
