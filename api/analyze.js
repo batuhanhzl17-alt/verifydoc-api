@@ -10935,6 +10935,16 @@ if (layoutForensics) {
 }
 if (referenceForensics) {
   result.referenceForensics = referenceForensics;
+
+  const humanForensicReport = buildHumanReadableReferenceForensicReport(referenceForensics);
+  if (humanForensicReport) {
+    result.referenceForensicReport = humanForensicReport;
+    // Telegram/UI için teknik engine cümlesi yerine anlaşılır bulgu metnini kullan.
+    result.summary = [result.summary, humanForensicReport.userText]
+      .filter(Boolean)
+      .join("\n\n");
+    console.log("HUMAN READABLE FORENSIC REPORT:", JSON.stringify(humanForensicReport));
+  }
 }
 
 if (amountForensics) {
@@ -10946,6 +10956,112 @@ if (amountForensics) {
       status: amountForensics.status,
     }));
   }
+}
+
+// =====================================================
+// KULLANICIYA YÖNELİK FORENSIC BULGU RAPORU
+// =====================================================
+// Teknik engine çıktısını Telegram kullanıcısının anlayabileceği dile çevirir.
+// Teknik skorlar/loglar korunur; kullanıcıya ise alan + değişikliğin türü +
+// referansa göre yaklaşık büyüklüğü gösterilir.
+function buildHumanReadableReferenceForensicReport(forensic) {
+  if (!forensic?.available) return null;
+
+  const spacing = Array.isArray(forensic.spacingAnomalies)
+    ? forensic.spacingAnomalies
+    : [];
+  const fields = Array.isArray(forensic.fields)
+    ? forensic.fields.filter(x => x?.suspicious === true)
+    : [];
+
+  const cleanLabel = (value) => {
+    let s = String(value || '').trim();
+    s = s.replace(/^generic\s*:\s*/i, '');
+    s = s.replace(/\s+/g, ' ').trim();
+    return s || 'alan';
+  };
+
+  const pct = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    return Math.round(Math.abs(n) * 100);
+  };
+
+  const findings = [];
+  const seen = new Set();
+
+  // Önce en anlaşılır ve en güçlü lokal boşluk bulgularını ver.
+  for (const row of [...spacing].sort((a,b) => Number(b?.score||0) - Number(a?.score||0))) {
+    const before = cleanLabel(row.beforeLabel || row.beforeField);
+    const after = cleanLabel(row.afterLabel || row.afterField);
+    const key = `${before}|${after}|${row.type}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const relative = pct(row.relativeDelta);
+    const refGap = Number(row.referenceGapNorm);
+    const targetGap = Number(row.targetGapNorm);
+    let direction = 'değişmiş';
+    if (Number.isFinite(refGap) && Number.isFinite(targetGap)) {
+      direction = targetGap > refGap ? 'daha geniş' : 'daha dar';
+    }
+
+    const severity = Number(row.score) >= 85 ? 'GÜÇLÜ' : Number(row.score) >= 60 ? 'BELİRGİN' : 'ORTA';
+    let detail = `${before} ile ${after} arasındaki dikey boşluk referans dekonta göre ${direction}.`;
+    if (relative !== null) {
+      detail += ` Yaklaşık %${relative} oranında fark var.`;
+    }
+    detail += ` Değerlendirme: ${severity} yapısal farklılık.`;
+
+    findings.push({
+      type: 'spacing',
+      severity,
+      title: `${before} → ${after} arasındaki boşluk`,
+      detail,
+      score: Number(row.score || 0),
+    });
+  }
+
+  // Alan bazlı güçlü render/geometri bulgularını insan diline çevir.
+  for (const row of fields.sort((a,b) => Number(b?.ensembleMedianStyleScore || b?.styleScore || 0) - Number(a?.ensembleMedianStyleScore || a?.styleScore || 0))) {
+    const label = cleanLabel(row.label || row.referenceLabel || row.field);
+    const score = Number(row.ensembleMedianStyleScore ?? row.styleScore ?? 0);
+    if (!Number.isFinite(score) || score < 60) continue;
+    const key = `field|${label}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const severity = score >= 75 ? 'BELİRGİN' : 'ORTA';
+    findings.push({
+      type: 'field',
+      severity,
+      title: `${label} alanında görsel farklılık`,
+      detail: `Bu alanın yazı/görünüm veya yerleşim özellikleri referans dekonttan belirgin biçimde farklı. Değerlendirme: ${severity}.`,
+      score,
+    });
+  }
+
+  const strongCount = findings.filter(x => x.severity === 'GÜÇLÜ').length;
+  const mediumOrStrong = findings.filter(x => ['GÜÇLÜ','BELİRGİN'].includes(x.severity)).length;
+
+  let headline = 'Referans dekontla karşılaştırmada belirgin bir yapısal farklılık tespit edilmedi.';
+  if (strongCount > 0) {
+    headline = `Referans dekontla karşılaştırmada ${strongCount} güçlü yapısal farklılık tespit edildi.`;
+  } else if (mediumOrStrong > 0) {
+    headline = `Referans dekontla karşılaştırmada ${mediumOrStrong} belirgin farklılık tespit edildi.`;
+  }
+
+  return {
+    headline,
+    findings: findings.slice(0, 8),
+    findingCount: findings.length,
+    strongFindingCount: strongCount,
+    userText: findings.length
+      ? [
+          headline,
+          ...findings.slice(0, 6).map((x, i) => `${i + 1}. ${x.title}: ${x.detail}`),
+        ].join('\n')
+      : headline,
+  };
 }
 
 // =====================================================
@@ -11178,8 +11294,9 @@ const finalSuspicious =
 finalScore >= 46;
 
 const finalEvidence =
-result?.amountAnalysis?.evidence ||
+result?.referenceForensicReport?.userText ||
 result?.summary ||
+result?.amountAnalysis?.evidence ||
 "Analiz tamamlandı."
 
 console.log(
