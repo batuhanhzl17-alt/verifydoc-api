@@ -4867,6 +4867,83 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         }
         spacingAnomalies.sort((a,b)=>b.score-a.score);
 
+        // =============================================================
+        // TYPOGRAPHY / GLYPH-RASTER FORENSICS v1
+        // =============================================================
+        // Bu katman gerçek font dosyasını tahmin etmeye çalışmaz. Kamera/JPEG
+        // ve PDF raster farklarını tolere ederek aynı semantik alanın yerel
+        // karakter geometrisini karşılaştırır: karakter oranları, doluluk,
+        // yatay ritim ve Türkçe diakritik bileşenleri. Farklı metinleri
+        // otomatik olarak "font sahteciliği" saymamak için değerlerde içerik
+        // türü/uzunluk kapısı uygulanır. Bu katman risk skoruna henüz dahil
+        // edilmez; yalnızca bağımsız forensic sinyal üretir.
+        const typographyFindings=[];
+        const typographyFieldProfiles=[];
+        for(const m of matches){
+          const key=m.rl.rule.key;
+          const refLabelRegion=rfFocusLabelRegion(m.rl.region,m.rl.text);
+          const tarLabelRegion=rfFocusLabelRegion(m.tl.region,m.tl.text);
+          const refChar=await rfCharacterMetrics(refBuffer,refLabelRegion,refSize);
+          const tarChar=await rfCharacterMetrics(targetBuffer,tarLabelRegion,targetSize);
+          if(!refChar||!tarChar)continue;
+
+          const labelComparable = rfLevenshtein(m.rl.labelText,m.tl.labelText) <= 0.18 ||
+            Number(m.rl.canonicalScore)>=100 || Number(m.tl.canonicalScore)>=70;
+          const labelDistance=rfCharacterDistance(refChar,tarChar);
+          const labelDiaDistance=rfDiacriticDistance(refChar,tarChar,m.rl.labelText,m.tl.labelText);
+          const valueRef=rfFindValueRegion(refRegions,m.rl);
+          const valueTar=rfFindValueRegion(targetRegions,m.tl);
+          let valueDistance=null,valueDiaDistance=null,valueComparable=false;
+          if(valueRef&&valueTar&&rfValueRenderComparable(valueRef.text,valueTar.text)){
+            const vr=await rfCharacterMetrics(refBuffer,valueRef.region,refSize);
+            const vt=await rfCharacterMetrics(targetBuffer,valueTar.region,targetSize);
+            if(vr&&vt){
+              valueComparable=true;
+              valueRef._char=vr;
+              valueTar._char=vt;
+              valueDistance=rfCharacterDistance(vr,vt);
+              valueDiaDistance=rfDiacriticDistance(vr,vt,valueRef.text,valueTar.text);
+            }
+          }
+
+          const labelFinding=rfCharacterFinding(
+            key,refChar,tarChar,labelDistance,labelDiaDistance,m.tl.labelText,
+            labelComparable,1
+          );
+          // Value glyph geometry is only promoted when the actual values are
+          // structurally comparable. This prevents "1000" vs "1490" or a
+          // person's name change from becoming a false font anomaly.
+          const valueFinding=rfCharacterFinding(
+            `${key}:value`,
+            valueComparable ? valueRef._char : null,
+            valueComparable ? valueTar._char : null,
+            valueDistance,valueDiaDistance,valueTar?.text||'',valueComparable,1
+          );
+
+          const profile={
+            field:key,
+            labelReference:m.rl.labelText,
+            labelTarget:m.tl.labelText,
+            labelComparable,
+            labelCharacterDistance:Number.isFinite(labelDistance)?Number(labelDistance.toFixed(4)):null,
+            labelDiacriticDistance:Number.isFinite(labelDiaDistance)?Number(labelDiaDistance.toFixed(4)):null,
+            valueComparable,
+            valueCharacterDistance:Number.isFinite(valueDistance)?Number(valueDistance.toFixed(4)):null,
+            valueDiacriticDistance:Number.isFinite(valueDiaDistance)?Number(valueDiaDistance.toFixed(4)):null,
+            labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
+            labelTargetProfile:{characterWidthToHeight:Number(tarChar.characterWidthToHeight?.toFixed?.(4) ?? tarChar.characterWidthToHeight),characterFillRatio:Number(tarChar.characterFillRatio?.toFixed?.(4) ?? tarChar.characterFillRatio),characterGapToHeight:Number(tarChar.characterGapToHeight?.toFixed?.(4) ?? tarChar.characterGapToHeight),diacriticCount:Number(tarChar.diacriticCount||0)},
+          };
+          typographyFieldProfiles.push(profile);
+          if(labelFinding)typographyFindings.push({...labelFinding,scope:'label'});
+          if(valueFinding)typographyFindings.push({...valueFinding,scope:'value'});
+        }
+
+        const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
+        const typographyScore=rfClamp100(
+          Math.min(45,typographyStrong.length*15)+
+          Math.min(35,typographyFindings.filter(x=>x.severity==='medium').length*8)+
+          Math.min(20,typographyFieldProfiles.filter(x=>x.labelComparable).length>0 ? 10 : 0)
+        );
         const suspiciousFields=fieldResults.filter(x=>x.suspicious);
         const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
         const referenceQuality={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
@@ -4876,7 +4953,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           localAnomalyScore:rfClamp100(suspiciousFields.length*18+strongSpacing.length*18),
           suspiciousFieldCount:suspiciousFields.length,suspiciousFields:[...new Set(suspiciousFields.map(x=>x.field))],
           spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies:spacingAnomalies.slice(0,20),
-          characterFindingCount:0,characterFindings:[],fields:fieldResults,referenceQuality,
+          typographyScore,typographySeverity:typographyStrong.length>=2?'strong':typographyFindings.length?'medium':'none',
+          characterFindingCount:typographyFindings.length,characterFindings:typographyFindings.slice(0,20),
+          typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
+          fields:fieldResults,referenceQuality,
         });
       }catch(error){
         console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:',path.basename(referencePath),error?.message||error);
@@ -4942,7 +5022,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
       available:true,engine:'reference-forensic-engine-v10-occurrence-semantic-spacing',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
-      spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,characterFindingCount:0,characterFindings:[],
+      spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,
+      characterFindingCount:rfMedian(referenceResults.map(x=>Number(x.characterFindingCount)||0)),
+      characterFindings:referenceResults.flatMap(x=>x.characterFindings||[]).slice(0,40),
+      typographyScore:rfClamp100(rfMedian(referenceResults.map(x=>Number(x.typographyScore)||0))),
+      typographySeverity:referenceResults.some(x=>x.typographySeverity==='strong')?'strong':referenceResults.some(x=>x.typographySeverity==='medium')?'medium':'none',
       localStructuralEdit:strongSpacing.length>=1,
       maxSpacingScore:Number(maxSpacingScore.toFixed(1)),
       score,severity,
@@ -4952,6 +5036,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
       evidence:localized.length
         ? `Referans ensemble + semantik occurrence eşleştirme + affine hizalama sonrasında ${suspicious.length} alan ve ${spacingAnomalies.length} yerel yapısal aralık anomalisi bulundu: ${localized.join(', ')}.`
         : `Referans ensemble + semantik occurrence eşleştirme + affine hizalama sonrasında belirgin yerel render veya yapısal aralık anomalisi bulunmadı.`,
+      typographyEvidence:referenceResults.flatMap(x=>x.characterFindings||[]).slice(0,8).map(f=>{
+        const scope=f.scope==='value'?'değer':'etiket';
+        return `${f.field} ${scope}: ${f.evidence}`;
+      }),
     };
   }catch(error){
     console.warn('REFERENCE FORENSIC ENGINE HATASI:',error?.message||error);
