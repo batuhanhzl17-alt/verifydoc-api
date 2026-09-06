@@ -11454,6 +11454,24 @@ if (pixelForensics) {
   }
 }
 
+// =============================================================
+// REFERANS PARMAK İZİ — TEK KULLANICI ÇIKTISI
+// =============================================================
+const referenceFingerprintReport = buildReferenceFingerprintReport(
+  referenceForensics,
+  layoutForensics,
+  pixelForensics
+);
+if (referenceFingerprintReport) {
+  result.referenceFingerprintReport = referenceFingerprintReport;
+  if (referenceFingerprintReport.differenceCount > 0) {
+    result.summary = [result.summary, referenceFingerprintReport.userText]
+      .filter(Boolean)
+      .join("\n\n");
+  }
+  console.log('REFERENCE FINGERPRINT REPORT:', JSON.stringify(referenceFingerprintReport));
+}
+
 if (amountForensics) {
   result.amountForensics = amountForensics;
   if (amountForensics.selectedAmountText) {
@@ -11692,6 +11710,148 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
   };
 }
 
+// =============================================================
+// REFERENCE FINGERPRINT REPORT — v1
+// =============================================================
+// Referans dekontu yalnızca alan koordinatı için değil; belge biçimi,
+// tipografi/render ve piksel davranışı için de baz kabul eder.
+// Bu rapor yeni bir risk skoru üretmez. Yalnızca referanstan ayrılan
+// somut sinyalleri tek bir kullanıcı çıktısında toplar.
+function buildReferenceFingerprintReport(referenceForensics, layout = null, pixel = null) {
+  const hasReference = Boolean(referenceForensics?.available);
+  const hasLayout = Boolean(layout?.available);
+  const hasPixel = Boolean(pixel?.available);
+  if (!hasReference && !hasLayout && !hasPixel) return null;
+
+  const differences = [];
+  const seen = new Set();
+  const push = (category, title, detail, severity = 'BELİRGİN', score = 0, field = null) => {
+    const key = `${category}|${field || ''}|${title}|${detail}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    differences.push({ category, field, title, detail, severity, score: Number(score) || 0 });
+  };
+
+  // 1) BELGE ŞEKLİ / YERLEŞİM
+  const spacing = Array.isArray(referenceForensics?.spacingAnomalies)
+    ? referenceForensics.spacingAnomalies : [];
+  const suspiciousFields = Array.isArray(referenceForensics?.fields)
+    ? referenceForensics.fields.filter(x => x?.suspicious === true) : [];
+  const layoutGaps = Array.isArray(layout?.localGapAnomalies) ? layout.localGapAnomalies : [];
+  const containers = Array.isArray(layout?.containerPairs) ? layout.containerPairs : [];
+  const shapeRows = [
+    ...spacing.map(x => ({ ...x, source: 'reference' })),
+    ...layoutGaps.map(x => ({ ...x, source: 'layout' })),
+    ...containers.map(x => ({ ...x, source: 'layout-container' })),
+  ].filter(x => Number(x?.score) >= 55).sort((a,b) => Number(b.score) - Number(a.score));
+
+  for (const row of shapeRows.slice(0, 6)) {
+    const before = String(row.beforeLabel || row.beforeField || '').trim();
+    const after = String(row.afterLabel || row.afterField || '').trim();
+    const score = Number(row.score) || 0;
+    const severity = score >= 85 ? 'GÜÇLÜ' : score >= 65 ? 'BELİRGİN' : 'ORTA';
+    if (before || after) {
+      push('shape', `${before || 'Alan'} → ${after || 'Alan'} yerleşim farkı`,
+        'Bu iki alan arasındaki yerleşim/boşluk referans dekonttan farklı.', severity, score, before || after);
+    } else {
+      push('shape', 'Belge yerleşiminde fark',
+        'Sayfanın ilgili bölgesindeki kutu/sınır veya yerleşim geometrisi referanstan farklı.', severity, score);
+    }
+  }
+
+  // 2) YAZI / FONT / RASTER PARMAK İZİ
+  // Exact font family is not claimed from raster alone; the comparison is
+  // deliberately phrased as render/font-like difference.
+  const typographyRows = Array.isArray(referenceForensics?.characterFindings)
+    ? referenceForensics.characterFindings : [];
+  const strongTypography = typographyRows.filter(x => x?.severity === 'strong');
+  const mediumTypography = typographyRows.filter(x => x?.severity === 'medium');
+
+  for (const row of [...strongTypography, ...mediumTypography].slice(0, 12)) {
+    const field = String(row?.field || 'alan').replace(/:value$/i, '');
+    const scope = row?.scope === 'value' || String(row?.field || '').endsWith(':value') ? 'değer' : 'etiket';
+    const cd = Number(row?.characterDistance);
+    const dd = Number(row?.diacriticDistance);
+    const score = row?.severity === 'strong' ? 85 : 60;
+    let detail = `${field} ${scope} bölümündeki harf/rakam geometrisi, koyuluk ve raster/kenar davranışı referans dekonttan farklı görünüyor.`;
+    if (Number.isFinite(cd)) detail += ` Karakter raster farkı: ${cd.toFixed(2)}.`;
+    if (Number.isFinite(dd) && dd >= 0.62) detail += ' Türkçe karakter raster farkı da destekleyici sinyal.';
+    push('typography', `${field} ${scope} yazı/render farkı`, detail,
+      row?.severity === 'strong' ? 'GÜÇLÜ' : 'BELİRGİN', score, field);
+  }
+
+  // Field-level style residuals catch cases where the character engine does
+  // not produce a standalone finding but the field's rendering is still far
+  // from the reference.
+  const styleRows = Array.isArray(referenceForensics?.fields)
+    ? referenceForensics.fields : [];
+  for (const row of [...styleRows]
+    .map(x => ({ ...x, _score: Number(x?.ensembleMedianStyleScore ?? x?.styleScore ?? 0) }))
+    .filter(x => x._score >= 70)
+    .sort((a,b) => b._score - a._score)
+    .slice(0, 10)) {
+    const field = String(row?.label || row?.referenceLabel || row?.field || 'alan');
+    push('typography', `${field} alanında yazı görünümü farklı`,
+      'Bu alanın yazı yoğunluğu, kalınlığı/inceliği, karakter aralığı veya raster görünümü referansla uyuşmuyor.',
+      row._score >= 80 ? 'GÜÇLÜ' : 'BELİRGİN', row._score, field);
+  }
+
+  // 3) PİKSEL / GÖRÜNTÜ OYNAMA SİNYALLERİ
+  const pm = pixel?.metrics || {};
+  const pixelSignals = [
+    ['ELA', pm.elaScore, 'yeniden-kodlama/residual'],
+    ['Doku', pm.textureScore, 'lokal doku/keskinlik'],
+    ['Klon', pm.cloneScore, 'uzak bölgeler arası piksel benzerliği'],
+    ['Referans piksel uyumu', pm.referenceMismatchScore, 'referansla sayfa görüntüsü uyumu'],
+  ];
+  for (const [name, rawScore, reason] of pixelSignals) {
+    const score = Number(rawScore);
+    if (!Number.isFinite(score) || score < 55) continue;
+    push('pixel', `${name} farklılığı`,
+      `${reason} açısından referans/görüntü karşılaştırmasında dikkat gerektiren lokal sinyal bulundu. Bu tek başına manipülasyon kanıtı değildir.`,
+      score >= 75 ? 'GÜÇLÜ' : 'BELİRGİN', score);
+  }
+
+  // 4) REFERANSIN KENDİSİNE KARŞI GENEL UYUMLULUK
+  const referenceCount = Number(referenceForensics?.referenceCount || 0);
+  const matchedFieldCount = Number(referenceForensics?.matchedFieldCount || 0);
+  if (hasReference && referenceCount > 0 && matchedFieldCount === 0) {
+    push('shape', 'Referans alan eşleşmesi yetersiz',
+      'Dekont ile referans arasında güvenilir alan eşleşmesi kurulamadığı için görsel farklar kesin yorumlanmamalı.',
+      'ORTA', 40);
+  }
+
+  differences.sort((a,b) => {
+    const sev = { GÜÇLÜ: 3, BELİRGİN: 2, ORTA: 1 };
+    return (sev[b.severity] - sev[a.severity]) || (b.score - a.score);
+  });
+
+  const strong = differences.filter(x => x.severity === 'GÜÇLÜ').length;
+  const notable = differences.filter(x => ['GÜÇLÜ','BELİRGİN'].includes(x.severity)).length;
+
+  return {
+    available: true,
+    engine: 'reference-fingerprint-report-v1',
+    referenceCount,
+    categories: {
+      shape: differences.filter(x => x.category === 'shape').length,
+      typography: differences.filter(x => x.category === 'typography').length,
+      pixel: differences.filter(x => x.category === 'pixel').length,
+    },
+    differenceCount: differences.length,
+    strongDifferenceCount: strong,
+    notableDifferenceCount: notable,
+    differences: differences.slice(0, 20),
+    status: differences.length ? 'differences-found' : 'no-material-difference-found',
+    userText: differences.length
+      ? [
+          '🔎 REFERANS DEKONT KARŞILAŞTIRMASI',
+          ...differences.slice(0, 8).map((x, i) => `${i + 1}. [${x.category.toUpperCase()}] ${x.title}: ${x.detail}`),
+        ].join('\n')
+      : '🔎 REFERANS DEKONT KARŞILAŞTIRMASI\nReferansla karşılaştırmada belirgin şekil, tipografi veya piksel farklılığı tespit edilmedi.',
+  };
+}
+
 // =====================================================
 // FORENSIC EVIDENCE FUSION — v1
 // =====================================================
@@ -11818,6 +11978,10 @@ function fuseForensicEvidence({
       }
     }
   }
+
+  // Reference fingerprint report is a presentation-level aggregation.
+  // It is intentionally not treated as an independent forensic engine, so it
+  // cannot falsely corroborate the engines that produced its inputs.
 
   // Amount engine is kept as a separate semantic field so an amount anomaly
   // cannot accidentally corroborate an unrelated page-wide visual anomaly.
