@@ -4868,66 +4868,128 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         spacingAnomalies.sort((a,b)=>b.score-a.score);
 
         // =============================================================
-        // TYPOGRAPHY / GLYPH-RASTER FORENSICS v1
+        // TYPOGRAPHY / GLYPH-RASTER FORENSICS v2 — PRECISION GATES
         // =============================================================
-        // Bu katman gerçek font dosyasını tahmin etmeye çalışmaz. Kamera/JPEG
-        // ve PDF raster farklarını tolere ederek aynı semantik alanın yerel
-        // karakter geometrisini karşılaştırır: karakter oranları, doluluk,
-        // yatay ritim ve Türkçe diakritik bileşenleri. Farklı metinleri
-        // otomatik olarak "font sahteciliği" saymamak için değerlerde içerik
-        // türü/uzunluk kapısı uygulanır. Bu katman risk skoruna henüz dahil
-        // edilmez; yalnızca bağımsız forensic sinyal üretir.
+        // Typography yalnızca güvenilir, semantik olarak aynı alanlarda çalışır.
+        // Generic OCR etiketleri, birleşik çok-satırlı kutular ve düşük OCR
+        // confidence sonuçları tipografi bulgusu üretmekten bilinçli olarak
+        // çıkarılır. Amaç "her farklı piksel = font farkı" yanlış pozitiflerini
+        // azaltmaktır.
         const typographyFindings=[];
         const typographyFieldProfiles=[];
+        const tpNorm=(v)=>normalizeFieldTextForMatch(String(v||''))
+          .replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
+        const tpDistance=(a,b)=>{
+          const aa=tpNorm(a),bb=tpNorm(b);
+          if(!aa||!bb)return 1;
+          return rfLevenshtein(aa,bb);
+        };
+        const tpConfidence=(x)=>{
+          const n=Number(x?.score ?? x?.confidence ?? x?.ocrConfidence);
+          return Number.isFinite(n) ? n : null;
+        };
+        const tpSingleLine=(text)=>{
+          const s=String(text||'').trim();
+          return !!s && !/[\r\n]/.test(s) && s.length<=70;
+        };
+        const tpValueText=(text)=>{
+          const s=String(text||'').trim();
+          if(!s)return '';
+          const parts=s.split(/[:：]/);
+          return parts.length>1 ? parts.slice(1).join(':').trim() : s;
+        };
+        const tpKind=(text)=>{
+          const s=String(text||'').trim();
+          const hasDigit=/\d/.test(s), hasLetter=/[A-Za-zÇĞİÖŞÜçğıöşü]/.test(s);
+          if(hasDigit&&hasLetter)return 'mixed';
+          if(hasDigit)return 'numeric';
+          if(hasLetter)return 'text';
+          return 'other';
+        };
+        const tpValueComparable=(a,b)=>{
+          const aa=tpValueText(a),bb=tpValueText(b);
+          if(!aa||!bb||!tpSingleLine(aa)||!tpSingleLine(bb))return false;
+          if(tpKind(aa)!==tpKind(bb))return false;
+          const lenRatio=Math.min(aa.length,bb.length)/Math.max(aa.length,bb.length);
+          return lenRatio>=0.65;
+        };
         for(const m of matches){
-          const key=m.rl.rule.key;
-          const refLabelRegion=rfFocusLabelRegion(m.rl.region,m.rl.text);
-          const tarLabelRegion=rfFocusLabelRegion(m.tl.region,m.tl.text);
+          const key=String(m?.rl?.rule?.key||'');
+          if(!key || key.startsWith('generic:')) continue;
+          const refLabelText=String(m?.rl?.labelText||'').trim();
+          const tarLabelText=String(m?.tl?.labelText||'').trim();
+          if(!tpSingleLine(refLabelText)||!tpSingleLine(tarLabelText))continue;
+
+          const labelDistance=tpDistance(refLabelText,tarLabelText);
+          const exactLabel=tpNorm(refLabelText)===tpNorm(tarLabelText);
+          // Typography için fuzzy semantic match yeterli değildir. Aynı gerçek
+          // label veya çok küçük OCR sapması gerekir.
+          const labelComparable=exactLabel || labelDistance<=0.08;
+          if(!labelComparable)continue;
+
+          const refConf=tpConfidence(m.rl);
+          const tarConf=tpConfidence(m.tl);
+          if(refConf!==null && refConf<65)continue;
+          if(tarConf!==null && tarConf<65)continue;
+
+          const refLabelRegion=rfFocusLabelRegion(m.rl.region,refLabelText);
+          const tarLabelRegion=rfFocusLabelRegion(m.tl.region,tarLabelText);
           const refChar=await rfCharacterMetrics(refBuffer,refLabelRegion,refSize);
           const tarChar=await rfCharacterMetrics(targetBuffer,tarLabelRegion,targetSize);
           if(!refChar||!tarChar)continue;
 
-          const labelComparable = rfLevenshtein(m.rl.labelText,m.tl.labelText) <= 0.18 ||
-            Number(m.rl.canonicalScore)>=100 || Number(m.tl.canonicalScore)>=70;
-          const labelDistance=rfCharacterDistance(refChar,tarChar);
-          const labelDiaDistance=rfDiacriticDistance(refChar,tarChar,m.rl.labelText,m.tl.labelText);
-          const valueRef=rfFindValueRegion(refRegions,m.rl);
-          const valueTar=rfFindValueRegion(targetRegions,m.tl);
-          let valueDistance=null,valueDiaDistance=null,valueComparable=false;
-          if(valueRef&&valueTar&&rfValueRenderComparable(valueRef.text,valueTar.text)){
-            const vr=await rfCharacterMetrics(refBuffer,valueRef.region,refSize);
-            const vt=await rfCharacterMetrics(targetBuffer,valueTar.region,targetSize);
-            if(vr&&vt){
-              valueComparable=true;
-              valueRef._char=vr;
-              valueTar._char=vt;
-              valueDistance=rfCharacterDistance(vr,vt);
-              valueDiaDistance=rfDiacriticDistance(vr,vt,valueRef.text,valueTar.text);
+          const labelCharDistance=rfCharacterDistance(refChar,tarChar);
+          const labelDiaDistance=rfDiacriticDistance(refChar,tarChar,refLabelText,tarLabelText);
+
+          const valueRefRaw=rfFindValueRegion(refRegions,m.rl);
+          const valueTarRaw=rfFindValueRegion(targetRegions,m.tl);
+          let valueComparable=false,valueDistance=null,valueDiaDistance=null;
+          let valueRefText='',valueTarText='';
+          if(valueRefRaw&&valueTarRaw){
+            valueRefText=tpValueText(valueRefRaw.text);
+            valueTarText=tpValueText(valueTarRaw.text);
+            valueComparable=tpValueComparable(valueRefText,valueTarText);
+
+            const vrConf=tpConfidence(valueRefRaw);
+            const vtConf=tpConfidence(valueTarRaw);
+            if(vrConf!==null&&vrConf<65)valueComparable=false;
+            if(vtConf!==null&&vtConf<65)valueComparable=false;
+
+            if(valueComparable){
+              const refValueRegion=rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key);
+              const tarValueRegion=rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key);
+              const vr=await rfCharacterMetrics(refBuffer,refValueRegion,refSize);
+              const vt=await rfCharacterMetrics(targetBuffer,tarValueRegion,targetSize);
+              if(vr&&vt){
+                valueDistance=rfCharacterDistance(vr,vt);
+                valueDiaDistance=rfDiacriticDistance(vr,vt,valueRefText,valueTarText);
+              }else valueComparable=false;
             }
           }
 
           const labelFinding=rfCharacterFinding(
-            key,refChar,tarChar,labelDistance,labelDiaDistance,m.tl.labelText,
-            labelComparable,1
+            key,refChar,tarChar,labelCharDistance,labelDiaDistance,tarLabelText,
+            true,1
           );
-          // Value glyph geometry is only promoted when the actual values are
-          // structurally comparable. This prevents "1000" vs "1490" or a
-          // person's name change from becoming a false font anomaly.
           const valueFinding=rfCharacterFinding(
             `${key}:value`,
-            valueComparable ? valueRef._char : null,
-            valueComparable ? valueTar._char : null,
-            valueDistance,valueDiaDistance,valueTar?.text||'',valueComparable,1
+            valueComparable ? await rfCharacterMetrics(refBuffer,rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key),refSize) : null,
+            valueComparable ? await rfCharacterMetrics(targetBuffer,rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key),targetSize) : null,
+            valueDistance,valueDiaDistance,valueTarText,valueComparable,1
           );
 
           const profile={
             field:key,
-            labelReference:m.rl.labelText,
-            labelTarget:m.tl.labelText,
-            labelComparable,
-            labelCharacterDistance:Number.isFinite(labelDistance)?Number(labelDistance.toFixed(4)):null,
+            labelReference:refLabelText,
+            labelTarget:tarLabelText,
+            labelComparable:true,
+            labelMatch:exactLabel?'exact':'near-exact',
+            labelOCRConfidence:{reference:refConf,target:tarConf},
+            labelCharacterDistance:Number.isFinite(labelCharDistance)?Number(labelCharDistance.toFixed(4)):null,
             labelDiacriticDistance:Number.isFinite(labelDiaDistance)?Number(labelDiaDistance.toFixed(4)):null,
             valueComparable,
+            valueReference:valueRefText||null,
+            valueTarget:valueTarText||null,
             valueCharacterDistance:Number.isFinite(valueDistance)?Number(valueDistance.toFixed(4)):null,
             valueDiacriticDistance:Number.isFinite(valueDiaDistance)?Number(valueDiaDistance.toFixed(4)):null,
             labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
@@ -5019,7 +5081,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
     );
     const severity=(maxSpacingScore>=85 && strongSpacing.length>=1)?'strong':(strongSpacing.length>=1&&score>=45?'medium':(suspicious.length>=1&&score>=45?'medium':'low'));
     return {
-      available:true,engine:'reference-forensic-engine-v10-occurrence-semantic-spacing',bank:normalizedBank,
+      available:true,engine:'reference-forensic-engine-v11-occurrence-semantic-spacing-typography-precision',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
       spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,
@@ -5027,6 +5089,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
       characterFindings:referenceResults.flatMap(x=>x.characterFindings||[]).slice(0,40),
       typographyScore:rfClamp100(rfMedian(referenceResults.map(x=>Number(x.typographyScore)||0))),
       typographySeverity:referenceResults.some(x=>x.typographySeverity==='strong')?'strong':referenceResults.some(x=>x.typographySeverity==='medium')?'medium':'none',
+      typographyFieldProfiles:referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).slice(0,60),
       localStructuralEdit:strongSpacing.length>=1,
       maxSpacingScore:Number(maxSpacingScore.toFixed(1)),
       score,severity,
@@ -11288,7 +11351,7 @@ if (referenceForensics) {
   // bağlandığını doğruluyoruz. Risk skoruna dahil edilmez.
   const typographyForensics = {
     available: true,
-    engine: 'reference-glyph-raster-typography-v1',
+    engine: 'reference-glyph-raster-typography-v2-precision',
     score: Number(referenceForensics.typographyScore || 0),
     severity: referenceForensics.typographySeverity || 'none',
     characterFindingCount: Number(referenceForensics.characterFindingCount || 0),
@@ -11518,7 +11581,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
 
   // Typography is an independent forensic section; it does not alter the
   // existing structural headline or deterministic risk score.
-  for (const row of typographyUserFindings.slice(0, 6)) {
+  for (const row of typographyUserFindings.slice(0, 10)) {
     const key = `typography|${row.title}|${row.detail}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -11553,7 +11616,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
       findingCount: typographyRows.length,
       strongFindingCount: typographyStrong.length,
       headline: typographyHeadline,
-      findings: typographyUserFindings.slice(0, 6),
+      findings: typographyUserFindings.slice(0, 10),
     },
     userText: findings.length
       ? [
