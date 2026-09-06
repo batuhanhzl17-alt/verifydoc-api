@@ -11279,6 +11279,31 @@ if (layoutForensics) {
 }
 if (referenceForensics) {
   result.referenceForensics = referenceForensics;
+
+  // =============================================================
+  // TYPOGRAPHY FORENSICS PIPELINE OUTPUT
+  // =============================================================
+  // Typography motoru referenceForensicEngine'in içinde çalışır.
+  // Burada çıktıyı ayrı ve açık biçimde loglayarak gerçekten pipeline'a
+  // bağlandığını doğruluyoruz. Risk skoruna dahil edilmez.
+  const typographyForensics = {
+    available: true,
+    engine: 'reference-glyph-raster-typography-v1',
+    score: Number(referenceForensics.typographyScore || 0),
+    severity: referenceForensics.typographySeverity || 'none',
+    characterFindingCount: Number(referenceForensics.characterFindingCount || 0),
+    characterFindings: Array.isArray(referenceForensics.characterFindings)
+      ? referenceForensics.characterFindings.slice(0, 40)
+      : [],
+    fieldProfiles: Array.isArray(referenceForensics.typographyFieldProfiles)
+      ? referenceForensics.typographyFieldProfiles.slice(0, 30)
+      : [],
+    evidence: Array.isArray(referenceForensics.typographyEvidence)
+      ? referenceForensics.typographyEvidence.slice(0, 12)
+      : []
+  };
+  result.typographyForensics = typographyForensics;
+  console.log('TYPOGRAPHY FORENSICS:', JSON.stringify(typographyForensics));
 }
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
@@ -11448,6 +11473,58 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
     }
   }
 
+  // Typography findings are reported separately from generic layout findings.
+  // This prevents a real typography signal from being silently hidden inside
+  // a generic "yapısal farklılık" sentence.
+  const typographyRows = Array.isArray(forensic?.characterFindings)
+    ? forensic.characterFindings
+    : [];
+  const typographyStrong = typographyRows.filter(x => x?.severity === 'strong');
+  const typographyMedium = typographyRows.filter(x => x?.severity === 'medium');
+  const typographyUserFindings = [];
+  const typographySeen = new Set();
+
+  for (const row of [...typographyRows].sort((a,b) => Number(b?.characterDistance || 0) - Number(a?.characterDistance || 0))) {
+    const field = cleanLabel(row?.field);
+    const scope = row?.scope === 'value' || String(row?.field || '').endsWith(':value')
+      ? 'değer'
+      : 'etiket';
+    const key = `${field}|${scope}|${row?.type || ''}`;
+    if (typographySeen.has(key)) continue;
+    typographySeen.add(key);
+
+    const severity = row?.severity === 'strong' ? 'GÜÇLÜ' : 'BELİRGİN';
+    const parts = [];
+    if (row?.type === 'character-diacritic-render-mismatch') {
+      parts.push('Türkçe karakter/diakritik render özellikleri referanstan ayrılıyor');
+    } else {
+      parts.push('karakter geometrisi ve raster/yazı özellikleri referanstan ayrılıyor');
+    }
+    if (Number.isFinite(Number(row?.characterDistance))) {
+      parts.push(`karakter fark skoru ${Number(row.characterDistance).toFixed(2)}`);
+    }
+    if (Number.isFinite(Number(row?.diacriticDistance))) {
+      parts.push(`diakritik fark skoru ${Number(row.diacriticDistance).toFixed(2)}`);
+    }
+
+    typographyUserFindings.push({
+      type: 'typography',
+      severity,
+      title: `${field} ${scope} tipografik render farklılığı`,
+      detail: `${parts.join('. ')}. Değerlendirme: ${severity} tipografik farklılık.`,
+      score: severity === 'GÜÇLÜ' ? 85 : 60
+    });
+  }
+
+  // Typography is an independent forensic section; it does not alter the
+  // existing structural headline or deterministic risk score.
+  for (const row of typographyUserFindings.slice(0, 6)) {
+    const key = `typography|${row.title}|${row.detail}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    findings.push(row);
+  }
+
   const strongCount = findings.filter(x => x.severity === 'GÜÇLÜ').length;
   const mediumOrStrong = findings.filter(x => ['GÜÇLÜ','BELİRGİN'].includes(x.severity)).length;
 
@@ -11458,17 +11535,33 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
     headline = `Referans dekontla karşılaştırmada ${mediumOrStrong} belirgin farklılık tespit edildi.`;
   }
 
+  const typographyHeadline = typographyStrong.length > 0
+    ? `Tipografi incelemesinde ${typographyStrong.length} güçlü yazı/render farklılığı tespit edildi.`
+    : typographyMedium.length > 0
+      ? `Tipografi incelemesinde ${typographyMedium.length} belirgin yazı/render farklılığı tespit edildi.`
+      : null;
+
   return {
     headline,
     findings: findings.slice(0, 8),
     findingCount: findings.length,
     strongFindingCount: strongCount,
+    typography: {
+      available: Boolean(forensic?.available),
+      score: Number(forensic?.typographyScore || 0),
+      severity: forensic?.typographySeverity || 'none',
+      findingCount: typographyRows.length,
+      strongFindingCount: typographyStrong.length,
+      headline: typographyHeadline,
+      findings: typographyUserFindings.slice(0, 6),
+    },
     userText: findings.length
       ? [
           headline,
           ...findings.slice(0, 6).map((x, i) => `${i + 1}. ${x.title}: ${x.detail}`),
-        ].join('\n')
-      : headline,
+          typographyHeadline ? `\n${typographyHeadline}` : null,
+        ].filter(Boolean).join('\n')
+      : (typographyHeadline ? `${headline}\n\n${typographyHeadline}` : headline),
   };
 }
 
