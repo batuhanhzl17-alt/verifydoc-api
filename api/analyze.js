@@ -11456,7 +11456,8 @@ if (pixelForensics) {
 const referenceFingerprintReport = buildReferenceFingerprintReport(
   referenceForensics,
   layoutForensics,
-  pixelForensics
+  pixelForensics,
+  referenceTemplateAnalysis
 );
 if (referenceFingerprintReport) {
   result.referenceFingerprintReport = referenceFingerprintReport;
@@ -11711,7 +11712,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
 // Kullanıcı çıktısı yalnızca "nerede fark var ve farkın türü ne" sorusunu cevaplar.
 // Teknik skorlar result.referenceFingerprintReport içinde tutulabilir ancak
 // summary/Telegram metnine taşınmaz.
-function buildReferenceFingerprintReport(referenceForensics, layout = null, pixel = null) {
+function buildReferenceFingerprintReport(referenceForensics, layout = null, pixel = null, referenceTemplateAnalysis = null) {
   const hasReference = Boolean(referenceForensics?.available);
   const hasLayout = Boolean(layout?.available);
   const hasPixel = Boolean(pixel?.available);
@@ -11756,8 +11757,25 @@ function buildReferenceFingerprintReport(referenceForensics, layout = null, pixe
     ? layout.localGapAnomalies : [];
   const containers = Array.isArray(layout?.containerPairs)
     ? layout.containerPairs : [];
+  const templateFields = Array.isArray(referenceTemplateAnalysis?.fields)
+    ? referenceTemplateAnalysis.fields : [];
+
+  // Şablon kalibrasyonu güvenilir alan eşleşmesi kurduysa, gerçek farkın
+  // konumunu önce doğrudan bu alanlardan al. Böylece referenceForensics'in
+  // kendi matchedFieldCount alanı eksik olsa bile kullanıcıya "konum
+  // belirlenemedi" demeyiz.
+  const templateShapeRows = templateFields
+    .filter(x => Number(x?.geometryScore) >= 60)
+    .map(x => ({
+      ...x,
+      score: Number(x.geometryScore) || 0,
+      beforeField: x.field || x.label || x.referenceLabel || 'Belge',
+      afterField: null,
+      source: 'template'
+    }));
 
   const shapeRows = [
+    ...templateShapeRows,
     ...spacing.map(x => ({ ...x, source: 'reference' })),
     ...layoutGaps.map(x => ({ ...x, source: 'layout' })),
     ...containers.map(x => ({ ...x, source: 'layout-container' })),
@@ -11770,7 +11788,16 @@ function buildReferenceFingerprintReport(referenceForensics, layout = null, pixe
     const after = fieldName(row.afterLabel || row.afterField);
     const score = Number(row.score) || 0;
     const severity = score >= 85 ? 'GÜÇLÜ' : 'BELİRGİN';
-    if (before !== 'Alan' || after !== 'Alan') {
+    if (row.source === 'template' && before !== 'Belge' && before !== 'Alan') {
+      push(
+        'shape',
+        before,
+        `${before} alanında yerleşim farkı`,
+        'Bu alanın konumu veya ölçüsü referans dekonttan farklı.',
+        severity,
+        score
+      );
+    } else if (before !== 'Alan' || after !== 'Alan') {
       push(
         'shape',
         `${before} / ${after}`,
@@ -11850,9 +11877,15 @@ function buildReferenceFingerprintReport(referenceForensics, layout = null, pixe
   }
 
   // 4) ALAN EŞLEŞMESİ YETERSİZSE FARK UYDURMA.
-  const referenceCount = Number(referenceForensics?.referenceCount || 0);
-  const matchedFieldCount = Number(referenceForensics?.matchedFieldCount || 0);
-  if (hasReference && referenceCount > 0 && matchedFieldCount === 0) {
+  const referenceCount = Number(
+    referenceForensics?.referenceCount || referenceTemplateAnalysis?.referenceCount || 0
+  );
+  const matchedFieldCount = Number(
+    referenceForensics?.matchedFieldCount || referenceTemplateAnalysis?.matchedFieldCount || 0
+  );
+  // Gerçek şablon eşleşmesi varsa referenceForensics tarafındaki eksik/uyumsuz
+  // sayaç yüzünden kullanıcıya "konum belirlenemedi" mesajı gösterme.
+  if (hasReference && referenceCount > 0 && matchedFieldCount === 0 && differences.length === 0) {
     return {
       available: true,
       engine: 'reference-fingerprint-report-v2',
@@ -12180,29 +12213,10 @@ amountForensics.evidence,
 .join(" ");
 }
 
-// Görsel forensics güçlü bir sapma bulduğunda, tek başına değil,
-// referans alan eşleşmeleri/missing alanlar gibi bağımsız yapı sinyalleriyle birlikte
-// nihai risk için bir alt sınır uygulanır.
-if (visualForensics?.available && visualForensics?.severity === "strong") {
-  const structuralSupport =
-    Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
-    Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
-  if (structuralSupport) {
-    result.summary = [result.summary, visualForensics.evidence].filter(Boolean).join(" ");
-  }
-}
-
-// Yapısal geometri çok güçlü biçimde referanstan sapıyorsa, yalnızca AI'ın
-// düşük skor vermesine izin verme. Bu hâlâ adli bir sinyaldir; kesin sahtecilik
-// hükmü değildir.
-if (layoutForensics?.available && layoutForensics.severity === "strong") {
-  // Layout sinyali artık kendi sayısal skoru üzerinden risk motoruna girer;
-  // tek başına sabit 70 tabanı uygulanmaz.
-  result.summary = [result.summary, layoutForensics.evidence].filter(Boolean).join(" ");
-}
-
-if (referenceForensics?.available && referenceForensics.severity !== "low") {
-  result.summary = [result.summary, referenceForensics.evidence].filter(Boolean).join(" ");
+// Kullanıcı özeti burada tekrar teknik motor cümleleriyle kirletilmez.
+// Telegram/UI için tek kaynak referenceFingerprintReport.userText'tir.
+if (referenceFingerprintReport?.userText) {
+  result.summary = referenceFingerprintReport.userText;
 }
 
 // FINAL RISK IS NOW INDEPENDENT FROM AI-GENERATED CHECK SCORES.
@@ -12376,7 +12390,7 @@ const finalSuspicious =
 finalScore >= 46;
 
 const finalEvidence =
-result?.referenceForensicReport?.userText ||
+result?.referenceFingerprintReport?.userText ||
 result?.summary ||
 result?.amountAnalysis?.evidence ||
 "Analiz tamamlandı."
