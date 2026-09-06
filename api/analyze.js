@@ -4924,7 +4924,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             branch:[/^sube(?:\s+adi)?$/i],
             date:[/^islem\s+tarihi(?:\s+ve\s+saati)?$/i,/^tarih$/i],
             time:[/^saat$/i,/^islem\s+saati$/i],
-            description:[/^aciklama$/i,^description$/i],
+            description:[/^aciklama$/i,/^description$/i],
             transactionNo:[/^(fis|islem|referans|sorgu)\s+(no|numarasi|numarası)$/i],
             accountNo:[/^(musteri|hesap)\s+(no|numarasi|numarası)$/i],
             taxNo:[/^vergi\s+(no|numarasi|numarası)$/i,/^tckn$/i],
