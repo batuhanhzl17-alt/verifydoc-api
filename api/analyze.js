@@ -4922,8 +4922,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           const n=normalizeFieldTextForMatch(label);
           const patterns={
             branch:[/^sube(?:\s+adi)?$/i],
-            date:[/^islem\s+tarihi(?:\s+ve\s+saati)?$/i,^tarih$/i],
-            time:[/^saat$/i,^islem\s+saati$/i],
+            date:[/^islem\s+tarihi(?:\s+ve\s+saati)?$/i,/^tarih$/i],
+            time:[/^saat$/i,/^islem\s+saati$/i],
             description:[/^aciklama$/i,^description$/i],
             transactionNo:[/^(fis|islem|referans|sorgu)\s+(no|numarasi|numarası)$/i],
             accountNo:[/^(musteri|hesap)\s+(no|numarasi|numarası)$/i],
