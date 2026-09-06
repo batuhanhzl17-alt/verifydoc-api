@@ -2255,15 +2255,31 @@ function pfCloneCandidate(data, width, height, grid = 16) {
       const i = y * width + x;
       sig.push(Math.abs(data[i] - data[i + 1]) + Math.abs(data[i] - data[i + width]));
     }
-    const m = pfMedian(sig); signatures.push({ gx, gy, sig: sig.map(v => v - m) });
+    // Flat/near-empty regions (white paper, margins, blank boxes) naturally
+    // produce identical signatures. They must never be reported as clone/copy.
+    const activity = sig.reduce((a, b) => a + b, 0) / sig.length;
+    const spread = Math.max(...sig) - Math.min(...sig);
+    if (activity < 5 || spread < 4) continue;
+    const m = pfMedian(sig);
+    signatures.push({ gx, gy, activity, spread, sig: sig.map(v => v - m) });
   }
   let best = { similarity: 0 };
   for (let i = 0; i < signatures.length; i++) for (let j = i + 1; j < signatures.length; j++) {
     const a = signatures[i], b = signatures[j];
     if (Math.abs(a.gx - b.gx) <= 1 && Math.abs(a.gy - b.gy) <= 1) continue;
+    // Require both regions to contain comparable non-trivial image structure.
+    const activityRatio = Math.min(a.activity, b.activity) / Math.max(a.activity, b.activity);
+    if (activityRatio < 0.55) continue;
     let mse = 0; for (let k = 0; k < a.sig.length; k++) { const d = a.sig[k] - b.sig[k]; mse += d * d; }
     const similarity = 1 / (1 + (mse / a.sig.length) / 40);
-    if (similarity > best.similarity) best = { similarity, blockA: [a.gx, a.gy], blockB: [b.gx, b.gy] };
+    if (similarity > best.similarity) best = {
+      similarity,
+      blockA: [a.gx, a.gy],
+      blockB: [b.gx, b.gy],
+      activityA: Number(a.activity.toFixed(2)),
+      activityB: Number(b.activity.toFixed(2)),
+      activityRatio: Number(activityRatio.toFixed(3))
+    };
   }
   return best;
 }
@@ -11706,232 +11722,257 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
 }
 
 // =============================================================
-// REFERENCE FINGERPRINT REPORT — v2
+// REFERENCE FINGERPRINT REPORT — v3 AGENT
 // =============================================================
 // Referans dekont = görsel/tipografik parmak izi.
 // Kullanıcı çıktısı yalnızca "nerede fark var ve farkın türü ne" sorusunu cevaplar.
 // Teknik skorlar result.referenceFingerprintReport içinde tutulabilir ancak
 // summary/Telegram metnine taşınmaz.
 function buildReferenceFingerprintReport(referenceForensics, layout = null, pixel = null, referenceTemplateAnalysis = null) {
-  const hasReference = Boolean(referenceForensics?.available);
+  // =============================================================
+  // USER-FACING REFERENCE AGENT — sade çıktı
+  // -------------------------------------------------------------
+  // Referans dekont "normal" kabul edilen görsel/tipografik parmak izidir.
+  // Burada amaç skor göstermek değil, yalnızca somut ve yerelleştirilebilir
+  // farkları söylemektir. Teknik motorların ham çıktıları result.* altında
+  // tutulur; Telegram summary'ye taşınmaz.
+  // =============================================================
+  const hasReference = Boolean(referenceForensics?.available || referenceTemplateAnalysis?.referenceCount);
   const hasLayout = Boolean(layout?.available);
   const hasPixel = Boolean(pixel?.available);
   if (!hasReference && !hasLayout && !hasPixel) return null;
 
   const differences = [];
+  const compatible = [];
   const seen = new Set();
-  const push = (category, field, title, detail, severity = 'BELİRGİN', score = 0) => {
-    const cleanField = String(field || '').trim() || null;
-    const cleanTitle = String(title || '').trim();
-    const cleanDetail = String(detail || '').trim();
-    if (!cleanTitle || !cleanDetail) return;
-    // Aynı alan + aynı fark türü farklı motorlardan tekrar gelirse tek satır göster.
-    const key = `${category}|${cleanField || ''}|${cleanTitle}`.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    differences.push({
-      category,
-      field: cleanField,
-      title: cleanTitle,
-      detail: cleanDetail,
-      severity,
-      score: Number(score) || 0
-    });
-  };
 
-  const fieldName = (value) => {
-    const raw = String(value || '').trim();
-    if (!raw) return 'Alan';
-    return raw
+  const cleanField = (value) => {
+    const s = String(value || '')
       .replace(/^generic\s*:\s*/i, '')
       .replace(/:value$/i, '')
       .replace(/\s+/g, ' ')
-      .trim() || 'Alan';
+      .trim();
+    return s || 'Belge';
   };
 
-  // 1) BELGE ŞEKLİ / YERLEŞİM
-  // Düşük seviyeli spacing gürültüsünü kullanıcıya göstermiyoruz.
-  const spacing = Array.isArray(referenceForensics?.spacingAnomalies)
-    ? referenceForensics.spacingAnomalies : [];
-  const layoutGaps = Array.isArray(layout?.localGapAnomalies)
-    ? layout.localGapAnomalies : [];
-  const containers = Array.isArray(layout?.containerPairs)
-    ? layout.containerPairs : [];
+  const addDifference = (category, field, title, detail, strength = 'belirgin', score = 0) => {
+    const f = cleanField(field);
+    const t = String(title || '').trim();
+    const d = String(detail || '').trim();
+    if (!t || !d) return;
+    const key = `${category}|${f}|${t}`.toLocaleLowerCase('tr-TR');
+    if (seen.has(key)) return;
+    seen.add(key);
+    differences.push({ category, field: f, title: t, detail: d, strength, score: Number(score) || 0 });
+  };
+
+  const addCompatible = (field, detail) => {
+    const f = cleanField(field);
+    if (!detail) return;
+    const key = `${f}|${detail}`.toLocaleLowerCase('tr-TR');
+    if (compatible.some(x => `${x.field}|${x.detail}`.toLocaleLowerCase('tr-TR') === key)) return;
+    compatible.push({ field: f, detail });
+  };
+
+  // -------------------------------------------------------------
+  // 1) ALAN / GEOMETRİ KARŞILAŞTIRMASI
+  // -------------------------------------------------------------
+  // KRİTİK: referenceTemplateAnalysis.geometryScore bir BENZERLİK skorudur.
+  // Yüksek skor = uyumlu, düşük skor = geometrik fark. Önceki sürüm bunun
+  // tersini okuyordu ve sağlam eşleşmeleri yanlışlıkla "fark" diye raporluyordu.
   const templateFields = Array.isArray(referenceTemplateAnalysis?.fields)
     ? referenceTemplateAnalysis.fields : [];
 
-  // Şablon kalibrasyonu güvenilir alan eşleşmesi kurduysa, gerçek farkın
-  // konumunu önce doğrudan bu alanlardan al. Böylece referenceForensics'in
-  // kendi matchedFieldCount alanı eksik olsa bile kullanıcıya "konum
-  // belirlenemedi" demeyiz.
-  const templateShapeRows = templateFields
-    .filter(x => Number(x?.geometryScore) >= 60)
-    .map(x => ({
-      ...x,
-      score: Number(x.geometryScore) || 0,
-      beforeField: x.field || x.label || x.referenceLabel || 'Belge',
-      afterField: null,
-      source: 'template'
-    }));
+  for (const row of templateFields) {
+    const field = cleanField(row?.field || row?.label || row?.referenceLabel);
+    const geometryScore = Number(row?.geometryScore);
+    if (!Number.isFinite(geometryScore)) continue;
 
-  const shapeRows = [
-    ...templateShapeRows,
-    ...spacing.map(x => ({ ...x, source: 'reference' })),
-    ...layoutGaps.map(x => ({ ...x, source: 'layout' })),
-    ...containers.map(x => ({ ...x, source: 'layout-container' })),
-  ]
-    .filter(x => Number(x?.score) >= 65)
-    .sort((a, b) => Number(b.score) - Number(a.score));
-
-  for (const row of shapeRows.slice(0, 6)) {
-    const before = fieldName(row.beforeLabel || row.beforeField);
-    const after = fieldName(row.afterLabel || row.afterField);
-    const score = Number(row.score) || 0;
-    const severity = score >= 85 ? 'GÜÇLÜ' : 'BELİRGİN';
-    if (row.source === 'template' && before !== 'Belge' && before !== 'Alan') {
-      push(
-        'shape',
-        before,
-        `${before} alanında yerleşim farkı`,
-        'Bu alanın konumu veya ölçüsü referans dekonttan farklı.',
-        severity,
-        score
+    if (geometryScore <= 42) {
+      addDifference(
+        'shape', field,
+        `${field} alanında yerleşim farkı`,
+        'Bu alanın konumu veya ölçüsü referans dekonttan belirgin biçimde farklı.',
+        geometryScore <= 25 ? 'güçlü' : 'belirgin',
+        100 - geometryScore
       );
-    } else if (before !== 'Alan' || after !== 'Alan') {
-      push(
-        'shape',
-        `${before} / ${after}`,
-        `${before} ile ${after} arasında yerleşim farkı`,
-        'Bu iki bölüm arasındaki konum veya boşluk referans dekonttan farklı.',
-        severity,
-        score
-      );
-    } else {
-      push(
-        'shape',
-        'Belge',
-        'Belge yerleşiminde fark',
-        'İlgili bölümün kutu, sınır veya genel geometrisi referans dekonttan farklı.',
-        severity,
-        score
-      );
+    } else if (geometryScore >= 78) {
+      addCompatible(field, 'yerleşim referansla uyumlu');
     }
   }
 
-  // 2) YAZI / FONT / HARF-RAMAK RENDER FARKI
-  // Türkçe diakritik farkı tek başına bulgu değildir; characterFindings zaten
-  // bu kapıdan geçmiş güçlü/orta geometri sinyallerini içerir.
+  // Reference spacing / layout anomaly skorları ters değil: yüksek skor
+  // anomaly anlamına gelir. Yalnızca güçlü lokal anomalileri göster.
+  const spacingRows = [
+    ...(Array.isArray(referenceForensics?.spacingAnomalies) ? referenceForensics.spacingAnomalies : []),
+    ...(Array.isArray(layout?.localGapAnomalies) ? layout.localGapAnomalies : []),
+  ];
+
+  for (const row of spacingRows.sort((a, b) => Number(b?.score || 0) - Number(a?.score || 0))) {
+    const score = Number(row?.score);
+    if (!Number.isFinite(score) || score < 78) continue;
+    const before = cleanField(row?.beforeLabel || row?.beforeField);
+    const after = cleanField(row?.afterLabel || row?.afterField);
+    addDifference(
+      'shape',
+      `${before} / ${after}`,
+      `${before} ile ${after} arasında yerleşim farkı`,
+      'Bu iki bölüm arasındaki boşluk veya hizalama referans dekonttan farklı.',
+      score >= 90 ? 'güçlü' : 'belirgin',
+      score
+    );
+  }
+
+  // Container anomaly: yalnızca alan/bölüm gerçekten lokalize edilebiliyorsa.
+  for (const row of (Array.isArray(layout?.containerPairs) ? layout.containerPairs : [])) {
+    const score = Number(row?.score);
+    if (!Number.isFinite(score) || score < 82) continue;
+    const field = cleanField(row?.field || row?.label);
+    if (field === 'Belge') continue;
+    addDifference(
+      'shape', field,
+      `${field} bölümünde kutu/geometri farkı`,
+      'Bölümün sınırı veya geometrisi referans dekonttan farklı.',
+      score >= 92 ? 'güçlü' : 'belirgin',
+      score
+    );
+  }
+
+  // -------------------------------------------------------------
+  // 2) YAZI / FONT / HARF-RAMAK RENDER
+  // -------------------------------------------------------------
   const typographyRows = Array.isArray(referenceForensics?.characterFindings)
     ? referenceForensics.characterFindings : [];
 
-  for (const row of typographyRows
-    .filter(x => x?.severity === 'strong')
-    .slice(0, 10)) {
-    const field = fieldName(row?.field);
-    const isValue = row?.scope === 'value' || String(row?.field || '').endsWith(':value');
-    push(
-      'typography',
-      field,
-      `${field} ${isValue ? 'değerinde' : 'yazısında'} font/render farkı`,
-      `Harf/rakam şekli, yazı koyuluğu-inceliği, karakter aralığı veya piksel kenar yapısı referans dekonttan farklı görünüyor.`,
-      'GÜÇLÜ',
+  for (const row of typographyRows) {
+    if (String(row?.severity || '').toLowerCase() !== 'strong') continue;
+    const field = cleanField(row?.field);
+    const isValue = row?.scope === 'value' || /:value$/i.test(String(row?.field || ''));
+    addDifference(
+      'typography', field,
+      `${field} ${isValue ? 'değerinde' : 'yazısında'} font/raster farkı`,
+      `Harf/rakam biçimi, yazı kalınlığı-inceliği, karakter aralığı veya kenar yapısı referans dekonttan farklı.`,
+      'güçlü',
       85
     );
   }
 
-  // Character engine bulgu vermese bile çok güçlü alan-stil sapması varsa göster.
+  // Character engine bulgusu yoksa, çok güçlü alan-stil anomalisi kullanılabilir.
+  // Ancak bunu "font kesin farklı" değil, gözlenen render farkı olarak ifade et.
   const styleRows = Array.isArray(referenceForensics?.fields)
     ? referenceForensics.fields : [];
   for (const row of styleRows
     .map(x => ({ ...x, _score: Number(x?.ensembleMedianStyleScore ?? x?.styleScore ?? 0) }))
-    .filter(x => x._score >= 80)
+    .filter(x => Number.isFinite(x._score) && x._score >= 82)
     .sort((a, b) => b._score - a._score)
     .slice(0, 8)) {
-    const field = fieldName(row?.label || row?.referenceLabel || row?.field);
-    push(
-      'typography',
-      field,
-      `${field} yazı görünümü farklı`,
+    const field = cleanField(row?.label || row?.referenceLabel || row?.field);
+    addDifference(
+      'typography', field,
+      `${field} yazı görünümünde fark`,
       'Yazı yoğunluğu, kalınlığı/inceliği, karakter aralığı veya raster görünümü referansla uyuşmuyor.',
-      'GÜÇLÜ',
+      'belirgin',
       row._score
     );
   }
 
+  // -------------------------------------------------------------
   // 3) PİKSEL / GÖRÜNTÜ OYNAMA
-  // ELA/texture gibi sinyaller tek başına "değiştirilmiş" hükmü değildir.
-  // Yalnızca güçlü ve anlamlı lokal/reference mismatch sinyallerini kullanıcıya çıkar.
+  // -------------------------------------------------------------
+  // ELA/texture gibi global skorlar tek başına "şurada oynama" demek için
+  // yeterli değildir. Konum verisi yoksa bunları kullanıcıya fark diye yazma.
+  // Reference mismatch yalnızca gerçekten lokal alan bilgisi taşıyan bir
+  // pixel bulgusu varsa gösterilir.
   const pm = pixel?.metrics || {};
-  const pixelCandidates = [
-    ['Referans piksel uyumu', pm.referenceMismatchScore,
-      'Bu bölgede piksel yapısı referans dekonttan belirgin biçimde ayrılıyor.'],
-    ['Klonlama / kopyalama izi', pm.cloneScore,
-      'Görüntü içinde kopyalanmış bölgeyi düşündüren piksel benzerliği bulundu.'],
-    ['Lokal görüntü düzenleme izi', pm.elaScore,
-      'Piksel sıkıştırma/yeniden-kodlama davranışı ilgili bölgede olağandışı.'],
-  ];
-  for (const [name, rawScore, detail] of pixelCandidates) {
-    const score = Number(rawScore);
-    if (!Number.isFinite(score) || score < 75) continue;
-    push('pixel', 'Belge', name, `${detail} Bu sinyal tek başına sahtecilik kanıtı değildir.`, 'BELİRGİN', score);
+  const localizedPixelRows = Array.isArray(pixel?.localizedFindings)
+    ? pixel.localizedFindings
+    : (Array.isArray(pixel?.localFindings) ? pixel.localFindings : []);
+
+  for (const row of localizedPixelRows) {
+    const score = Number(row?.score ?? row?.confidence);
+    if (!Number.isFinite(score) || score < 78) continue;
+    const field = cleanField(row?.field || row?.label || row?.regionName);
+    addDifference(
+      'pixel', field,
+      `${field} bölgesinde piksel farkı`,
+      'Bu bölgede referansa göre lokal piksel/görüntü yapısı farklı.',
+      score >= 90 ? 'güçlü' : 'belirgin',
+      score
+    );
   }
 
-  // 4) ALAN EŞLEŞMESİ YETERSİZSE FARK UYDURMA.
-  const referenceCount = Number(
-    referenceForensics?.referenceCount || referenceTemplateAnalysis?.referenceCount || 0
-  );
-  const matchedFieldCount = Number(
-    referenceForensics?.matchedFieldCount || referenceTemplateAnalysis?.matchedFieldCount || 0
-  );
-  // Gerçek şablon eşleşmesi varsa referenceForensics tarafındaki eksik/uyumsuz
-  // sayaç yüzünden kullanıcıya "konum belirlenemedi" mesajı gösterme.
-  if (hasReference && referenceCount > 0 && matchedFieldCount === 0 && differences.length === 0) {
-    return {
-      available: true,
-      engine: 'reference-fingerprint-report-v2',
-      referenceCount,
-      categories: { shape: 0, typography: 0, pixel: 0 },
-      differenceCount: 0,
-      strongDifferenceCount: 0,
-      notableDifferenceCount: 0,
-      differences: [],
-      status: 'insufficient-reference-match',
-      userText: '🔎 REFERANS KARŞILAŞTIRMASI\nGüvenilir alan eşleşmesi kurulamadığı için fark konumu belirlenemedi.'
-    };
+  // Clone/copy sadece güçlü ve dolu, uzak bölgeler eşleştiğinde gösterilir.
+  const cloneCandidate = pm.cloneCandidate || {};
+  const cloneScore = Number(pm.cloneScore);
+  const cloneSimilarity = Number(cloneCandidate.similarity);
+  const cloneActivityRatio = Number(cloneCandidate.activityRatio);
+  if (
+    Number.isFinite(cloneScore) && cloneScore >= 92 &&
+    Number.isFinite(cloneSimilarity) && cloneSimilarity >= 0.997 &&
+    Number.isFinite(cloneActivityRatio) && cloneActivityRatio >= 0.70
+  ) {
+    addDifference(
+      'pixel',
+      'Belge',
+      'Klonlama / kopyalama izi',
+      'Birbirinden uzak dolu görüntü bölgelerinde olağandışı yüksek benzerlik bulundu.',
+      'belirgin',
+      cloneScore
+    );
   }
 
-  differences.sort((a, b) => {
-    const sev = { GÜÇLÜ: 3, BELİRGİN: 2, ORTA: 1 };
-    return (sev[b.severity] - sev[a.severity]) || (b.score - a.score);
+  // -------------------------------------------------------------
+  // 4) SADE SONUÇ
+  // -------------------------------------------------------------
+  // Bir alan hem uyumlu hem de bir başka motor tarafından zayıf biçimde
+  // farklı gösteriliyorsa, yalnızca güçlü/belirgin farkı tut.
+  const material = differences.filter(x => x.strength === 'güçlü' || x.strength === 'belirgin');
+
+  material.sort((a, b) => {
+    const order = { güçlü: 3, belirgin: 2, orta: 1 };
+    return (order[b.strength] - order[a.strength]) || (b.score - a.score);
   });
 
-  const strong = differences.filter(x => x.severity === 'GÜÇLÜ').length;
-  const notable = differences.filter(x => ['GÜÇLÜ', 'BELİRGİN'].includes(x.severity)).length;
-
   const lines = ['🔎 REFERANS KARŞILAŞTIRMASI'];
-  if (differences.length) {
-    lines.push(...differences.slice(0, 8).map((x, i) => {
-      const prefix = x.field && x.field !== 'Belge' ? `${x.field}: ` : '';
-      return `${i + 1}. ${prefix}${x.title}`;
-    }));
+  if (material.length) {
+    lines.push('🔴 FARKLAR');
+    for (const row of material.slice(0, 10)) {
+      lines.push(`• ${row.title}`);
+    }
   } else {
-    lines.push('Belirgin şekil, yazı/font veya piksel farkı tespit edilmedi.');
+    lines.push('🟢 Belirgin bir fark tespit edilmedi.');
+  }
+
+  // Kullanıcı "burada yok" bilgisini istediğinde, yalnızca güvenilir şekilde
+  // eşleşmiş birkaç ana alanı göster; bütün OCR alanlarını listeleme.
+  if (material.length && compatible.length) {
+    const preferred = ['Tutar', 'Amount', 'Alıcı Adı', 'Recipient Name', 'IBAN', 'Tarih', 'Date'];
+    const selected = [];
+    for (const pref of preferred) {
+      const hit = compatible.find(x => x.field.toLocaleLowerCase('tr-TR').includes(pref.toLocaleLowerCase('tr-TR')));
+      if (hit && !selected.some(x => x.field === hit.field)) selected.push(hit);
+    }
+    if (selected.length) {
+      lines.push('🟢 UYUMLU');
+      for (const row of selected.slice(0, 6)) lines.push(`• ${row.field}`);
+    }
   }
 
   return {
     available: true,
-    engine: 'reference-fingerprint-report-v2',
-    referenceCount,
+    engine: 'reference-fingerprint-agent-v3',
+    referenceCount: Number(referenceForensics?.referenceCount || referenceTemplateAnalysis?.referenceCount || 0),
     categories: {
-      shape: differences.filter(x => x.category === 'shape').length,
-      typography: differences.filter(x => x.category === 'typography').length,
-      pixel: differences.filter(x => x.category === 'pixel').length,
+      shape: material.filter(x => x.category === 'shape').length,
+      typography: material.filter(x => x.category === 'typography').length,
+      pixel: material.filter(x => x.category === 'pixel').length,
     },
-    differenceCount: differences.length,
-    strongDifferenceCount: strong,
-    notableDifferenceCount: notable,
-    differences: differences.slice(0, 20),
-    status: differences.length ? 'differences-found' : 'no-material-difference-found',
+    differenceCount: material.length,
+    strongDifferenceCount: material.filter(x => x.strength === 'güçlü').length,
+    notableDifferenceCount: material.filter(x => x.strength === 'belirgin').length,
+    differences: material.slice(0, 20),
+    compatible: compatible.slice(0, 20),
+    status: material.length ? 'differences-found' : 'no-material-difference-found',
     userText: lines.join('\n'),
   };
 }
