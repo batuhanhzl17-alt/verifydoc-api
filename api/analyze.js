@@ -4868,42 +4868,40 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         spacingAnomalies.sort((a,b)=>b.score-a.score);
 
         // =============================================================
-        // TYPOGRAPHY / GLYPH-RASTER FORENSICS v2 — PRECISION GATES
+        // TYPOGRAPHY / GLYPH-RASTER FORENSICS v3 — PRECISION V2
         // =============================================================
-        // Typography yalnızca güvenilir, semantik olarak aynı alanlarda çalışır.
-        // Generic OCR etiketleri, birleşik çok-satırlı kutular ve düşük OCR
-        // confidence sonuçları tipografi bulgusu üretmekten bilinçli olarak
-        // çıkarılır. Amaç "her farklı piksel = font farkı" yanlış pozitiflerini
-        // azaltmaktır.
+        // Sadece gerçekten kanonik bir banka alanı ve güvenilir bir OCR etiketi
+        // karşılaştırılır. Generic OCR alanları burada KESİNLİKLE yoktur.
+        // Değer karşılaştırması ise ancak aynı semantic field + aynı içerik tipi
+        // + yeterli metin benzerliği + temiz tek satır koşullarında yapılır.
         const typographyFindings=[];
         const typographyFieldProfiles=[];
+        const TP_ALLOWED_FIELDS=new Set([
+          'branch','date','time','description','transactionNo','accountNo','taxNo',
+          'amount','iban','senderName','recipientName','senderAddress','recipientAddress','address'
+        ]);
         const tpNorm=(v)=>normalizeFieldTextForMatch(String(v||''))
           .replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
-        // rfLevenshtein is re-declared later in this file by legacy amount
-        // recovery and returns a raw distance there. Typography needs a stable
-        // normalized distance, so it owns this implementation.
         const tpDistance=(a,b)=>{
           const aa=tpNorm(a),bb=tpNorm(b);
           if(!aa||!bb)return 1;
-          const prev=Array.from({length:bb.length+1},(_,i)=>i);
-          for(let i=1;i<=aa.length;i++){
-            let left=i;
-            for(let j=1;j<=bb.length;j++){
-              const up=prev[j];
-              const cost=aa[i-1]===bb[j-1]?0:1;
-              prev[j]=Math.min(prev[j]+1,left+1,prev[j-1]+cost);
-              left=prev[j];
-            }
-          }
-          return prev[bb.length]/Math.max(aa.length,bb.length,1);
+          return rfLevenshtein(aa,bb);
         };
         const tpConfidence=(x)=>{
-          const n=Number(x?.score ?? x?.confidence ?? x?.ocrConfidence);
-          return Number.isFinite(n) ? n : null;
+          const raw=x?.score ?? x?.confidence ?? x?.ocrConfidence;
+          const n=Number(raw);
+          if(!Number.isFinite(n))return null;
+          // PaddleOCR confidence is normally 0..1, while some OCR adapters
+          // expose 0..100. Normalize both forms to a common 0..100 scale.
+          return n>=0 && n<=1.000001 ? n*100 : n;
         };
-        const tpSingleLine=(text)=>{
+        const tpSingleLine=(text,max=70)=>{
           const s=String(text||'').trim();
-          return !!s && !/[\r\n]/.test(s) && s.length<=70;
+          return !!s && !/[\r\n]/.test(s) && s.length<=max;
+        };
+        const tpLabelClean=(text)=>{
+          const s=String(text||'').trim();
+          return s.split(/[:：]/)[0].replace(/\s+/g,' ').trim();
         };
         const tpValueText=(text)=>{
           const s=String(text||'').trim();
@@ -4919,31 +4917,65 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           if(hasLetter)return 'text';
           return 'other';
         };
+        const tpCanonicalLabel=(field,text)=>{
+          const label=tpLabelClean(text);
+          const n=normalizeFieldTextForMatch(label);
+          const patterns={
+            branch:[/^sube(?:\s+adi)?$/i],
+            date:[/^islem\s+tarihi(?:\s+ve\s+saati)?$/i,^tarih$/i],
+            time:[/^saat$/i,^islem\s+saati$/i],
+            description:[/^aciklama$/i,^description$/i],
+            transactionNo:[/^(fis|islem|referans|sorgu)\s+(no|numarasi|numarası)$/i],
+            accountNo:[/^(musteri|hesap)\s+(no|numarasi|numarası)$/i],
+            taxNo:[/^vergi\s+(no|numarasi|numarası)$/i,/^tckn$/i],
+            amount:[/^(giden\s+fast|giden\s+eft|islem|eft|transfer|ana)\s+tutari$/i,/^tutar$/i],
+            iban:[/^iban(?:\s+no)?$/i,/^iban\/kart\s+no$/i,/^(gonderen|alici|alacakli)\s+iban$/i],
+            senderName:[/^gonderen(?:\s+adi)?$/i,/^gonderici(?:\s+adi)?$/i],
+            recipientName:[/^(alici|alacakli)(?:\s+adi|\s+unvani)?$/i],
+            senderAddress:[/^(gonderen|gonderici)\s+adres$/i],
+            recipientAddress:[/^(alici|alacakli)\s+adres$/i],
+            address:[/^adres$/i],
+          };
+          return (patterns[field]||[]).some(re=>re.test(n));
+        };
         const tpValueComparable=(a,b)=>{
           const aa=tpValueText(a),bb=tpValueText(b);
-          if(!aa||!bb||!tpSingleLine(aa)||!tpSingleLine(bb))return false;
-          if(tpKind(aa)!==tpKind(bb))return false;
+          if(!aa||!bb||!tpSingleLine(aa,90)||!tpSingleLine(bb,90))return false;
+          const ka=tpKind(aa),kb=tpKind(bb);
+          if(ka==='other'||kb==='other'||ka!==kb)return false;
           const lenRatio=Math.min(aa.length,bb.length)/Math.max(aa.length,bb.length);
-          return lenRatio>=0.65;
+          return lenRatio>=0.55;
         };
+        const tpSafeRegion=(r)=>{
+          if(!r?.region)return false;
+          const w=Number(r.region.x2)-Number(r.region.x1);
+          const h=Number(r.region.y2)-Number(r.region.y1);
+          if(!(w>2&&h>2))return false;
+          const aspect=w/Math.max(1,h);
+          return aspect>=1.15 && aspect<=90;
+        };
+
         for(const m of matches){
           const key=String(m?.rl?.rule?.key||'');
-          if(!key || key.startsWith('generic:')) continue;
-          const refLabelText=String(m?.rl?.labelText||'').trim();
-          const tarLabelText=String(m?.tl?.labelText||'').trim();
-          if(!tpSingleLine(refLabelText)||!tpSingleLine(tarLabelText))continue;
+          if(!TP_ALLOWED_FIELDS.has(key))continue;
+          if(String(key).startsWith('generic:'))continue;
+
+          const refLabelText=tpLabelClean(m?.rl?.labelText || m?.rl?.text);
+          const tarLabelText=tpLabelClean(m?.tl?.labelText || m?.tl?.text);
+          if(!tpSingleLine(refLabelText,55)||!tpSingleLine(tarLabelText,55))continue;
+          if(!tpSafeRegion(m.rl)||!tpSafeRegion(m.tl))continue;
+
+          // Canonical label gate: fuzzy semantic recovery alone cannot feed
+          // typography. Both sides must visibly represent the same real field.
+          if(!tpCanonicalLabel(key,refLabelText)||!tpCanonicalLabel(key,tarLabelText))continue;
 
           const labelDistance=tpDistance(refLabelText,tarLabelText);
           const exactLabel=tpNorm(refLabelText)===tpNorm(tarLabelText);
-          // Typography için fuzzy semantic match yeterli değildir. Aynı gerçek
-          // label veya çok küçük OCR sapması gerekir.
-          const labelComparable=exactLabel || labelDistance<=0.08;
-          if(!labelComparable)continue;
+          if(!exactLabel && labelDistance>0.16)continue;
 
-          const refConf=tpConfidence(m.rl);
-          const tarConf=tpConfidence(m.tl);
-          if(refConf!==null && refConf<65)continue;
-          if(tarConf!==null && tarConf<65)continue;
+          const refConf=tpConfidence(m.rl),tarConf=tpConfidence(m.tl);
+          if(refConf!==null&&refConf<65)continue;
+          if(tarConf!==null&&tarConf<65)continue;
 
           const refLabelRegion=rfFocusLabelRegion(m.rl.region,refLabelText);
           const tarLabelRegion=rfFocusLabelRegion(m.tl.region,tarLabelText);
@@ -4954,45 +4986,37 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           const labelCharDistance=rfCharacterDistance(refChar,tarChar);
           const labelDiaDistance=rfDiacriticDistance(refChar,tarChar,refLabelText,tarLabelText);
 
-          const valueRefRaw=rfFindValueRegion(refRegions,m.rl);
-          const valueTarRaw=rfFindValueRegion(targetRegions,m.tl);
           let valueComparable=false,valueDistance=null,valueDiaDistance=null;
           let valueRefText='',valueTarText='';
+          let refValueChar=null,tarValueChar=null;
+          const valueRefRaw=rfFindValueRegion(refRegions,m.rl);
+          const valueTarRaw=rfFindValueRegion(targetRegions,m.tl);
           if(valueRefRaw&&valueTarRaw){
             valueRefText=tpValueText(valueRefRaw.text);
             valueTarText=tpValueText(valueTarRaw.text);
             valueComparable=tpValueComparable(valueRefText,valueTarText);
-            if(valueComparable){
-              const valueTextDistance=tpDistance(valueRefText,valueTarText);
-              if(valueTextDistance>0.45) valueComparable=false;
-            }
-
-            const vrConf=tpConfidence(valueRefRaw);
-            const vtConf=tpConfidence(valueTarRaw);
+            const vrConf=tpConfidence(valueRefRaw),vtConf=tpConfidence(valueTarRaw);
             if(vrConf!==null&&vrConf<65)valueComparable=false;
             if(vtConf!==null&&vtConf<65)valueComparable=false;
-
             if(valueComparable){
-              const refValueRegion=rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key);
-              const tarValueRegion=rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key);
-              const vr=await rfCharacterMetrics(refBuffer,refValueRegion,refSize);
-              const vt=await rfCharacterMetrics(targetBuffer,tarValueRegion,targetSize);
-              if(vr&&vt){
-                valueDistance=rfCharacterDistance(vr,vt);
-                valueDiaDistance=rfDiacriticDistance(vr,vt,valueRefText,valueTarText);
+              const rr=rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key);
+              const tr=rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key);
+              refValueChar=await rfCharacterMetrics(refBuffer,rr,refSize);
+              tarValueChar=await rfCharacterMetrics(targetBuffer,tr,targetSize);
+              if(refValueChar&&tarValueChar){
+                valueDistance=rfCharacterDistance(refValueChar,tarValueChar);
+                valueDiaDistance=rfDiacriticDistance(refValueChar,tarValueChar,valueRefText,valueTarText);
               }else valueComparable=false;
             }
           }
 
           const labelFinding=rfCharacterFinding(
             key,refChar,tarChar,labelCharDistance,labelDiaDistance,tarLabelText,
-            true,1
+            true,exactLabel?1:Math.max(.88,1-labelDistance)
           );
           const valueFinding=rfCharacterFinding(
-            `${key}:value`,
-            valueComparable ? await rfCharacterMetrics(refBuffer,rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key),refSize) : null,
-            valueComparable ? await rfCharacterMetrics(targetBuffer,rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key),targetSize) : null,
-            valueDistance,valueDiaDistance,valueTarText,valueComparable,1
+            `${key}:value`,refValueChar,tarValueChar,valueDistance,valueDiaDistance,
+            valueTarText,valueComparable,1
           );
 
           const profile={
@@ -5017,17 +5041,34 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           if(valueFinding)typographyFindings.push({...valueFinding,scope:'value'});
         }
 
+        console.log('TYPOGRAPHY PRECISION GATE:',JSON.stringify({
+          matchedFields:matches.length,
+          allowedFieldCandidates:matches.filter(m=>TP_ALLOWED_FIELDS.has(String(m?.rl?.rule?.key||''))).length,
+          profilesBeforeDedup:typographyFieldProfiles.length,
+          confidenceGate:'0..1 ve 0..100 OCR skorları normalize edilerek minimum 65/100',
+          profileFields:typographyFieldProfiles.map(p=>p.field).slice(0,30)
+        }));
+
+        // Aynı semantic field aynı referansta birden fazla kez gelirse yalnızca
+        // en güçlü ölçümü tut. Bu, OCR tekrarlarının skoru şişirmesini engeller.
+        const dedupTp=new Map();
+        for(const f of typographyFindings){
+          const k=`${f.field}|${f.scope||''}`;
+          const old=dedupTp.get(k);
+          if(!old || Number(f.characterDistance||0)+Number(f.diacriticDistance||0)>
+            Number(old.characterDistance||0)+Number(old.diacriticDistance||0)) dedupTp.set(k,f);
+        }
+        typographyFindings.length=0;
+        typographyFindings.push(...dedupTp.values());
+
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
         const typographyMedium=typographyFindings.filter(x=>x.severity==='medium');
-        const typographyComparableFieldCount=typographyFieldProfiles.filter(x=>x.labelComparable).length;
-        const typographyStatus=typographyComparableFieldCount>0 ? 'analyzed' : 'insufficient-data';
-        const typographyScore=typographyComparableFieldCount>0
-          ? rfClamp100(
-              Math.min(45,typographyStrong.length*15)+
-              Math.min(35,typographyMedium.length*8)+
-              Math.min(20,10)
-            )
-          : null;
+        const typographyComparableCount=typographyFieldProfiles.length;
+        const typographyScore=rfClamp100(
+          Math.min(45,typographyStrong.length*15)+
+          Math.min(35,typographyMedium.length*8)+
+          Math.min(20,typographyComparableCount>0?10:0)
+        );
         const suspiciousFields=fieldResults.filter(x=>x.suspicious);
         const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
         const referenceQuality={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
@@ -5037,10 +5078,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           localAnomalyScore:rfClamp100(suspiciousFields.length*18+strongSpacing.length*18),
           suspiciousFieldCount:suspiciousFields.length,suspiciousFields:[...new Set(suspiciousFields.map(x=>x.field))],
           spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies:spacingAnomalies.slice(0,20),
-          typographyScore,
-          typographyStatus,
-          typographyComparableFieldCount,
-          typographySeverity:typographyStatus==='insufficient-data'?'insufficient-data':typographyStrong.length>=2?'strong':typographyFindings.length?'medium':'none',
+          typographyScore,typographySeverity:typographyStrong.length>=2?'strong':typographyFindings.length?'medium':(typographyFieldProfiles.length?'low':'insufficient-data'),
           characterFindingCount:typographyFindings.length,characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
           fields:fieldResults,referenceQuality,
@@ -5106,18 +5144,15 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
     );
     const severity=(maxSpacingScore>=85 && strongSpacing.length>=1)?'strong':(strongSpacing.length>=1&&score>=45?'medium':(suspicious.length>=1&&score>=45?'medium':'low'));
     return {
-      available:true,engine:'reference-forensic-engine-v12-occurrence-semantic-spacing-typography-precision-v2',bank:normalizedBank,
+      available:true,engine:'reference-forensic-engine-v12-occurrence-semantic-spacing-typography-v4',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
       spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,
       characterFindingCount:rfMedian(referenceResults.map(x=>Number(x.characterFindingCount)||0)),
       characterFindings:referenceResults.flatMap(x=>x.characterFindings||[]).slice(0,40),
-      typographyScore:referenceResults.some(x=>x.typographyStatus==='analyzed')
-        ? rfClamp100(rfMedian(referenceResults.filter(x=>Number.isFinite(Number(x.typographyScore))).map(x=>Number(x.typographyScore))))
-        : null,
-      typographyStatus:referenceResults.some(x=>x.typographyStatus==='analyzed')?'analyzed':'insufficient-data',
-      typographyComparableFieldCount:referenceResults.reduce((sum,x)=>sum+Number(x.typographyComparableFieldCount||0),0),
-      typographySeverity:referenceResults.some(x=>x.typographySeverity==='strong')?'strong':referenceResults.some(x=>x.typographySeverity==='medium')?'medium':referenceResults.some(x=>x.typographyStatus==='analyzed')?'none':'insufficient-data',
+      typographyScore:rfClamp100(rfMedian(referenceResults.map(x=>Number(x.typographyScore)||0))),
+      typographySeverity:referenceResults.some(x=>x.typographySeverity==='strong')?'strong':referenceResults.some(x=>x.typographySeverity==='medium')?'medium':(referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).length?'low':'insufficient-data'),
+      typographyStatus:referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).length?'comparable-data':'insufficient-data',
       typographyFieldProfiles:referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).slice(0,60),
       localStructuralEdit:strongSpacing.length>=1,
       maxSpacingScore:Number(maxSpacingScore.toFixed(1)),
@@ -11380,10 +11415,8 @@ if (referenceForensics) {
   // bağlandığını doğruluyoruz. Risk skoruna dahil edilmez.
   const typographyForensics = {
     available: true,
-    engine: 'reference-glyph-raster-typography-v3-precision',
-    score: Number.isFinite(Number(referenceForensics.typographyScore)) ? Number(referenceForensics.typographyScore) : null,
-    status: referenceForensics.typographyStatus || 'insufficient-data',
-    comparableFieldCount: Number(referenceForensics.typographyComparableFieldCount || 0),
+    engine: 'reference-glyph-raster-typography-v2-precision',
+    score: Number(referenceForensics.typographyScore || 0),
     severity: referenceForensics.typographySeverity || 'insufficient-data',
     characterFindingCount: Number(referenceForensics.characterFindingCount || 0),
     characterFindings: Array.isArray(referenceForensics.characterFindings)
@@ -11629,15 +11662,11 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
     headline = `Referans dekontla karşılaştırmada ${mediumOrStrong} belirgin farklılık tespit edildi.`;
   }
 
-  const typographyStatus = forensic?.typographyStatus || (forensic?.typographyComparableFieldCount > 0 ? 'analyzed' : 'insufficient-data');
-  const typographyComparableFieldCount = Number(forensic?.typographyComparableFieldCount || 0);
-  const typographyHeadline = typographyStatus === 'insufficient-data'
-    ? `Tipografi incelemesi için güvenilir eşleşen alan bulunamadı; tipografi sonucu yetersiz veri olarak değerlendirildi.`
-    : typographyStrong.length > 0
-      ? `Tipografi incelemesinde ${typographyStrong.length} güçlü yazı/render farklılığı tespit edildi.`
-      : typographyMedium.length > 0
-        ? `Tipografi incelemesinde ${typographyMedium.length} belirgin yazı/render farklılığı tespit edildi.`
-        : `Tipografi incelemesi ${typographyComparableFieldCount} güvenilir alan üzerinden yapıldı; belirgin tipografik farklılık tespit edilmedi.`;
+  const typographyHeadline = typographyStrong.length > 0
+    ? `Tipografi incelemesinde ${typographyStrong.length} güçlü yazı/render farklılığı tespit edildi.`
+    : typographyMedium.length > 0
+      ? `Tipografi incelemesinde ${typographyMedium.length} belirgin yazı/render farklılığı tespit edildi.`
+      : null;
 
   return {
     headline,
@@ -11646,10 +11675,8 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
     strongFindingCount: strongCount,
     typography: {
       available: Boolean(forensic?.available),
-      status: typographyStatus,
-      comparableFieldCount: typographyComparableFieldCount,
-      score: Number.isFinite(Number(forensic?.typographyScore)) ? Number(forensic.typographyScore) : null,
-      severity: forensic?.typographySeverity || 'insufficient-data',
+      score: Number(forensic?.typographyScore || 0),
+      severity: forensic?.typographySeverity || 'none',
       findingCount: typographyRows.length,
       strongFindingCount: typographyStrong.length,
       headline: typographyHeadline,
