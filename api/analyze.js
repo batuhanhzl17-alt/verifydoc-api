@@ -10599,6 +10599,20 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
   }
 }
 
+let referenceLocalCrop = null;
+if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+  try {
+    referenceLocalCrop = await runReferenceLocalCropComparator(
+      forensicTargetPath,
+      bank,
+      paddleImageOCR
+    );
+    console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
+  } catch (error) {
+    console.warn("REFERENCE LOCAL CROP HATASI:", error?.message || error);
+  }
+}
+
 // =====================================================
 // ANALYZE44 — PIXEL / IMAGE FORENSICS
 // =====================================================
@@ -11524,7 +11538,7 @@ if (referenceForensics) {
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
 // "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
 if (referenceForensics || layoutForensics?.available) {
-  const humanForensicReport = buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics);
+  const humanForensicReport = buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics, referenceLocalCrop);
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     // Telegram/UI için teknik engine cümlesi yerine anlaşılır bulgu metnini kullan.
@@ -11556,7 +11570,160 @@ if (amountForensics) {
 // Teknik engine çıktısını Telegram kullanıcısının anlayabileceği dile çevirir.
 // Teknik skorlar/loglar korunur; kullanıcıya ise alan + değişikliğin türü +
 // referansa göre yaklaşık büyüklüğü gösterilir.
-function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
+
+// =====================================================
+// REFERENCE LOCAL CROP COMPARATOR v1
+// =====================================================
+// Amaç: "hangi alan referanstan gerçekten ayrılıyor?" sorusunu cevaplamak.
+// Global spacing/perspective/clone skorlarını kullanıcı sonucuna taşımaz.
+// Aynı semantic alanın referans ve hedef crop'larını normalize edip,
+// yerel render/karakter ölçümlerini karşılaştırır.
+// Bu bir sahtecilik kararı değil, lokal görsel karşılaştırma kanıtıdır.
+async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
+  if (!targetPath || !bank || !targetOCR?.success) return null;
+
+  try {
+    const profile = await buildReferenceTemplateProfile(bank);
+    if (!profile?.fields || !Object.keys(profile.fields).length) return null;
+
+    const refs = Array.isArray(profile.referenceFiles) ? profile.referenceFiles : [];
+    const referencePath =
+      refs.find(p => /\.(pdf)$/i.test(String(p))) ||
+      refs.find(p => /\.(png|jpe?g|webp)$/i.test(String(p)));
+    if (!referencePath) return null;
+
+    const refExt = path.extname(referencePath).toLowerCase();
+    let refBuffer = null;
+    let refSize = null;
+
+    if (refExt === '.pdf') {
+      const rb = await fs.readFile(referencePath);
+      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(rb) }).promise;
+      const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+      if (!rendered?.buffer || !rendered.width || !rendered.height) return null;
+      refBuffer = rendered.buffer;
+      refSize = { width: Number(rendered.width), height: Number(rendered.height) };
+    } else {
+      refBuffer = await fs.readFile(referencePath);
+      const meta = await sharp(refBuffer).metadata();
+      refSize = { width: Number(meta.width) || 0, height: Number(meta.height) || 0 };
+    }
+
+    const targetBuffer = await fs.readFile(targetPath);
+    const tmeta = await sharp(targetBuffer).metadata();
+    const targetSize = { width: Number(tmeta.width) || 0, height: Number(tmeta.height) || 0 };
+    if (!refSize.width || !refSize.height || !targetSize.width || !targetSize.height) return null;
+
+    const regions = Array.isArray(targetOCR.regions)
+      ? targetOCR.regions.filter(x => x?.region && String(x.text || '').trim())
+      : [];
+    if (!regions.length) return null;
+
+    const observations = [];
+
+    for (const [field, ref] of Object.entries(profile.fields)) {
+      const variants = Array.isArray(ref?.variants) && ref.variants.length ? ref.variants : [ref];
+      const refVariant = variants[0];
+      if (!refVariant) continue;
+
+      const candidates = referenceFieldTargetCandidates(field, ref, regions, targetSize);
+      if (!candidates.length) continue;
+
+      const best = candidates[0];
+      const targetBox = best.box;
+
+      const rx = Math.max(0, Math.floor(refVariant.xNorm * refSize.width));
+      const ry = Math.max(0, Math.floor(refVariant.yNorm * refSize.height));
+      const rw = Math.max(4, Math.min(refSize.width - rx, Math.ceil(refVariant.widthNorm * refSize.width)));
+      const rh = Math.max(4, Math.min(refSize.height - ry, Math.ceil(refVariant.heightNorm * refSize.height)));
+
+      const refRegion = { x1: rx, y1: ry, x2: rx + rw, y2: ry + rh };
+      const tarRegion = {
+        x1: Number(targetBox.x1), y1: Number(targetBox.y1),
+        x2: Number(targetBox.x2), y2: Number(targetBox.y2)
+      };
+
+      const refStyle = await rfStableTextMetrics(refBuffer, refRegion, refSize);
+      const tarStyle = await rfStableTextMetrics(targetBuffer, tarRegion, targetSize);
+      const refChar = await rfCharacterMetrics(refBuffer, refRegion, refSize);
+      const tarChar = await rfCharacterMetrics(targetBuffer, tarRegion, targetSize);
+
+      const styleDistance = refStyle && tarStyle ? rfStyleResidual(refStyle, tarStyle) : null;
+      const charDistance = refChar && tarChar ? rfCharacterDistance(refChar, tarChar) : null;
+
+      if (!Number.isFinite(styleDistance) && !Number.isFinite(charDistance)) continue;
+
+      observations.push({
+        field,
+        targetText: String(best.item.text || '').trim(),
+        referenceFile: path.basename(referencePath),
+        styleDistance: Number.isFinite(styleDistance) ? Number(styleDistance.toFixed(4)) : null,
+        characterDistance: Number.isFinite(charDistance) ? Number(charDistance.toFixed(4)) : null,
+        targetOCRConfidence: Number(best.item.score || 0),
+        referenceBox: refRegion,
+        targetBox: tarRegion,
+      });
+    }
+
+    if (!observations.length) return null;
+
+    // Global render conversion (PDF -> JPG, camera blur, contrast) affects most
+    // fields. Use the median as a baseline and report only local outliers.
+    const styleVals = observations.map(x => x.styleDistance).filter(Number.isFinite);
+    const charVals = observations.map(x => x.characterDistance).filter(Number.isFinite);
+    const styleBaseline = rfMedianSigned(styleVals);
+    const charBaseline = rfMedianSigned(charVals);
+
+    const findings = [];
+    for (const o of observations) {
+      const styleExcess = Number.isFinite(o.styleDistance)
+        ? Math.max(0, o.styleDistance - styleBaseline)
+        : 0;
+      const charExcess = Number.isFinite(o.characterDistance)
+        ? Math.max(0, o.characterDistance - charBaseline)
+        : 0;
+
+      // Conservative gates: a field must be a local outlier, not merely different
+      // because the entire image was photographed or recompressed.
+      const strongLocalStyle = styleExcess >= 0.16 && Number(o.styleDistance) >= 0.30;
+      const strongLocalChar = charExcess >= 0.14 && Number(o.characterDistance) >= 0.36;
+
+      if (!(strongLocalStyle || strongLocalChar)) continue;
+
+      findings.push({
+        field: o.field,
+        targetText: o.targetText,
+        styleDistance: o.styleDistance,
+        characterDistance: o.characterDistance,
+        localStyleExcess: Number(styleExcess.toFixed(4)),
+        localCharacterExcess: Number(charExcess.toFixed(4)),
+        reason: strongLocalChar && strongLocalStyle
+          ? 'Alan, referansın genel render farkından bağımsız olarak hem yazı hem karakter rasterında belirgin bir yerel sapma gösteriyor.'
+          : strongLocalChar
+            ? 'Alan, referansın genel render farkından bağımsız olarak karakter rasterında belirgin bir yerel sapma gösteriyor.'
+            : 'Alan, referansın genel render farkından bağımsız olarak yazı/render görünümünde belirgin bir yerel sapma gösteriyor.'
+      });
+    }
+
+    return {
+      available: true,
+      engine: 'reference-local-crop-comparator-v1',
+      bank: normalizeBank(bank),
+      referenceFile: path.basename(referencePath),
+      comparedFieldCount: observations.length,
+      findingCount: findings.length,
+      styleBaseline: Number(styleBaseline.toFixed(4)),
+      characterBaseline: Number(charBaseline.toFixed(4)),
+      observations,
+      findings
+    };
+  } catch (error) {
+    console.warn('REFERENCE LOCAL CROP COMPARATOR HATASI:', error?.message || error);
+    return null;
+  }
+}
+
+function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
   // Only localized, concrete differences are exposed to Telegram.
   // Raw spacing/clone/ELA/fusion/engine messages are not user-facing evidence.
@@ -11585,6 +11752,20 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
 
   const findings = [];
   const seen = new Set();
+
+  // 0) Local crop comparator: strongest source for answering "where?"
+  // It is already normalized against the page-wide render baseline.
+  for (const row of (Array.isArray(localCrop?.findings) ? localCrop.findings : [])) {
+    const key = `local-crop|${row.field}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    findings.push({
+      priority: row.field === 'amount' ? 1 : 2,
+      title: fieldName(row.field),
+      detail: row.reason,
+      kind: 'local-crop'
+    });
+  }
 
   // 1) Semantic typography/raster differences.
   // A diacritic-only difference is never enough.
@@ -11637,25 +11818,10 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
     });
   }
 
-  // 3) Do not call ordinary camera perspective/scaling/spacing a difference.
-  // Page-shape is reported only when the layout engine is very strong AND
-  // there are already at least two independent localized findings.
-  let strongLayout = false;
-  if (layout?.available) {
-    const gapStrong = (Array.isArray(layout.localGapAnomalies) ? layout.localGapAnomalies : [])
-      .some(x => Number(x?.score) >= 80);
-    const containerStrong = (Array.isArray(layout.containerPairs) ? layout.containerPairs : [])
-      .some(x => Number(x?.score) >= 80);
-    strongLayout = gapStrong || containerStrong;
-  }
-
-  if (strongLayout && findings.length >= 2) {
-    findings.push({
-      priority: 4,
-      title: 'Belge yerleşimi',
-      detail: 'Belgenin belirli bir bölümünün şekli/yerleşimi referanstan belirgin biçimde farklı.'
-    });
-  }
+  // 3) Generic layout/spacing is deliberately NOT surfaced here.
+  // Perspective, scaling, PDF->JPG conversion and ordinary spacing shifts
+  // are not enough to say "oynama". The local crop comparator must localize
+  // the difference first.
 
   findings.sort((a, b) => a.priority - b.priority);
 
