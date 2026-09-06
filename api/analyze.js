@@ -4050,77 +4050,6 @@ function rfValueRenderComparable(refText, targetText) {
   return lenRatio >= 0.45;
 }
 
-
-// =====================================================
-// AMOUNT GLYPH SEQUENCE — same-character raster comparison
-// =====================================================
-// The whole amount string is not a reliable glyph comparison because the
-// actual digits can legitimately differ. For the amount field we compare only
-// glyphs whose semantic character is the SAME on both sides (e.g. 2 vs 2),
-// while also recording whether the numeric layout is plausible.
-async function rfNumericGlyphSequence(imageBuffer, region, imageSize, text) {
-  if (!imageBuffer || !region || !imageSize?.width || !imageSize?.height) return null;
-  const rawText = String(text || '').trim();
-  const chars = [...rawText].filter(ch => /[0-9.,:-]/.test(ch));
-  const numericChars = chars.filter(ch => /\d/.test(ch));
-  if (numericChars.length < 2) return null;
-  try {
-    const x0=Math.max(0,Math.floor(Number(region.x1))), y0=Math.max(0,Math.floor(Number(region.y1)));
-    const x2=Math.min(imageSize.width,Math.ceil(Number(region.x2))), y2=Math.min(imageSize.height,Math.ceil(Number(region.y2)));
-    const w=Math.max(3,x2-x0), h=Math.max(3,y2-y0);
-    const mx=Math.max(2,Math.round(w*.04)), my=Math.max(2,Math.round(h*.18));
-    const left=Math.max(0,x0-mx), top=Math.max(0,y0-my);
-    const width=Math.min(imageSize.width-left,w+mx*2), height=Math.min(imageSize.height-top,h+my*2);
-    const {data,info}=await sharp(imageBuffer).extract({left,top,width,height}).resize({width:360,height:100,fit:'fill'}).grayscale().raw().toBuffer({resolveWithObject:true});
-    const W=info.width,H=info.height,threshold=185,mask=new Uint8Array(W*H),seen=new Uint8Array(W*H),comps=[];
-    for(let i=0;i<data.length;i++)if(data[i]<threshold)mask[i]=1;
-    const qx=new Int32Array(W*H),qy=new Int32Array(W*H);
-    for(let sy=0;sy<H;sy++)for(let sx=0;sx<W;sx++){
-      const si=sy*W+sx;if(!mask[si]||seen[si])continue;
-      let head=0,tail=0;qx[tail]=sx;qy[tail]=sy;tail++;seen[si]=1;
-      let minX=sx,maxX=sx,minY=sy,maxY=sy,area=0;
-      while(head<tail){const cx=qx[head],cy=qy[head++];area++;minX=Math.min(minX,cx);maxX=Math.max(maxX,cx);minY=Math.min(minY,cy);maxY=Math.max(maxY,cy);
-        for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){if(!dx&&!dy)continue;const nx=cx+dx,ny=cy+dy;if(nx<0||ny<0||nx>=W||ny>=H)continue;const ni=ny*W+nx;if(mask[ni]&&!seen[ni]){seen[ni]=1;qx[tail]=nx;qy[tail]=ny;tail++;}}}
-      const cw=maxX-minX+1,ch=maxY-minY+1;
-      if(area>=5&&ch>=8&&ch<=H*.72&&cw<=W*.16)comps.push({minX,maxX,minY,maxY,width:cw,height:ch,area});
-    }
-    const body=comps.sort((a,b)=>a.minX-b.minX).slice(0,80);
-    if(body.length<2)return null;
-    const medianH=rfMedian(body.map(c=>c.height));
-    const glyphs=body.filter(c=>c.height>=Math.max(8,medianH*.58));
-    if(glyphs.length<2)return null;
-    // Map OCR characters to glyph slots by proportional horizontal position.
-    // We only compare same-character slots and never infer fraud from a digit
-    // merely being a different value.
-    const slots=[];
-    for(let i=0;i<glyphs.length;i++){
-      const c=glyphs[i];
-      slots.push({i,x:(c.minX+c.maxX)/2,width:c.width,height:c.height,fill:c.area/Math.max(1,c.width*c.height)});
-    }
-    const usable=numericChars.slice(0,slots.length);
-    return {text:rawText,chars:usable,slots,medianH};
-  } catch { return null; }
-}
-
-function rfNumericGlyphDistance(a,b){
-  if(!a||!b)return null;
-  const n=Math.min(a.chars?.length||0,b.chars?.length||0,a.slots?.length||0,b.slots?.length||0);
-  if(n<2)return null;
-  const parts=[];
-  for(let i=0;i<n;i++){
-    const ca=a.chars[i],cb=b.chars[i];
-    if(!/\d/.test(ca)||ca!==cb)continue;
-    const ga=a.slots[i],gb=b.slots[i];
-    const vals=[
-      rfSafeRel(ga.width/Math.max(1,ga.height),gb.width/Math.max(1,gb.height),.30),
-      rfSafeRel(ga.fill,gb.fill,.16),
-      rfSafeRel(ga.height/Math.max(1,a.medianH),gb.height/Math.max(1,b.medianH),.18)
-    ].filter(Number.isFinite);
-    if(vals.length)parts.push(vals.reduce((x,y)=>x+y,0)/vals.length);
-  }
-  return parts.length>=2 ? parts.reduce((x,y)=>x+y,0)/parts.length : null;
-}
-
 function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance, text = '', comparable = false, labelSimilarity = 1) {
   if (!refChar || !targetChar) return null;
   const cd = Number(characterDistance);
@@ -4131,23 +4060,16 @@ function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacr
   // connected-component distributions and must not be called "render" fraud.
   const structureComparable = Boolean(comparable) || Number(labelSimilarity) >= 0.88;
   if (!structureComparable) return null;
-
-  // IMPORTANT: diacritic raster variation is a SUPPORTING signal only.
-  // OCR segmentation, JPEG ringing, scan softness and Turkish glyph tails can
-  // move this metric substantially without any document manipulation. A
-  // diacritic mismatch therefore cannot create a finding by itself.
   const strongChar = Number.isFinite(cd) && cd >= 0.52;
-  const supportingDia = hasDia && Number.isFinite(dd) && dd >= 0.62;
-  const strongDia = supportingDia && strongChar && dd >= 0.68;
-  if (!strongChar) return null;
+  const strongDia = hasDia && Number.isFinite(dd) && dd >= 0.62;
   if (!strongChar && !strongDia) return null;
   const reasons = [];
   if (strongChar) reasons.push('karakter geometri/raster özellikleri referanstan belirgin ayrılıyor');
-  if (supportingDia) reasons.push('Türkçe diakritik raster farkı karakter geometrisi bulgusunu destekliyor');
+  if (strongDia) reasons.push('Türkçe diakritik karakter bileşenleri (ö/ü/ş/ç/ğ/ı/İ) referans render profilinden ayrılıyor');
   return {
     field,
     type: strongDia ? 'character-diacritic-render-mismatch' : 'character-render-mismatch',
-    severity: strongDia ? 'strong' : 'medium',
+    severity: (strongChar && strongDia) ? 'strong' : 'medium',
     characterDistance: Number.isFinite(cd) ? Number(cd.toFixed(4)) : null,
     diacriticDistance: Number.isFinite(dd) ? Number(dd.toFixed(4)) : null,
     text: String(text || ''),
@@ -5084,16 +5006,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
               if(refValueChar&&tarValueChar){
                 valueDistance=rfCharacterDistance(refValueChar,tarValueChar);
                 valueDiaDistance=rfDiacriticDistance(refValueChar,tarValueChar,valueRefText,valueTarText);
-                // For the main amount, add a same-digit-only raster comparison.
-                // This prevents different legitimate numbers from looking like
-                // a font mismatch while still catching a changed rendering of
-                // the same digit.
-                if(key==='amount'){
-                  const refGlyphs=await rfNumericGlyphSequence(refBuffer,rr,refSize,valueRefText);
-                  const tarGlyphs=await rfNumericGlyphSequence(targetBuffer,tr,targetSize,valueTarText);
-                  const sameDigitDistance=rfNumericGlyphDistance(refGlyphs,tarGlyphs);
-                  if(Number.isFinite(sameDigitDistance)) valueDistance=Math.max(Number(valueDistance)||0,sameDigitDistance);
-                }
               }else valueComparable=false;
             }
           }
@@ -11779,6 +11691,244 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null) {
       : (typographyHeadline ? `${headline}\n\n${typographyHeadline}` : headline),
   };
 }
+
+// =====================================================
+// FORENSIC EVIDENCE FUSION — v1
+// =====================================================
+// Amaç: Aynı fiziksel/semantik olayı farklı motorların tekrar tekrar
+// saymasını engellemek ve gerçekten bağımsız sinyallerin birlikte
+// desteklediği bulguları öne çıkarmak.
+//
+// Bu katman yeni bir sahtecilik hükmü üretmez. Yalnızca mevcut
+// deterministic bulguları normalize eder, kümeler ve kaynak bağımsızlığını
+// görünür hale getirir.
+function fuseForensicEvidence({
+  referenceForensics = null,
+  layoutForensics = null,
+  visualForensics = null,
+  pixelForensics = null,
+  amountForensics = null,
+} = {}) {
+  const events = [];
+  const add = (source, type, field, score, severity, detail, extra = {}) => {
+    const numericScore = Number(score);
+    if (!Number.isFinite(numericScore) || numericScore < 0) return;
+    events.push({
+      source,
+      type,
+      field: String(field || 'document').trim() || 'document',
+      score: Math.max(0, Math.min(100, numericScore)),
+      severity: String(severity || 'unknown'),
+      detail: String(detail || '').trim(),
+      ...extra,
+    });
+  };
+
+  // Reference/glyph engine
+  if (referenceForensics?.available) {
+    for (const row of (Array.isArray(referenceForensics.characterFindings)
+      ? referenceForensics.characterFindings : [])) {
+      const field = String(row?.field || '').replace(/:value$/i, '') || 'document';
+      add(
+        'reference-typography',
+        'typography',
+        field,
+        row?.severity === 'strong' ? 85 : 60,
+        row?.severity,
+        row?.evidence || row?.type,
+        { characterDistance: Number(row?.characterDistance), diacriticDistance: Number(row?.diacriticDistance) }
+      );
+    }
+    for (const row of (Array.isArray(referenceForensics.suspicious)
+      ? referenceForensics.suspicious : [])) {
+      add(
+        'reference-field',
+        'reference-field',
+        row?.field,
+        row?.styleScore ?? row?.ensembleMedianStyleScore ?? referenceForensics.typographyScore,
+        row?.severity || (Number(row?.styleScore) >= 72 ? 'strong' : 'medium'),
+        'Referans alan motorunda bağımsız alan/render sapması.'
+      );
+    }
+    for (const row of (Array.isArray(referenceForensics.spacingAnomalies)
+      ? referenceForensics.spacingAnomalies : [])) {
+      add(
+        'reference-spacing',
+        'spacing',
+        `${row?.beforeField || 'field'}->${row?.afterField || 'field'}`,
+        row?.score,
+        row?.severity,
+        row?.evidence
+      );
+    }
+  }
+
+  // Independent layout engine
+  if (layoutForensics?.available) {
+    for (const row of (Array.isArray(layoutForensics.localGapAnomalies)
+      ? layoutForensics.localGapAnomalies : [])) {
+      add(
+        'layout',
+        'layout-spacing',
+        `${row?.beforeField || 'field'}->${row?.afterField || 'field'}`,
+        row?.score,
+        row?.severity,
+        row?.evidence
+      );
+    }
+    for (const row of (Array.isArray(layoutForensics.containerPairs)
+      ? layoutForensics.containerPairs : [])) {
+      add(
+        'layout',
+        'layout-container',
+        row?.field || 'document',
+        row?.score,
+        row?.severity,
+        row?.evidence
+      );
+    }
+  }
+
+  // Whole-image visual engine
+  if (visualForensics?.available) {
+    add(
+      'visual',
+      'visual-reference',
+      'document',
+      visualForensics.score,
+      visualForensics.severity,
+      visualForensics.evidence
+    );
+  }
+
+  // Pixel engine
+  if (pixelForensics?.available) {
+    const m = pixelForensics.metrics || {};
+    const pixelSignals = [
+      ['ela', m.elaScore],
+      ['texture', m.textureScore],
+      ['clone', m.cloneScore],
+      ['reference-mismatch', m.referenceMismatchScore],
+    ];
+    for (const [type, score] of pixelSignals) {
+      if (Number.isFinite(Number(score)) && Number(score) >= 45) {
+        add('pixel', type, 'document', score,
+          Number(score) >= 70 ? 'strong' : 'medium',
+          pixelForensics.evidence);
+      }
+    }
+  }
+
+  // Amount engine is kept as a separate semantic field so an amount anomaly
+  // cannot accidentally corroborate an unrelated page-wide visual anomaly.
+  if (amountForensics?.status === 'warning') {
+    add(
+      'amount',
+      'amount',
+      'amount',
+      amountForensics.severity === 'strong' ? 85 : 60,
+      amountForensics.severity,
+      amountForensics.evidence || amountForensics.selectedAmountText
+    );
+  }
+
+  // Spatial/semantic clustering. We deliberately do NOT merge all document-
+  // level signals into one cluster: unrelated page-wide signals are not proof
+  // of the same event. Field-level events merge only when their semantic key
+  // matches. Spacing events use their ordered field pair as the key.
+  const clusters = new Map();
+  for (const e of events) {
+    const key = `${e.type}|${e.field}`;
+    if (!clusters.has(key)) clusters.set(key, []);
+    clusters.get(key).push(e);
+  }
+
+  const fused = [];
+  for (const [key, rows] of clusters.entries()) {
+    const bySource = new Map();
+    for (const row of rows) {
+      const prev = bySource.get(row.source);
+      if (!prev || row.score > prev.score) bySource.set(row.source, row);
+    }
+    const representatives = [...bySource.values()].sort((a,b) => b.score - a.score);
+    const independentSources = representatives.map(x => x.source);
+    const strongCount = representatives.filter(x => x.severity === 'strong' || x.score >= 70).length;
+    const mediumCount = representatives.filter(x => x.severity === 'medium' || x.score >= 55).length;
+    const maxScore = Math.max(...representatives.map(x => x.score));
+
+    // Two genuinely independent sources corroborating the same semantic/local
+    // event are stronger than duplicated findings from one engine.
+    const corroborated = independentSources.length >= 2;
+    const highConfidence = corroborated && strongCount >= 1;
+    const confidence = Math.round(Math.min(100,
+      maxScore * 0.55 +
+      Math.min(25, independentSources.length * 12) +
+      Math.min(20, strongCount * 10 + mediumCount * 4)
+    ));
+
+    fused.push({
+      key,
+      field: rows[0].field,
+      type: rows[0].type,
+      score: Math.round(maxScore),
+      confidence,
+      independentSourceCount: independentSources.length,
+      independentSources,
+      strongSignalCount: strongCount,
+      mediumSignalCount: mediumCount,
+      corroborated,
+      highConfidence,
+      severity: highConfidence ? 'strong' : (maxScore >= 55 ? 'medium' : 'low'),
+      primaryEvidence: representatives[0]?.detail || '',
+      sourceFindings: representatives.slice(0, 6),
+    });
+  }
+
+  fused.sort((a,b) => {
+    if (Number(b.independentSourceCount) !== Number(a.independentSourceCount)) {
+      return Number(b.independentSourceCount) - Number(a.independentSourceCount);
+    }
+    return Number(b.score) - Number(a.score);
+  });
+
+  const corroborated = fused.filter(x => x.corroborated);
+  const strongCorroborated = corroborated.filter(x => x.highConfidence);
+  const uniqueSources = [...new Set(events.map(x => x.source))];
+
+  return {
+    available: true,
+    engine: 'forensic-evidence-fusion-v1',
+    rawFindingCount: events.length,
+    fusedFindingCount: fused.length,
+    duplicateReduction: Math.max(0, events.length - fused.length),
+    uniqueSourceCount: uniqueSources.length,
+    uniqueSources,
+    corroboratedCount: corroborated.length,
+    strongCorroboratedCount: strongCorroborated.length,
+    findings: fused.slice(0, 30),
+    // This is deliberately an evidence/confidence indicator, not a risk score.
+    evidenceConfidence: fused.length
+      ? Math.round(Math.max(...fused.map(x => x.confidence)))
+      : 0,
+    evidence: strongCorroborated.length
+      ? `${strongCorroborated.length} lokal/semantik bulgu en az iki bağımsız forensic motor tarafından destekleniyor.`
+      : corroborated.length
+        ? `${corroborated.length} bulgu birden fazla bağımsız forensic motor tarafından destekleniyor; ancak güçlü ortak kanıt eşiği oluşmadı.`
+        : events.length
+          ? 'Forensic bulgular mevcut, ancak aynı olayı destekleyen en az iki bağımsız motor bulunmadı.'
+          : 'Birleştirilecek yeterli deterministic forensic bulgu bulunmadı.',
+  };
+}
+
+const forensicEvidenceFusion = fuseForensicEvidence({
+  referenceForensics,
+  layoutForensics,
+  visualForensics,
+  pixelForensics,
+  amountForensics,
+});
+result.forensicEvidenceFusion = forensicEvidenceFusion;
+console.log('FORENSIC EVIDENCE FUSION:', JSON.stringify(forensicEvidenceFusion));
 
 // =====================================================
 // DETERMINISTIK RİSK MOTORU
