@@ -124,6 +124,165 @@ return paddleOCRClient;
 
 const paddleOCRInFlight = new Map();
 
+
+// =====================================================
+// AZURE DOCUMENT INTELLIGENCE — SECOND OCR / LAYOUT EYE
+// =====================================================
+// Azure yalnızca ikinci bir OCR + geometri kaynağıdır. Tek başına
+// sahtecilik kararı üretmez ve mevcut PaddleOCR/reference motorunun
+// yerine geçmez.
+const AZURE_DI_API_VERSION = "2024-11-30";
+
+function getAzureDocumentIntelligenceConfig() {
+  const endpoint = String(process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT || "")
+    .trim().replace(/\/$/, "");
+  const key = String(process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY || "").trim();
+  if (!endpoint || !key) return null;
+  return { endpoint, key };
+}
+
+function azurePointBoxToRect(polygon = []) {
+  const nums = Array.isArray(polygon) ? polygon.map(Number).filter(Number.isFinite) : [];
+  if (nums.length < 8) return null;
+  const xs = [], ys = [];
+  for (let i = 0; i < nums.length - 1; i += 2) {
+    xs.push(nums[i]); ys.push(nums[i + 1]);
+  }
+  if (!xs.length || !ys.length) return null;
+  return { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
+}
+
+function normalizeAzureLayoutResult(payload) {
+  const ar = payload?.analyzeResult || {};
+  const pages = Array.isArray(ar.pages) ? ar.pages : [];
+  const paragraphs = Array.isArray(ar.paragraphs) ? ar.paragraphs : [];
+  const tables = Array.isArray(ar.tables) ? ar.tables : [];
+  const lines = [], words = [];
+
+  for (const page of pages) {
+    const pageNumber = Number(page?.pageNumber) || 1;
+    const width = Number(page?.width) || 0;
+    const height = Number(page?.height) || 0;
+    for (const line of (Array.isArray(page?.lines) ? page.lines : [])) {
+      const box = azurePointBoxToRect(line?.polygon);
+      if (!box) continue;
+      lines.push({
+        pageNumber,
+        text: String(line?.content || "").trim(),
+        box,
+        xNorm: width ? box.x1 / width : null,
+        yNorm: height ? box.y1 / height : null,
+        widthNorm: width ? (box.x2 - box.x1) / width : null,
+        heightNorm: height ? (box.y2 - box.y1) / height : null,
+      });
+    }
+    for (const word of (Array.isArray(page?.words) ? page.words : [])) {
+      const box = azurePointBoxToRect(word?.polygon);
+      if (!box) continue;
+      words.push({
+        pageNumber,
+        text: String(word?.content || "").trim(),
+        confidence: Number.isFinite(Number(word?.confidence)) ? Number(word.confidence) : null,
+        box,
+        xNorm: width ? box.x1 / width : null,
+        yNorm: height ? box.y1 / height : null,
+        widthNorm: width ? (box.x2 - box.x1) / width : null,
+        heightNorm: height ? (box.y2 - box.y1) / height : null,
+      });
+    }
+  }
+
+  return {
+    available: true,
+    engine: "azure-document-intelligence-layout-v4",
+    apiVersion: String(ar.apiVersion || AZURE_DI_API_VERSION),
+    modelId: "prebuilt-layout",
+    content: String(ar.content || ""),
+    pageCount: pages.length,
+    pages: pages.map((page) => ({
+      pageNumber: Number(page?.pageNumber) || 1,
+      width: Number(page?.width) || 0,
+      height: Number(page?.height) || 0,
+      unit: page?.unit || null,
+      angle: Number.isFinite(Number(page?.angle)) ? Number(page.angle) : null,
+      lineCount: Array.isArray(page?.lines) ? page.lines.length : 0,
+      wordCount: Array.isArray(page?.words) ? page.words.length : 0,
+    })),
+    lines,
+    words,
+    paragraphs: paragraphs.map((p) => ({
+      content: String(p?.content || "").trim(),
+      role: p?.role || null,
+      boundingRegions: Array.isArray(p?.boundingRegions) ? p.boundingRegions.slice(0, 4) : [],
+    })).filter((p) => p.content),
+    tableCount: tables.length,
+  };
+}
+
+async function runAzureDocumentLayout(filePath) {
+  const cfg = getAzureDocumentIntelligenceConfig();
+  if (!cfg) {
+    console.log("AZURE DOCUMENT INTELLIGENCE: ENV YOK, ATLANDI");
+    return null;
+  }
+
+  try {
+    const buffer = await fs.readFile(filePath);
+    if (!buffer?.length) return null;
+
+    const endpoint = `${cfg.endpoint}/documentintelligence/documentModels/prebuilt-layout:analyze?_overload=analyzeDocument&api-version=${AZURE_DI_API_VERSION}&locale=tr-TR&stringIndexType=textElements`;
+    const post = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Ocp-Apim-Subscription-Key": cfg.key,
+      },
+      body: JSON.stringify({ base64Source: buffer.toString("base64") }),
+    });
+
+    if (!post.ok) {
+      const text = await post.text().catch(() => "");
+      throw new Error(`Azure analyze POST ${post.status}: ${text.slice(0, 500)}`);
+    }
+
+    const operationLocation = post.headers.get("operation-location") || post.headers.get("Operation-Location");
+    if (!operationLocation) throw new Error("Azure Operation-Location header bulunamadı.");
+
+    for (let attempt = 0; attempt < 45; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const poll = await fetch(operationLocation, {
+        method: "GET",
+        headers: { "Ocp-Apim-Subscription-Key": cfg.key },
+      });
+      if (!poll.ok) {
+        const text = await poll.text().catch(() => "");
+        throw new Error(`Azure analyze GET ${poll.status}: ${text.slice(0, 500)}`);
+      }
+      const payload = await poll.json();
+      const status = String(payload?.status || "").toLowerCase();
+      if (status === "succeeded") {
+        const normalized = normalizeAzureLayoutResult(payload);
+        console.log("AZURE DOCUMENT INTELLIGENCE LAYOUT:", JSON.stringify({
+          pageCount: normalized.pageCount,
+          lineCount: normalized.lines.length,
+          wordCount: normalized.words.length,
+          paragraphCount: normalized.paragraphs.length,
+          tableCount: normalized.tableCount,
+          apiVersion: normalized.apiVersion,
+        }));
+        return normalized;
+      }
+      if (["failed", "canceled", "cancelled"].includes(status)) {
+        throw new Error(`Azure analyze status: ${status}`);
+      }
+    }
+    throw new Error("Azure Document Intelligence zaman aşımı.");
+  } catch (error) {
+    console.warn("AZURE DOCUMENT INTELLIGENCE HATASI:", error?.message || error);
+    return null;
+  }
+}
+
 async function runPaddleOCR(
 filePath
 ) {
@@ -10858,6 +11017,7 @@ let visualForensics = null;
 let layoutForensics = null;
 let referenceForensics = null;
 let pixelForensics = null;
+let azureLayout = null;
 
 // PDF'yi de görüntü tabanlı forensic hattına sok.
 // OpenAI için orijinal PDF korunur; OCR/geometry/visual forensic için ilk sayfa
@@ -10910,6 +11070,13 @@ console.log(
 "PADDLEOCR IMAGE CONFIDENCE:",
 paddleImageOCR.confidence
 );
+
+// Azure ikinci OCR/layout gözü: mevcut PaddleOCR ve forensic motoru korunur.
+try {
+  azureLayout = await runAzureDocumentLayout(forensicTargetPath);
+} catch (error) {
+  console.warn("AZURE LAYOUT ÇAĞRISI HATASI:", error?.message || error);
+}
 
 amountForensics =
 await analyzeAmountForensics(
@@ -11771,6 +11938,41 @@ Konum veya font/render farkı tek başına sahtecilik kanıtı değildir; başka
 }
 
 // -------------------------------------------------
+// AZURE DOCUMENT INTELLIGENCE CONTEXT
+// -------------------------------------------------
+if (azureLayout?.available) {
+  content.unshift({
+    type: "input_text",
+    text: `
+=====================================================
+AZURE DOCUMENT INTELLIGENCE — İKİNCİ OCR / LAYOUT GÖZÜ
+=====================================================
+
+Azure yalnızca gerçek yüklenen belgeden ikinci bir OCR ve geometri kaynağıdır.
+Bu veri tek başına sahtecilik kararı değildir. PaddleOCR ve gerçek görüntü ana kaynaktır.
+
+Model: ${azureLayout.modelId}
+API: ${azureLayout.apiVersion}
+Sayfa sayısı: ${azureLayout.pageCount}
+Satır sayısı: ${azureLayout.lines.length}
+Kelime sayısı: ${azureLayout.words.length}
+Paragraf sayısı: ${azureLayout.paragraphs.length}
+
+Azure OCR/LAYOUT özeti:
+${JSON.stringify({
+  pages: azureLayout.pages,
+  lines: azureLayout.lines.slice(0, 250),
+  paragraphs: azureLayout.paragraphs.slice(0, 120),
+}, null, 2)}
+
+Azure ile PaddleOCR arasında küçük OCR/koordinat farklarını tek başına manipülasyon olarak değerlendirme.
+Azure bilgisi özellikle alan konumu, satır sırası ve dikey boşlukların ikinci bir gözle doğrulanması için kullanılabilir.
+=====================================================
+`,
+  });
+}
+
+// -------------------------------------------------
 // YAPISAL GEOMETRİ FORENSICS CONTEXT
 // -------------------------------------------------
 if (layoutForensics?.available) {
@@ -11914,6 +12116,9 @@ if (
 }
 }
 
+if (azureLayout) {
+  result.azureDocumentIntelligence = azureLayout;
+}
 if (visualForensics) {
   result.visualForensics = visualForensics;
 }
@@ -12514,6 +12719,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   referenceTemplateAnalysis,
   referenceForensics,
   pixelForensics,
+  azureLayout,
 });
 console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
 
