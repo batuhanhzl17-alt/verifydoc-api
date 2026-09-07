@@ -3713,6 +3713,49 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     }
 
     const localGapAnomalies=[];
+    // When the target contains only a few detectable borders, ordinary pairwise
+    // gap matching can miss a large blank span. Compare the REFERENCE lines
+    // between two confidently matched anchors against the single target span
+    // between those same anchors. This catches an inserted/expanded blank area
+    // without treating the raw line-count difference as fraud evidence.
+    const unmatchedSpanAnomalies=[];
+    for(let pi=0;pi<pairs.length-1;pi++){
+      const a=pairs[pi], b=pairs[pi+1];
+      if(Number(a.cost)>1.8 || Number(b.cost)>1.8) continue;
+      const lenA=Math.min(Number(a.reference.lengthNorm),Number(a.target.lengthNorm))/Math.max(.001,Math.max(Number(a.reference.lengthNorm),Number(a.target.lengthNorm)));
+      const lenB=Math.min(Number(b.reference.lengthNorm),Number(b.target.lengthNorm))/Math.max(.001,Math.max(Number(b.reference.lengthNorm),Number(b.target.lengthNorm)));
+      if(lenA<.72 || lenB<.72) continue;
+      const ri=Number(a.indexR), rj=Number(b.indexR), ti=Number(a.indexT), tj=Number(b.indexT);
+      if(!Number.isInteger(ri)||!Number.isInteger(rj)||!Number.isInteger(ti)||!Number.isInteger(tj)||rj<=ri||tj<=ti) continue;
+      const refSpan=Number(b.reference.yNorm)-Number(a.reference.yNorm);
+      const targetSpan=Number(b.target.yNorm)-Number(a.target.yNorm);
+      if(refSpan<=0||targetSpan<=0) continue;
+      const expected=refSpan*globalScale;
+      const delta=Math.abs(targetSpan-expected);
+      const rel=delta/Math.max(expected,.03);
+      const missingRefBetween=Math.max(0,rj-ri-1);
+      const missingTargetBetween=Math.max(0,tj-ti-1);
+      // Require a genuinely expanded/shrunk span and at least one reference
+      // boundary missing inside it. A normal photo can move the whole block,
+      // but should not create a large local expansion between matching anchors.
+      if(missingRefBetween>=1 && rel>=.38 && expected>=.05){
+        unmatchedSpanAnomalies.push({
+          type:'unmatched-structural-span',
+          referenceBeforeY:Number(a.reference.yNorm.toFixed(5)),
+          referenceAfterY:Number(b.reference.yNorm.toFixed(5)),
+          targetBeforeY:Number(a.target.yNorm.toFixed(5)),
+          targetAfterY:Number(b.target.yNorm.toFixed(5)),
+          referenceSpanNorm:Number(refSpan.toFixed(5)),
+          targetSpanNorm:Number(targetSpan.toFixed(5)),
+          expectedTargetSpanNorm:Number(expected.toFixed(5)),
+          relativeDelta:Number(rel.toFixed(3)),
+          missingReferenceLinesBetween:missingRefBetween,
+          missingTargetLinesBetween:missingTargetBetween,
+          score:Math.min(100,Math.round(rel*100))
+        });
+      }
+    }
+    unmatchedSpanAnomalies.sort((a,b)=>b.score-a.score);
     for(let i=0;i<pairs.length-1;i++){
       const a=pairs[i],b=pairs[i+1];
       const refGap=b.reference.yNorm-a.reference.yNorm;
@@ -3783,7 +3826,8 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     const strongContainerCount = containerPairs.filter(x=>x.score>=35).length;
     const strongStepCount = structureSignals.filter(x => x.type==='localized-structural-step' && Number(x.score)>=35).length;
     const strongGapCount = strongLocal;
-    const hasGeometryConfirmation = (strongGapCount>=1) || (strongContainerCount>=1) || (strongStepCount>=1);
+    const strongSpanCount = unmatchedSpanAnomalies.filter(x=>x.score>=50).length;
+    const hasGeometryConfirmation = (strongGapCount>=1) || (strongContainerCount>=1) || (strongStepCount>=1) || (strongSpanCount>=1);
     const missingStructureConfirmed = (coverage<.70 && (Math.max(0, Number(refH?.length || 0) - Number(pairs?.length || 0))>=3) && hasGeometryConfirmation);
     if (missingStructureConfirmed) {
       structureSignals.push({
@@ -3808,6 +3852,7 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     const finalScore = Math.min(100, score + structuralBonus);
     const independentSignals=[
       strongGapCount>=1,
+      strongSpanCount>=1,
       strongContainerCount>=1,
       strongStepCount>=1,
       lengthOutliers>=2,
@@ -3822,6 +3867,7 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       matchedLineCount:pairs.length,unmatchedReferenceLines:unmatchedRef,unmatchedTargetLines:unmatchedTarget,
       affineY:{scale:Number(globalScale.toFixed(5)),offset:Number(globalOffset.toFixed(5))},coverage:Number(coverage.toFixed(3)),
       localGapAnomalies:localGapAnomalies.sort((a,b)=>b.score-a.score).slice(0,12),
+      unmatchedSpanAnomalies:unmatchedSpanAnomalies.slice(0,12),
       containerPairs:containerPairs.sort((a,b)=>b.score-a.score).slice(0,12),
       missingStructureCandidate,
       strongLocalGapCount:strongLocal,containerHeightChangeCount:containerPairs.length,lengthOutlierCount:lengthOutliers,
@@ -12131,6 +12177,23 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 
     // Strong local spacing/section-height changes are concrete whole-page
     // structural evidence. Do not expose numeric scores to the user.
+    // Prefer a detected expanded blank span over the generic "missing lines"
+    // message because it tells the user WHERE the structural change is.
+    const spans = Array.isArray(layout.unmatchedSpanAnomalies) ? layout.unmatchedSpanAnomalies : [];
+    for (const row of spans.filter(x => Number(x?.score) >= 50).slice(0, 2)) {
+      const y = Number.isFinite(Number(row?.targetBeforeY)) ? Number(row.targetBeforeY) : null;
+      const zone = zoneLabel(y);
+      const key = `layout|${zone}|span`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      findings.push({
+        priority: 1,
+        title: 'Belge yerleşimi',
+        detail: `${zone}: Referans ile hedef arasında belirgin bir dikey boşluk/bölüm aralığı farkı tespit edildi.`,
+        kind: 'layout'
+      });
+    }
+
     for (const row of [...containers, ...gaps]
       .filter(x => Number(x?.score) >= 45)
       .sort((a,b) => Number(b.score || 0) - Number(a.score || 0))
@@ -12151,7 +12214,8 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 
     // Missing long structural borders can indicate an omitted section, but only
     // surface it when the line matching coverage is materially incomplete.
-    if (Number(layout.coverage) < 0.72 && Number(layout.unmatchedReferenceLines) >= 2) {
+    const concreteSpacingFinding = findings.some(x => x.kind === 'layout' && /dikey boşluk|bölüm\/kutu yüksekliği|ardışık bölümler/.test(String(x.detail || '')));
+    if (!concreteSpacingFinding && Number(layout.coverage) < 0.72 && Number(layout.unmatchedReferenceLines) >= 2) {
       findings.push({
         priority: 1,
         title: 'Belge yapısı',
