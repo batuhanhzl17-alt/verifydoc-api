@@ -197,7 +197,7 @@ try {
 
 console.log(
 "================================================"
-\);
+);
 
 console.log(
 "PADDLEOCR BAŞLADI"
