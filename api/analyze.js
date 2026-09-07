@@ -283,6 +283,257 @@ async function runAzureDocumentLayout(filePath) {
   }
 }
 
+
+// =====================================================
+// AZURE REFERENCE GEOMETRY — SEMANTIC ANCHOR / GAP CHECK
+// =====================================================
+// Azure'ın hedef belge koordinatlarını, seçilen bankanın referans PDF'sindeki
+// aynı semantik alanların koordinatlarıyla karşılaştırır. Amaç özellikle
+// "iki bölüm arasındaki büyük boşluk" gibi lokal yerleşim farklarını ikinci
+// bir gözle doğrulamaktır. Tek başına sahtecilik kararı üretmez.
+const azureReferenceLayoutCache = new Map();
+
+function azureReferenceAnchorLines(layout) {
+  const out = [];
+  if (!layout?.available || !Array.isArray(layout.lines)) return out;
+
+  for (const line of layout.lines) {
+    const text = String(line?.text || '').trim();
+    if (!text || !Number.isFinite(Number(line?.yNorm))) continue;
+    const rule = referenceFieldRuleForText(text);
+    if (!rule?.key) continue;
+
+    out.push({
+      field: String(rule.key),
+      label: text.slice(0, 120),
+      yNorm: Number(line.yNorm),
+      xNorm: Number.isFinite(Number(line.xNorm)) ? Number(line.xNorm) : null,
+      widthNorm: Number.isFinite(Number(line.widthNorm)) ? Number(line.widthNorm) : null,
+      heightNorm: Number.isFinite(Number(line.heightNorm)) ? Number(line.heightNorm) : null,
+      pageNumber: Number(line.pageNumber) || 1
+    });
+  }
+
+  // Aynı alan birden fazla satırda geçebilir. İlk görülen semantik anchor'ı
+  // kullanmak yerine, sayfadaki en belirgin/üst düzey satırı seç.
+  const byField = new Map();
+  for (const row of out) {
+    if (!byField.has(row.field)) byField.set(row.field, []);
+    byField.get(row.field).push(row);
+  }
+
+  const selected = [];
+  for (const [field, rows] of byField.entries()) {
+    rows.sort((a, b) => {
+      const ay = Number(a.yNorm), by = Number(b.yNorm);
+      return ay - by;
+    });
+    selected.push(rows[0]);
+  }
+
+  return selected.sort((a, b) => a.yNorm - b.yNorm);
+}
+
+function azureFieldDisplayName(field) {
+  const map = {
+    branch: 'Şube',
+    date: 'Tarih',
+    time: 'Saat',
+    description: 'Açıklama',
+    transactionNo: 'İşlem No',
+    accountNo: 'Hesap No',
+    taxNo: 'Vergi No',
+    amount: 'Tutar',
+    iban: 'IBAN',
+    senderName: 'Gönderen Adı',
+    recipientName: 'Alıcı Adı',
+    senderAddress: 'Gönderen Adresi',
+    recipientAddress: 'Alıcı Adresi',
+    address: 'Adres'
+  };
+  return map[String(field || '')] || String(field || 'Alan');
+}
+
+async function getAzureReferenceLayouts(bank) {
+  const normalizedBank = normalizeBank(bank);
+  if (!normalizedBank) return [];
+
+  const cacheKey = `azure-reference-layout:v1:${normalizedBank}`;
+  if (azureReferenceLayoutCache.has(cacheKey)) {
+    return azureReferenceLayoutCache.get(cacheKey);
+  }
+
+  const referencePaths = await getReferenceFiles(normalizedBank);
+  const layouts = [];
+
+  for (const referencePath of referencePaths) {
+    try {
+      const layout = await runAzureDocumentLayout(referencePath);
+      if (layout?.available && layout.lines?.length) {
+        layouts.push({
+          file: path.basename(referencePath),
+          layout
+        });
+      }
+    } catch (error) {
+      console.warn(
+        'AZURE REFERANS LAYOUT TEK DOSYA ATLANDI:',
+        path.basename(referencePath),
+        error?.message || error
+      );
+    }
+  }
+
+  azureReferenceLayoutCache.set(cacheKey, layouts);
+  return layouts;
+}
+
+async function runAzureReferenceGeometryComparison(targetAzureLayout, bank) {
+  if (!targetAzureLayout?.available || !bank) return null;
+
+  try {
+    const references = await getAzureReferenceLayouts(bank);
+    if (!references.length) return null;
+
+    const targetAnchors = azureReferenceAnchorLines(targetAzureLayout);
+    if (targetAnchors.length < 3) return null;
+
+    const perReference = [];
+
+    for (const refEntry of references) {
+      const refAnchors = azureReferenceAnchorLines(refEntry.layout);
+      if (refAnchors.length < 3) continue;
+
+      const targetByField = new Map(targetAnchors.map(x => [x.field, x]));
+      const refByField = new Map(refAnchors.map(x => [x.field, x]));
+
+      const shared = refAnchors
+        .filter(x => targetByField.has(x.field))
+        .map(x => ({
+          field: x.field,
+          reference: x,
+          target: targetByField.get(x.field)
+        }))
+        .sort((a, b) => a.reference.yNorm - b.reference.yNorm);
+
+      if (shared.length < 3) continue;
+
+      // Ardışık semantik anchor'lar arasındaki boşluk oranı, global ölçek/
+      // kamera boyutundan büyük ölçüde bağımsızdır.
+      const anomalies = [];
+      for (let i = 1; i < shared.length; i++) {
+        const before = shared[i - 1];
+        const after = shared[i];
+
+        const refGap = Number(after.reference.yNorm) - Number(before.reference.yNorm);
+        const targetGap = Number(after.target.yNorm) - Number(before.target.yNorm);
+
+        if (!(refGap >= 0.025 && targetGap >= 0)) continue;
+
+        const ratio = targetGap / Math.max(0.001, refGap);
+        const absoluteDelta = Math.abs(targetGap - refGap);
+
+        // Normal fotoğraf/resize etkisi oranı değiştirmez; burada yalnızca
+        // belirgin lokal genişleme/daralma aranır.
+        const expanded = ratio >= 1.70 && absoluteDelta >= 0.030;
+        const compressed = ratio <= 0.55 && absoluteDelta >= 0.030;
+        if (!expanded && !compressed) continue;
+
+        const severityFactor = expanded
+          ? Math.min(1.8, ratio / 1.70)
+          : Math.min(1.8, 0.55 / Math.max(0.01, ratio));
+
+        const score = Math.min(
+          100,
+          Math.round(55 + Math.min(35, absoluteDelta * 500) + Math.min(10, (severityFactor - 1) * 20))
+        );
+
+        anomalies.push({
+          type: 'azure-semantic-gap',
+          direction: expanded ? 'expanded' : 'compressed',
+          beforeField: before.field,
+          afterField: after.field,
+          beforeLabel: azureFieldDisplayName(before.field),
+          afterLabel: azureFieldDisplayName(after.field),
+          referenceGap: Number(refGap.toFixed(4)),
+          targetGap: Number(targetGap.toFixed(4)),
+          gapRatio: Number(ratio.toFixed(3)),
+          absoluteDelta: Number(absoluteDelta.toFixed(4)),
+          targetBeforeY: Number(before.target.yNorm.toFixed(4)),
+          targetAfterY: Number(after.target.yNorm.toFixed(4)),
+          score
+        });
+      }
+
+      anomalies.sort((a, b) => b.score - a.score);
+      perReference.push({
+        file: refEntry.file,
+        sharedAnchorCount: shared.length,
+        anomalies: anomalies.slice(0, 20)
+      });
+    }
+
+    if (!perReference.length) return null;
+
+    // Birden fazla trusted reference varsa aynı anchor çiftini en az yarısının
+    // doğrulaması gerekir. Tek referansta ise güçlü tek bulgu yeterlidir.
+    const groups = new Map();
+    for (const ref of perReference) {
+      for (const anomaly of ref.anomalies || []) {
+        const key = `${anomaly.beforeField}|${anomaly.afterField}|${anomaly.direction}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(anomaly);
+      }
+    }
+
+    const anomalies = [];
+    for (const rows of groups.values()) {
+      const ordered = [...rows].sort((a, b) => b.score - a.score);
+      const max = ordered[0];
+      const hits = rows.filter(x => Number(x.score) >= 60).length;
+      const required = perReference.length >= 2
+        ? Math.ceil(perReference.length * 0.5)
+        : 1;
+
+      if (hits < required) continue;
+
+      const medianRatioValues = rows
+        .map(x => Number(x.gapRatio))
+        .filter(Number.isFinite)
+        .sort((a, b) => a - b);
+      const medianRatio = medianRatioValues.length
+        ? medianRatioValues[Math.floor(medianRatioValues.length / 2)]
+        : Number(max.gapRatio);
+
+      anomalies.push({
+        ...max,
+        gapRatio: Number(medianRatio.toFixed(3)),
+        referenceConsensusCount: hits,
+        referenceCount: perReference.length
+      });
+    }
+
+    anomalies.sort((a, b) => b.score - a.score);
+
+    return {
+      available: true,
+      engine: 'azure-reference-semantic-gap-v1',
+      bank: normalizeBank(bank),
+      referenceCount: perReference.length,
+      targetAnchorCount: targetAnchors.length,
+      anomalies: anomalies.slice(0, 20),
+      strongAnomalies: anomalies.filter(x => Number(x.score) >= 70).slice(0, 10),
+      references: perReference
+    };
+  } catch (error) {
+    console.warn(
+      'AZURE REFERENCE GEOMETRY HATASI:',
+      error?.message || error
+    );
+    return null;
+  }
+}
+
 async function runPaddleOCR(
 filePath
 ) {
@@ -11018,6 +11269,7 @@ let layoutForensics = null;
 let referenceForensics = null;
 let pixelForensics = null;
 let azureLayout = null;
+let azureReferenceGeometry = null;
 
 // PDF'yi de görüntü tabanlı forensic hattına sok.
 // OpenAI için orijinal PDF korunur; OCR/geometry/visual forensic için ilk sayfa
@@ -11074,6 +11326,16 @@ paddleImageOCR.confidence
 // Azure ikinci OCR/layout gözü: mevcut PaddleOCR ve forensic motoru korunur.
 try {
   azureLayout = await runAzureDocumentLayout(forensicTargetPath);
+  if (azureLayout?.available && bank && reference) {
+    azureReferenceGeometry = await runAzureReferenceGeometryComparison(
+      azureLayout,
+      bank
+    );
+    console.log(
+      "AZURE REFERENCE GEOMETRY:",
+      JSON.stringify(azureReferenceGeometry)
+    );
+  }
 } catch (error) {
   console.warn("AZURE LAYOUT ÇAĞRISI HATASI:", error?.message || error);
 }
@@ -11973,6 +12235,44 @@ Azure bilgisi özellikle alan konumu, satır sırası ve dikey boşlukların iki
 }
 
 // -------------------------------------------------
+// AZURE REFERANS GEOMETRİ CONTEXT
+// -------------------------------------------------
+if (azureReferenceGeometry?.available) {
+  content.unshift({
+    type: "input_text",
+    text: `
+=====================================================
+AZURE REFERANS GEOMETRİ — SEMANTİK BOŞLUK DOĞRULAMASI
+=====================================================
+
+Azure, gerçek hedef belgenin koordinatlarını aynı bankanın güvenilir
+referans belgesindeki semantik alanların koordinatlarıyla karşılaştırdı.
+
+Bu bölüm yalnızca referansla hedef arasındaki belirgin lokal dikey
+boşluk/yerleşim farklarını ikinci bir göz olarak doğrular.
+Global ölçek, kamera, JPEG ve perspektif farkları tek başına bulgu değildir.
+
+BULGULAR:
+${JSON.stringify({
+  anomalies: azureReferenceGeometry.anomalies || [],
+  strongAnomalies: azureReferenceGeometry.strongAnomalies || [],
+}, null, 2)}
+
+Kurallar:
+- Aynı semantik alan çiftinin referans ve hedef arasındaki dikey boşluğu
+  belirgin biçimde genişlemiş/daralmışsa bunu somut yerleşim farkı olarak
+  değerlendirebilirsin.
+- Azure bulgusunu tek başına kesin sahtecilik hükmü olarak kullanma.
+- Küçük koordinat/OCR farklarını raporlama.
+- Kullanıcıya ham skor, oran veya teknik motor adı gösterme.
+- Güçlü Azure bulgusu varsa nerede olduğunu kısa ve somut Türkçe bir
+  cümleyle belirt.
+=====================================================
+`,
+  });
+}
+
+// -------------------------------------------------
 // YAPISAL GEOMETRİ FORENSICS CONTEXT
 // -------------------------------------------------
 if (layoutForensics?.available) {
@@ -12119,6 +12419,9 @@ if (
 if (azureLayout) {
   result.azureDocumentIntelligence = azureLayout;
 }
+if (azureReferenceGeometry) {
+  result.azureReferenceGeometry = azureReferenceGeometry;
+}
 if (visualForensics) {
   result.visualForensics = visualForensics;
 }
@@ -12157,7 +12460,7 @@ if (referenceForensics) {
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
 // "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
 if (referenceForensics || layoutForensics?.available) {
-  const humanForensicReport = buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics, referenceLocalCrop);
+  const humanForensicReport = buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics, referenceLocalCrop, azureReferenceGeometry);
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     // Telegram/UI için teknik engine cümlesi yerine anlaşılır bulgu metnini kullan.
@@ -12371,7 +12674,7 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
   }
 }
 
-function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null) {
+function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
   // The reference is a whole-document fingerprint. Compare structure/spacing first,
   // then fields, typography and localized pixels. Raw scores remain hidden.
@@ -12401,6 +12704,37 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 
   const findings = [];
   const seen = new Set();
+
+  // 0) Azure semantic anchor geometry: a second independent eye for
+  // large local vertical spacing changes. This is intentionally reported
+  // before generic missing-border wording because it answers WHERE.
+  if (azureGeometry?.available) {
+    for (const row of (Array.isArray(azureGeometry.strongAnomalies)
+      ? azureGeometry.strongAnomalies
+      : [])) {
+      const before = String(row?.beforeLabel || '').trim();
+      const after = String(row?.afterLabel || '').trim();
+      if (!before || !after) continue;
+
+      const direction = String(row?.direction || '') === 'compressed'
+        ? 'daralmış'
+        : 'genişlemiş';
+
+      const key = `azure-gap|${before}|${after}|${direction}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      findings.push({
+        priority: 1,
+        title: 'Belge yerleşimi',
+        detail: `Referansa göre ${before} ile ${after} arasındaki dikey boşluk belirgin şekilde ${direction}.`,
+        kind: 'azure-layout'
+      });
+
+      // Keep the user-facing list concise.
+      if (findings.filter(x => x.kind === 'azure-layout').length >= 2) break;
+    }
+  }
 
   // 0) Whole-document structural comparison comes first.
   // The reference must be treated as a full-page visual fingerprint: long
@@ -12720,6 +13054,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   referenceForensics,
   pixelForensics,
   azureLayout,
+  azureReferenceGeometry,
 });
 console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
 
