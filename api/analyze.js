@@ -3450,6 +3450,75 @@ async function extractLongLineFingerprint(buffer) {
   }
 }
 
+// =====================================================
+// REFERENCE WHOLE-PAGE STRUCTURE SIGNATURE v4
+// =====================================================
+// Borders, section boundaries and page extent are part of the document
+// fingerprint. This layer is independent from OCR values and can therefore
+// see missing sections and abnormal empty space.
+async function extractWholePageStructureSignature(buffer) {
+  if (!buffer) return null;
+  try {
+    const raw = await sharp(buffer).grayscale().raw().toBuffer({ resolveWithObject: true });
+    const { width, height } = raw.info;
+    if (!width || !height) return null;
+    const candidates = [];
+    for (const threshold of [175, 195, 215]) {
+      const rowMaxRun = new Array(height).fill(0);
+      const rowDarkCount = new Array(height).fill(0);
+      for (let y = 0; y < height; y++) {
+        const off = y * width;
+        let dark = 0, run = 0, maxRun = 0;
+        for (let x = 0; x < width; x++) {
+          if (raw.data[off + x] < threshold) { dark++; run++; if (run > maxRun) maxRun = run; }
+          else run = 0;
+        }
+        rowMaxRun[y] = maxRun;
+        rowDarkCount[y] = dark;
+      }
+      const qualifying = [];
+      for (let y = 0; y < height; y++) {
+        const rr = rowMaxRun[y] / width;
+        const dr = rowDarkCount[y] / width;
+        if (rr >= 0.48 || (rr >= 0.36 && dr >= 0.42)) qualifying.push(y);
+      }
+      const clusters = [];
+      let start = null, prev = null;
+      for (const y of qualifying) {
+        if (start === null) start = y;
+        if (prev !== null && y > prev + 2) { clusters.push([start, prev]); start = y; }
+        prev = y;
+      }
+      if (start !== null) clusters.push([start, prev]);
+      for (const [a, b] of clusters) {
+        const y = Math.round((a + b) / 2);
+        const run = Math.max(...rowMaxRun.slice(a, b + 1));
+        if (run / width < 0.40) continue;
+        candidates.push({ yNorm: y / height, runNorm: Number((run / width).toFixed(4)), threshold });
+      }
+    }
+    candidates.sort((a,b) => a.yNorm - b.yNorm);
+    const merged = [];
+    for (const c of candidates) {
+      const last = merged[merged.length - 1];
+      if (last && Math.abs(last.yNorm - c.yNorm) <= 0.006) {
+        if (c.runNorm > last.runNorm) Object.assign(last, c);
+      } else merged.push({ ...c });
+    }
+    const lines = merged.filter(x => x.runNorm >= 0.52 || (x.runNorm >= 0.44 && x.yNorm > 0.04 && x.yNorm < 0.97));
+    const gaps = [];
+    for (let i = 1; i < lines.length; i++) gaps.push({ beforeY: lines[i-1].yNorm, afterY: lines[i].yNorm, gap: lines[i].yNorm-lines[i-1].yNorm });
+    return {
+      width, height, lines, lineCount: lines.length,
+      firstLineY: lines.length ? lines[0].yNorm : null,
+      lastLineY: lines.length ? lines[lines.length-1].yNorm : null,
+      verticalExtent: lines.length ? lines[lines.length-1].yNorm-lines[0].yNorm : 0,
+      gaps
+    };
+  } catch (_) { return null; }
+}
+
+
 async function runReferenceLayoutForensics(targetPath, bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath) return null;
@@ -3458,7 +3527,8 @@ async function runReferenceLayoutForensics(targetPath, bank) {
   try {
     const targetBuffer = await fs.readFile(targetPath);
     const targetFingerprint = await extractLongLineFingerprint(targetBuffer);
-    if (!targetFingerprint) return null;
+    const targetStructure = await extractWholePageStructureSignature(targetBuffer);
+    if (!targetFingerprint || !targetStructure) return null;
 
     let ensemble = referenceLayoutForensicsCache.get(cacheKey);
     if (!ensemble) {
@@ -3476,7 +3546,8 @@ async function runReferenceLayoutForensics(targetPath, bank) {
             refBuffer = rendered.buffer;
           }
           const fp = await extractLongLineFingerprint(refBuffer);
-          if (fp) fingerprints.push({ file: path.basename(referencePath), fingerprint: fp });
+          const structure = await extractWholePageStructureSignature(refBuffer);
+          if (fp) fingerprints.push({ file: path.basename(referencePath), fingerprint: fp, structure });
         } catch (error) {
           console.warn('REFERENCE LAYOUT TEK DOSYA ATLANDI:', path.basename(referencePath), error?.message || error);
         }
@@ -3565,6 +3636,23 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     }
     if(!best)return null;
 
+    // Whole-page structure: independent from OCR content. This catches omitted
+    // lower sections and abnormal page extent/empty space after normalization.
+    const refStructure = best.structure || null;
+    const structureSignals = [];
+    if (refStructure?.lineCount && targetStructure?.lineCount) {
+      const refCount = Number(refStructure.lineCount), tarCount = Number(targetStructure.lineCount);
+      const countLoss = Math.max(0, refCount - tarCount) / Math.max(1, refCount);
+      const firstDelta = Math.abs(Number(refStructure.firstLineY) - Number(targetStructure.firstLineY));
+      const lastDelta = Math.abs(Number(refStructure.lastLineY) - Number(targetStructure.lastLineY));
+      const extentLoss = Math.max(0, Number(refStructure.verticalExtent) - Number(targetStructure.verticalExtent)) /
+        Math.max(0.05, Number(refStructure.verticalExtent));
+      if (countLoss >= 0.30) structureSignals.push({type:'missing-structural-lines',score:Math.min(100,Math.round(countLoss*100)),referenceLineCount:refCount,targetLineCount:tarCount});
+      if (extentLoss >= 0.10) structureSignals.push({type:'page-vertical-extent-change',score:Math.min(100,Math.round(extentLoss*100)),referenceVerticalExtent:Number(refStructure.verticalExtent.toFixed(4)),targetVerticalExtent:Number(targetStructure.verticalExtent.toFixed(4))});
+      if (firstDelta >= 0.035) structureSignals.push({type:'top-structure-offset',score:Math.min(100,Math.round(firstDelta*180)),referenceFirstLineY:Number(refStructure.firstLineY.toFixed(4)),targetFirstLineY:Number(targetStructure.firstLineY.toFixed(4))});
+      if (lastDelta >= 0.045) structureSignals.push({type:'bottom-structure-offset',score:Math.min(100,Math.round(lastDelta*180)),referenceLastLineY:Number(refStructure.lastLineY.toFixed(4)),targetLastLineY:Number(targetStructure.lastLineY.toFixed(4))});
+    }
+
     const refH=best.refLines, pairs=best.pairs;
     const globalScale=best.affine.scale, globalOffset=best.affine.offset;
     const localGapAnomalies=[];
@@ -3633,8 +3721,11 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       Math.min(20,lengthOutliers*4)+
       Math.min(15,Math.max(0,(1-coverage))*30)
     ));
-    const independentSignals=[strongLocal>=1,containerPairs.some(x=>x.score>=35),lengthOutliers>=2,coverage<.70].filter(Boolean).length;
-    const severity=independentSignals>=2&&score>=55?'strong':score>=28?'medium':'low';
+    const structuralStrong = structureSignals.filter(x => Number(x.score) >= 35).length;
+    const structuralBonus = Math.min(35, structuralStrong * 18);
+    const finalScore = Math.min(100, score + structuralBonus);
+    const independentSignals=[strongLocal>=1,containerPairs.some(x=>x.score>=35),lengthOutliers>=2,coverage<.70,structuralStrong>=1].filter(Boolean).length;
+    const severity=independentSignals>=2&&finalScore>=55?'strong':finalScore>=28?'medium':'low';
 
     return {
       available:true,engine:'reference-layout-engine-v2-local-gap',bank:normalizedBank,
@@ -3645,13 +3736,14 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       localGapAnomalies:localGapAnomalies.sort((a,b)=>b.score-a.score).slice(0,12),
       containerPairs:containerPairs.sort((a,b)=>b.score-a.score).slice(0,12),
       strongLocalGapCount:strongLocal,containerHeightChangeCount:containerPairs.length,lengthOutlierCount:lengthOutliers,
-      independentSignals,score,severity,
-      check:{status:severity==='strong'?'fail':severity==='medium'?'unknown':'pass',score,evidence:severity==='low'
-        ?'Referans şablonun ana yatay sınırları ve lokal aralıkları tolerans içinde.'
-        :`Referans şablonla karşılaştırmada ${strongLocal} güçlü lokal aralık ve ${containerPairs.length} kutu yüksekliği değişimi tespit edildi.`},
+      independentSignals,score:finalScore,rawLayoutScore:score,structureSignals,severity,
+      wholePageStructure:{reference:refStructure,target:targetStructure},
+      check:{status:severity==='strong'?'fail':severity==='medium'?'unknown':'pass',score:finalScore,evidence:severity==='low'
+        ?'Referans şablonun ana yatay sınırları, lokal aralıkları ve bütün sayfa yapısı tolerans içinde.'
+        :`Referans şablonla karşılaştırmada ${strongLocal} güçlü lokal aralık, ${containerPairs.length} kutu yüksekliği değişimi ve ${structuralStrong} bağımsız bütün-sayfa yapısal sinyal tespit edildi.`},
       evidence:severity==='low'
-        ?'Referans şablonla lokal sınır/boşluk karşılaştırmasında belirgin bağımsız yapısal sapma bulunmadı.'
-        :`Referans şablonla lokal sınır/boşluk karşılaştırmasında belirgin yapısal sapma bulundu; ${strongLocal} güçlü lokal aralık ve ${containerPairs.length} kutu yüksekliği değişimi.`
+        ?'Referans şablonla bütün sayfa ve lokal sınır/boşluk karşılaştırmasında belirgin bağımsız yapısal sapma bulunmadı.'
+        :`Referans şablonla bütün sayfa ve lokal sınır/boşluk karşılaştırmasında belirgin yapısal sapma bulundu; ${strongLocal} güçlü lokal aralık, ${containerPairs.length} kutu yüksekliği değişimi ve ${structuralStrong} bağımsız yapısal sinyal.`
     };
   } catch(error){
     console.warn('REFERENCE LAYOUT FORENSICS HATASI:',error?.message||error);
@@ -11801,6 +11893,16 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
       const styleDistance = refStyle && tarStyle ? rfStyleResidual(refStyle, tarStyle) : null;
       const charDistance = refChar && tarChar ? rfCharacterDistance(refChar, tarChar) : null;
 
+      const normText = (v) => String(v ?? '').trim().toLocaleLowerCase('tr-TR').replace(/\s+/g, '');
+      const sameText = normText(best.item.text) && normText(ref?.valueText) && normText(best.item.text) === normText(ref?.valueText);
+      const fieldIsFreeText = ['description','senderName','recipientName','senderAddress','recipientAddress','address'].includes(field);
+      if (field === 'taxNo' && (isPlaceholderOnly(best.item.text) || isPlaceholderOnly(ref?.valueText))) continue;
+      // A different legitimate name/description naturally has different glyph
+      // shapes. It cannot be called a typography mismatch without same-content
+      // evidence. Structured numeric/date fields are allowed to proceed through
+      // their dedicated comparable-glyph logic.
+      if (fieldIsFreeText && !sameText) continue;
+      if (!sameText && !['amount','accountNo','transactionNo','iban','date','time'].includes(field)) continue;
       if (!Number.isFinite(styleDistance) && !Number.isFinite(charDistance)) continue;
 
       observations.push({
@@ -11919,6 +12021,24 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
       if (n < 0.68) return 'Orta bölüm';
       return 'Alt bölüm';
     };
+
+    // Whole-page signature has priority. It can identify omitted sections and
+    // abnormal page extent without depending on OCR field values.
+    for (const signal of (Array.isArray(layout.structureSignals) ? layout.structureSignals : [])
+      .filter(x => Number(x?.score) >= 35)
+      .sort((a,b) => Number(b.score || 0) - Number(a.score || 0))
+      .slice(0, 3)) {
+      let detail = '';
+      if (signal.type === 'missing-structural-lines') detail = 'Referansa göre belgenin belirgin bölüm/sınır yapısının bir kısmı hedef belgede bulunmuyor.';
+      else if (signal.type === 'page-vertical-extent-change') detail = 'Belgenin dikey yapısı referansa göre belirgin şekilde farklı.';
+      else if (signal.type === 'top-structure-offset') detail = 'Üst bölümün referansa göre dikey konumu belirgin şekilde farklı.';
+      else if (signal.type === 'bottom-structure-offset') detail = 'Alt bölümün referansa göre dikey konumu belirgin şekilde farklı.';
+      if (!detail) continue;
+      const key = `whole-page|${signal.type}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      findings.push({ priority: 1, title: 'Belge yapısı', detail, kind: 'whole-page' });
+    }
 
     // Strong local spacing/section-height changes are concrete whole-page
     // structural evidence. Do not expose numeric scores to the user.
