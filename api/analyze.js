@@ -3524,7 +3524,12 @@ async function runReferenceLayoutForensics(targetPath, bank) {
         const mx=median(anchors.map(p=>p.ref)), my=median(anchors.map(p=>p.tar));
         let num=0,den=0;
         for(const p of anchors){num+=(p.ref-mx)*(p.tar-my);den+=(p.ref-mx)**2;}
-        scale=den>1e-8?Math.max(.6,Math.min(1.8,num/den)):1;
+        // Reference and target are compared in normalized page coordinates.
+        // Do not let a locally stretched/removed section be absorbed as a huge
+        // global scale change. Real camera/resize variation is normally modest;
+        // keep the affine Y scale conservative so local spacing anomalies remain
+        // visible to the structural comparator.
+        scale=den>1e-8?Math.max(.85,Math.min(1.15,num/den)):1;
         offset=my-scale*mx;
       } else if(anchors.length===1) offset=anchors[0].tar-anchors[0].ref;
 
@@ -11749,6 +11754,17 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
 
     const observations = [];
 
+    // Placeholder-only fields such as '-' are not valid typography evidence.
+    // A one-character dash is extremely sensitive to rasterization, scaling and
+    // PDF/JPG conversion, and must never become a user-facing difference.
+    const isPlaceholderOnly = (value) => {
+      const t = String(value ?? '')
+        .trim()
+        .replace(/[–—−]/g, '-')
+        .replace(/\s+/g, '');
+      return !t || /^[-_/]+$/.test(t);
+    };
+
     for (const [field, ref] of Object.entries(profile.fields)) {
       const variants = Array.isArray(ref?.variants) && ref.variants.length ? ref.variants : [ref];
       const refVariant = variants[0];
@@ -11759,6 +11775,12 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
 
       const best = candidates[0];
       const targetBox = best.box;
+
+      // Do not compare placeholder-only values as typography/raster evidence.
+      // Example: target '-' vs reference '-' must never create a taxNo finding.
+      if (isPlaceholderOnly(best.item.text) && isPlaceholderOnly(ref?.valueText)) {
+        continue;
+      }
 
       const rx = Math.max(0, Math.floor(refVariant.xNorm * refSize.width));
       const ry = Math.max(0, Math.floor(refVariant.yNorm * refSize.height));
@@ -11835,7 +11857,7 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
 
     return {
       available: true,
-      engine: 'reference-local-crop-comparator-v1',
+      engine: 'reference-local-crop-comparator-v2-all-points',
       bank: normalizeBank(bank),
       referenceFile: path.basename(referencePath),
       comparedFieldCount: observations.length,
@@ -11853,8 +11875,9 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
 
 function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
-  // Only localized, concrete differences are exposed to Telegram.
-  // Raw spacing/clone/ELA/fusion/engine messages are not user-facing evidence.
+  // The reference is a whole-document fingerprint. Compare structure/spacing first,
+  // then fields, typography and localized pixels. Raw scores remain hidden.
+  // Only concrete, sufficiently supported differences are exposed to Telegram.
   if (!forensic?.available && !layout?.available) return null;
 
   const fieldName = (value) => {
@@ -11881,7 +11904,55 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   const findings = [];
   const seen = new Set();
 
-  // 0) Local crop comparator: strongest source for answering "where?"
+  // 0) Whole-document structural comparison comes first.
+  // The reference must be treated as a full-page visual fingerprint: long
+  // borders, section heights, vertical spacing and missing/extra structure are
+  // more informative than a single character raster mismatch.
+  if (layout?.available) {
+    const gaps = Array.isArray(layout.localGapAnomalies) ? layout.localGapAnomalies : [];
+    const containers = Array.isArray(layout.containerPairs) ? layout.containerPairs : [];
+
+    const zoneLabel = (y) => {
+      const n = Number(y);
+      if (!Number.isFinite(n)) return 'Belge';
+      if (n < 0.30) return 'Üst bölüm';
+      if (n < 0.68) return 'Orta bölüm';
+      return 'Alt bölüm';
+    };
+
+    // Strong local spacing/section-height changes are concrete whole-page
+    // structural evidence. Do not expose numeric scores to the user.
+    for (const row of [...containers, ...gaps]
+      .filter(x => Number(x?.score) >= 45)
+      .sort((a,b) => Number(b.score || 0) - Number(a.score || 0))
+      .slice(0, 3)) {
+      const y = Number.isFinite(Number(row?.targetTopY))
+        ? Number(row.targetTopY)
+        : Number(row?.targetBeforeY);
+      const zone = zoneLabel(y);
+      const isContainer = row?.type === 'container-height-change';
+      const detail = isContainer
+        ? `${zone}: Referans ile hedef arasındaki bölüm/kutu yüksekliği ve dikey boşluk belirgin şekilde farklı.`
+        : `${zone}: Referans ile hedef arasındaki ardışık bölümler arasındaki dikey boşluk belirgin şekilde farklı.`;
+      const key = `layout|${zone}|${isContainer ? 'container' : 'gap'}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      findings.push({ priority: 1, title: 'Belge yerleşimi', detail, kind: 'layout' });
+    }
+
+    // Missing long structural borders can indicate an omitted section, but only
+    // surface it when the line matching coverage is materially incomplete.
+    if (Number(layout.coverage) < 0.72 && Number(layout.unmatchedReferenceLines) >= 2) {
+      findings.push({
+        priority: 1,
+        title: 'Belge yapısı',
+        detail: 'Referansın bazı belirgin bölüm/sınır çizgileri hedef belgede karşılanmıyor.',
+        kind: 'layout'
+      });
+    }
+  }
+
+  // 1) Local crop comparator: strongest source for answering "where?"
   // It is already normalized against the page-wide render baseline.
   for (const row of (Array.isArray(localCrop?.findings) ? localCrop.findings : [])) {
     const key = `local-crop|${row.field}`;
@@ -11895,7 +11966,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 1) Semantic typography/raster differences.
+  // 2) Semantic typography/raster differences.
   // A diacritic-only difference is never enough.
   for (const row of (Array.isArray(forensic?.characterFindings) ? forensic.characterFindings : [])) {
     const cd = Number(row?.characterDistance);
@@ -11920,7 +11991,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 2) Localized pixel findings only. Generic ELA/texture/clone findings
+  // 3) Localized pixel findings only. Generic ELA/texture/clone findings
   // without a field/region are deliberately hidden.
   const pixelRows = Array.isArray(forensic?.pixelFindings)
     ? forensic.pixelFindings
@@ -11946,10 +12017,8 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 3) Generic layout/spacing is deliberately NOT surfaced here.
-  // Perspective, scaling, PDF->JPG conversion and ordinary spacing shifts
-  // are not enough to say "oynama". The local crop comparator must localize
-  // the difference first.
+  // 4) Generic layout/spacing remains hidden unless the dedicated whole-page
+  // layout engine has produced a concrete, sufficiently strong local finding.
 
   findings.sort((a, b) => a.priority - b.priority);
 
