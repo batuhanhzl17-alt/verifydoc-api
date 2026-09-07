@@ -12274,7 +12274,22 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     // Missing long structural borders can indicate an omitted section, but only
     // surface it when the line matching coverage is materially incomplete.
     const concreteSpacingFinding = findings.some(x => x.kind === 'layout' && /dikey boşluk|bölüm\/kutu yüksekliği|ardışık bölümler/.test(String(x.detail || '')));
-    if (!concreteSpacingFinding && Number(layout.coverage) < 0.72 && Number(layout.unmatchedReferenceLines) >= 2) {
+    // IMPORTANT: low line coverage alone is NOT a user-facing finding.
+    // Thin/blurred borders can disappear in a photographed receipt even when
+    // the underlying section is present. Only surface the generic
+    // "missing borders" message when the layout engine itself has reached at
+    // least medium severity OR explicitly confirmed a missing structure.
+    const layoutSeverity = String(layout.severity || '').toLowerCase();
+    const missingConfirmed =
+      Array.isArray(layout.structureSignals) &&
+      layout.structureSignals.some(x =>
+        String(x?.type || '') === 'missing-structural-lines' &&
+        Number(x?.score || 0) >= 55
+      );
+    if (!concreteSpacingFinding &&
+        (layoutSeverity === 'medium' || layoutSeverity === 'strong' || missingConfirmed) &&
+        Number(layout.coverage) < 0.72 &&
+        Number(layout.unmatchedReferenceLines) >= 2) {
       findings.push({
         priority: 1,
         title: 'Belge yapısı',
@@ -12282,6 +12297,26 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
         kind: 'layout'
       });
     }
+  }
+
+  // 1) Strong field-spacing anomalies from the reference forensic engine.
+  // These are more informative than raw line-count coverage because they are
+  // anchored to semantic fields and survive whole-page crop/scale changes.
+  for (const row of (Array.isArray(forensic?.spacingAnomalies) ? forensic.spacingAnomalies : [])) {
+    if (String(row?.type || '') !== 'vertical-field-spacing') continue;
+    if (String(row?.severity || '').toLowerCase() !== 'strong') continue;
+    const before = String(row?.beforeLabel || '').trim();
+    const after = String(row?.afterLabel || '').trim();
+    if (!before || !after) continue;
+    const key = `field-spacing|${before}|${after}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    findings.push({
+      priority: 1,
+      title: 'Belge yerleşimi',
+      detail: `Referansa göre ${before} ile ${after} arasındaki dikey boşluk belirgin şekilde farklı.`,
+      kind: 'layout'
+    });
   }
 
   // 1) Local crop comparator: strongest source for answering "where?"
