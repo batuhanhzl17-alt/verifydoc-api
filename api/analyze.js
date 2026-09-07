@@ -122,6 +122,8 @@ return paddleOCRClient;
 // PP-OCRv6 kullanılır.
 // =====================================================
 
+const paddleOCRInFlight = new Map();
+
 async function runPaddleOCR(
 filePath
 ) {
@@ -167,25 +169,35 @@ regions:
 
 }
 
-// Dosya değişmediyse OCR sonucu deterministik olarak tekrar kullanılır.
-// Cache anahtarı içerik boyutu + mtime içerir; aynı isimle yeni dosya gelirse
-// normalde mtime/size değişeceği için eski sonuç kullanılmaz.
+// OCR cache dosya yoluna değil dosya içeriğine göre tutulur. Böylece aynı
+// referans farklı /tmp dosya adıyla oluşturulsa bile ikinci kez PaddleOCR'a
+// gönderilmez. Eşzamanlı aynı içerik çağrıları da tek isteğe birleşir.
 let paddleCacheKey = null;
+let paddleContentHash = null;
 try {
-  const st = await fs.stat(filePath);
-  paddleCacheKey = `paddle:${path.resolve(filePath)}:${st.size}:${st.mtimeMs}`;
+  const rawForHash = await fs.readFile(filePath);
+  paddleContentHash = createHash('sha256').update(rawForHash).digest('hex');
+  paddleCacheKey = `paddle-content:${paddleContentHash}`;
   const cached = paddleOCRCache.get(paddleCacheKey);
   if (cached?.success) {
-    console.log("PADDLEOCR CACHE HIT:", filePath);
+    console.log("PADDLEOCR CONTENT CACHE HIT:", filePath);
     return JSON.parse(JSON.stringify(cached));
   }
-} catch {}
+  const inFlight = paddleOCRInFlight.get(paddleCacheKey);
+  if (inFlight) {
+    console.log("PADDLEOCR IN-FLIGHT JOIN:", filePath);
+    return JSON.parse(JSON.stringify(await inFlight));
+  }
+} catch (e) {
+  console.warn("PADDLEOCR CACHE HAZIRLIK HATASI:", e?.message || e);
+}
 
+const executePaddleOCR = (async () => {
 try {
 
 console.log(
 "================================================"
-);
+\);
 
 console.log(
 "PADDLEOCR BAŞLADI"
@@ -204,13 +216,23 @@ console.log(
 "================================================"
 );
 
-const result =
-await client.ocr({
-filePath:
-filePath,
-model:
-Model.PPOCRv6,
-});
+let result = null;
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    result = await client.ocr({
+      filePath: filePath,
+      model: Model.PPOCRv6,
+    });
+    break;
+  } catch (ocrError) {
+    const msg = String(ocrError?.message || ocrError || "");
+    const queueFull = /queue|队列|task.*full|too many|busy|kuyruk/i.test(msg);
+    if (!queueFull || attempt === 3) throw ocrError;
+    const waitMs = attempt === 1 ? 1200 : 2500;
+    console.warn(`PADDLEOCR KUYRUK DOLU — ${waitMs}ms bekleniyor (deneme ${attempt}/3)`);
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+  }
+}
 
 const pages =
 Array.isArray(
@@ -518,6 +540,17 @@ error?.message ||
 "Unknown PaddleOCR error",
 };
 
+}
+})();
+
+if (paddleCacheKey) {
+  paddleOCRInFlight.set(paddleCacheKey, executePaddleOCR);
+}
+
+try {
+  return await executePaddleOCR;
+} finally {
+  if (paddleCacheKey) paddleOCRInFlight.delete(paddleCacheKey);
 }
 
 }
@@ -9113,6 +9146,99 @@ Bir kontrol güvenilir şekilde yapılamıyorsa:
 "Hesabınızdan..." tutarı, tarih ve saat üzerinde görülen somut
 uyumsuzluklara öncelik ver.
 
+=====================================================
+REFERENCE ANALYSIS v2 — KARAR KALİTESİ KURALLARI
+=====================================================
+
+REFERANS yalnızca görsel ve yapısal bazdır; hedef dekontun gerçek
+verilerini sağlamak için kullanılamaz. Hedefte gerçekten görülen bilgi
+her zaman önceliklidir.
+
+REFERANS KARŞILAŞTIRMA:
+Belge tipi/genel şekil, bölüm geometrisi, alanların göreli konumu,
+yazı koyuluğu/stroke yapısı, font görünümü, harf-rakam geometrisi,
+karakter aralığı, baseline, hizalama, kenar/raster yapısı ve lokal
+piksel düzenini birlikte değerlendir.
+Tek bir küçük farkı tek başına bulgu kabul etme.
+
+HİYERARŞİK KARAR:
+1) Alan hedef görüntüde gerçekten mevcut mu?
+2) Doğru semantik alanla eşleşiyor mu?
+3) Görüntü karşılaştırmaya yeterli mi?
+4) Referans ve hedef aynı dekont türü/yapıda mı?
+5) Fark perspektif, ışık, JPEG, tarama, ölçek veya resize ile açıklanabilir mi?
+6) Fark aynı lokal bölgede birden fazla görsel özellikte birlikte görülüyor mu?
+7) Fark lokal ve tekrarlanabilir mi?
+Somut lokal kanıt oluşmuyorsa fark bildirme.
+
+TEK SİNYAL YASAĞI:
+Küçük font/koyuluk farkı, JPEG artefaktı, fotoğraf açısı, perspektif,
+hafif bulanıklık, ışık/gölge, tarama/çözünürlük farkı, resize,
+anti-aliasing veya tek karakterlik OCR hatası tek başına manipülasyon
+kanıtı değildir.
+
+ALANLAR:
+Tutar, alıcı adı, gönderen adı, alıcı IBAN, gönderen IBAN, tarih, saat,
+işlem/referans no, açıklama, vergi no, hesap no ve şube bilgilerini
+mümkün olduğunda bağımsız değerlendir. Gerçek fark varsa alan adını
+belirt. Sadece OCR metni farklı diye alanı farklı ilan etme.
+
+TUTAR:
+Aynı sayısal değerin farklı font/raster ile yazılması ile farklı işlem
+tutarını birbirine karıştırma. IBAN, hesap no, işlem no ve tarih
+rakamlarını tutar sanma. Aynı rakamların karakter geometrisi/stroke/
+baseline/raster yapısı belirgin ve lokal olarak farklıysa, görüntü
+kanıtı yeterliyse tutar farkı olarak raporla.
+
+TÜRKÇE KARAKTERLER:
+ş/ş, ı/i, İ/I, ğ/g, ö/o, ü/u, ç/c raster veya OCR farkını tek başına
+şüpheli sayma. Karakter kesin okunmuyorsa tahmin etme.
+
+FOTOĞRAF:
+Global perspektif, açı, ışık, kontrast, sıkıştırma, bulanıklık veya
+ölçek farkını lokal düzenleme olarak raporlama. Yalnızca belirli bir
+alanın çevresinden ayrışan lokal bozulma varsa değerlendirmeye al.
+
+LOCAL / GLOBAL:
+Global değişiklikler normal çekim/işleme koşulları olabilir.
+Manipülasyon değerlendirmesinde lokal, belirli ve açıklanabilir
+farkları önceliklendir.
+
+CLONE/COPY-MOVE:
+Boş arka plan, düz renk, çizgi, tablo veya doğal tekrarlar clone kanıtı
+değildir. Clone bulgusu ancak içerik taşıyan bir bölgenin olağandışı
+şekilde başka bölgeye kopyalandığı açıkça destekleniyorsa raporlanabilir.
+
+ÇELİŞEN KANIT:
+OCR ile görüntü çelişirse görüntüyü esas al. Teknik sinyal görsel
+kanıtla desteklenmiyorsa onu tek başına kullanma. Aynı bulgunun farklı
+teknik ölçümleri varsa tek bir kullanıcı maddesinde birleştir.
+
+TEKRARLANABİLİRLİK:
+Aynı belge tekrar gönderildiğinde küçük OCR/raster rastlantıları nedeniyle
+farklı sonuç üretme. Kararı gözlemlenebilir ve kararlı bulgulara dayandır.
+
+RAPORLAMA:
+Kullanıcıya yalnızca somut bulguları göster. Skor, confidence, fusion,
+model, OCR süreci veya algoritma ayrıntısı anlatma.
+Bir fark varsa: "• [Alan]: [somut görsel/yapısal fark]."
+Aynı bulguyu tekrar etme. Kanıt yoksa fark uydurma.
+
+SON KARAR FİLTRESİ:
+Her bulgu için şu soruları kontrol et:
+- Hedefte gerçekten görülebiliyor mu?
+- Doğru alan mı?
+- Lokal mi?
+- Birden fazla görsel özellik destekliyor mu?
+- Fotoğraf/JPEG/ışık/perspektif ile açıklanabilir mi?
+- OCR hatası olabilir mi?
+- Normal bir görüntüleme farkıyla açıklanabilir mi?
+Bu kontroller somut kanıt üretmiyorsa summary'ye ekleme.
+
+KESİN KURAL: Belirsizlikte muhafazakâr davran. "Fark var" demek için
+somut, lokal ve açıklanabilir kanıt gerekir. Referanstan gerçek değer
+kopyalama veya eksik bilgiyi tahmin etme.
+
 `;
 
 
@@ -11586,74 +11712,14 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
     const profile = await buildReferenceTemplateProfile(bank);
     if (!profile?.fields || !Object.keys(profile.fields).length) return null;
 
-    // IMPORTANT: never open a bare filename such as "enpara.pdf".
-    // Resolve a real existing file first.
-    const candidates = [];
-    const addCandidate = (p) => {
-      if (!p) return;
-      const s = String(p).trim();
-      if (s) candidates.push(s);
-    };
+    // profile.referenceFiles intentionally stores only basenames (security boundary).
+    // Resolve the real absolute reference path again through the canonical resolver.
+    const referencePaths = await getReferenceFiles(bank);
+    const referencePath =
+      referencePaths.find(p => /\.(pdf)$/i.test(String(p))) ||
+      referencePaths.find(p => /\.(png|jpe?g|webp)$/i.test(String(p)));
+    if (!referencePath) return null;
 
-    if (typeof getReferenceFiles === "function") {
-      try {
-        const r = await getReferenceFiles(bank);
-        if (Array.isArray(r)) r.forEach(addCandidate);
-        else addCandidate(r);
-      } catch {}
-    }
-
-    if (Array.isArray(profile.referenceFiles)) profile.referenceFiles.forEach(addCandidate);
-    addCandidate(profile.referenceFile);
-
-    const bankKey = normalizeBank(bank);
-    const names = {
-      enpara: "enpara.pdf",
-      akbank: "akbank.pdf",
-      denizbank: "denizbank.pdf",
-      garanti: "garanti.pdf",
-      halkbank: "halkbank.pdf",
-      isbankasi: "isbankasi.pdf",
-      vakifbank: "vakifbank.pdf",
-      yapikredi: "yapikredi.pdf",
-      ziraat: "ziraat.pdf"
-    };
-
-    const moduleDir = path.dirname(new URL(import.meta.url).pathname);
-    const roots = [
-      process.cwd(),
-      moduleDir,
-      path.join(process.cwd(), "references"),
-      path.join(moduleDir, "references"),
-      "/var/task/references",
-      "/app/references"
-    ];
-
-    if (names[bankKey]) {
-      for (const root of roots) addCandidate(path.join(root, names[bankKey]));
-    }
-
-    let referencePath = null;
-    for (const candidate of candidates) {
-      const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(candidate);
-      try {
-        const st = await fs.stat(resolved);
-        if (st.isFile()) {
-          referencePath = resolved;
-          break;
-        }
-      } catch {}
-    }
-
-    if (!referencePath) {
-      console.warn("REFERENCE LOCAL CROP: REFERANS DOSYASI BULUNAMADI", {
-        bank: bankKey,
-        candidates: candidates.slice(0, 20)
-      });
-      return null;
-    }
-
-    console.log("REFERENCE LOCAL CROP PATH:", referencePath);
     const refExt = path.extname(referencePath).toLowerCase();
     let refBuffer = null;
     let refSize = null;
