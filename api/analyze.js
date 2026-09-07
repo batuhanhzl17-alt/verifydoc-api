@@ -11323,23 +11323,6 @@ console.log(
 paddleImageOCR.confidence
 );
 
-// Azure ikinci OCR/layout gözü: mevcut PaddleOCR ve forensic motoru korunur.
-try {
-  azureLayout = await runAzureDocumentLayout(forensicTargetPath);
-  if (azureLayout?.available && bank && reference) {
-    azureReferenceGeometry = await runAzureReferenceGeometryComparison(
-      azureLayout,
-      bank
-    );
-    console.log(
-      "AZURE REFERENCE GEOMETRY:",
-      JSON.stringify(azureReferenceGeometry)
-    );
-  }
-} catch (error) {
-  console.warn("AZURE LAYOUT ÇAĞRISI HATASI:", error?.message || error);
-}
-
 amountForensics =
 await analyzeAmountForensics(
 filePath,
@@ -11372,6 +11355,24 @@ if (type !== "video" && type !== "statement") {
 
 console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
+
+// Azure ikinci OCR/layout gözü: mevcut PaddleOCR ve forensic motoru korunur.
+// Referans karşılaştırması yapılacağı için reference önce yüklenmiş olmalıdır.
+try {
+  azureLayout = await runAzureDocumentLayout(forensicTargetPath);
+  if (azureLayout?.available && bank && reference) {
+    azureReferenceGeometry = await runAzureReferenceGeometryComparison(
+      azureLayout,
+      bank
+    );
+    console.log(
+      "AZURE REFERENCE GEOMETRY:",
+      JSON.stringify(azureReferenceGeometry)
+    );
+  }
+} catch (error) {
+  console.warn("AZURE LAYOUT ÇAĞRISI HATASI:", error?.message || error);
+}
 
 // =====================================================
 // REFERANS ŞABLON KALİBRASYONU
