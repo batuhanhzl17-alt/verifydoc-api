@@ -3636,21 +3636,77 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     }
     if(!best)return null;
 
-    // Whole-page structure: independent from OCR content. This catches omitted
-    // lower sections and abnormal page extent/empty space after normalization.
+    // Whole-page structure is evaluated ONLY after registration. Raw normalized
+    // first/last Y coordinates and raw line counts are not sufficient evidence:
+    // a camera photo, crop, perspective or PDF/JPG conversion can change them.
+    // The reliable signal is an abrupt LOCAL residual/coverage break after the
+    // best reference-to-target line alignment has been established.
     const refStructure = best.structure || null;
     const structureSignals = [];
-    if (refStructure?.lineCount && targetStructure?.lineCount) {
-      const refCount = Number(refStructure.lineCount), tarCount = Number(targetStructure.lineCount);
-      const countLoss = Math.max(0, refCount - tarCount) / Math.max(1, refCount);
-      const firstDelta = Math.abs(Number(refStructure.firstLineY) - Number(targetStructure.firstLineY));
-      const lastDelta = Math.abs(Number(refStructure.lastLineY) - Number(targetStructure.lastLineY));
-      const extentLoss = Math.max(0, Number(refStructure.verticalExtent) - Number(targetStructure.verticalExtent)) /
-        Math.max(0.05, Number(refStructure.verticalExtent));
-      if (countLoss >= 0.30) structureSignals.push({type:'missing-structural-lines',score:Math.min(100,Math.round(countLoss*100)),referenceLineCount:refCount,targetLineCount:tarCount});
-      if (extentLoss >= 0.10) structureSignals.push({type:'page-vertical-extent-change',score:Math.min(100,Math.round(extentLoss*100)),referenceVerticalExtent:Number(refStructure.verticalExtent.toFixed(4)),targetVerticalExtent:Number(targetStructure.verticalExtent.toFixed(4))});
-      if (firstDelta >= 0.035) structureSignals.push({type:'top-structure-offset',score:Math.min(100,Math.round(firstDelta*180)),referenceFirstLineY:Number(refStructure.firstLineY.toFixed(4)),targetFirstLineY:Number(targetStructure.firstLineY.toFixed(4))});
-      if (lastDelta >= 0.045) structureSignals.push({type:'bottom-structure-offset',score:Math.min(100,Math.round(lastDelta*180)),referenceLastLineY:Number(refStructure.lastLineY.toFixed(4)),targetLastLineY:Number(targetStructure.lastLineY.toFixed(4))});
+    const matchedPairs = Array.isArray(pairs) ? pairs : [];
+    const matchedCoverage = matchedPairs.length / Math.max(1, refH.length);
+
+    if (matchedPairs.length >= 4) {
+      const residuals = matchedPairs.map(p => ({
+        refY: Number(p.reference.yNorm),
+        tarY: Number(p.target.yNorm),
+        residual: Number(p.target.yNorm) - (globalScale * Number(p.reference.yNorm) + globalOffset),
+        refLen: Number(p.reference.lengthNorm),
+        tarLen: Number(p.target.lengthNorm),
+        cost: Number(p.cost)
+      })).filter(x => Number.isFinite(x.residual));
+
+      // Robust baseline: median residual. This absorbs camera crop/translation.
+      const residualMedian = median(residuals.map(x => x.residual));
+      const centered = residuals.map(x => ({...x, centered:x.residual-residualMedian}));
+      const absCentered = centered.map(x => Math.abs(x.centered));
+      const residualMAD = median(absCentered);
+
+      // Missing-structure signal: require BOTH low coverage and several long,
+      // well-supported unmatched reference lines. A few noisy/missed edge lines
+      // must never be enough to report a structural difference.
+      const unmatchedLong = Math.max(0, refH.length - matchedPairs.length);
+      if (matchedCoverage < 0.78 && unmatchedLong >= 3) {
+        const score = Math.min(100, Math.round((1-matchedCoverage)*160));
+        structureSignals.push({
+          type:'missing-structural-lines', score,
+          referenceLineCount:refH.length, targetLineCount:tarLines.length,
+          matchedLineCount:matchedPairs.length
+        });
+      }
+
+      // Abrupt residual step: a real inserted/removed section creates a sudden
+      // offset that persists for subsequent matched lines. Normal perspective
+      // produces a smooth drift, not a step. Require good line-length agreement.
+      const stepCandidates=[];
+      for(let i=1;i<centered.length;i++){
+        const a=centered[i-1], b=centered[i];
+        const step=Math.abs(b.centered-a.centered);
+        const lenSimilarity=Math.min(a.refLen,a.tarLen)/Math.max(.001,Math.max(a.refLen,a.tarLen));
+        if(step>=0.032 && lenSimilarity>=0.72 && a.cost<=1.8 && b.cost<=1.8){
+          stepCandidates.push({step,lenSimilarity,atRefY:b.refY,atTargetY:b.tarY});
+        }
+      }
+      stepCandidates.sort((a,b)=>b.step-a.step);
+      if(stepCandidates.length){
+        const strongest=stepCandidates[0];
+        // One moderate step is enough only when it is clearly above registration
+        // noise. Two nearby supporting steps are stronger evidence.
+        const support=stepCandidates.filter(x=>x.step>=Math.max(.032,strongest.step*.65)).length;
+        if(strongest.step>=0.045 || (strongest.step>=0.032 && support>=2)){
+          structureSignals.push({
+            type:'localized-structural-step',
+            score:Math.min(100,Math.round(strongest.step*1500)),
+            residualStep:Number(strongest.step.toFixed(4)),
+            supportCount:support,
+            targetY:Number(strongest.atTargetY.toFixed(4))
+          });
+        }
+      }
+
+      // Do NOT report page extent/first/last-line offsets here. Those are highly
+      // sensitive to framing and are already represented by the registered line
+      // sequence and the dedicated local gap/container checks below.
     }
 
     const refH=best.refLines, pairs=best.pairs;
@@ -3661,11 +3717,17 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       const refGap=b.reference.yNorm-a.reference.yNorm;
       const targetGap=b.target.yNorm-a.target.yNorm;
       if(refGap<=0||targetGap<=0)continue;
+      const lenSimilarityA=Math.min(Number(a.reference.lengthNorm),Number(a.target.lengthNorm))/Math.max(.001,Math.max(Number(a.reference.lengthNorm),Number(a.target.lengthNorm)));
+      const lenSimilarityB=Math.min(Number(b.reference.lengthNorm),Number(b.target.lengthNorm))/Math.max(.001,Math.max(Number(b.reference.lengthNorm),Number(b.target.lengthNorm)));
+      if(lenSimilarityA<0.72||lenSimilarityB<0.72||Number(a.cost)>1.8||Number(b.cost)>1.8)continue;
+
       const expectedGap=refGap*globalScale;
       const delta=Math.abs(targetGap-expectedGap);
-      const rel=delta/Math.max(expectedGap,.012);
+      const rel=delta/Math.max(expectedGap,.018);
       const score=Math.max(0,Math.min(100,Math.round(rel*100)));
-      if(score>=25){
+      // Small gaps and low/moderate deviations are common after camera capture.
+      // Require a genuinely large normalized change before exposing it.
+      if((expectedGap>=0.025 && rel>=0.30) || (expectedGap>=0.055 && rel>=0.22)){
         localGapAnomalies.push({
           type:'local-border-spacing',
           referenceBeforeY:Number(a.reference.yNorm.toFixed(5)),
@@ -3701,7 +3763,7 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       if(rh<0.035||th<0.025)continue;
       const ratio=th/Math.max(rh*globalScale,.001);
       const deviation=Math.abs(ratio-1);
-      if(deviation>=0.16){
+      if(deviation>=0.28 && Math.min(Number(a.reference.lengthNorm),Number(a.target.lengthNorm))/Math.max(.001,Math.max(Number(a.reference.lengthNorm),Number(a.target.lengthNorm)))>=0.72 && Number(a.cost)<=1.8 && Number(b.cost)<=1.8){
         containerPairs.push({
           type:'container-height-change',
           referenceTopY:Number(a.reference.yNorm.toFixed(5)),referenceBottomY:Number(b.reference.yNorm.toFixed(5)),
@@ -3728,7 +3790,7 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     const severity=independentSignals>=2&&finalScore>=55?'strong':finalScore>=28?'medium':'low';
 
     return {
-      available:true,engine:'reference-layout-engine-v2-local-gap',bank:normalizedBank,
+      available:true,engine:'reference-layout-engine-v3-registered-whole-page',bank:normalizedBank,
       referenceFiles:ensemble.referenceFiles,referenceCount:ensemble.fingerprints.length,
       selectedReference:best.file,referenceLineCount:refH.length,targetLineCount:tarLines.length,
       matchedLineCount:pairs.length,unmatchedReferenceLines:unmatchedRef,unmatchedTargetLines:unmatchedTarget,
@@ -11959,7 +12021,7 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
 
     return {
       available: true,
-      engine: 'reference-local-crop-comparator-v2-all-points',
+      engine: 'reference-local-crop-comparator-v3-all-points',
       bank: normalizeBank(bank),
       referenceFile: path.basename(referencePath),
       comparedFieldCount: observations.length,
@@ -12093,6 +12155,9 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     if (!Number.isFinite(cd) || cd < 0.52) continue;
 
     const rawField = String(row?.field || '').replace(/:value$/i, '');
+    // Placeholder/administrative tax fields are not reliable typography evidence.
+    // Never surface a taxNo finding from raster differences alone.
+    if (rawField === 'taxNo') continue;
     const field = fieldName(rawField);
     const scope = /:value$/i.test(String(row?.field || '')) || row?.scope === 'value'
       ? 'değer'
@@ -12139,6 +12204,25 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 
   // 4) Generic layout/spacing remains hidden unless the dedicated whole-page
   // layout engine has produced a concrete, sufficiently strong local finding.
+
+  // Final quality gate: a reference difference is user-facing only when it is
+  // concrete and independently supported. This prevents normal camera/resize
+  // noise from becoming a false positive while preserving strong structural
+  // changes and localized field evidence.
+  const structuralKinds = new Set(['whole-page','layout']);
+  const structuralFindings = findings.filter(x => structuralKinds.has(x.kind));
+  if (structuralFindings.length > 1) {
+    // Keep at most two structural statements, preferring different evidence types.
+    const kept=[]; const kinds=new Set();
+    for(const row of structuralFindings){
+      const k=String(row.kind||'');
+      if(kinds.has(k) && kept.length>=2) continue;
+      kinds.add(k); kept.push(row);
+      if(kept.length>=2) break;
+    }
+    const nonStructural=findings.filter(x => !structuralKinds.has(x.kind));
+    findings.splice(0, findings.length, ...kept, ...nonStructural);
+  }
 
   findings.sort((a, b) => a.priority - b.priority);
 
