@@ -3756,6 +3756,49 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       }
     }
     unmatchedSpanAnomalies.sort((a,b)=>b.score-a.score);
+
+    // Sparse-anchor fallback: when the target photo exposes only a few long
+    // borders, the normal 4+ matched-line residual analysis cannot run. In that
+    // case, compare the vertical span between the two best matching anchors
+    // and the reference span they enclose. A large expanded span PLUS at least
+    // one missing reference boundary is a concrete structural signal; small
+    // camera/crop drift remains below the threshold.
+    if (unmatchedSpanAnomalies.length === 0 && pairs.length >= 2) {
+      const sparse=[];
+      for(let pi=0;pi<pairs.length-1;pi++){
+        const a=pairs[pi], b=pairs[pi+1];
+        if(Number(a.cost)>2.25 || Number(b.cost)>2.25) continue;
+        const refSpan=Number(b.reference.yNorm)-Number(a.reference.yNorm);
+        const targetSpan=Number(b.target.yNorm)-Number(a.target.yNorm);
+        if(!(refSpan>0 && targetSpan>0)) continue;
+        const expected=refSpan*globalScale;
+        const missingRef=Math.max(0,Number(b.indexR)-Number(a.indexR)-1);
+        const lenA=Math.min(Number(a.reference.lengthNorm),Number(a.target.lengthNorm))/Math.max(.001,Math.max(Number(a.reference.lengthNorm),Number(a.target.lengthNorm)));
+        const lenB=Math.min(Number(b.reference.lengthNorm),Number(b.target.lengthNorm))/Math.max(.001,Math.max(Number(b.reference.lengthNorm),Number(b.target.lengthNorm)));
+        if(missingRef<1 || lenA<.65 || lenB<.65 || expected<.045) continue;
+        const rel=(targetSpan-expected)/Math.max(expected,.035);
+        if(rel>=.45 && (targetSpan-expected)>=.045){
+          sparse.push({
+            type:'sparse-anchor-expanded-span',
+            referenceBeforeY:Number(a.reference.yNorm.toFixed(5)),
+            referenceAfterY:Number(b.reference.yNorm.toFixed(5)),
+            targetBeforeY:Number(a.target.yNorm.toFixed(5)),
+            targetAfterY:Number(b.target.yNorm.toFixed(5)),
+            referenceSpanNorm:Number(refSpan.toFixed(5)),
+            targetSpanNorm:Number(targetSpan.toFixed(5)),
+            expectedTargetSpanNorm:Number(expected.toFixed(5)),
+            relativeExpansion:Number(rel.toFixed(3)),
+            missingReferenceLinesBetween:missingRef,
+            score:Math.min(100,Math.round(rel*100))
+          });
+        }
+      }
+      if(sparse.length){
+        sparse.sort((a,b)=>b.score-a.score);
+        unmatchedSpanAnomalies.push(...sparse.slice(0,4));
+      }
+    }
+
     for(let i=0;i<pairs.length-1;i++){
       const a=pairs[i],b=pairs[i+1];
       const refGap=b.reference.yNorm-a.reference.yNorm;
@@ -3821,12 +3864,25 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       }
     }
 
+    // Promote a sparse-anchor expanded span into an independent structural
+    // signal. This is the fallback for photos where only 2-3 long borders are
+    // detectable, while still requiring a genuinely large local expansion.
+    const sparseSpanStrong = unmatchedSpanAnomalies.filter(x => x.type==='sparse-anchor-expanded-span' && Number(x.score)>=55).length;
+    if (sparseSpanStrong > 0) {
+      structureSignals.push({
+        type:'localized-structural-span',
+        score:Math.min(100, Math.max(...unmatchedSpanAnomalies.filter(x=>x.type==='sparse-anchor-expanded-span').map(x=>Number(x.score)||0))),
+        corroborated:true,
+        evidence:'Seyrek çizgi eşleşmesi içinde referansın birden fazla sınırı arasındaki bölüm aralığı hedefte belirgin şekilde genişlemiş.'
+      });
+    }
+
     // Combine evidence before making a structural decision. Coverage alone is
     // not enough because thin borders are frequently missed in camera photos.
     const strongContainerCount = containerPairs.filter(x=>x.score>=35).length;
     const strongStepCount = structureSignals.filter(x => x.type==='localized-structural-step' && Number(x.score)>=35).length;
     const strongGapCount = strongLocal;
-    const strongSpanCount = unmatchedSpanAnomalies.filter(x=>x.score>=50).length;
+    const strongSpanCount = unmatchedSpanAnomalies.filter(x=>Number(x.score)>=50).length;
     const hasGeometryConfirmation = (strongGapCount>=1) || (strongContainerCount>=1) || (strongStepCount>=1) || (strongSpanCount>=1);
     const missingStructureConfirmed = (coverage<.70 && (Math.max(0, Number(refH?.length || 0) - Number(pairs?.length || 0))>=3) && hasGeometryConfirmation);
     if (missingStructureConfirmed) {
@@ -12186,10 +12242,13 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
       const key = `layout|${zone}|span`;
       if (seen.has(key)) continue;
       seen.add(key);
+      const detail = row?.type === 'sparse-anchor-expanded-span'
+        ? `${zone}: Referans ile hedef arasında belirgin bir dikey boşluk genişlemesi tespit edildi.`
+        : `${zone}: Referans ile hedef arasında belirgin bir dikey boşluk/bölüm aralığı farkı tespit edildi.`;
       findings.push({
         priority: 1,
         title: 'Belge yerleşimi',
-        detail: `${zone}: Referans ile hedef arasında belirgin bir dikey boşluk/bölüm aralığı farkı tespit edildi.`,
+        detail,
         kind: 'layout'
       });
     }
