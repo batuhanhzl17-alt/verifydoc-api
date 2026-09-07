@@ -3647,6 +3647,15 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     const globalScale=best.affine.scale, globalOffset=best.affine.offset;
     const matchedPairs = Array.isArray(pairs) ? pairs : [];
     const matchedCoverage = matchedPairs.length / Math.max(1, refH.length);
+    // Keep this candidate in the outer function scope because it is returned
+    // even when fewer than 4 lines match.
+    const missingStructureCandidate = {
+      type:'missing-structural-lines-candidate',
+      score:Math.min(100, Math.round((1-matchedCoverage)*160)),
+      referenceLineCount:refH.length, targetLineCount:tarLines.length,
+      matchedLineCount:matchedPairs.length,
+      unmatchedLong:Math.max(0, Number(refH?.length || 0) - Number(matchedPairs?.length || 0))
+    };
 
     if (matchedPairs.length >= 4) {
       const residuals = matchedPairs.map(p => ({
@@ -3669,15 +3678,6 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       // turn "8 reference lines vs 3 target lines" into a finding by itself.
       // It becomes meaningful only when an independent local geometry signal
       // (gap/container/step) confirms the same structural change below.
-      const unmatchedLong = Math.max(0, Number(refH?.length || 0) - Number(matchedPairs?.length || 0));
-      const missingStructureCandidate = {
-        type:'missing-structural-lines-candidate',
-        score:Math.min(100, Math.round((1-matchedCoverage)*160)),
-        referenceLineCount:refH.length, targetLineCount:tarLines.length,
-        matchedLineCount:matchedPairs.length,
-        unmatchedLong
-      };
-
       // Abrupt residual step: a real inserted/removed section creates a sudden
       // offset that persists for subsequent matched lines. Normal perspective
       // produces a smooth drift, not a step. Require good line-length agreement.
