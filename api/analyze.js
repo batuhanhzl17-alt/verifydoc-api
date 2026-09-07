@@ -3664,18 +3664,19 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       const absCentered = centered.map(x => Math.abs(x.centered));
       const residualMAD = median(absCentered);
 
-      // Missing-structure signal: require BOTH low coverage and several long,
-      // well-supported unmatched reference lines. A few noisy/missed edge lines
-      // must never be enough to report a structural difference.
+      // IMPORTANT: a low line-coverage count is ONLY a supporting signal.
+      // Camera photos and screen captures routinely hide thin borders. Do not
+      // turn "8 reference lines vs 3 target lines" into a finding by itself.
+      // It becomes meaningful only when an independent local geometry signal
+      // (gap/container/step) confirms the same structural change below.
       const unmatchedLong = Math.max(0, refH.length - matchedPairs.length);
-      if (matchedCoverage < 0.78 && unmatchedLong >= 3) {
-        const score = Math.min(100, Math.round((1-matchedCoverage)*160));
-        structureSignals.push({
-          type:'missing-structural-lines', score,
-          referenceLineCount:refH.length, targetLineCount:tarLines.length,
-          matchedLineCount:matchedPairs.length
-        });
-      }
+      const missingStructureCandidate = {
+        type:'missing-structural-lines-candidate',
+        score:Math.min(100, Math.round((1-matchedCoverage)*160)),
+        referenceLineCount:refH.length, targetLineCount:tarLines.length,
+        matchedLineCount:matchedPairs.length,
+        unmatchedLong
+      };
 
       // Abrupt residual step: a real inserted/removed section creates a sudden
       // offset that persists for subsequent matched lines. Normal perspective
@@ -3777,17 +3778,42 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       }
     }
 
+    // Combine evidence before making a structural decision. Coverage alone is
+    // not enough because thin borders are frequently missed in camera photos.
+    const strongContainerCount = containerPairs.filter(x=>x.score>=35).length;
+    const strongStepCount = structureSignals.filter(x => x.type==='localized-structural-step' && Number(x.score)>=35).length;
+    const strongGapCount = strongLocal;
+    const hasGeometryConfirmation = (strongGapCount>=1) || (strongContainerCount>=1) || (strongStepCount>=1);
+    const missingStructureConfirmed = (coverage<.70 && unmatchedLong>=3 && hasGeometryConfirmation);
+    if (missingStructureConfirmed) {
+      structureSignals.push({
+        type:'missing-structural-lines',
+        score:Math.min(100, Math.round((1-coverage)*160)),
+        referenceLineCount:refH.length, targetLineCount:tarLines.length,
+        matchedLineCount:pairs.length, corroborated:true,
+        evidence:'Düşük çizgi eşleşmesi, bağımsız lokal bölüm/geometri farkıyla destekleniyor.'
+      });
+    }
+
     const score=Math.round(Math.min(100,
       Math.min(35,strongLocal*12+mediumLocal*4)+
-      Math.min(30,containerPairs.filter(x=>x.score>=35).length*15)+
+      Math.min(30,strongContainerCount*15)+
       Math.min(20,lengthOutliers*4)+
-      Math.min(15,Math.max(0,(1-coverage))*30)
+      // Coverage contributes only as a weak supporting factor.
+      Math.min(8,Math.max(0,(1-coverage))*16)
     ));
-    const structuralStrong = structureSignals.filter(x => Number(x.score) >= 35).length;
+    const structuralStrong = structureSignals.filter(x => Number(x.score) >= 35 && x.type!=='missing-structural-lines-candidate').length
+      + (missingStructureConfirmed ? 1 : 0);
     const structuralBonus = Math.min(35, structuralStrong * 18);
     const finalScore = Math.min(100, score + structuralBonus);
-    const independentSignals=[strongLocal>=1,containerPairs.some(x=>x.score>=35),lengthOutliers>=2,coverage<.70,structuralStrong>=1].filter(Boolean).length;
-    const severity=independentSignals>=2&&finalScore>=55?'strong':finalScore>=28?'medium':'low';
+    const independentSignals=[
+      strongGapCount>=1,
+      strongContainerCount>=1,
+      strongStepCount>=1,
+      lengthOutliers>=2,
+      missingStructureConfirmed
+    ].filter(Boolean).length;
+    const severity=independentSignals>=2&&finalScore>=55?'strong':(independentSignals>=1&&finalScore>=45?'medium':'low');
 
     return {
       available:true,engine:'reference-layout-engine-v3-registered-whole-page',bank:normalizedBank,
@@ -3797,6 +3823,7 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       affineY:{scale:Number(globalScale.toFixed(5)),offset:Number(globalOffset.toFixed(5))},coverage:Number(coverage.toFixed(3)),
       localGapAnomalies:localGapAnomalies.sort((a,b)=>b.score-a.score).slice(0,12),
       containerPairs:containerPairs.sort((a,b)=>b.score-a.score).slice(0,12),
+      missingStructureCandidate,
       strongLocalGapCount:strongLocal,containerHeightChangeCount:containerPairs.length,lengthOutlierCount:lengthOutliers,
       independentSignals,score:finalScore,rawLayoutScore:score,structureSignals,severity,
       wholePageStructure:{reference:refStructure,target:targetStructure},
