@@ -11586,12 +11586,74 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
     const profile = await buildReferenceTemplateProfile(bank);
     if (!profile?.fields || !Object.keys(profile.fields).length) return null;
 
-    const refs = Array.isArray(profile.referenceFiles) ? profile.referenceFiles : [];
-    const referencePath =
-      refs.find(p => /\.(pdf)$/i.test(String(p))) ||
-      refs.find(p => /\.(png|jpe?g|webp)$/i.test(String(p)));
-    if (!referencePath) return null;
+    // IMPORTANT: never open a bare filename such as "enpara.pdf".
+    // Resolve a real existing file first.
+    const candidates = [];
+    const addCandidate = (p) => {
+      if (!p) return;
+      const s = String(p).trim();
+      if (s) candidates.push(s);
+    };
 
+    if (typeof getReferenceFiles === "function") {
+      try {
+        const r = await getReferenceFiles(bank);
+        if (Array.isArray(r)) r.forEach(addCandidate);
+        else addCandidate(r);
+      } catch {}
+    }
+
+    if (Array.isArray(profile.referenceFiles)) profile.referenceFiles.forEach(addCandidate);
+    addCandidate(profile.referenceFile);
+
+    const bankKey = normalizeBank(bank);
+    const names = {
+      enpara: "enpara.pdf",
+      akbank: "akbank.pdf",
+      denizbank: "denizbank.pdf",
+      garanti: "garanti.pdf",
+      halkbank: "halkbank.pdf",
+      isbankasi: "isbankasi.pdf",
+      vakifbank: "vakifbank.pdf",
+      yapikredi: "yapikredi.pdf",
+      ziraat: "ziraat.pdf"
+    };
+
+    const moduleDir = path.dirname(new URL(import.meta.url).pathname);
+    const roots = [
+      process.cwd(),
+      moduleDir,
+      path.join(process.cwd(), "references"),
+      path.join(moduleDir, "references"),
+      "/var/task/references",
+      "/app/references"
+    ];
+
+    if (names[bankKey]) {
+      for (const root of roots) addCandidate(path.join(root, names[bankKey]));
+    }
+
+    let referencePath = null;
+    for (const candidate of candidates) {
+      const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(candidate);
+      try {
+        const st = await fs.stat(resolved);
+        if (st.isFile()) {
+          referencePath = resolved;
+          break;
+        }
+      } catch {}
+    }
+
+    if (!referencePath) {
+      console.warn("REFERENCE LOCAL CROP: REFERANS DOSYASI BULUNAMADI", {
+        bank: bankKey,
+        candidates: candidates.slice(0, 20)
+      });
+      return null;
+    }
+
+    console.log("REFERENCE LOCAL CROP PATH:", referencePath);
     const refExt = path.extname(referencePath).toLowerCase();
     let refBuffer = null;
     let refSize = null;
