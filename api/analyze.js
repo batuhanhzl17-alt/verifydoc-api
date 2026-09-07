@@ -3669,7 +3669,7 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       // turn "8 reference lines vs 3 target lines" into a finding by itself.
       // It becomes meaningful only when an independent local geometry signal
       // (gap/container/step) confirms the same structural change below.
-      const unmatchedLong = Math.max(0, refH.length - matchedPairs.length);
+      const unmatchedLong = Math.max(0, Number(refH?.length || 0) - Number(matchedPairs?.length || 0));
       const missingStructureCandidate = {
         type:'missing-structural-lines-candidate',
         score:Math.min(100, Math.round((1-matchedCoverage)*160)),
@@ -3784,7 +3784,7 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     const strongStepCount = structureSignals.filter(x => x.type==='localized-structural-step' && Number(x.score)>=35).length;
     const strongGapCount = strongLocal;
     const hasGeometryConfirmation = (strongGapCount>=1) || (strongContainerCount>=1) || (strongStepCount>=1);
-    const missingStructureConfirmed = (coverage<.70 && unmatchedLong>=3 && hasGeometryConfirmation);
+    const missingStructureConfirmed = (coverage<.70 && (Math.max(0, Number(refH?.length || 0) - Number(pairs?.length || 0))>=3) && hasGeometryConfirmation);
     if (missingStructureConfirmed) {
       structureSignals.push({
         type:'missing-structural-lines',
