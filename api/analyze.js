@@ -3643,6 +3643,8 @@ async function runReferenceLayoutForensics(targetPath, bank) {
     // best reference-to-target line alignment has been established.
     const refStructure = best.structure || null;
     const structureSignals = [];
+    const refH=best.refLines, pairs=best.pairs;
+    const globalScale=best.affine.scale, globalOffset=best.affine.offset;
     const matchedPairs = Array.isArray(pairs) ? pairs : [];
     const matchedCoverage = matchedPairs.length / Math.max(1, refH.length);
 
@@ -3709,8 +3711,6 @@ async function runReferenceLayoutForensics(targetPath, bank) {
       // sequence and the dedicated local gap/container checks below.
     }
 
-    const refH=best.refLines, pairs=best.pairs;
-    const globalScale=best.affine.scale, globalOffset=best.affine.offset;
     const localGapAnomalies=[];
     for(let i=0;i<pairs.length-1;i++){
       const a=pairs[i],b=pairs[i+1];
