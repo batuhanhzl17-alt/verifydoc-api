@@ -5684,8 +5684,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         // =============================================================
         // TYPOGRAPHY / GLYPH-RASTER FORENSICS v3 — PRECISION V2
         // =============================================================
-        // Sadece gerçekten kanonik bir banka alanı ve güvenilir bir OCR etiketi
-        // karşılaştırılır. Generic OCR alanları burada KESİNLİKLE yoktur.
+        // Sadece güvenilir bir OCR etiketi ve gerçek alan eşleşmesi karşılaştırılır.
+        // Bankaya özgü generic alanlar da exact-label gate ile kontrollü olarak
+        // dahil edilir; böylece DOKÜMAN NUMARASI, İŞLEM YERİ gibi alanlar font/raster
+        // açısından ölçülebilir. Generic alanlarda fuzzy label eşleşmesi kullanılmaz.
         // Değer karşılaştırması ise ancak aynı semantic field + aynı içerik tipi
         // + yeterli metin benzerliği + temiz tek satır koşullarında yapılır.
         const typographyFindings=[];
@@ -5694,6 +5696,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           'branch','date','time','description','transactionNo','accountNo','taxNo',
           'amount','iban','senderName','recipientName','senderAddress','recipientAddress','address'
         ]);
+        const tpAllowedFieldKey=(key)=>TP_ALLOWED_FIELDS.has(String(key||'')) || String(key||'').startsWith('generic:');
+
         const tpNorm=(v)=>normalizeFieldTextForMatch(String(v||''))
           .replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
         const tpDistance=(a,b)=>{
@@ -5771,7 +5775,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
 
         for(const m of matches){
           const key=String(m?.rl?.rule?.key||'');
-          if(!TP_ALLOWED_FIELDS.has(key))continue;
+          if(!tpAllowedFieldKey(key))continue;
           if(String(key).startsWith('generic:'))continue;
 
           const refLabelText=tpLabelClean(m?.rl?.labelText || m?.rl?.text);
@@ -5875,7 +5879,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
 
         console.log('TYPOGRAPHY PRECISION GATE:',JSON.stringify({
           matchedFields:matches.length,
-          allowedFieldCandidates:matches.filter(m=>TP_ALLOWED_FIELDS.has(String(m?.rl?.rule?.key||''))).length,
+          allowedFieldCandidates:matches.filter(m=>tpAllowedFieldKey(String(m?.rl?.rule?.key||''))).length,
           profilesBeforeDedup:typographyFieldProfiles.length,
           confidenceGate:'0..1 ve 0..100 OCR skorları normalize edilerek minimum 65/100',
           profileFields:typographyFieldProfiles.map(p=>p.field).slice(0,30)
@@ -5893,7 +5897,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         typographyFindings.length=0;
         typographyFindings.push(...dedupTp.values());
 
-        // Generic exact-label findings are valid typography evidence, but keep
+        // Generic exact-label findings are valid typography evidence; keep
         // the field itself attached so the human report/annotator can localize
         // the finding on the target receipt.
         for(const f of typographyFindings){
