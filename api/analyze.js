@@ -4866,12 +4866,12 @@ function rfNumericGlyphDistance(a,b){
 
 
 // =====================================================
-// V21 DYNAMIC-VALUE GLYPH COMPARISON
+// V22 DYNAMIC-VALUE GLYPH COMPARISON
 // =====================================================
 // Dynamic values are often legitimately different between a trusted reference
 // and the incoming receipt. Therefore whole-string connected-component geometry
 // is NOT sufficient: "451890001600" vs "320067009135" naturally has different
-// glyph shapes. V21 compares only characters that occur on both sides, using
+// glyph shapes. V22 compares only characters that occur on both sides, using
 // normalized per-glyph raster proxies. This makes the comparison about the
 // rendering/font of the same character rather than the literal value.
 async function rfGeneralGlyphSequence(imageBuffer, region, imageSize, text) {
@@ -4918,47 +4918,89 @@ function rfSharedCharacterGlyphDistance(a,b) {
   if(!a||!b)return null;
   const ca=a.chars||[], cb=b.chars||[], sa=a.slots||[], sb=b.slots||[];
   if(ca.length<3||cb.length<3||sa.length<3||sb.length<3)return null;
-  const nA=ca.length, nB=cb.length;
-  // Align character sequences by normalized position. We intentionally compare
-  // only the same character; different legitimate values therefore contribute
-  // nothing to the distance.
+
+  // V22: do NOT pair characters by global normalized position. A changed
+  // transaction value can insert/remove digits and that shifts every later
+  // character, creating artificial font differences. Pair the 1st/2nd/3rd
+  // occurrence of the SAME character independently on both sides.
+  const keyOf = ch => String(ch||'').toLocaleLowerCase('tr-TR');
+  const occA=new Map(), occB=new Map();
+  for(let i=0;i<Math.min(ca.length,80);i++){
+    const k=keyOf(ca[i]);
+    if(!/[0-9a-zçğıöşü]/i.test(k))continue;
+    if(!occA.has(k))occA.set(k,[]); occA.get(k).push(i);
+  }
+  for(let i=0;i<Math.min(cb.length,80);i++){
+    const k=keyOf(cb[i]);
+    if(!/[0-9a-zçğıöşü]/i.test(k))continue;
+    if(!occB.has(k))occB.set(k,[]); occB.get(k).push(i);
+  }
+
   const parts=[];
   const shared=[];
-  for(let i=0;i<Math.min(nA,80);i++){
-    const pa=i/Math.max(1,nA-1);
-    const j=Math.round(pa*Math.max(0,nB-1));
-    const ch=ca[i], target=cb[j];
-    if(ch.toLocaleLowerCase('tr-TR')!==target.toLocaleLowerCase('tr-TR'))continue;
-    const gi=Math.min(sa.length-1,Math.round((i/Math.max(1,nA-1))*Math.max(0,sa.length-1)));
-    const gj=Math.min(sb.length-1,Math.round((j/Math.max(1,nB-1))*Math.max(0,sb.length-1)));
-    const ga=sa[gi],gb=sb[gj];
-    if(!ga||!gb)continue;
-    const vals=[
-      rfSafeRel(ga.width/Math.max(1,ga.height),gb.width/Math.max(1,gb.height),.28),
-      rfSafeRel(ga.fill,gb.fill,.13),
-      rfSafeRel(ga.height/Math.max(1,a.medianH),gb.height/Math.max(1,b.medianH),.16),
-      rfSafeRel(ga.aspect,gb.aspect,.28),
-    ].filter(Number.isFinite);
-    if(vals.length){parts.push(vals.reduce((x,y)=>x+y,0)/vals.length);shared.push(ch);}
+  const detail=[];
+  for(const [k,ia] of occA.entries()){
+    const ib=occB.get(k);
+    if(!ib)continue;
+    const n=Math.min(ia.length,ib.length);
+    for(let r=0;r<n;r++){
+      const i=ia[r], j=ib[r];
+      const gi=Math.min(sa.length-1,Math.round((i/Math.max(1,ca.length-1))*Math.max(0,sa.length-1)));
+      const gj=Math.min(sb.length-1,Math.round((j/Math.max(1,cb.length-1))*Math.max(0,sb.length-1)));
+      const ga=sa[gi],gb=sb[gj];
+      if(!ga||!gb)continue;
+      const vals=[
+        // Relative shape is useful across different image scales.
+        rfSafeRel(ga.width/Math.max(1,ga.height),gb.width/Math.max(1,gb.height),.22),
+        rfSafeRel(ga.fill,gb.fill,.10),
+        rfSafeRel(ga.height/Math.max(1,a.medianH),gb.height/Math.max(1,b.medianH),.12),
+        rfSafeRel(ga.aspect,gb.aspect,.22)
+      ].filter(Number.isFinite);
+      if(vals.length){
+        parts.push(vals.reduce((x,y)=>x+y,0)/vals.length);
+        shared.push(k);
+        detail.push({character:k,occurrence:r,distance:Number((parts[parts.length-1]).toFixed(4))});
+      }
+    }
   }
   if(parts.length<3)return null;
-  const distance=parts.reduce((x,y)=>x+y,0)/parts.length;
-  return {distance,sharedCount:parts.length,sharedCharacters:[...new Set(shared)].slice(0,20)};
+
+  // V22 robust aggregation: one bad segmentation must not dominate the field.
+  parts.sort((x,y)=>x-y);
+  const trim=parts.length>=7 ? Math.floor(parts.length*.15) : 0;
+  const core=parts.slice(trim,parts.length-trim||undefined);
+  const distance=rfMedian(core);
+  const highCount=parts.filter(x=>x>=0.46).length;
+  const strongCount=parts.filter(x=>x>=0.58).length;
+  return {
+    distance,
+    sharedCount:parts.length,
+    sharedCharacters:[...new Set(shared)].slice(0,20),
+    highCount,
+    strongCount,
+    glyphDetails:detail.slice(0,40)
+  };
 }
 
 function rfDynamicValueFinding(field, labelText, valueText, sameGlyph) {
   if(!sameGlyph||!Number.isFinite(Number(sameGlyph.distance)))return null;
   const d=Number(sameGlyph.distance);
   const count=Number(sameGlyph.sharedCount)||0;
-  // Require at least three same-character observations. A single matching glyph
-  // is too easy to distort through OCR segmentation or JPEG artifacts.
-  if(count<3)return null;
-  const strong=d>=0.58 && count>=4;
-  const medium=d>=0.46 && count>=3;
+  const highCount=Number(sameGlyph.highCount)||0;
+  const strongCount=Number(sameGlyph.strongCount)||0;
+
+  // V22: a font/raster finding needs several independently matched glyphs,
+  // and the elevated distance must be repeated across those glyphs. This is
+  // intentionally harder to trigger than V21 so normal PDF->camera/JPEG
+  // rendering does not become a fraud finding.
+  if(count<4)return null;
+  if(highCount<Math.max(3,Math.ceil(count*.55)))return null;
+  const strong = d>=0.60 && strongCount>=Math.max(3,Math.ceil(count*.45));
+  const medium = d>=0.50 && highCount>=Math.max(3,Math.ceil(count*.55));
   if(!medium)return null;
   return {
     field:`${field}:value`,
-    type:'dynamic-value-character-render-mismatch',
+    type:'dynamic-value-character-render-mismatch-v22',
     severity:strong?'strong':'medium',
     characterDistance:Number(d.toFixed(4)),
     diacriticDistance:null,
@@ -4966,7 +5008,9 @@ function rfDynamicValueFinding(field, labelText, valueText, sameGlyph) {
     labelText:String(labelText||''),
     sharedCharacterCount:count,
     sharedCharacters:sameGlyph.sharedCharacters,
-    evidence:`Aynı harf/rakamların raster karakter özellikleri referanstan belirgin ayrılıyor (${count} ortak karakter karşılaştırıldı).`
+    repeatedHighDistanceGlyphCount:highCount,
+    repeatedStrongDistanceGlyphCount:strongCount,
+    evidence:`Aynı harf/rakamların raster karakter özelliklerinde tekrarlanan belirgin sapma var (${count} ortak karakter; ${highCount} karakterde yüksek sapma).`
   };
 }
 
@@ -5968,7 +6012,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
                   const sameDigitDistance=rfNumericGlyphDistance(refGlyphs,tarGlyphs);
                   if(Number.isFinite(sameDigitDistance)) valueDistance=Math.max(Number(valueDistance)||0,sameDigitDistance);
                 }
-                // V21: for every dynamic value, compare only characters that
+                // V22: for every dynamic value, compare only characters that
                 // actually occur on both sides. This removes the major V20
                 // false-positive source: different legitimate values have
                 // different connected-component shapes even with identical fonts.
@@ -6003,10 +6047,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             valueDiacriticDistance:Number.isFinite(valueDiaDistance)?Number(valueDiaDistance.toFixed(4)):null,
             valueSharedCharacterCount:Number(sameValueGlyph?.sharedCount)||0,
             valueSharedCharacters:Array.isArray(sameValueGlyph?.sharedCharacters)?sameValueGlyph.sharedCharacters:[],
+            valueRepeatedHighDistanceGlyphCount:Number(sameValueGlyph?.highCount)||0,
+            valueRepeatedStrongDistanceGlyphCount:Number(sameValueGlyph?.strongCount)||0,
             labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
             labelTargetProfile:{characterWidthToHeight:Number(tarChar.characterWidthToHeight?.toFixed?.(4) ?? tarChar.characterWidthToHeight),characterFillRatio:Number(tarChar.characterFillRatio?.toFixed?.(4) ?? tarChar.characterFillRatio),characterGapToHeight:Number(tarChar.characterGapToHeight?.toFixed?.(4) ?? tarChar.characterGapToHeight),diacriticCount:Number(tarChar.diacriticCount||0)},
           };
-          // V20: label-only raster differences are not enough. PDF-vs-camera/JPEG
+          // V22: label-only raster differences are not enough. PDF-vs-camera/JPEG
           // rendering commonly changes label edges even when the document is genuine.
           // A typography anomaly becomes credible when the value ROI independently
           // supports the same rendering difference, or when a static label is backed
@@ -6023,7 +6069,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           }
         }
 
-        console.log('TYPOGRAPHY PRECISION GATE V21:',JSON.stringify({
+        console.log('TYPOGRAPHY PRECISION GATE V22:',JSON.stringify({
           matchedFields:matches.length,
           allowedFieldCandidates:matches.filter(m=>tpAllowedFieldKey(String(m?.rl?.rule?.key||''))).length,
           profilesBeforeDedup:typographyFieldProfiles.length,
@@ -6055,7 +6101,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
         const typographyMedium=typographyFindings.filter(x=>x.severity==='medium');
         const typographyComparableCount=typographyFieldProfiles.length;
-        // V20 credibility: one isolated value mismatch is weak; repeated value
+        // V22 credibility: one isolated value mismatch is weak; repeated value
         // rendering anomalies across distinct semantic fields are much stronger.
         // Label-only differences are deliberately excluded from the score.
         const credibleFieldCount=new Set(typographyFindings.map(x=>String(x.field||'').replace(/:value$/i,''))).size;
@@ -6144,7 +6190,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
     );
     const severity=(maxSpacingScore>=85 && strongSpacing.length>=1)?'strong':(strongSpacing.length>=1&&score>=45?'medium':(suspicious.length>=1&&score>=45?'medium':'low'));
     return {
-      available:true,engine:'reference-forensic-engine-v20-occurrence-semantic-spacing-typography-v5',bank:normalizedBank,
+      available:true,engine:'reference-forensic-engine-v22-dynamic-shared-glyph-robust',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
       spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,
@@ -12616,14 +12662,14 @@ if (referenceForensics) {
   result.referenceForensics = referenceForensics;
 
   // =============================================================
-  // TYPOGRAPHY FORENSICS V21 PIPELINE OUTPUT
+  // TYPOGRAPHY FORENSICS V22 PIPELINE OUTPUT
   // =============================================================
   // Typography motoru referenceForensicEngine'in içinde çalışır.
   // Burada çıktıyı ayrı ve açık biçimde loglayarak gerçekten pipeline'a
   // bağlandığını doğruluyoruz. Risk skoruna dahil edilmez.
   const typographyForensics = {
     available: true,
-    engine: 'reference-glyph-raster-typography-v4-dynamic-shared-glyph',
+    engine: 'reference-glyph-raster-typography-v5-v22-robust-shared-glyph',
     score: Number(referenceForensics.typographyScore || 0),
     severity: referenceForensics.typographySeverity || 'insufficient-data',
     credibility: referenceForensics.typographyCredibility || 'none',
@@ -12640,7 +12686,7 @@ if (referenceForensics) {
       : []
   };
   result.typographyForensics = typographyForensics;
-  console.log('TYPOGRAPHY FORENSICS V21:', JSON.stringify(typographyForensics));
+  console.log('TYPOGRAPHY FORENSICS V22:', JSON.stringify(typographyForensics));
 }
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
