@@ -12469,6 +12469,29 @@ if (referenceForensics || layoutForensics?.available) {
       .filter(Boolean)
       .join("\n\n");
     console.log("HUMAN READABLE FORENSIC REPORT:", JSON.stringify(humanForensicReport));
+
+    // Somut referans farklarını hedef dekont üzerinde görselleştir.
+    // Bu katman yalnızca sunum içindir; risk/karar mantığını değiştirmez.
+    try {
+      const annotatedReferenceDifference = await buildAnnotatedReferenceDifferenceImage({
+        targetPath: forensicTargetPath,
+        targetOCR: paddleImageOCR,
+        referenceForensics,
+        referenceLocalCrop,
+        azureReferenceGeometry,
+        humanReport: humanForensicReport,
+      });
+      if (annotatedReferenceDifference?.available) {
+        result.annotatedReferenceDifference = annotatedReferenceDifference;
+        console.log("ANNOTATED REFERENCE DIFFERENCE:", JSON.stringify({
+          available: true,
+          boxCount: annotatedReferenceDifference.boxCount,
+          gapMarkerCount: annotatedReferenceDifference.gapMarkerCount
+        }));
+      }
+    } catch (error) {
+      console.warn("ANNOTATED REFERENCE DIFFERENCE HATASI:", error?.message || error);
+    }
   }
 }
 
@@ -12983,6 +13006,215 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     strongFindingCount: unique.length,
     userText
   };
+}
+
+// =====================================================
+// REFERENCE DIFFERENCE ANNOTATOR v1
+// =====================================================
+// Amaç: Kullanıcıya bildirilen somut referans farklarını hedef dekont
+// üzerinde yaklaşık konumlarıyla göstermek. Bu katman karar üretmez;
+// yalnızca mevcut bulguları görselleştirir.
+async function buildAnnotatedReferenceDifferenceImage({
+  targetPath,
+  targetOCR,
+  referenceForensics,
+  referenceLocalCrop,
+  azureReferenceGeometry,
+  humanReport,
+}) {
+  if (!targetPath || !humanReport?.findings?.length) return null;
+  if (!createCanvas || !sharp) return null;
+
+  try {
+    const original = await fs.readFile(targetPath);
+    const meta = await sharp(original).metadata();
+    const W = Number(meta.width) || 0;
+    const H = Number(meta.height) || 0;
+    if (W < 20 || H < 20) return null;
+
+    const regions = Array.isArray(targetOCR?.regions)
+      ? targetOCR.regions.filter(r => r?.region && String(r.text || '').trim())
+      : [];
+
+    const norm = (v) => String(v ?? '')
+      .toLocaleLowerCase('tr-TR')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/ı/g, 'i')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+
+    const fieldLabels = {
+      branch:'sube', date:'tarih', time:'saat', description:'aciklama',
+      transactionNo:'islem no', accountNo:'hesap no', taxNo:'vergi no',
+      amount:'tutar', iban:'iban', senderName:'gonderen adi',
+      recipientName:'alici adi', senderAddress:'gonderen adresi',
+      recipientAddress:'alici adresi', address:'adres'
+    };
+
+    const fieldPatterns = {
+      branch:[/\bsube\b/i, /sube kodu/i],
+      date:[/\btarih\b/i, /islem tarihi/i, /belge tarihi/i],
+      time:[/\bsaat\b/i],
+      description:[/aciklama/i],
+      transactionNo:[/islem no/i, /islem numar/i, /sorgu no/i, /fis no/i],
+      accountNo:[/hesap no/i, /hesap numar/i, /musteri no/i],
+      taxNo:[/vergi no/i, /vergi kimlik/i, /tckn/i, /vkn/i],
+      amount:[/tutar/i, /islem tutari/i, /giden fast tutari/i, /transfer tutari/i, /toplam.*tutar/i],
+      iban:[/iban/i, /alici hesap/i, /gonderen iban/i, /alici iban/i],
+      senderName:[/gonderen/i, /gonderici/i],
+      recipientName:[/alici/i],
+      senderAddress:[/gonderen adres/i],
+      recipientAddress:[/alici adres/i],
+      address:[/adres/i]
+    };
+
+    const boxOf = (r) => {
+      if (!r?.region) return null;
+      const x1 = Number(r.region.x1), y1 = Number(r.region.y1);
+      const x2 = Number(r.region.x2), y2 = Number(r.region.y2);
+      if (![x1,y1,x2,y2].every(Number.isFinite)) return null;
+      return {
+        x1: Math.max(0, Math.min(W, Math.round(x1))),
+        y1: Math.max(0, Math.min(H, Math.round(y1))),
+        x2: Math.max(0, Math.min(W, Math.round(x2))),
+        y2: Math.max(0, Math.min(H, Math.round(y2)))
+      };
+    };
+
+    const union = (a,b) => ({
+      x1: Math.min(a.x1,b.x1), y1: Math.min(a.y1,b.y1),
+      x2: Math.max(a.x2,b.x2), y2: Math.max(a.y2,b.y2)
+    });
+
+    const regionTextScore = (text, query) => {
+      const a = norm(text), b = norm(query);
+      if (!a || !b) return 0;
+      if (a === b) return 100;
+      if (a.includes(b) || b.includes(a)) return 85;
+      const aw = new Set(a.split(/\s+/).filter(Boolean));
+      const bw = new Set(b.split(/\s+/).filter(Boolean));
+      const hit = [...aw].filter(x => bw.has(x)).length;
+      return hit ? Math.min(75, 40 + hit * 15) : 0;
+    };
+
+    function findFieldRegion(field, preferredText='') {
+      const candidates = [];
+      const patterns = fieldPatterns[field] || [];
+      for (const item of regions) {
+        const text = String(item.text || '');
+        const t = norm(text);
+        let score = regionTextScore(text, preferredText);
+        if (patterns.some(re => re.test(t))) score += 55;
+        if (field === 'amount' && /\d/.test(text)) score += 5;
+        if (score > 0) {
+          const b = boxOf(item);
+          if (b && b.x2 > b.x1 && b.y2 > b.y1) candidates.push({score, box:b, text});
+        }
+      }
+      candidates.sort((a,b)=>b.score-a.score || a.box.y1-b.box.y1);
+      return candidates[0]?.box || null;
+    }
+
+    const boxes = [];
+    const gapMarkers = [];
+    const seenBox = new Set();
+
+    // 1) Local crop findings already carry exact target boxes.
+    for (const row of (referenceLocalCrop?.findings || [])) {
+      const b = row?.targetBox && boxOf({region:row.targetBox});
+      if (!b) continue;
+      const key = `box|${row.field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({box:b, label:fieldLabels[row.field] || row.field, source:'local-crop'});
+    }
+
+    // 2) Strong Azure semantic gaps: mark both anchors and the blank interval.
+    for (const row of (azureReferenceGeometry?.strongAnomalies || []).slice(0,4)) {
+      const before = findFieldRegion(row.beforeField, row.beforeLabel);
+      const after = findFieldRegion(row.afterField, row.afterLabel);
+      if (!before || !after) continue;
+      boxes.push({box:before, label:row.beforeLabel, source:'azure-anchor'});
+      boxes.push({box:after, label:row.afterLabel, source:'azure-anchor'});
+      const top = Math.min(before.y2, after.y2);
+      const bottom = Math.max(before.y1, after.y1);
+      if (bottom - top >= Math.max(8, H*0.01)) {
+        gapMarkers.push({
+          x1: Math.max(0, Math.min(before.x1, after.x1) - Math.round(W*0.01)),
+          x2: Math.min(W, Math.max(before.x2, after.x2) + Math.round(W*0.01)),
+          y1: top,
+          y2: bottom,
+          label: `${row.beforeLabel} ↔ ${row.afterLabel}`
+        });
+      }
+    }
+
+    // 3) Typography findings: locate the corresponding field label/value in OCR.
+    for (const row of (referenceForensics?.characterFindings || []).slice(0,8)) {
+      const field = String(row?.field || '').replace(/:value$/i,'');
+      const box = findFieldRegion(field, row?.targetText || fieldLabels[field] || '');
+      if (!box) continue;
+      const key = `tp|${field}|${box.x1}|${box.y1}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({box, label:fieldLabels[field] || field, source:'typography'});
+    }
+
+    // 4) If the human report has a field finding not covered above, add a best-effort box.
+    const titleToField = Object.fromEntries(Object.entries(fieldLabels).map(([k,v])=>[v,k]));
+    for (const row of humanReport.findings || []) {
+      const title = norm(row?.title || '');
+      const field = titleToField[title];
+      if (!field) continue;
+      const box = findFieldRegion(field, fieldLabels[field]);
+      if (!box) continue;
+      const key = `fallback|${field}|${box.x1}|${box.y1}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({box, label:fieldLabels[field] || field, source:'fallback'});
+    }
+
+    if (!boxes.length && !gapMarkers.length) return null;
+
+    const esc = (v) => String(v ?? '')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;');
+
+    const sw = Math.max(3, Math.round(Math.min(W,H)*0.004));
+    const parts = [];
+    for (const item of boxes.slice(0,14)) {
+      const b=item.box;
+      const pad=Math.max(4,Math.round(Math.min(W,H)*0.006));
+      const x=Math.max(0,b.x1-pad), y=Math.max(0,b.y1-pad);
+      const w=Math.min(W-x,(b.x2-b.x1)+pad*2), h=Math.min(H-y,(b.y2-b.y1)+pad*2);
+      parts.push(`<rect x="${x}" y="${y}" width="${Math.max(2,w)}" height="${Math.max(2,h)}" rx="4" fill="none" stroke="#ff1f1f" stroke-width="${sw}"/>`);
+    }
+    for (const g of gapMarkers.slice(0,4)) {
+      const h=Math.max(4,g.y2-g.y1);
+      parts.push(`<rect x="${g.x1}" y="${g.y1}" width="${Math.max(2,g.x2-g.x1)}" height="${h}" rx="6" fill="#ff1f1f" fill-opacity="0.12" stroke="#ff1f1f" stroke-width="${sw}" stroke-dasharray="${sw*3} ${sw*2}"/>`);
+      parts.push(`<line x1="${g.x1}" y1="${g.y1}" x2="${g.x2}" y2="${g.y1}" stroke="#ff1f1f" stroke-width="${sw}"/>`);
+      parts.push(`<line x1="${g.x1}" y1="${g.y2}" x2="${g.x2}" y2="${g.y2}" stroke="#ff1f1f" stroke-width="${sw}"/>`);
+    }
+
+    const svg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${parts.join('')}</svg>`);
+    const annotated = await sharp(original)
+      .composite([{input:svg, left:0, top:0}])
+      .jpeg({quality:92, mozjpeg:true})
+      .toBuffer();
+
+    return {
+      available:true,
+      mimeType:'image/jpeg',
+      imageBase64:annotated.toString('base64'),
+      boxCount:boxes.length,
+      gapMarkerCount:gapMarkers.length,
+      boxes:boxes.map(x=>({label:x.label, source:x.source, ...x.box})).slice(0,20),
+      gaps:gapMarkers.slice(0,8)
+    };
+  } catch (error) {
+    console.warn('REFERENCE DIFFERENCE ANNOTATOR HATASI:', error?.message || error);
+    return null;
+  }
 }
 
 // =====================================================
