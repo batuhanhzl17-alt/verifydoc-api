@@ -11850,7 +11850,7 @@ try {
 
 
 // =====================================================
-// V34 — DIRECT REFERENCE DIFFERENCE ENGINE
+// V35 — DIRECT REFERENCE DIFFERENCE ENGINE + REGION FORENSICS
 // =====================================================
 // The trusted bank reference is the visual baseline. Compare the target and
 // reference as documents, not as independent OCR fields. AI is used only to
@@ -11893,13 +11893,24 @@ async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo })
     // Full page plus focused zones. Every view compares target and reference
     // in the SAME normalized coordinates, so a finding can be mapped back to
     // the target image for annotation.
+    // V35: broad crops alone made Terra spend its attention on the easiest
+    // visible difference (often a header/logo) and miss local edits inside the
+    // transaction blocks.  We therefore inspect the document at three scales:
+    // whole page, semantic blocks, and narrow row bands.  The row bands overlap
+    // intentionally so a changed line is seen in more than one context.
     const views=[
-      {id:'full',title:'TÜM BELGE',box:{x1:0,y1:0,x2:1,y2:1}},
-      {id:'header',title:'ÜST / BAŞLIK VE SAĞ ÜST BİLGİLER',box:{x1:0,y1:0,x2:1,y2:.30}},
-      {id:'left',title:'SOL İŞLEM BÖLGESİ',box:{x1:0,y1:.25,x2:.56,y2:.75}},
-      {id:'amount',title:'TUTAR VE RAKAM BÖLGESİ',box:{x1:0,y1:.34,x2:.58,y2:.62}},
-      {id:'right',title:'SAĞ ALICI / İŞLEM BÖLGESİ',box:{x1:.48,y1:.10,x2:1,y2:.72}},
-      {id:'footer',title:'ALT BÖLÜM',box:{x1:0,y1:.70,x2:1,y2:1}},
+      {id:'full',title:'TÜM BELGE — genel şablon',box:{x1:0,y1:0,x2:1,y2:1}},
+      {id:'header',title:'ÜST / BAŞLIK / e-Dekont',box:{x1:0,y1:0,x2:1,y2:.30}},
+      {id:'left_block',title:'SOL İŞLEM BLOĞU — tüm bölüm',box:{x1:0,y1:.28,x2:.56,y2:.69}},
+      {id:'right_block',title:'SAĞ ALICI / İŞLEM BLOĞU — tüm bölüm',box:{x1:.45,y1:.25,x2:1,y2:.70}},
+      {id:'left_top',title:'SOL BLOK — başlık ve gönderici hesap',box:{x1:0,y1:.31,x2:.56,y2:.48}},
+      {id:'left_mid',title:'SOL BLOK — tutar / ücret / IBAN satırları',box:{x1:0,y1:.40,x2:.56,y2:.59}},
+      {id:'left_bottom',title:'SOL BLOK — açıklama ve alt satırlar',box:{x1:0,y1:.53,x2:.60,y2:.69}},
+      {id:'right_top',title:'SAĞ BLOK — alıcı hesap / banka',box:{x1:.43,y1:.30,x2:1,y2:.48}},
+      {id:'right_mid',title:'SAĞ BLOK — sorgu / toplam / işlem',box:{x1:.43,y1:.43,x2:1,y2:.61}},
+      {id:'right_bottom',title:'SAĞ BLOK — işlem türü ve alt satırlar',box:{x1:.43,y1:.54,x2:1,y2:.70}},
+      {id:'amount',title:'TUTAR — rakam karakterleri ve aynı satır içi font',box:{x1:.08,y1:.38,x2:.55,y2:.55}},
+      {id:'footer',title:'ALT BÖLÜM / FOOTER',box:{x1:0,y1:.67,x2:1,y2:1}},
     ];
 
     const schema={type:'object',properties:{findings:{type:'array',items:{type:'object',properties:{
@@ -11923,18 +11934,23 @@ Bu görev OCR metin eşitliği değildir. İki dekonttaki işlem bilgileri doğa
 olabilir. İsim, IBAN, tarih, saat, belge numarası, sorgu numarası veya tutarın farklı olması
 TEK BAŞINA bulgu değildir.
 
-${view.title} görünümünde şunların tamamını dikkatle karşılaştır:
+${view.title} görünümünde TARGET ile REFERENCE'ı SATIR SATIR ve BLOK İÇİ YAPIYI dikkate alarak karşılaştır.
+Özellikle şu bölümlerde hiçbir satırı atlama: gönderici hesap, aktarılan/işlem tutarı, ücret/vergi, ücret tah IBAN, açıklama; sağ tarafta alıcı hesap, alıcı banka, sorgu numarası, toplam tutar ve işlem türü.
+
+Şunların tamamını kontrol et:
 - yazı karakteri/font görünümü ve stroke kalınlığı,
-- rakamların şekli ve karakter genişliği; özellikle aynı sayı içindeki karakterlerin birbirinden ayrılması,
-- harf/rakam yükseklik-genişlik oranı,
-- baseline ve satır hizası,
+- aynı satır içinde karakterlerin birbirine göre şekli ve genişliği, özellikle aynı rakamın farklı üretildiği durumlar,
+- harf/rakam yükseklik-genişlik oranı ve baseline,
 - karakter ve kelime aralıkları,
-- alanların ve değerlerin konumu,
-- satır/bölüm dikey boşlukları,
-- metin yoğunluğu ve anti-aliasing/raster görünümü,
-- bir alanın başka bir font/render ile sonradan üretilmiş görünmesi,
-- silme/ekleme/yeniden yazma gibi lokal üretim izleri,
-- belge yapısı ve bölüm geometrisi.
+- etiket ile değer arasındaki mesafe,
+- satırlar arası dikey boşluk ve satırların hizası,
+- değerlerin bulunduğu metin bloklarının genişliği ve başlangıç noktası,
+- metin yoğunluğu, keskinlik ve anti-aliasing/raster davranışı,
+- tek bir alanın çevresindeki özgün yazıdan farklı render edilmiş görünmesi,
+- silme/ekleme/yeniden yazma izleri,
+- bölümün genel geometrisi ve satır düzeni.
+
+ÖZELLİKLE: TARGET'taki sol ve sağ işlem bloklarını tek bir büyük şekil olarak değil, içindeki her satırın yazı ve yerleşim davranışı olarak incele. Bir blokta birkaç farklı satır aynı referans davranışından sapıyorsa bunu tek bir 'işlem bilgileri bölümü' bulgusu altında birleştir.
 
 NORMAL FARKLARI YOK SAY:
 - kamera fotoğrafı, perspektif, döndürme, ölçek,
@@ -11946,6 +11962,14 @@ NORMAL FARKLARI YOK SAY:
 ÇOK ÖNEMLİ KARAR KURALI:
 Bir şeyi yalnızca “referanstan farklı görünüyor” diye bildirme.
 Farkın TARGET içinde lokal olarak anlamlı olması ve görsel olarak desteklenmesi gerekir.
+
+TİPOGRAFİ KARARI İÇİN EN AZ İKİ BAĞIMSIZ GÖRSEL İŞARET ARA: örneğin stroke + karakter genişliği,
+veya baseline + karakter aralığı, veya aynı blokta birden fazla satırın aynı farklı render davranışı.
+Tek başına JPEG bulanıklığı, fotoğraf açısı veya tek piksel farkı yeterli değildir.
+
+İÇERİK DEĞİŞİKLİĞİ NORMALDİR: TARGET'taki isim, IBAN, tarih, numara veya tutarın REFERENCE'tan farklı
+olması beklenebilir. Bu farklılığı değil, bu değerin NASIL YAZILDIĞINI ve bulunduğu satırın
+REFERANS YAPISINA göre nasıl üretildiğini değerlendir.
 Örneğin tek bir alanın yazısı çevresindeki normal yazılardan farklı kalınlıkta/şekildeyse
 bunu bildir. Aynı şekilde belirli bir bölümün satır aralıkları referans yapısından açıkça
 sapıyorsa bildir.
@@ -12015,18 +12039,18 @@ Kutuyu mümkün olduğunca yalnızca farklı görünen yazı/değer/bölüm üze
       });
     }
     final.sort((a,b)=>b.confidence-a.confidence);
-    return {available:true,engine:'gpt-5.6-terra-direct-reference-v34',findingCount:Math.min(12,final.length),findings:final.slice(0,12)};
+    return {available:true,engine:'gpt-5.6-terra-direct-reference-v35-region-forensics',findingCount:Math.min(12,final.length),findings:final.slice(0,12)};
   } catch(e){ console.warn('V34 DIRECT REFERENCE HATASI:',e?.message||e); return null; }
 }
 
-// V34 is the sole user-facing reference comparison. Legacy forensic engines
+// V35 is the sole user-facing reference comparison. Legacy forensic engines
 // remain available for internal diagnostics, but their noisy individual field
 // messages do not override the direct reference comparison.
 referenceVisualAdjudication = null;
 if ((type === 'image' || type === 'pdf') && bank && reference) {
   try {
     referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference});
-    console.log('REFERENCE VISUAL ADJUDICATOR V34:',JSON.stringify(referenceVisualAdjudication));
+    console.log('REFERENCE VISUAL ADJUDICATOR V35:',JSON.stringify(referenceVisualAdjudication));
   } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V34 HATASI:',e?.message||e); }
 }
 
