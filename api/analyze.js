@@ -4867,7 +4867,12 @@ function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacr
   // OCR segmentation, JPEG ringing, scan softness and Turkish glyph tails can
   // move this metric substantially without any document manipulation. A
   // diacritic mismatch therefore cannot create a finding by itself.
-  const strongChar = Number.isFinite(cd) && cd >= 0.52;
+  // Typography is a supporting reference signal. 0.42 is deliberately
+  // lower than the old 0.52 gate because the precision engine now also
+  // requires an exact/near-exact semantic label match below. This lets us
+  // catch real font/raster substitutions that are subtle but repeatable,
+  // while the semantic gate prevents unrelated text from becoming a finding.
+  const strongChar = Number.isFinite(cd) && cd >= 0.42;
   const supportingDia = hasDia && Number.isFinite(dd) && dd >= 0.62;
   const strongDia = supportingDia && strongChar && dd >= 0.68;
   if (!strongChar) return null;
@@ -5776,7 +5781,15 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
 
           // Canonical label gate: fuzzy semantic recovery alone cannot feed
           // typography. Both sides must visibly represent the same real field.
-          if(!tpCanonicalLabel(key,refLabelText)||!tpCanonicalLabel(key,tarLabelText))continue;
+          // Generic bank-specific labels are allowed ONLY when their normalized
+          // label text is exact (or near-exact). This is important for fields
+          // such as DOKÜMAN NUMARASI / İŞLEM YERİ that are real fields in a
+          // trusted bank reference but are not hard-coded canonical vocabulary.
+          const refCanonical=tpCanonicalLabel(key,refLabelText);
+          const tarCanonical=tpCanonicalLabel(key,tarLabelText);
+          const genericKey=String(key).startsWith('generic:');
+          const genericExact=genericKey && tpNorm(refLabelText)===tpNorm(tarLabelText);
+          if((!refCanonical||!tarCanonical) && !genericExact)continue;
 
           const labelDistance=tpDistance(refLabelText,tarLabelText);
           const exactLabel=tpNorm(refLabelText)===tpNorm(tarLabelText);
@@ -5856,8 +5869,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             labelTargetProfile:{characterWidthToHeight:Number(tarChar.characterWidthToHeight?.toFixed?.(4) ?? tarChar.characterWidthToHeight),characterFillRatio:Number(tarChar.characterFillRatio?.toFixed?.(4) ?? tarChar.characterFillRatio),characterGapToHeight:Number(tarChar.characterGapToHeight?.toFixed?.(4) ?? tarChar.characterGapToHeight),diacriticCount:Number(tarChar.diacriticCount||0)},
           };
           typographyFieldProfiles.push(profile);
-          if(labelFinding)typographyFindings.push({...labelFinding,scope:'label'});
-          if(valueFinding)typographyFindings.push({...valueFinding,scope:'value'});
+          if(labelFinding)typographyFindings.push({...labelFinding,scope:'label',labelText:refLabelText,targetLabelText:tarLabelText});
+          if(valueFinding)typographyFindings.push({...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText});
         }
 
         console.log('TYPOGRAPHY PRECISION GATE:',JSON.stringify({
@@ -5879,6 +5892,15 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         }
         typographyFindings.length=0;
         typographyFindings.push(...dedupTp.values());
+
+        // Generic exact-label findings are valid typography evidence, but keep
+        // the field itself attached so the human report/annotator can localize
+        // the finding on the target receipt.
+        for(const f of typographyFindings){
+          if(String(f.field||'').startsWith('generic:') && !f.labelText){
+            f.labelText=String(f.text||'').trim();
+          }
+        }
 
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
         const typographyMedium=typographyFindings.filter(x=>x.severity==='medium');
@@ -12900,13 +12922,17 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   // A diacritic-only difference is never enough.
   for (const row of (Array.isArray(forensic?.characterFindings) ? forensic.characterFindings : [])) {
     const cd = Number(row?.characterDistance);
-    if (!Number.isFinite(cd) || cd < 0.52) continue;
+    if (!Number.isFinite(cd) || cd < 0.42) continue;
 
     const rawField = String(row?.field || '').replace(/:value$/i, '');
     // Placeholder/administrative tax fields are not reliable typography evidence.
     // Never surface a taxNo finding from raster differences alone.
     if (rawField === 'taxNo') continue;
-    const field = fieldName(rawField);
+    const genericField = rawField.startsWith('generic:');
+    const genericLabel = genericField
+      ? String(row?.labelText || row?.text || rawField.slice(8) || '').trim()
+      : '';
+    const field = genericLabel || fieldName(rawField);
     const scope = /:value$/i.test(String(row?.field || '')) || row?.scope === 'value'
       ? 'değer'
       : 'yazı';
