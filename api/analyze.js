@@ -123,6 +123,10 @@ return paddleOCRClient;
 // =====================================================
 
 const paddleOCRInFlight = new Map();
+// PaddleOCR queue/rate-limit failures are cached briefly so repeated internal
+// calls do not hammer the same remote queue during one analysis request.
+const paddleOCRFailureCache = new Map();
+const PADDLE_FAILURE_CACHE_MS = 12000;
 
 
 // =====================================================
@@ -588,6 +592,11 @@ try {
   const rawForHash = await fs.readFile(filePath);
   paddleContentHash = createHash('sha256').update(rawForHash).digest('hex');
   paddleCacheKey = `paddle-content:${paddleContentHash}`;
+  const failedAt = paddleOCRFailureCache.get(paddleCacheKey);
+  if (failedAt && (Date.now() - failedAt) < PADDLE_FAILURE_CACHE_MS) {
+    console.warn("PADDLEOCR RECENT FAILURE CACHE HIT:", filePath);
+    return { text:"", confidence:0, success:false, regions:[], error:"PaddleOCR recently unavailable (queue/rate limit)." };
+  }
   const cached = paddleOCRCache.get(paddleCacheKey);
   if (cached?.success) {
     console.log("PADDLEOCR CONTENT CACHE HIT:", filePath);
@@ -627,7 +636,8 @@ console.log(
 );
 
 let result = null;
-for (let attempt = 1; attempt <= 3; attempt++) {
+const maxAttempts = 6;
+for (let attempt = 1; attempt <= maxAttempts; attempt++) {
   try {
     result = await client.ocr({
       filePath: filePath,
@@ -636,10 +646,11 @@ for (let attempt = 1; attempt <= 3; attempt++) {
     break;
   } catch (ocrError) {
     const msg = String(ocrError?.message || ocrError || "");
-    const queueFull = /queue|队列|task.*full|too many|busy|kuyruk/i.test(msg);
-    if (!queueFull || attempt === 3) throw ocrError;
-    const waitMs = attempt === 1 ? 1200 : 2500;
-    console.warn(`PADDLEOCR KUYRUK DOLU — ${waitMs}ms bekleniyor (deneme ${attempt}/3)`);
+    const queueFull = /queue|队列|task.*full|too many|busy|rate.?limit|429|kuyruk/i.test(msg);
+    if (!queueFull || attempt === maxAttempts) throw ocrError;
+    const base = [1500, 3000, 5000, 8000, 12000][attempt - 1] || 12000;
+    const waitMs = base + Math.floor(Math.random() * 750);
+    console.warn(`PADDLEOCR KUYRUK DOLU — ${waitMs}ms bekleniyor (deneme ${attempt}/${maxAttempts})`);
     await new Promise(resolve => setTimeout(resolve, waitMs));
   }
 }
@@ -935,6 +946,7 @@ error
 console.error(
 "================================================"
 );
+if (paddleCacheKey) paddleOCRFailureCache.set(paddleCacheKey, Date.now());
 
 return {
 text:
@@ -11582,6 +11594,7 @@ buffer.toString(
 // =====================================================
 
 let paddleImageOCR = null;
+let paddleCriticalFailure = false;
 let amountForensics = null;
 let referenceTemplateAnalysis = null;
 let visualForensics = null;
@@ -11629,6 +11642,12 @@ paddleImageOCR =
 await runPaddleOCR(
 forensicTargetPath
 );
+
+if (!paddleImageOCR?.success) {
+  paddleCriticalFailure = true;
+  console.error("PADDLEOCR CRITICAL FAILURE — ANALYSIS WILL NOT CLAIM CLEAN RESULT");
+  console.error("PADDLEOCR FAILURE DETAIL:", paddleImageOCR?.error || "unknown");
+}
 
 if (
 paddleImageOCR.success
@@ -14515,6 +14534,19 @@ informationCheck
 
 
 console.log("ENSEMBLE FORENSICS ACTIVE: all same-bank references + PDF raster + tolerant layout scoring");
+if (paddleCriticalFailure) {
+  console.error("ANALYSIS INCOMPLETE: PaddleOCR unavailable; refusing to return a clean/low-risk forensic result.");
+  return res.status(503).json({
+    success: false,
+    retryable: true,
+    code: "PADDLEOCR_UNAVAILABLE",
+    message: "Belge analizi tamamlanamadı. PaddleOCR servisi geçici olarak meşgul veya kuyruk limiti dolu. Lütfen aynı dekontu yeniden gönderin.",
+    fileName,
+    type,
+    bank: bank || null,
+  });
+}
+
 console.log(
 "ANALYSIS SUCCESS"
 );
