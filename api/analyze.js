@@ -11717,6 +11717,25 @@ if (
 }
 
 // =====================================================
+// TERRA REFERANS GÖRSEL HAKEMİ — FINAL REFERENCE DECISION SUPPORT
+// =====================================================
+let referenceVisualAdjudication = null;
+if ((type === 'image' || type === 'pdf') && bank && reference) {
+  try {
+    referenceVisualAdjudication = await runReferenceVisualAdjudicator({
+      targetPath: forensicTargetPath,
+      targetMime: forensicTargetMime,
+      targetBase64: base64,
+      referenceInfo: reference,
+      bank,
+    });
+    console.log('REFERENCE VISUAL ADJUDICATOR V27:', JSON.stringify(referenceVisualAdjudication));
+  } catch (error) {
+    console.warn('REFERENCE VISUAL ADJUDICATOR V27 HATASI:', error?.message || error);
+  }
+}
+
+// =====================================================
 // GÖRSEL FORENSICS — BÜTÜN SAYFA REFERANS KARŞILAŞTIRMASI
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
@@ -12743,6 +12762,9 @@ if (azureLayout) {
 if (azureReferenceGeometry) {
   result.azureReferenceGeometry = azureReferenceGeometry;
 }
+if (referenceVisualAdjudication) {
+  result.referenceVisualAdjudication = referenceVisualAdjudication;
+}
 if (visualForensics) {
   result.visualForensics = visualForensics;
 }
@@ -12784,7 +12806,9 @@ if (referenceForensics) {
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
 // "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
 if (referenceForensics || layoutForensics?.available) {
-  const humanForensicReport = buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics, referenceLocalCrop, azureReferenceGeometry);
+  const humanForensicReport = referenceVisualAdjudication?.available
+    ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
+    : buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics, referenceLocalCrop, azureReferenceGeometry);
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     // Telegram/UI için teknik engine cümlesi yerine anlaşılır bulgu metnini kullan.
@@ -13102,6 +13126,198 @@ function buildReferenceEvidenceLedger(forensic, layout = null, localCrop = null,
     row.strength = Math.max(...row.signals.map(x=>Number(x.strength)||0), 0);
     return row;
   });
+}
+
+
+// =====================================================
+// REFERENCE VISUAL ADJUDICATOR V27 — FINAL VISUAL ARBITER
+// =====================================================
+// Amaç: Deterministik motorların ürettiği "referanstan farklı" sinyallerini
+// doğrudan kullanıcıya taşımak yerine hedef dekont + güvenilir referansı
+// birlikte gören Terra'ya yalnızca görsel olarak gerçekten ayırt edilebilen,
+// lokal ve güçlü manipülasyon adaylarını sordurmak.
+//
+// KRİTİK: Referans ve hedefteki gerçek işlem değerleri farklı olabilir. Bu
+// nedenle literal metin farkı ASLA bulgu değildir. Terra yalnızca font/stroke,
+// karakter rasterı, hizalama ve aynı belgenin kendi içindeki lokal tutarlılık
+// üzerinden karar verebilir. Emin değilse findings=[] döndürmek zorundadır.
+async function runReferenceVisualAdjudicator({ targetPath, targetMime, targetBase64, referenceInfo, bank }) {
+  if (!targetPath || !targetBase64 || !referenceInfo?.path || !bank) return null;
+  try {
+    const targetExt = path.extname(String(targetPath)).toLowerCase();
+    const refExt = path.extname(String(referenceInfo.path)).toLowerCase();
+
+    const targetContent = (targetMime && String(targetMime).includes('pdf')) || targetExt === '.pdf'
+      ? {
+          type: 'input_file',
+          filename: path.basename(targetPath),
+          file_data: `data:application/pdf;base64,${targetBase64}`,
+        }
+      : {
+          type: 'input_image',
+          image_url: `data:${targetMime || 'image/jpeg'};base64,${targetBase64}`,
+          detail: 'high',
+        };
+
+    const refMime = refExt === '.pdf' ? 'application/pdf'
+      : refExt === '.png' ? 'image/png'
+      : refExt === '.webp' ? 'image/webp'
+      : 'image/jpeg';
+
+    const refContent = refExt === '.pdf'
+      ? {
+          type: 'input_file',
+          filename: path.basename(referenceInfo.path),
+          file_data: `data:application/pdf;base64,${referenceInfo.base64 || (await fs.readFile(referenceInfo.path)).toString('base64')}`,
+        }
+      : {
+          type: 'input_image',
+          image_url: `data:${refMime};base64,${referenceInfo.base64 || (await fs.readFile(referenceInfo.path)).toString('base64')}`,
+          detail: 'high',
+        };
+
+    const schema = {
+      type: 'object',
+      properties: {
+        overallConfidence: { type: 'integer', minimum: 0, maximum: 100 },
+        findings: {
+          type: 'array',
+          maxItems: 8,
+          items: {
+            type: 'object',
+            properties: {
+              field: { type: 'string' },
+              side: { type: 'string', enum: ['left', 'right', 'top', 'middle', 'bottom', 'unknown'] },
+              issueType: { type: 'string', enum: ['typography', 'layout', 'local-render', 'mixed'] },
+              confidence: { type: 'integer', minimum: 0, maximum: 100 },
+              evidence: { type: 'string' },
+            },
+            required: ['field','side','issueType','confidence','evidence'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['overallConfidence','findings'],
+      additionalProperties: false,
+    };
+
+    const prompt = `
+Sen bir banka dekontu görsel adli inceleme yardımcısısın.
+
+Aşağıda AYNI BANKAYA ait iki belge var:
+1) TARGET = kullanıcının kontrol edilmesini istediği dekont.
+2) REFERENCE = güvenilir banka referans dekontu.
+
+BANKA: ${bank}
+
+GÖREVİN:
+TARGET'ın gerçekten değiştirilmiş/manipüle edilmiş görünen bölümlerini bul.
+Ama bunu yaparken aşağıdaki kurallar MUTLAKTIR.
+
+1. TARGET ve REFERENCE'taki gerçek işlem değerleri farklı olabilir. Farklı isim,
+   farklı tutar, farklı IBAN, farklı tarih, farklı numara veya farklı açıklama
+   tek başına hata değildir.
+2. Bir alanı sırf REFERENCE'taki metinle aynı olmadığı için işaretleme.
+3. Fotoğraf, JPEG, ekran görüntüsü, çözünürlük, hafif bulanıklık, ışık,
+   perspektif ve PDF->JPG render farklarını sahtecilik kabul etme.
+4. Özellikle metnin kendi içindeki lokal tutarsızlığa bak: aynı dekontta bir
+   alanın yazı tipi/stroke/karakter rasterı diğer benzer alanlardan belirgin
+   biçimde ayrılıyor mu? Referansın aynı bölgesi bu gözlemi destekliyor mu?
+5. Etiket (ör. "BANKASI", "Doküman Numarası") farklı görünüyorsa bunu tek
+   başına bulgu yapma. Mümkünse ilgili DEĞER alanını incele.
+6. Tek bir bulanık harf, OCR hatası veya küçük piksel farkı bulgu değildir.
+7. Bir bulguyu ancak görüntü üzerinde gözle görülür, lokal ve güçlü biçimde
+   destekleniyorsa döndür. Emin değilsen findings içine koyma.
+8. Aynı tür doğal render farkı belgenin her yerinde görülüyorsa bunu NORMAL kabul et.
+9. "field" alanında mümkün olduğunca şu adları kullan: Gönderen Hesap,
+   Açıklama, İşlem Tutarı/Tutar, Doküman Numarası, İşlem Yeri,
+   İşlem Zam./Valör, Referans Numarası, ETTN, Senaryo/Dekont Tipi,
+   Alıcı Hesap, Sorgu Numarası, Toplam Tutar, İşlem Türü, IBAN,
+   Alıcı İsim/Unvan.
+10. Kullanıcıya kesin "sahte" kararı verme. Yalnızca belirgin görsel farkı bildir.
+11. Özellikle bir alanın içindeki rakamların font/stroke farkını incelerken,
+    farklı rakamların doğal şekil farkını font farkıyla karıştırma.
+12. Üç veya daha fazla alanın aynı lokal stil değişikliği gösterdiğini görürsen
+    bunu bağımsız güçlü bir örüntü olarak değerlendirebilirsin.
+
+ÇIKTI:
+- Yalnızca güçlü ve lokal bulguları döndür.
+- Hiçbiri yeterince güçlü değilse findings=[].
+- Genel/teknik açıklama yerine somut alan adı ve kısa kanıt yaz.
+`;
+
+    const response = await openai.responses.create({
+      model: 'gpt-5.6-terra',
+      input: [{
+        role: 'user',
+        content: [
+          { type: 'input_text', text: prompt },
+          { type: 'input_text', text: '=== TARGET ===' },
+          targetContent,
+          { type: 'input_text', text: '=== REFERENCE ===' },
+          refContent,
+        ],
+      }],
+      text: { format: { type: 'json_schema', name: 'reference_visual_adjudication_v27', strict: true, schema } },
+    });
+
+    const parsed = parseAIResponse(response?.output_text || '');
+    if (!parsed || !Array.isArray(parsed.findings)) return null;
+
+    const findings = parsed.findings
+      .filter(x => Number(x?.confidence) >= 80 && String(x?.evidence || '').trim().length >= 12)
+      .slice(0, 8);
+
+    return {
+      available: true,
+      engine: 'gpt-5.6-terra-reference-visual-adjudicator-v27',
+      overallConfidence: Number(parsed.overallConfidence) || 0,
+      findingCount: findings.length,
+      findings,
+    };
+  } catch (error) {
+    console.warn('REFERENCE VISUAL ADJUDICATOR HATASI:', error?.message || error);
+    return null;
+  }
+}
+
+
+function buildHumanReadableReferenceVisualAdjudicationReport(adjudication) {
+  const findings = Array.isArray(adjudication?.findings) ? adjudication.findings : [];
+  const userFindings = findings.map((x) => ({
+    priority: 1,
+    title: String(x?.field || 'Alan').trim() || 'Alan',
+    detail: String(x?.evidence || '').trim(),
+    kind: 'terra-visual-adjudication',
+    confidence: Number(x?.confidence) || 0,
+    side: x?.side || 'unknown',
+    issueType: x?.issueType || 'mixed',
+  })).filter(x => x.detail);
+
+  const unique = [];
+  const seen = new Set();
+  for (const row of userFindings) {
+    const key = `${row.title}|${row.detail}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(row);
+    if (unique.length >= 8) break;
+  }
+
+  const userText = unique.length
+    ? ['🔎 REFERANS KARŞILAŞTIRMASI', '', '🔴 FARKLAR', ...unique.map(x => `• ${x.title}: ${x.detail}`)].join('\n')
+    : ['🔎 REFERANS KARŞILAŞTIRMASI', '', '🟢 Belirgin bir fark tespit edilmedi.'].join('\n');
+
+  return {
+    headline: unique.length
+      ? `Referans karşılaştırmasında ${unique.length} güçlü görsel fark bulundu.`
+      : 'Referans karşılaştırmasında güçlü görsel fark bulunmadı.',
+    findings: unique,
+    findingCount: unique.length,
+    strongFindingCount: unique.length,
+    source: 'terra-visual-adjudication',
+    userText,
+  };
 }
 
 function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null) {
