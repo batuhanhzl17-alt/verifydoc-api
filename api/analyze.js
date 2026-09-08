@@ -4866,7 +4866,7 @@ function rfNumericGlyphDistance(a,b){
 
 
 // =====================================================
-// V22 DYNAMIC-VALUE GLYPH COMPARISON
+// V23 DYNAMIC-VALUE GLYPH DIAGNOSTIC
 // =====================================================
 // Dynamic values are often legitimately different between a trusted reference
 // and the incoming receipt. Therefore whole-string connected-component geometry
@@ -5000,7 +5000,7 @@ function rfDynamicValueFinding(field, labelText, valueText, sameGlyph) {
   if(!medium)return null;
   return {
     field:`${field}:value`,
-    type:'dynamic-value-character-render-mismatch-v22',
+    type:'legacy-dynamic-value-character-render-mismatch-v22',
     severity:strong?'strong':'medium',
     characterDistance:Number(d.toFixed(4)),
     diacriticDistance:null,
@@ -5935,6 +5935,76 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           return aspect>=1.15 && aspect<=90;
         };
 
+        // V23: Compare the VALUE's typography to the LABEL's typography within
+        // the same document, and compare that relationship to the same field in
+        // the trusted reference. This cancels most PDF->camera/JPEG/rendering
+        // differences because both label and value in the target share the same
+        // capture conditions. A changed value font therefore appears as a local
+        // style substitution instead of a generic "reference looks different".
+        const tpRatio=(a,b)=>{
+          const x=Number(a),y=Number(b);
+          if(!Number.isFinite(x)||!Number.isFinite(y)||x<=0||y<=0)return null;
+          return x/y;
+        };
+        const tpLogRatio=(a,b)=>{
+          const r=tpRatio(a,b);
+          return Number.isFinite(r)&&r>0 ? Math.abs(Math.log(r)) : null;
+        };
+        const tpRelationMetrics=(valueChar,labelChar)=>{
+          if(!valueChar||!labelChar)return null;
+          const pairs=[
+            ['widthToHeight',tpRatio(valueChar.characterWidthToHeight,labelChar.characterWidthToHeight)],
+            ['fillRatio',tpRatio(valueChar.characterFillRatio,labelChar.characterFillRatio)],
+            ['gapToHeight',tpRatio(valueChar.characterGapToHeight,labelChar.characterGapToHeight)],
+            ['heightToInk',tpRatio(valueChar.characterHeightToInkHeight,labelChar.characterHeightToInkHeight)],
+            ['areaToInk',tpRatio(valueChar.characterAreaToInkArea,labelChar.characterAreaToInkArea)],
+            ['heightSpread',tpRatio(valueChar.heightSpreadLocal,labelChar.heightSpreadLocal)],
+            ['widthSpread',tpRatio(valueChar.widthSpreadLocal,labelChar.widthSpreadLocal)]
+          ];
+          const out={};
+          for(const [k,v] of pairs)if(Number.isFinite(v)&&v>0)out[k]=v;
+          return Object.keys(out).length>=3?out:null;
+        };
+        const tpRelationDistance=(refRel,tarRel)=>{
+          if(!refRel||!tarRel)return null;
+          const vals=[];
+          for(const k of Object.keys(refRel)){
+            if(!Number.isFinite(Number(tarRel[k])))continue;
+            const d=tpLogRatio(refRel[k],tarRel[k]);
+            if(Number.isFinite(d))vals.push(d);
+          }
+          if(vals.length<3)return null;
+          vals.sort((a,b)=>a-b);
+          const trim=vals.length>=6?Math.floor(vals.length*.15):0;
+          const core=vals.slice(trim,vals.length-trim||undefined);
+          return {distance:rfMedian(core),components:vals.length,componentDistances:vals};
+        };
+        const tpInternalStyleFinding=(field,labelText,valueText,refValueChar,tarValueChar,refLabelChar,tarLabelChar)=>{
+          const refRel=tpRelationMetrics(refValueChar,refLabelChar);
+          const tarRel=tpRelationMetrics(tarValueChar,tarLabelChar);
+          const cmp=tpRelationDistance(refRel,tarRel);
+          if(!cmp||!Number.isFinite(cmp.distance)||cmp.components<3)return null;
+          // Require several relation dimensions to move together. One metric
+          // alone is too sensitive to OCR segmentation or camera noise.
+          const elevated=cmp.componentDistances.filter(v=>v>=0.26).length;
+          const strongParts=cmp.componentDistances.filter(v=>v>=0.42).length;
+          if(elevated<3)return null;
+          const strong=cmp.distance>=0.42 && strongParts>=2;
+          const medium=cmp.distance>=0.30 && elevated>=3;
+          if(!medium)return null;
+          return {
+            field:`${field}:value`,
+            type:'internal-value-style-substitution-v23',
+            severity:strong?'strong':'medium',
+            characterDistance:Number(cmp.distance.toFixed(4)),
+            diacriticDistance:null,
+            text:String(valueText||''),
+            labelText:String(labelText||''),
+            evidence:`Değer alanının etiketine göre yazı karakter yapısı, güvenilir referanstaki aynı alan ilişkisine göre lokal olarak sapıyor (${cmp.components} ölçüm boyutu).`,
+            relationComponents:cmp.components
+          };
+        };
+
         for(const m of matches){
           const key=String(m?.rl?.rule?.key||'');
           if(!tpAllowedFieldKey(key))continue;
@@ -5992,34 +6062,32 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             const vrConf=tpConfidence(valueRefRaw),vtConf=tpConfidence(valueTarRaw);
             if(vrConf!==null&&vrConf<65)valueComparable=false;
             if(vtConf!==null&&vtConf<65)valueComparable=false;
-            if(valueComparable){
-              const rr=rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key);
-              const tr=rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key);
-              refValueChar=await rfCharacterMetrics(refBuffer,rr,refSize);
-              tarValueChar=await rfCharacterMetrics(targetBuffer,tr,targetSize);
-              if(!refValueChar) refValueChar=await rfCharacterMetrics(refBuffer,valueRefRaw.region,refSize);
-              if(!tarValueChar) tarValueChar=await rfCharacterMetrics(targetBuffer,valueTarRaw.region,targetSize);
-              if(refValueChar&&tarValueChar){
-                valueDistance=rfCharacterDistance(refValueChar,tarValueChar);
-                valueDiaDistance=rfDiacriticDistance(refValueChar,tarValueChar,valueRefText,valueTarText);
-                // For the main amount, add a same-digit-only raster comparison.
-                // This prevents different legitimate numbers from looking like
-                // a font mismatch while still catching a changed rendering of
-                // the same digit.
+
+            // V23: value raster metrics are collected independently of literal
+            // value similarity. This is the key change: 104028004619 vs
+            // 320067009135 can still be compared structurally without pretending
+            // that different digits should have identical glyph shapes.
+            const rr=rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key);
+            const tr=rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key);
+            refValueChar=await rfCharacterMetrics(refBuffer,rr,refSize);
+            tarValueChar=await rfCharacterMetrics(targetBuffer,tr,targetSize);
+            if(!refValueChar) refValueChar=await rfCharacterMetrics(refBuffer,valueRefRaw.region,refSize);
+            if(!tarValueChar) tarValueChar=await rfCharacterMetrics(targetBuffer,valueTarRaw.region,targetSize);
+
+            if(refValueChar&&tarValueChar){
+              valueDistance=rfCharacterDistance(refValueChar,tarValueChar);
+              valueDiaDistance=rfDiacriticDistance(refValueChar,tarValueChar,valueRefText,valueTarText);
+              if(valueComparable){
                 if(key==='amount'){
                   const refGlyphs=await rfNumericGlyphSequence(refBuffer,rr,refSize,valueRefText);
                   const tarGlyphs=await rfNumericGlyphSequence(targetBuffer,tr,targetSize,valueTarText);
                   const sameDigitDistance=rfNumericGlyphDistance(refGlyphs,tarGlyphs);
                   if(Number.isFinite(sameDigitDistance)) valueDistance=Math.max(Number(valueDistance)||0,sameDigitDistance);
                 }
-                // V22: for every dynamic value, compare only characters that
-                // actually occur on both sides. This removes the major V20
-                // false-positive source: different legitimate values have
-                // different connected-component shapes even with identical fonts.
                 const refGeneralGlyphs=await rfGeneralGlyphSequence(refBuffer,rr,refSize,valueRefText);
                 const tarGeneralGlyphs=await rfGeneralGlyphSequence(targetBuffer,tr,targetSize,valueTarText);
                 sameValueGlyph=rfSharedCharacterGlyphDistance(refGeneralGlyphs,tarGeneralGlyphs);
-              }else valueComparable=false;
+              }
             }
           }
 
@@ -6030,6 +6098,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           // V21: do not use whole-value character geometry as the primary
           // evidence. Use the same-character glyph comparison instead.
           const valueFinding=rfDynamicValueFinding(key,refLabelText,valueTarText,sameValueGlyph);
+          // V23 primary typography evidence: internal style substitution.
+          // This compares value-vs-label typography relationship in target vs
+          // reference, so a global camera/JPEG rendering shift largely cancels.
+          const internalStyleFinding=tpInternalStyleFinding(
+            key,refLabelText,valueTarText,refValueChar,tarValueChar,refChar,tarChar
+          );
 
           const profile={
             field:key,
@@ -6049,6 +6123,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             valueSharedCharacters:Array.isArray(sameValueGlyph?.sharedCharacters)?sameValueGlyph.sharedCharacters:[],
             valueRepeatedHighDistanceGlyphCount:Number(sameValueGlyph?.highCount)||0,
             valueRepeatedStrongDistanceGlyphCount:Number(sameValueGlyph?.strongCount)||0,
+            internalStyleFinding:internalStyleFinding?{...internalStyleFinding}:null,
             labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
             labelTargetProfile:{characterWidthToHeight:Number(tarChar.characterWidthToHeight?.toFixed?.(4) ?? tarChar.characterWidthToHeight),characterFillRatio:Number(tarChar.characterFillRatio?.toFixed?.(4) ?? tarChar.characterFillRatio),characterGapToHeight:Number(tarChar.characterGapToHeight?.toFixed?.(4) ?? tarChar.characterGapToHeight),diacriticCount:Number(tarChar.diacriticCount||0)},
           };
@@ -6063,13 +6138,17 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             labelFinding: labelFinding ? {...labelFinding,scope:'label',labelText:refLabelText,targetLabelText:tarLabelText} : null,
             valueFinding: valueFinding ? {...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText} : null,
           });
-          if(valueFinding){
-            typographyFindings.push({...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText,
-              corroboration:'label+value'});
+          if(internalStyleFinding){
+            typographyFindings.push({...internalStyleFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText,
+              corroboration:'internal-label-value-style'});
           }
+          // Keep V22 shared-glyph result only as diagnostics inside the profile.
+          // It is intentionally NOT promoted to a finding in V23 because literal
+          // value changes make shared-glyph segmentation too unstable.
+          if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
 
-        console.log('TYPOGRAPHY PRECISION GATE V22:',JSON.stringify({
+        console.log('TYPOGRAPHY PRECISION GATE V23:',JSON.stringify({
           matchedFields:matches.length,
           allowedFieldCandidates:matches.filter(m=>tpAllowedFieldKey(String(m?.rl?.rule?.key||''))).length,
           profilesBeforeDedup:typographyFieldProfiles.length,
@@ -6101,7 +6180,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
         const typographyMedium=typographyFindings.filter(x=>x.severity==='medium');
         const typographyComparableCount=typographyFieldProfiles.length;
-        // V22 credibility: one isolated value mismatch is weak; repeated value
+        // V23 credibility: one isolated value mismatch is weak; repeated value
         // rendering anomalies across distinct semantic fields are much stronger.
         // Label-only differences are deliberately excluded from the score.
         const credibleFieldCount=new Set(typographyFindings.map(x=>String(x.field||'').replace(/:value$/i,''))).size;
@@ -12675,6 +12754,7 @@ if (referenceForensics) {
     credibility: referenceForensics.typographyCredibility || 'none',
     credibleFieldCount: Number(referenceForensics.typographyCredibleFieldCount || 0),
     characterFindingCount: Number(referenceForensics.characterFindingCount || 0),
+    typographyMethod: 'internal value-vs-label style substitution; literal value similarity is diagnostic only',
     characterFindings: Array.isArray(referenceForensics.characterFindings)
       ? referenceForensics.characterFindings.slice(0, 40)
       : [],
@@ -12686,7 +12766,7 @@ if (referenceForensics) {
       : []
   };
   result.typographyForensics = typographyForensics;
-  console.log('TYPOGRAPHY FORENSICS V22:', JSON.stringify(typographyForensics));
+  console.log('TYPOGRAPHY FORENSICS V23:', JSON.stringify(typographyForensics));
 }
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
