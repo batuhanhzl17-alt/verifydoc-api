@@ -11848,6 +11848,211 @@ try {
   console.warn("REFERENCE VISUAL ADJUDICATOR V29 HATASI:", error?.message || error);
 }
 
+
+// =====================================================
+// V32 — ZONE ENSEMBLE TERRA
+// =====================================================
+// V31'in ana zayıflığı: tek tek OCR value ROI'ları Terra'ya verildiğinde
+// model, hedef/reference içeriği farklı olduğu için gerçek render/font
+// değişikliğini NORMAL sayabiliyor. V32 bunu alan bağlamı ile çözer:
+// aynı bankanın referansı ve hedef dekont, üç ana semantik bölgede birlikte
+// incelenir. Modelden sadece lokal render/stil anomalisi istenir; literal
+// metin/değer farkı kanıt sayılmaz.
+async function runZoneEnsembleReferenceVisualAdjudicator({
+  targetPath,
+  referenceInfo,
+  bank,
+  targetOCR,
+}) {
+  if (!targetPath || !referenceInfo?.path || !bank || !sharp) return null;
+  try {
+    const loadImage = async (filePath) => {
+      const ext = path.extname(String(filePath)).toLowerCase();
+      if (ext === '.pdf') {
+        const raw = await fs.readFile(filePath);
+        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+        const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+        return rendered?.buffer || null;
+      }
+      return fs.readFile(filePath);
+    };
+
+    const [tb, rb] = await Promise.all([loadImage(targetPath), loadImage(referenceInfo.path)]);
+    if (!tb || !rb) return null;
+    const tm = await sharp(tb).metadata();
+    const rm = await sharp(rb).metadata();
+    const tw = Number(tm.width)||0, th = Number(tm.height)||0;
+    const rw = Number(rm.width)||0, rh = Number(rm.height)||0;
+    if (tw < 300 || th < 300 || rw < 300 || rh < 300) return null;
+
+    const clamp = (b,W,H) => ({
+      x1:Math.max(0,Math.min(W-2,Math.round(b.x1))),
+      y1:Math.max(0,Math.min(H-2,Math.round(b.y1))),
+      x2:Math.max(2,Math.min(W,Math.round(b.x2))),
+      y2:Math.max(2,Math.min(H,Math.round(b.y2))),
+    });
+    const crop = async (buf,b,W,H) => {
+      const c=clamp(b,W,H);
+      const padX=Math.round((c.x2-c.x1)*0.025);
+      const padY=Math.round((c.y2-c.y1)*0.025);
+      const left=Math.max(0,c.x1-padX), top=Math.max(0,c.y1-padY);
+      const right=Math.min(W,c.x2+padX), bottom=Math.min(H,c.y2+padY);
+      const out=await sharp(buf).extract({left,top,width:right-left,height:bottom-top})
+        .resize({width:1400,withoutEnlargement:false}).jpeg({quality:94}).toBuffer();
+      return `data:image/jpeg;base64,${out.toString('base64')}`;
+    };
+
+    // Normalized zones are deliberately broad. They are not fraud boxes and
+    // are used only to give Terra enough surrounding typography context.
+    const zones = [
+      { id:'left-transaction', title:'SOL İŞLEM BÖLGESİ', x1:0.01,y1:0.27,x2:0.53,y2:0.72,
+        fields:['Gönderen Hesap','Aktarılan Tutar','İşlem Tutarı','FAST Ücreti ve Vergi','Ücret Tah. IBAN','Açıklama'] },
+      { id:'amount', title:'TUTAR / RAKAM BÖLGESİ', x1:0.01,y1:0.39,x2:0.56,y2:0.58,
+        fields:['İşlem Tutarı','Aktarılan Tutar','FAST Ücreti ve Vergi','Toplam İşlem Tutarı','Toplam Tutar'] },
+      { id:'right-transaction', title:'SAĞ ALICI / İŞLEM BÖLGESİ', x1:0.49,y1:0.12,x2:0.99,y2:0.65,
+        fields:['Doküman Numarası','İşlem Yeri','İşlem Zam./Valör','Referans Numarası','e-Dekont Belge No','ETTN','Senaryo/Dekont Tipi','Alıcı Hesap','Sorgu Numarası','Toplam Tutar','İşlem Türü'] },
+    ];
+
+    const schema={
+      type:'object',
+      properties:{
+        findings:{type:'array',items:{type:'object',properties:{
+          field:{type:'string'}, issueType:{type:'string',enum:['typography','local-render','layout','mixed']},
+          severity:{type:'string',enum:['strong','medium']}, evidence:{type:'string'}, confidence:{type:'integer',minimum:0,maximum:100},
+        },required:['field','issueType','severity','evidence','confidence'],additionalProperties:false}},
+      },required:['findings'],additionalProperties:false
+    };
+
+    const all=[];
+    for (const z of zones) {
+      const targetUrl=await crop(tb,{x1:z.x1*tw,y1:z.y1*th,x2:z.x2*tw,y2:z.y2*th},tw,th);
+      const refUrl=await crop(rb,{x1:z.x1*rw,y1:z.y1*rh,x2:z.x2*rw,y2:z.y2*rh},rw,rh);
+      const prompt=`
+Sen banka dekontu görsel adli incelemesi yapan uzman bir hakemsin.
+
+Aşağıda AYNI BANKANIN güvenilir REFERANS dekontu ile incelenen TARGET dekontun
+aynı bölgesi var. Bu bir OCR/metin eşitliği testi DEĞİLDİR.
+
+BÖLGE: ${z.title}
+BU BÖLGEDEKİ BEKLENEN ALANLAR: ${z.fields.join(', ')}
+
+AMAÇ:
+Target'ta sonradan değiştirilmiş/yeni render edilmiş yazı veya lokal görsel
+üretim izi var mı? Özellikle:
+- aynı belge içindeki normal değer yazılarına göre font/stroke kalınlığı,
+- karakterlerin yükseklik-genişlik oranı,
+- baseline ve karakter aralığı,
+- keskinlik/anti-aliasing davranışı,
+- tek bir alan veya birkaç ilişkili alanın diğer normal alanlardan ayrılan
+  lokal raster yapısı,
+- bir bölümün başka bir font/render ile yeniden üretilmiş görünmesi.
+
+ÇOK ÖNEMLİ:
+- Target ve reference içindeki gerçek isim, tarih, IBAN, belge numarası ve
+  tutarların farklı olması NORMALDİR.
+- Farklı metin tek başına bulgu değildir.
+- Fotoğraf, JPEG, perspektif, ölçek ve genel sıkıştırma farklarını yok say.
+- Reference'ın tüm sayfasındaki genel kalite farkını bulgu yapma.
+- Yalnızca belirli bir alanın/karakter grubunun kendi çevresindeki normal
+  yazı stilinden belirgin şekilde ayrıldığı durumları bildir.
+- Türkçe ş, ı, ğ, ö, ü, ç karakterlerinin doğal şekil farkını font farkı sanma.
+- Emin değilsen findings=[].
+- Bir alanı ancak görsel olarak gerçekten destekliyorsan field adını yaz.
+- 'BANKASI', 'Doküman Numarası' gibi sabit etiketleri sırf referanstan farklı
+  görünüyor diye raporlama.
+- Birden fazla alanda aynı yeni render/stil örüntüsü varsa bunu güçlü örüntü
+  olarak değerlendirebilirsin.
+
+SADECE GÜÇLÜ/MEDIUM LOKAL BULGULARI JSON'DA DÖNDÜR.
+`;
+      try {
+        const response=await openai.responses.create({
+          model:'gpt-5.6-terra',
+          input:[{role:'user',content:[
+            {type:'input_text',text:prompt},
+            {type:'input_text',text:'=== TARGET ZONE ==='},
+            {type:'input_image',image_url:targetUrl,detail:'high'},
+            {type:'input_text',text:'=== REFERENCE ZONE ==='},
+            {type:'input_image',image_url:refUrl,detail:'high'},
+          ]}],
+          text:{format:{type:'json_schema',name:`v32_zone_${z.id.replace(/[^a-z0-9]+/gi,'_')}`,strict:true,schema}},
+        });
+        const parsed=parseAIResponse(response?.output_text||'');
+        for(const f of (parsed?.findings||[])) {
+          const conf=Number(f?.confidence)||0;
+          if(conf < 80 || !String(f?.evidence||'').trim()) continue;
+          all.push({...f,zone:z.id,zoneTitle:z.title});
+        }
+      } catch(e) {
+        console.warn(`V32 TERRA ZONE HATASI [${z.id}]:`,e?.message||e);
+      }
+    }
+
+    // A finding is user-facing only when it is repeated by at least two zones,
+    // or is a strong localized typography/render finding from the amount zone.
+    const byField=new Map();
+    for(const f of all) {
+      const key=String(f.field||'').trim().toLocaleLowerCase('tr-TR');
+      if(!key) continue;
+      const arr=byField.get(key)||[]; arr.push(f); byField.set(key,arr);
+    }
+    const final=[];
+    for(const [field,arr] of byField) {
+      const strong=arr.some(x=>x.severity==='strong' && Number(x.confidence)>=88);
+      const repeated=new Set(arr.map(x=>x.zone)).size>=2;
+      const amountStrong=arr.some(x=>x.zone==='amount' && x.severity==='strong' && Number(x.confidence)>=85);
+      if(!(strong || repeated || amountStrong)) continue;
+      arr.sort((a,b)=>Number(b.confidence)-Number(a.confidence));
+      const best=arr[0];
+      final.push({field:best.field,issueType:best.issueType,severity:best.severity,
+        evidence:best.evidence,confidence:Number(best.confidence),targetZone:best.zone,
+        corroboratingZones:[...new Set(arr.map(x=>x.zone))]});
+    }
+    final.sort((a,b)=>Number(b.confidence)-Number(a.confidence));
+    return {available:true,engine:'gpt-5.6-terra-zone-ensemble-v32',findingCount:Math.min(10,final.length),findings:final.slice(0,10)};
+  } catch(e) {
+    console.warn('V32 ZONE ENSEMBLE HATASI:',e?.message||e);
+    return null;
+  }
+}
+
+// Run V32 after the legacy/evidence-linked adjudicator. V32 findings are
+// independent and may recover fields that V31's OCR candidate gate missed.
+let referenceVisualAdjudicationV32 = null;
+if ((type === 'image' || type === 'pdf') && bank && reference && paddleImageOCR?.success) {
+  try {
+    referenceVisualAdjudicationV32 = await runZoneEnsembleReferenceVisualAdjudicator({
+      targetPath: forensicTargetPath,
+      referenceInfo: reference,
+      bank,
+      targetOCR: paddleImageOCR,
+    });
+    if (referenceVisualAdjudicationV32?.available) {
+      console.log('REFERENCE VISUAL ADJUDICATOR V32 ZONE ENSEMBLE:', JSON.stringify(referenceVisualAdjudicationV32));
+      const prior = referenceVisualAdjudication?.findings || [];
+      const next = referenceVisualAdjudicationV32.findings || [];
+      const merged = [...prior, ...next];
+      const seen = new Set();
+      const dedup = merged.filter(f => {
+        const k = `${String(f?.field||'').toLowerCase()}|${String(f?.issueType||'').toLowerCase()}|${String(f?.evidence||'').slice(0,90)}`;
+        if (seen.has(k)) return false; seen.add(k); return true;
+      }).slice(0,10);
+      if (dedup.length) {
+        referenceVisualAdjudication = {
+          ...(referenceVisualAdjudication || {}),
+          available:true,
+          engine:'gpt-5.6-terra-v32-zone-ensemble',
+          findingCount:dedup.length,
+          findings:dedup,
+          v32ZoneFindings:referenceVisualAdjudicationV32.findings,
+        };
+      }
+    }
+  } catch(e) {
+    console.warn('REFERENCE VISUAL ADJUDICATOR V32 HATASI:',e?.message||e);
+  }
+}
+
 // =====================================================
 // ANALYZE44 — PIXEL / IMAGE FORENSICS
 // =====================================================
