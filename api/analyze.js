@@ -13532,9 +13532,85 @@ async function runEvidenceLinkedVisualAdjudicator({
   };
   const canonical = (v) => fieldAliases[norm(v)] || String(v || '').trim();
 
-  // Candidate ledger: collect only fields for which the deterministic layer has
-  // a concrete target ROI. Do not manufacture a box from a label.
+  // V31: deterministic engines may miss a manipulated field, so the Terra
+  // adjudicator must not depend on a pre-existing forensic suspicion. Build
+  // semantic ROIs from OCR + trusted reference field order first, then let Terra
+  // judge the visual evidence. A label is NEVER itself a fraud ROI.
   const map = new Map();
+
+  const ocrRegions = Array.isArray(targetOCR?.regions)
+    ? targetOCR.regions.filter(x => x?.region && String(x.text || '').trim())
+    : [];
+
+  const ocrBox = (item) => item?.region ? clampBox(item.region, tw, th) : null;
+  const labelSimilarity = (a,b) => {
+    const aa = norm(a), bb = norm(b);
+    if (!aa || !bb) return 0;
+    if (aa === bb) return 1;
+    const A = aa.split(/\s+/).filter(Boolean), B = bb.split(/\s+/).filter(Boolean);
+    const sa = new Set(A), sb = new Set(B);
+    let inter = 0; for (const x of sa) if (sb.has(x)) inter++;
+    return inter / Math.max(1, Math.max(sa.size, sb.size));
+  };
+
+  const findSemanticLabel = (labelText) => {
+    const q = norm(labelText);
+    if (!q) return null;
+    let best = null;
+    for (const item of ocrRegions) {
+      const text = String(item.text || '').trim();
+      const b = ocrBox(item);
+      if (!b) continue;
+      const sim = labelSimilarity(text, labelText);
+      if (sim < 0.55) continue;
+      const exact = norm(text) === q;
+      const score = (exact ? 1000 : sim * 500) - b.y1 * 0.001;
+      if (!best || score > best.score) best = {item, box:b, score};
+    }
+    return best;
+  };
+
+  const findSemanticValue = (labelBox) => {
+    if (!labelBox) return null;
+    const lc = (labelBox.y1 + labelBox.y2) / 2;
+    const lh = Math.max(4, labelBox.y2 - labelBox.y1);
+    const choices = [];
+    for (const item of ocrRegions) {
+      const b = ocrBox(item); if (!b) continue;
+      const text = String(item.text || '').trim(); if (!text) continue;
+      const yc = (b.y1 + b.y2) / 2;
+      const sameRow = Math.abs(yc - lc) <= Math.max(14, lh * 2.0);
+      if (!sameRow || b.x1 < labelBox.x2 - Math.max(4, lh * 0.5)) continue;
+      const gap = Math.max(0, b.x1 - labelBox.x2);
+      if (gap > Math.max(520, tw * 0.60)) continue;
+      const valueLike = /[0-9A-Za-zÇĞİÖŞÜçğıöşü]/.test(text);
+      const score = (valueLike ? 300 : 0) - gap * 0.4 + Math.min(120, text.length * 2);
+      choices.push({item, box:b, score});
+    }
+    choices.sort((a,b)=>b.score-a.score);
+    return choices[0] || null;
+  };
+
+  const priorityFields = new Set([
+    'senderName','senderAccount','accountNo','description','amount','totalAmount',
+    'transactionNo','documentNo','referenceNo','ettn','transactionDate','date','time',
+    'recipientAccount','queryNo','transactionType','recipientName','iban','fee','taxNo'
+  ]);
+
+  const addSemanticCandidatesFromReference = () => {
+    for (const f of (referenceForensics?.fields || [])) {
+      const key = String(f?.field || '').trim();
+      if (!key) continue;
+      const label = String(f?.targetLabel || f?.referenceLabel || '').trim();
+      const lm = findSemanticLabel(label);
+      if (!lm) continue;
+      const vm = findSemanticValue(lm.box);
+      // Value ROI is required for typography/local-render adjudication. If OCR
+      // cannot localize it, do not invent coordinates from the label.
+      if (!vm?.box) continue;
+      addCandidate(key, vm.box, null, ['semantic-field'], 'semantik alan ROI adayı');
+    }
+  };
   const addCandidate = (field, targetBox, referenceBox, signals, reason) => {
     const f = canonical(field);
     const tb = clampBox(targetBox, tw, th);
@@ -13546,6 +13622,8 @@ async function runEvidenceLinkedVisualAdjudicator({
     for (const sig of (Array.isArray(signals) ? signals : [])) if (!row.signals.includes(sig)) row.signals.push(sig);
     if (reason && !row.reasons.includes(reason)) row.reasons.push(reason);
   };
+
+  addSemanticCandidatesFromReference();
 
   for (const f of (referenceForensics?.characterFindings || [])) {
     if (f?.scope !== 'value') continue;
@@ -13570,8 +13648,12 @@ async function runEvidenceLinkedVisualAdjudicator({
   // the user, but it can still be offered to Terra for a local visual verdict.
   const candidates = [...map.values()]
     .map(x => ({...x, signalCount:x.signals.length}))
-    .sort((a,b) => b.signalCount-a.signalCount)
-    .slice(0, 14);
+    .sort((a,b) => {
+      const pa = priorityFields.has(String(a.field)) ? 1 : 0;
+      const pb = priorityFields.has(String(b.field)) ? 1 : 0;
+      return (pb-pa) || (b.signalCount-a.signalCount);
+    })
+    .slice(0, 20);
 
   if (!candidates.length) return { available:true, engine:'v29-evidence-linked-terra', findings:[], findingCount:0, candidateCount:0 };
 
@@ -13617,6 +13699,11 @@ async function runEvidenceLinkedVisualAdjudicator({
 
     const prompt = `
 Sen banka dekontlarında sonradan yapılmış görsel değişiklikleri ayıklayan çok sıkı bir adli görsel hakemsin.
+
+V31 ÖNEMLİ: Bu alanı aday yapan sistemin önceden 'şüpheli' demesi gerekmez.
+Bu crop, özellikle hedef dekontte sonradan değiştirilmiş bir değer olup olmadığını
+incelemek için gönderiliyor. Önceki motorların 'normal' demesi seni bağlamaz; fakat
+kanıt görsel olarak güçlü değilse yine normal dön.
 
 Alan: ${c.field}
 Banka: ${bank}
@@ -14124,10 +14211,10 @@ async function buildAnnotatedReferenceDifferenceImage({
     const gapMarkers = [];
     const seenBox = new Set();
 
-    // V28 FINAL GATE: if Terra is available, annotations may ONLY originate
-    // from Terra's final findings. Never show stale deterministic candidates when
+    // V31 FINAL GATE: annotations may ONLY originate from Terra-confirmed
+    // evidence-linked findings. Deterministic candidates are never drawn. Never show stale deterministic candidates when
     // Terra explicitly decided that no strong visual difference exists.
-    const useFinalAdjudicationOnly = false;
+    const useFinalAdjudicationOnly = true;
     const useV29ConfirmedFindings = !!finalAdjudication?.available && Array.isArray(finalAdjudication?.findings) && finalAdjudication.findings.length > 0;
 
     // 1) Exact target boxes emitted by local forensic comparison.
