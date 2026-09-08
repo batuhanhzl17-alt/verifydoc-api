@@ -11850,6 +11850,13 @@ try {
 
 
 // =====================================================
+// V38 — DIRECT REFERENCE TRUTH GATE
+// =====================================================
+// User-facing reference comparison is driven ONLY by the direct target-vs-trusted
+// reference adjudication. Legacy Azure/layout/forensic signals remain diagnostics
+// but are forbidden from creating a user-facing difference on their own.
+
+// =====================================================
 // V35 — DIRECT REFERENCE DIFFERENCE ENGINE + REGION FORENSICS
 // =====================================================
 // The trusted bank reference is the visual baseline. Compare the target and
@@ -11893,6 +11900,28 @@ async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo, t
     const refProfile = await extractReferenceTemplateProfile(referenceInfo.path, normalizeBank(bank || referenceInfo.bank || ''));
     const fields = refProfile?.fields || {};
     if (!Object.keys(fields).length) return null;
+
+    // V38: never treat a different dekont family as a fraud difference. The
+    // trusted reference must be structurally compatible with the target. If the
+    // reference/target scenario labels are both available and disagree, abort
+    // this direct comparison rather than manufacturing field differences.
+    const targetScenario = targetRegions
+      .map(r => String(r.text || '').trim())
+      .find(t => /DEKONT\s*\/\s*(EFT|HVL|FAST|HAVALE)|SENARYO\s*\/\s*DEKONT/i.test(t));
+    const referenceScenario = Object.values(fields)
+      .map(f => String(f?.referenceValue || f?.valueText || f?.label || '').trim())
+      .find(t => /DEKONT\s*\/\s*(EFT|HVL|FAST|HAVALE)|SENARYO\s*\/\s*DEKONT/i.test(t));
+    if (targetScenario && referenceScenario) {
+      const family = t => {
+        const m=String(t).toLocaleUpperCase('tr-TR').match(/DEKONT\s*\/\s*(EFT|HVL|FAST|HAVALE)/);
+        return m ? m[1] : '';
+      };
+      const tf=family(targetScenario), rf=family(referenceScenario);
+      if(tf && rf && tf!==rf) {
+        console.log(`V38 REFERANS TİP UYUMSUZ: TARGET=${tf} REFERENCE=${rf} — karşılaştırma yapılmadı.`);
+        return {available:true, engine:'gpt-5.6-terra-semantic-reference-difference-v38', referenceFile:path.basename(referenceInfo.path), comparedFieldCount:0, findingCount:0, findings:[], blockConsensus:{}, skippedReason:'incompatible-dekont-family'};
+      }
+    }
 
     const wantedFields = [
       'senderName','accountNo','amount','description','senderAddress',
@@ -11972,7 +12001,94 @@ async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo, t
       },required:['findings'],additionalProperties:false
     };
 
+    // V38 BLOCK-LEVEL PASS: compare the actual semantic document blocks as whole
+    // visual regions. This catches edits spanning several adjacent fields that a
+    // single-value crop can miss. The model is explicitly forbidden from treating
+    // literal values as differences.
+    const blockBox = (items) => {
+      const xs=[]; const ys=[]; const xe=[]; const ye=[];
+      for (const it of (items||[])) {
+        const b=it?.box || it;
+        if (!b) continue;
+        const x=Number(b.x)||0,y=Number(b.y)||0,w=Number(b.w)||0,h=Number(b.h)||0;
+        xs.push(x); ys.push(y); xe.push(x+w); ye.push(y+h);
+      }
+      if (!xs.length) return null;
+      const padX=0.018, padY=0.018;
+      const x=Math.max(0,Math.min(...xs)-padX);
+      const y=Math.max(0,Math.min(...ys)-padY);
+      const x2=Math.min(1,Math.max(...xe)+padX);
+      const y2=Math.min(1,Math.max(...ye)+padY);
+      return {x,y,w:Math.max(.01,x2-x),h:Math.max(.01,y2-y)};
+    };
+
+    const targetBlockBoxes = {};
+    const referenceBlockBoxes = {};
+    for (const group of groups) {
+      targetBlockBoxes[group.id] = blockBox(group.fields.map(x=>x.targetBox));
+      referenceBlockBoxes[group.id] = blockBox(group.fields.map(x=>x.referenceBox));
+    }
+
     const raw=[];
+
+    const blockSchema = {
+      type:'object',
+      properties:{
+        findings:{type:'array',maxItems:5,items:{type:'object',properties:{
+          field:{type:'string'},
+          issueType:{type:'string',enum:['typography','layout','spacing','local-render','mixed']},
+          confidence:{type:'integer',minimum:0,maximum:100},
+          evidence:{type:'string'},
+          targetBox:{type:'object',properties:{x:{type:'number'},y:{type:'number'},w:{type:'number'},h:{type:'number'}},required:['x','y','w','h'],additionalProperties:false}
+        },required:['field','issueType','confidence','evidence','targetBox'],additionalProperties:false}}
+      },required:['findings'],additionalProperties:false
+    };
+
+    for (const group of groups) {
+      const rbBox=referenceBlockBoxes[group.id];
+      const tbBox=targetBlockBoxes[group.id];
+      if (!rbBox || !tbBox) continue;
+      try {
+        const rbBlock=await crop(rb,rm,rbBox);
+        const tbBlock=await crop(tb,tm,tbBox);
+        const response=await openai.responses.create({
+          model:'gpt-5.6-terra',
+          input:[{role:'user',content:[
+            {type:'input_text',text:`V38: AYNI BANKANIN GÜVENİLİR REFERANSI ile TARGET DEKONTUNUN ${group.id.toUpperCase()} BLOĞUNU KARŞILAŞTIR.
+
+REFERENCE güvenilir baselinedır. TARGET fotoğraf olabilir. İki görüntü aynı dekont tipine aitse aynı alanların nasıl üretildiğini karşılaştır. Literal içerik farklılıklarını (isim, IBAN, tarih, tutar, numara) KESİNLİKLE fark sayma.
+
+SADECE gerçek belge üretim/manipülasyon belirtisi olan farkları bildir: bir alanda font/stroke ailesinin değişmesi, karakterlerin biçim/ölçü oranının değişmesi, aynı satırda karakter aralığı veya baseline bozulması, alanın yerleşiminin gerçekten değişmesi, lokal silme-yeniden yazma izi veya aynı bölgenin belirgin farklı raster üretimi.
+
+Fotoğraf çekim kalitesi, perspektif, JPEG, ekran/telefon, gölge, ışık, bulanıklık, sıkıştırma ve genel çözünürlük farkı BULGU DEĞİLDİR.
+
+Çok sıkı karar ver: yalnızca açıkça görülen ve en az iki bağımsız görsel belirtiyle desteklenen farkları findings'e koy. Belirsizse BOŞ findings döndür. Bir farkı başka bir alana taşıma. targetBox sadece gerçekten farklı görülen hedef bölgeyi göstermeli.`},
+            {type:'input_text',text:'REFERENCE BLOĞU:'},{type:'input_image',image_url:rbBlock,detail:'high'},
+            {type:'input_text',text:'TARGET BLOĞU:'},{type:'input_image',image_url:tbBlock,detail:'high'}
+          ]}],
+          text:{format:{type:'json_schema',name:`v38_block_${group.id}`,strict:true,schema:blockSchema}}
+        });
+        const parsed=parseAIResponse(response?.output_text||'');
+        for (const f of (Array.isArray(parsed?.findings)?parsed.findings:[])) {
+          const c=Number(f.confidence)||0;
+          if(c<92 || String(f.evidence||'').trim().length<25) continue;
+          const tbx=f.targetBox;
+          if(!tbx || !Number.isFinite(Number(tbx.x)) || !Number.isFinite(Number(tbx.y)) || Number(tbx.w)<=0 || Number(tbx.h)<=0) continue;
+          // Terra's block crop coordinates are LOCAL to the block image. Convert
+          // them back to whole-page normalized target coordinates before storing
+          // them; otherwise annotation would point to the wrong place.
+          const gx=Number(tbBox.x)+Number(tbx.x)*Number(tbBox.w);
+          const gy=Number(tbBox.y)+Number(tbx.y)*Number(tbBox.h);
+          const gw=Math.max(0.001,Number(tbx.w)*Number(tbBox.w));
+          const gh=Math.max(0.001,Number(tbx.h)*Number(tbBox.h));
+          if(gx<0 || gy<0 || gx+gw>1.01 || gy+gh>1.01) continue;
+          raw.push({...f, field:String(f.field||group.id), targetBox:{x:gx,y:gy,w:Math.min(gw,1-gx),h:Math.min(gh,1-gy)}, group:group.id, confidence:c, source:'block-visual'});
+        }
+      } catch(e) {
+        console.warn(`V38 BLOK GÖRSEL HAKEM HATASI [${group.id}]:`,e?.message||e);
+      }
+    }
+
     for (const group of groups) {
       const content=[{
         type:'input_text',
@@ -12062,7 +12178,7 @@ referenceVisualAdjudication = null;
 if ((type === 'image' || type === 'pdf') && bank && reference) {
   try {
     referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference,targetOCR:paddleImageOCR,bank});
-    console.log('REFERENCE VISUAL ADJUDICATOR V36:',JSON.stringify(referenceVisualAdjudication));
+    console.log('REFERENCE VISUAL ADJUDICATOR V38:',JSON.stringify(referenceVisualAdjudication));
   } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V34 HATASI:',e?.message||e); }
 }
 
@@ -13076,14 +13192,21 @@ if (referenceForensics) {
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
 // "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
 if (referenceForensics || layoutForensics?.available || referenceVisualAdjudication?.available) {
-  // Terra must have an actual finding before it is allowed to replace the
-  // deterministic forensic report. Empty Terra findings are a neutral result,
-  // not a clean-document verdict.
-  const hasTerraFindings = Array.isArray(referenceVisualAdjudication?.findings)
+  // V38 HARD GATE: the trusted-reference comparison is the only source of
+  // user-facing reference findings. If the direct visual adjudicator has no
+  // sufficiently strong finding, report CLEAN rather than falling back to
+  // Azure gaps, line geometry, OCR artifacts, or legacy forensic scores.
+  const hasDirectReferenceFindings = Array.isArray(referenceVisualAdjudication?.findings)
     && referenceVisualAdjudication.findings.length > 0;
-  const humanForensicReport = hasTerraFindings
+  const humanForensicReport = hasDirectReferenceFindings
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
-    : buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics, referenceLocalCrop, azureReferenceGeometry);
+    : {
+        headline: 'Referans karşılaştırmasında belirgin fark bulunmadı.',
+        findings: [],
+        findingCount: 0,
+        strongFindingCount: 0,
+        userText: '🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.'
+      };
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     // Telegram/UI için teknik engine cümlesi yerine anlaşılır bulgu metnini kullan.
@@ -13098,9 +13221,9 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
       const annotatedReferenceDifference = await buildAnnotatedReferenceDifferenceImage({
         targetPath: forensicTargetPath,
         targetOCR: paddleImageOCR,
-        referenceForensics,
-        referenceLocalCrop,
-        azureReferenceGeometry,
+        referenceForensics: null,
+        referenceLocalCrop: null,
+        azureReferenceGeometry: null,
         humanReport: humanForensicReport,
         finalAdjudication: referenceVisualAdjudication,
       });
