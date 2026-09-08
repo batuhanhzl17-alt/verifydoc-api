@@ -11850,21 +11850,14 @@ try {
 
 
 // =====================================================
-// V32 — ZONE ENSEMBLE TERRA
+// V34 — DIRECT REFERENCE DIFFERENCE ENGINE
 // =====================================================
-// V31'in ana zayıflığı: tek tek OCR value ROI'ları Terra'ya verildiğinde
-// model, hedef/reference içeriği farklı olduğu için gerçek render/font
-// değişikliğini NORMAL sayabiliyor. V32 bunu alan bağlamı ile çözer:
-// aynı bankanın referansı ve hedef dekont, üç ana semantik bölgede birlikte
-// incelenir. Modelden sadece lokal render/stil anomalisi istenir; literal
-// metin/değer farkı kanıt sayılmaz.
-async function runZoneEnsembleReferenceVisualAdjudicator({
-  targetPath,
-  referenceInfo,
-  bank,
-  targetOCR,
-}) {
-  if (!targetPath || !referenceInfo?.path || !bank || !sharp) return null;
+// The trusted bank reference is the visual baseline. Compare the target and
+// reference as documents, not as independent OCR fields. AI is used only to
+// interpret visible differences; OCR/Sharp remain supporting tools.
+async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo }) {
+  if (!targetPath || !referenceInfo?.path || !openai || !sharp) return null;
+
   try {
     const loadImage = async (filePath) => {
       const ext = path.extname(String(filePath)).toLowerCase();
@@ -11879,197 +11872,162 @@ async function runZoneEnsembleReferenceVisualAdjudicator({
 
     const [tb, rb] = await Promise.all([loadImage(targetPath), loadImage(referenceInfo.path)]);
     if (!tb || !rb) return null;
+
     const tm = await sharp(tb).metadata();
     const rm = await sharp(rb).metadata();
     const tw = Number(tm.width)||0, th = Number(tm.height)||0;
     const rw = Number(rm.width)||0, rh = Number(rm.height)||0;
-    if (tw < 300 || th < 300 || rw < 300 || rh < 300) return null;
+    if (tw < 400 || th < 400 || rw < 400 || rh < 400) return null;
 
-    const clamp = (b,W,H) => ({
-      x1:Math.max(0,Math.min(W-2,Math.round(b.x1))),
-      y1:Math.max(0,Math.min(H-2,Math.round(b.y1))),
-      x2:Math.max(2,Math.min(W,Math.round(b.x2))),
-      y2:Math.max(2,Math.min(H,Math.round(b.y2))),
-    });
-    const crop = async (buf,b,W,H) => {
-      const c=clamp(b,W,H);
-      const padX=Math.round((c.x2-c.x1)*0.025);
-      const padY=Math.round((c.y2-c.y1)*0.025);
-      const left=Math.max(0,c.x1-padX), top=Math.max(0,c.y1-padY);
-      const right=Math.min(W,c.x2+padX), bottom=Math.min(H,c.y2+padY);
-      const out=await sharp(buf).extract({left,top,width:right-left,height:bottom-top})
-        .resize({width:1400,withoutEnlargement:false}).jpeg({quality:94}).toBuffer();
+    const makeView = async (buf, box, W, H, width=1800) => {
+      const x1=Math.max(0,Math.min(W-1,Math.round(box.x1*W)));
+      const y1=Math.max(0,Math.min(H-1,Math.round(box.y1*H)));
+      const x2=Math.max(x1+2,Math.min(W,Math.round(box.x2*W)));
+      const y2=Math.max(y1+2,Math.min(H,Math.round(box.y2*H)));
+      const out=await sharp(buf).extract({left:x1,top:y1,width:x2-x1,height:y2-y1})
+        .resize({width,withoutEnlargement:false})
+        .jpeg({quality:95,mozjpeg:true}).toBuffer();
       return `data:image/jpeg;base64,${out.toString('base64')}`;
     };
 
-    // Normalized zones are deliberately broad. They are not fraud boxes and
-    // are used only to give Terra enough surrounding typography context.
-    const zones = [
-      { id:'left-transaction', title:'SOL İŞLEM BÖLGESİ', x1:0.01,y1:0.27,x2:0.53,y2:0.72,
-        fields:['Gönderen Hesap','Aktarılan Tutar','İşlem Tutarı','FAST Ücreti ve Vergi','Ücret Tah. IBAN','Açıklama'] },
-      { id:'amount', title:'TUTAR / RAKAM BÖLGESİ', x1:0.01,y1:0.39,x2:0.56,y2:0.58,
-        fields:['İşlem Tutarı','Aktarılan Tutar','FAST Ücreti ve Vergi','Toplam İşlem Tutarı','Toplam Tutar'] },
-      { id:'right-transaction', title:'SAĞ ALICI / İŞLEM BÖLGESİ', x1:0.49,y1:0.12,x2:0.99,y2:0.65,
-        fields:['Doküman Numarası','İşlem Yeri','İşlem Zam./Valör','Referans Numarası','e-Dekont Belge No','ETTN','Senaryo/Dekont Tipi','Alıcı Hesap','Sorgu Numarası','Toplam Tutar','İşlem Türü'] },
+    // Full page plus focused zones. Every view compares target and reference
+    // in the SAME normalized coordinates, so a finding can be mapped back to
+    // the target image for annotation.
+    const views=[
+      {id:'full',title:'TÜM BELGE',box:{x1:0,y1:0,x2:1,y2:1}},
+      {id:'header',title:'ÜST / BAŞLIK VE SAĞ ÜST BİLGİLER',box:{x1:0,y1:0,x2:1,y2:.30}},
+      {id:'left',title:'SOL İŞLEM BÖLGESİ',box:{x1:0,y1:.25,x2:.56,y2:.75}},
+      {id:'amount',title:'TUTAR VE RAKAM BÖLGESİ',box:{x1:0,y1:.34,x2:.58,y2:.62}},
+      {id:'right',title:'SAĞ ALICI / İŞLEM BÖLGESİ',box:{x1:.48,y1:.10,x2:1,y2:.72}},
+      {id:'footer',title:'ALT BÖLÜM',box:{x1:0,y1:.70,x2:1,y2:1}},
     ];
 
-    const schema={
-      type:'object',
-      properties:{
-        findings:{type:'array',items:{type:'object',properties:{
-          field:{type:'string'}, issueType:{type:'string',enum:['typography','local-render','layout','mixed']},
-          severity:{type:'string',enum:['strong','medium']}, evidence:{type:'string'}, confidence:{type:'integer',minimum:0,maximum:100},
-        },required:['field','issueType','severity','evidence','confidence'],additionalProperties:false}},
-      },required:['findings'],additionalProperties:false
-    };
+    const schema={type:'object',properties:{findings:{type:'array',items:{type:'object',properties:{
+      field:{type:'string'}, issueType:{type:'string',enum:['typography','layout','spacing','local-render','mixed']},
+      severity:{type:'string',enum:['strong','medium']}, evidence:{type:'string'}, confidence:{type:'integer',minimum:0,maximum:100},
+      box:{type:'object',properties:{x:{type:'number',minimum:0,maximum:1},y:{type:'number',minimum:0,maximum:1},w:{type:'number',minimum:0,maximum:1},h:{type:'number',minimum:0,maximum:1}},required:['x','y','w','h'],additionalProperties:false}
+    },required:['field','issueType','severity','evidence','confidence','box'],additionalProperties:false}},},required:['findings'],additionalProperties:false};
 
-    const all=[];
-    for (const z of zones) {
-      const targetUrl=await crop(tb,{x1:z.x1*tw,y1:z.y1*th,x2:z.x2*tw,y2:z.y2*th},tw,th);
-      const refUrl=await crop(rb,{x1:z.x1*rw,y1:z.y1*rh,x2:z.x2*rw,y2:z.y2*rh},rw,rh);
+    const raw=[];
+    for (const view of views) {
+      const targetUrl=await makeView(tb,view.box,tw,th);
+      const refUrl=await makeView(rb,view.box,rw,rh);
       const prompt=`
-Sen banka dekontu görsel adli incelemesi yapan uzman bir hakemsin.
+Sen banka dekontlarının GÖRSEL REFERANS KARŞILAŞTIRMASINI yapan uzman bir inceleme motorusun.
 
-Aşağıda AYNI BANKANIN güvenilir REFERANS dekontu ile incelenen TARGET dekontun
-aynı bölgesi var. Bu bir OCR/metin eşitliği testi DEĞİLDİR.
+TARGET = incelenen dekont.
+REFERENCE = aynı bankanın güvenilir ve ORİJİNAL referans dekontu.
+REFERENCE doğru kabul edilir.
 
-BÖLGE: ${z.title}
-BU BÖLGEDEKİ BEKLENEN ALANLAR: ${z.fields.join(', ')}
+Bu görev OCR metin eşitliği değildir. İki dekonttaki işlem bilgileri doğal olarak farklı
+olabilir. İsim, IBAN, tarih, saat, belge numarası, sorgu numarası veya tutarın farklı olması
+TEK BAŞINA bulgu değildir.
 
-AMAÇ:
-Target'ta sonradan değiştirilmiş/yeni render edilmiş yazı veya lokal görsel
-üretim izi var mı? Özellikle:
-- aynı belge içindeki normal değer yazılarına göre font/stroke kalınlığı,
-- karakterlerin yükseklik-genişlik oranı,
-- baseline ve karakter aralığı,
-- keskinlik/anti-aliasing davranışı,
-- tek bir alan veya birkaç ilişkili alanın diğer normal alanlardan ayrılan
-  lokal raster yapısı,
-- bir bölümün başka bir font/render ile yeniden üretilmiş görünmesi.
+${view.title} görünümünde şunların tamamını dikkatle karşılaştır:
+- yazı karakteri/font görünümü ve stroke kalınlığı,
+- rakamların şekli ve karakter genişliği; özellikle aynı sayı içindeki karakterlerin birbirinden ayrılması,
+- harf/rakam yükseklik-genişlik oranı,
+- baseline ve satır hizası,
+- karakter ve kelime aralıkları,
+- alanların ve değerlerin konumu,
+- satır/bölüm dikey boşlukları,
+- metin yoğunluğu ve anti-aliasing/raster görünümü,
+- bir alanın başka bir font/render ile sonradan üretilmiş görünmesi,
+- silme/ekleme/yeniden yazma gibi lokal üretim izleri,
+- belge yapısı ve bölüm geometrisi.
 
-ÇOK ÖNEMLİ:
-- Target ve reference içindeki gerçek isim, tarih, IBAN, belge numarası ve
-  tutarların farklı olması NORMALDİR.
-- Farklı metin tek başına bulgu değildir.
-- Fotoğraf, JPEG, perspektif, ölçek ve genel sıkıştırma farklarını yok say.
-- Reference'ın tüm sayfasındaki genel kalite farkını bulgu yapma.
-- Yalnızca belirli bir alanın/karakter grubunun kendi çevresindeki normal
-  yazı stilinden belirgin şekilde ayrıldığı durumları bildir.
-- Türkçe ş, ı, ğ, ö, ü, ç karakterlerinin doğal şekil farkını font farkı sanma.
-- Emin değilsen findings=[].
-- Bir alanı ancak görsel olarak gerçekten destekliyorsan field adını yaz.
-- 'BANKASI', 'Doküman Numarası' gibi sabit etiketleri sırf referanstan farklı
-  görünüyor diye raporlama.
-- Birden fazla alanda aynı yeni render/stil örüntüsü varsa bunu güçlü örüntü
-  olarak değerlendirebilirsin.
+NORMAL FARKLARI YOK SAY:
+- kamera fotoğrafı, perspektif, döndürme, ölçek,
+- JPEG sıkıştırması, genel bulanıklık veya ışık farkı,
+- tüm belgeyi etkileyen kalite farkı,
+- Türkçe ş, ı, ğ, ö, ü, ç karakterlerinin doğal raster farkları,
+- TARGET ve REFERENCE'ın gerçek işlem değerlerinin farklı olması.
 
-SADECE GÜÇLÜ/MEDIUM LOKAL BULGULARI JSON'DA DÖNDÜR.
+ÇOK ÖNEMLİ KARAR KURALI:
+Bir şeyi yalnızca “referanstan farklı görünüyor” diye bildirme.
+Farkın TARGET içinde lokal olarak anlamlı olması ve görsel olarak desteklenmesi gerekir.
+Örneğin tek bir alanın yazısı çevresindeki normal yazılardan farklı kalınlıkta/şekildeyse
+bunu bildir. Aynı şekilde belirli bir bölümün satır aralıkları referans yapısından açıkça
+sapıyorsa bildir.
+
+SADECE gerçekten gördüğün güçlü veya orta seviyeli farkları döndür.
+Emin değilsen findings boş olsun.
+
+box, farkın TARGET içindeki konumudur. Koordinatlar bu gönderilen görünümün 0..1 aralığındadır.
+Kutuyu mümkün olduğunca yalnızca farklı görünen yazı/değer/bölüm üzerine koy; bütün sayfayı kutulama.
 `;
       try {
         const response=await openai.responses.create({
           model:'gpt-5.6-terra',
           input:[{role:'user',content:[
             {type:'input_text',text:prompt},
-            {type:'input_text',text:'=== TARGET ZONE ==='},
+            {type:'input_text',text:'=== TARGET ==='},
             {type:'input_image',image_url:targetUrl,detail:'high'},
-            {type:'input_text',text:'=== REFERENCE ZONE ==='},
+            {type:'input_text',text:'=== REFERENCE ==='},
             {type:'input_image',image_url:refUrl,detail:'high'},
           ]}],
-          text:{format:{type:'json_schema',name:`v32_zone_${z.id.replace(/[^a-z0-9]+/gi,'_')}`,strict:true,schema}},
+          text:{format:{type:'json_schema',name:`v34_${view.id}`,strict:true,schema}},
         });
         const parsed=parseAIResponse(response?.output_text||'');
-        console.log(`V33 TERRA ZONE SONUCU [${z.id}]:`, JSON.stringify({
-          findingCount:Array.isArray(parsed?.findings) ? parsed.findings.length : 0,
-          findings:Array.isArray(parsed?.findings) ? parsed.findings : []
-        }));
-        for(const f of (parsed?.findings||[])) {
-          const conf=Number(f?.confidence)||0;
-          if(conf < 80 || !String(f?.evidence||'').trim()) continue;
-          all.push({...f,zone:z.id,zoneTitle:z.title});
+        const fsx=Array.isArray(parsed?.findings)?parsed.findings:[];
+        console.log(`V34 DIRECT REFERENCE [${view.id}]:`,JSON.stringify({findingCount:fsx.length,findings:fsx}));
+        for(const f of fsx){
+          const c=Number(f.confidence)||0;
+          if(c<82 || !String(f.evidence||'').trim()) continue;
+          const bx=f.box||{};
+          if(!(Number.isFinite(Number(bx.x))&&Number.isFinite(Number(bx.y))&&Number.isFinite(Number(bx.w))&&Number.isFinite(Number(bx.h)))) continue;
+          if(Number(bx.w)<=0 || Number(bx.h)<=0) continue;
+          // Convert view-local box to whole-target normalized coordinates.
+          const x=view.box.x1+Number(bx.x)*((view.box.x2-view.box.x1));
+          const y=view.box.y1+Number(bx.y)*((view.box.y2-view.box.y1));
+          const w=Number(bx.w)*((view.box.x2-view.box.x1));
+          const h=Number(bx.h)*((view.box.y2-view.box.y1));
+          raw.push({...f,view:view.id,confidence:c,box:{x:Math.max(0,Math.min(1,x)),y:Math.max(0,Math.min(1,y)),w:Math.max(.002,Math.min(1-x,w)),h:Math.max(.002,Math.min(1-y,h))}});
         }
-      } catch(e) {
-        console.warn(`V32 TERRA ZONE HATASI [${z.id}]:`,e?.message||e);
-      }
+      } catch(e) { console.warn(`V34 DIRECT REFERENCE HATASI [${view.id}]:`,e?.message||e); }
     }
 
-    // A finding is user-facing only when it is repeated by at least two zones,
-    // or is a strong localized typography/render finding from the amount zone.
-    const byField=new Map();
-    for(const f of all) {
-      const key=String(f.field||'').trim().toLocaleLowerCase('tr-TR');
-      if(!key) continue;
-      const arr=byField.get(key)||[]; arr.push(f); byField.set(key,arr);
+    // Cluster overlapping findings. A local finding may legitimately appear in
+    // only one focused zone, but repeated support from another view strengthens
+    // it. We never merge unrelated distant findings just because the field name
+    // is the same.
+    const iou=(a,b)=>{const ax1=a.x,ay1=a.y,ax2=a.x+a.w,ay2=a.y+a.h,bx1=b.x,by1=b.y,bx2=b.x+b.w,by2=b.y+b.h;const ix1=Math.max(ax1,bx1),iy1=Math.max(ay1,by1),ix2=Math.min(ax2,bx2),iy2=Math.min(ay2,by2);const iw=Math.max(0,ix2-ix1),ih=Math.max(0,iy2-iy1);const inter=iw*ih,ua=a.w*a.h+b.w*b.h-inter;return ua>0?inter/ua:0;};
+    const clusters=[];
+    for(const f of raw.sort((a,b)=>b.confidence-a.confidence)){
+      let hit=null;
+      for(const c of clusters){
+        if(iou(f.box,c.best.box)>=.20 || (String(f.field).trim().toLocaleLowerCase('tr-TR')===String(c.best.field).trim().toLocaleLowerCase('tr-TR') && iou(f.box,c.best.box)>=.08)){hit=c;break;}
+      }
+      if(hit) hit.items.push(f); else clusters.push({best:f,items:[f]});
     }
+
     const final=[];
-    for(const [field,arr] of byField) {
-      // V33: a single zone is already a localized comparison. Requiring two
-      // different zones made legitimate left/right edits disappear because
-      // those fields naturally belong to only one zone. Keep a high-confidence
-      // single-zone finding, while retaining repeated-zone corroboration for
-      // medium findings.
-      const strong=arr.some(x=>x.severity==='strong' && Number(x.confidence)>=84);
-      const repeated=new Set(arr.map(x=>x.zone)).size>=2 && arr.some(x=>Number(x.confidence)>=80);
-      const amountStrong=arr.some(x=>x.zone==='amount' && Number(x.confidence)>=82);
-      if(!(strong || repeated || amountStrong)) continue;
-      arr.sort((a,b)=>Number(b.confidence)-Number(a.confidence));
-      const best=arr[0];
-      final.push({field:best.field,issueType:best.issueType,severity:best.severity,
-        evidence:best.evidence,confidence:Number(best.confidence),targetZone:best.zone,
-        corroboratingZones:[...new Set(arr.map(x=>x.zone))]});
+    for(const c of clusters){
+      const best=c.items.slice().sort((a,b)=>b.confidence-a.confidence)[0];
+      const viewsSeen=new Set(c.items.map(x=>x.view));
+      const repeated=viewsSeen.size>=2;
+      const score=best.confidence+(repeated?5:0);
+      if(score<82) continue;
+      final.push({
+        field:best.field, issueType:best.issueType, severity:best.severity,
+        evidence:best.evidence, confidence:Math.min(99,score), targetBox:best.box,
+        supportingViews:[...viewsSeen], occurrenceCount:c.items.length
+      });
     }
-    final.sort((a,b)=>Number(b.confidence)-Number(a.confidence));
-    return {available:true,engine:'gpt-5.6-terra-zone-ensemble-v32',findingCount:Math.min(10,final.length),findings:final.slice(0,10)};
-  } catch(e) {
-    console.warn('V32 ZONE ENSEMBLE HATASI:',e?.message||e);
-    return null;
-  }
+    final.sort((a,b)=>b.confidence-a.confidence);
+    return {available:true,engine:'gpt-5.6-terra-direct-reference-v34',findingCount:Math.min(12,final.length),findings:final.slice(0,12)};
+  } catch(e){ console.warn('V34 DIRECT REFERENCE HATASI:',e?.message||e); return null; }
 }
 
-// Run V32 after the legacy/evidence-linked adjudicator. V32 findings are
-// independent and may recover fields that V31's OCR candidate gate missed.
-let referenceVisualAdjudicationV32 = null;
-if ((type === 'image' || type === 'pdf') && bank && reference && paddleImageOCR?.success) {
+// V34 is the sole user-facing reference comparison. Legacy forensic engines
+// remain available for internal diagnostics, but their noisy individual field
+// messages do not override the direct reference comparison.
+let referenceVisualAdjudication = null;
+if ((type === 'image' || type === 'pdf') && bank && reference) {
   try {
-    referenceVisualAdjudicationV32 = await runZoneEnsembleReferenceVisualAdjudicator({
-      targetPath: forensicTargetPath,
-      referenceInfo: reference,
-      bank,
-      targetOCR: paddleImageOCR,
-    });
-    if (referenceVisualAdjudicationV32?.available) {
-      console.log('REFERENCE VISUAL ADJUDICATOR V33 ZONE ENSEMBLE:', JSON.stringify(referenceVisualAdjudicationV32));
-      const prior = referenceVisualAdjudication?.findings || [];
-      const next = referenceVisualAdjudicationV32.findings || [];
-      const merged = [...prior, ...next];
-      const seen = new Set();
-      const dedup = merged.filter(f => {
-        const k = `${String(f?.field||'').toLowerCase()}|${String(f?.issueType||'').toLowerCase()}|${String(f?.evidence||'').slice(0,90)}`;
-        if (seen.has(k)) return false; seen.add(k); return true;
-      }).slice(0,10);
-
-      // An empty Terra response is not evidence that the document is clean.
-      // Keep the deterministic forensic fallback alive when Terra has no finding.
-      if (dedup.length) {
-        referenceVisualAdjudication = {
-          ...(referenceVisualAdjudication || {}),
-          available:true,
-          engine:'gpt-5.6-terra-v33-zone-ensemble',
-          findingCount:dedup.length,
-          findings:dedup,
-          v33ZoneFindings:referenceVisualAdjudicationV32.findings,
-        };
-      } else if (referenceVisualAdjudication?.findings?.length) {
-        referenceVisualAdjudication = {
-          ...referenceVisualAdjudication,
-          v33ZoneFindings:[],
-        };
-      } else {
-        referenceVisualAdjudication = null;
-      }
-    }
-  } catch(e) {
-    console.warn('REFERENCE VISUAL ADJUDICATOR V32 HATASI:',e?.message||e);
-  }
+    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference});
+    console.log('REFERENCE VISUAL ADJUDICATOR V34:',JSON.stringify(referenceVisualAdjudication));
+  } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V34 HATASI:',e?.message||e); }
 }
 
 // =====================================================
@@ -14367,6 +14325,14 @@ async function buildAnnotatedReferenceDifferenceImage({
     const boxOf = (r) => {
       const q = r?.region || r;
       if (!q) return null;
+      // V34 direct-reference findings use normalized target coordinates.
+      if ([q.x,q.y,q.w,q.h].every(v => Number.isFinite(Number(v))) &&
+          ![q.x1,q.y1,q.x2,q.y2].every(v => Number.isFinite(Number(v)))) {
+        const nx=Number(q.x), ny=Number(q.y), nw=Number(q.w), nh=Number(q.h);
+        if (nx>=0 && nx<=1 && ny>=0 && ny<=1 && nw>0 && nh>0 && nx+nw<=1.001 && ny+nh<=1.001) {
+          return {x1:Math.max(0,Math.min(W,Math.round(nx*W))),y1:Math.max(0,Math.min(H,Math.round(ny*H))),x2:Math.max(0,Math.min(W,Math.round((nx+nw)*W))),y2:Math.max(0,Math.min(H,Math.round((ny+nh)*H)))};
+        }
+      }
       const x1 = Number(q.x1), y1 = Number(q.y1);
       const x2 = Number(q.x2), y2 = Number(q.y2);
       if (![x1,y1,x2,y2].every(Number.isFinite)) return null;
