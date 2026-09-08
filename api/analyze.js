@@ -11978,6 +11978,10 @@ SADECE GÜÇLÜ/MEDIUM LOKAL BULGULARI JSON'DA DÖNDÜR.
           text:{format:{type:'json_schema',name:`v32_zone_${z.id.replace(/[^a-z0-9]+/gi,'_')}`,strict:true,schema}},
         });
         const parsed=parseAIResponse(response?.output_text||'');
+        console.log(`V33 TERRA ZONE SONUCU [${z.id}]:`, JSON.stringify({
+          findingCount:Array.isArray(parsed?.findings) ? parsed.findings.length : 0,
+          findings:Array.isArray(parsed?.findings) ? parsed.findings : []
+        }));
         for(const f of (parsed?.findings||[])) {
           const conf=Number(f?.confidence)||0;
           if(conf < 80 || !String(f?.evidence||'').trim()) continue;
@@ -11998,9 +12002,14 @@ SADECE GÜÇLÜ/MEDIUM LOKAL BULGULARI JSON'DA DÖNDÜR.
     }
     const final=[];
     for(const [field,arr] of byField) {
-      const strong=arr.some(x=>x.severity==='strong' && Number(x.confidence)>=88);
-      const repeated=new Set(arr.map(x=>x.zone)).size>=2;
-      const amountStrong=arr.some(x=>x.zone==='amount' && x.severity==='strong' && Number(x.confidence)>=85);
+      // V33: a single zone is already a localized comparison. Requiring two
+      // different zones made legitimate left/right edits disappear because
+      // those fields naturally belong to only one zone. Keep a high-confidence
+      // single-zone finding, while retaining repeated-zone corroboration for
+      // medium findings.
+      const strong=arr.some(x=>x.severity==='strong' && Number(x.confidence)>=84);
+      const repeated=new Set(arr.map(x=>x.zone)).size>=2 && arr.some(x=>Number(x.confidence)>=80);
+      const amountStrong=arr.some(x=>x.zone==='amount' && Number(x.confidence)>=82);
       if(!(strong || repeated || amountStrong)) continue;
       arr.sort((a,b)=>Number(b.confidence)-Number(a.confidence));
       const best=arr[0];
@@ -12028,7 +12037,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && paddleImageOCR?
       targetOCR: paddleImageOCR,
     });
     if (referenceVisualAdjudicationV32?.available) {
-      console.log('REFERENCE VISUAL ADJUDICATOR V32 ZONE ENSEMBLE:', JSON.stringify(referenceVisualAdjudicationV32));
+      console.log('REFERENCE VISUAL ADJUDICATOR V33 ZONE ENSEMBLE:', JSON.stringify(referenceVisualAdjudicationV32));
       const prior = referenceVisualAdjudication?.findings || [];
       const next = referenceVisualAdjudicationV32.findings || [];
       const merged = [...prior, ...next];
@@ -12037,15 +12046,25 @@ if ((type === 'image' || type === 'pdf') && bank && reference && paddleImageOCR?
         const k = `${String(f?.field||'').toLowerCase()}|${String(f?.issueType||'').toLowerCase()}|${String(f?.evidence||'').slice(0,90)}`;
         if (seen.has(k)) return false; seen.add(k); return true;
       }).slice(0,10);
+
+      // An empty Terra response is not evidence that the document is clean.
+      // Keep the deterministic forensic fallback alive when Terra has no finding.
       if (dedup.length) {
         referenceVisualAdjudication = {
           ...(referenceVisualAdjudication || {}),
           available:true,
-          engine:'gpt-5.6-terra-v32-zone-ensemble',
+          engine:'gpt-5.6-terra-v33-zone-ensemble',
           findingCount:dedup.length,
           findings:dedup,
-          v32ZoneFindings:referenceVisualAdjudicationV32.findings,
+          v33ZoneFindings:referenceVisualAdjudicationV32.findings,
         };
+      } else if (referenceVisualAdjudication?.findings?.length) {
+        referenceVisualAdjudication = {
+          ...referenceVisualAdjudication,
+          v33ZoneFindings:[],
+        };
+      } else {
+        referenceVisualAdjudication = null;
       }
     }
   } catch(e) {
@@ -13062,8 +13081,13 @@ if (referenceForensics) {
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
 // "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
-if (referenceForensics || layoutForensics?.available) {
-  const humanForensicReport = referenceVisualAdjudication?.available
+if (referenceForensics || layoutForensics?.available || referenceVisualAdjudication?.available) {
+  // Terra must have an actual finding before it is allowed to replace the
+  // deterministic forensic report. Empty Terra findings are a neutral result,
+  // not a clean-document verdict.
+  const hasTerraFindings = Array.isArray(referenceVisualAdjudication?.findings)
+    && referenceVisualAdjudication.findings.length > 0;
+  const humanForensicReport = hasTerraFindings
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
     : buildHumanReadableReferenceForensicReport(referenceForensics, layoutForensics, referenceLocalCrop, azureReferenceGeometry);
   if (humanForensicReport) {
