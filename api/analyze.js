@@ -11901,27 +11901,58 @@ async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo, t
     const fields = refProfile?.fields || {};
     if (!Object.keys(fields).length) return null;
 
-    // V38: never treat a different dekont family as a fraud difference. The
-    // trusted reference must be structurally compatible with the target. If the
-    // reference/target scenario labels are both available and disagree, abort
-    // this direct comparison rather than manufacturing field differences.
+    // V39: choose the trusted reference that belongs to the SAME dekont family.
+    // The old V38 hard-gated on the canonical reference file. That made a real
+    // HVL target look clean when isbankasi.pdf happened to be an EFT reference.
+    // All files in references/ are trusted originals; family mismatch is a
+    // reference-selection problem, not a clean-document result.
+    const familyOf = (t) => {
+      const m = String(t || '').toLocaleUpperCase('tr-TR').match(/DEKONT\s*\/\s*(EFT|HVL|FAST|HAVALE)/);
+      return m ? m[1] : '';
+    };
     const targetScenario = targetRegions
       .map(r => String(r.text || '').trim())
       .find(t => /DEKONT\s*\/\s*(EFT|HVL|FAST|HAVALE)|SENARYO\s*\/\s*DEKONT/i.test(t));
-    const referenceScenario = Object.values(fields)
-      .map(f => String(f?.referenceValue || f?.valueText || f?.label || '').trim())
-      .find(t => /DEKONT\s*\/\s*(EFT|HVL|FAST|HAVALE)|SENARYO\s*\/\s*DEKONT/i.test(t));
-    if (targetScenario && referenceScenario) {
-      const family = t => {
-        const m=String(t).toLocaleUpperCase('tr-TR').match(/DEKONT\s*\/\s*(EFT|HVL|FAST|HAVALE)/);
-        return m ? m[1] : '';
-      };
-      const tf=family(targetScenario), rf=family(referenceScenario);
-      if(tf && rf && tf!==rf) {
-        console.log(`V38 REFERANS TİP UYUMSUZ: TARGET=${tf} REFERENCE=${rf} — karşılaştırma yapılmadı.`);
-        return {available:true, engine:'gpt-5.6-terra-semantic-reference-difference-v38', referenceFile:path.basename(referenceInfo.path), comparedFieldCount:0, findingCount:0, findings:[], blockConsensus:{}, skippedReason:'incompatible-dekont-family'};
+    const targetFamily = familyOf(targetScenario);
+
+    let selectedReferenceInfo = referenceInfo;
+    let selectedFields = fields;
+    if (targetFamily) {
+      try {
+        const allRefs = await getReferenceFiles(bank || referenceInfo.bank || '');
+        const ranked = [];
+        for (const rp of allRefs) {
+          if (!/\.pdf$/i.test(String(rp))) continue;
+          try {
+            const prof = await extractReferenceTemplateProfile(rp, normalizeBank(bank || referenceInfo.bank || ''));
+            const rfText = Object.values(prof?.fields || {})
+              .flat()
+              .map(f => String(f?.label || f?.valueText || f?.referenceValue || '').trim())
+              .find(t => /DEKONT\s*\/\s*(EFT|HVL|FAST|HAVALE)|SENARYO\s*\/\s*DEKONT/i.test(t));
+            const rf = familyOf(rfText);
+            if (rf === targetFamily) ranked.push({path:rp, profile:prof, canonical:String(rp)===String(referenceInfo.path)});
+          } catch {}
+        }
+        // Prefer the canonical reference only when it is compatible. Otherwise
+        // use the first trusted reference of the correct family.
+        const chosen = ranked.find(x => x.canonical) || ranked[0];
+        if (chosen) {
+          selectedReferenceInfo = {...referenceInfo, path:chosen.path, bank:bank || referenceInfo.bank};
+          selectedFields = chosen.profile?.fields || fields;
+          console.log(`V39 REFERANS SEÇİLDİ: TARGET=${targetFamily} REFERENCE=${path.basename(chosen.path)}`);
+        } else {
+          console.log(`V39 AYNI TİP REFERANS YOK: TARGET=${targetFamily}; canonical referansla semantik görsel karşılaştırma sürdürülecek.`);
+        }
+      } catch (e) {
+        console.warn('V39 REFERANS TİP SEÇİMİ HATASI:', e?.message || e);
       }
     }
+
+    // From this point on, the selected trusted reference is the visual truth.
+    // If no same-family reference exists, we still inspect the canonical trusted
+    // reference visually; we do NOT convert a family mismatch into a fake finding.
+    referenceInfo = selectedReferenceInfo;
+    fields = selectedFields;
 
     const wantedFields = [
       'senderName','accountNo','amount','description','senderAddress',
@@ -12158,7 +12189,7 @@ Eğer yeterince güçlü fark yoksa o alanı findings'e hiç koyma.`
 
     return {
       available:true,
-      engine:'gpt-5.6-terra-semantic-reference-difference-v37',
+      engine:'gpt-5.6-terra-semantic-reference-difference-v39',
       referenceFile:path.basename(referenceInfo.path),
       comparedFieldCount:boxes.length,
       findingCount:Math.min(8,dedup.length),
@@ -12171,7 +12202,7 @@ Eğer yeterince güçlü fark yoksa o alanı findings'e hiç koyma.`
   }
 }
 
-// V35 is the sole user-facing reference comparison. Legacy forensic engines
+// V39 is the sole user-facing reference comparison. Legacy forensic engines
 // remain available for internal diagnostics, but their noisy individual field
 // messages do not override the direct reference comparison.
 referenceVisualAdjudication = null;
