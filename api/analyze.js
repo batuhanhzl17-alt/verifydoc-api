@@ -11728,6 +11728,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference) {
       targetBase64: base64,
       referenceInfo: reference,
       bank,
+      targetOCR: paddleImageOCR,
     });
     console.log('REFERENCE VISUAL ADJUDICATOR V27:', JSON.stringify(referenceVisualAdjudication));
   } catch (error) {
@@ -12827,6 +12828,7 @@ if (referenceForensics || layoutForensics?.available) {
         referenceLocalCrop,
         azureReferenceGeometry,
         humanReport: humanForensicReport,
+        finalAdjudication: referenceVisualAdjudication,
       });
       if (annotatedReferenceDifference?.available) {
         result.annotatedReferenceDifference = annotatedReferenceDifference;
@@ -13141,7 +13143,7 @@ function buildReferenceEvidenceLedger(forensic, layout = null, localCrop = null,
 // nedenle literal metin farkı ASLA bulgu değildir. Terra yalnızca font/stroke,
 // karakter rasterı, hizalama ve aynı belgenin kendi içindeki lokal tutarlılık
 // üzerinden karar verebilir. Emin değilse findings=[] döndürmek zorundadır.
-async function runReferenceVisualAdjudicator({ targetPath, targetMime, targetBase64, referenceInfo, bank }) {
+async function runReferenceVisualAdjudicator({ targetPath, targetMime, targetBase64, referenceInfo, bank, targetOCR = null }) {
   if (!targetPath || !targetBase64 || !referenceInfo?.path || !bank) return null;
   try {
     const targetExt = path.extname(String(targetPath)).toLowerCase();
@@ -13268,16 +13270,161 @@ Ama bunu yaparken aşağıdaki kurallar MUTLAKTIR.
       .filter(x => Number(x?.confidence) >= 80 && String(x?.evidence || '').trim().length >= 12)
       .slice(0, 8);
 
+    const targetedFindings = await runTargetedReferenceVisualZones({
+      targetPath,
+      referenceInfo,
+      bank,
+    });
+
+    // Targeted zone findings have priority because they are made on enlarged local
+    // crops. Deduplicate by field + issue type + evidence prefix.
+    const merged = [];
+    const seen = new Set();
+    for (const row of [...targetedFindings, ...findings]) {
+      const key = `${String(row?.field || '').toLowerCase()}|${String(row?.issueType || '').toLowerCase()}|${String(row?.evidence || '').slice(0,80)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(row);
+      if (merged.length >= 8) break;
+    }
+
     return {
       available: true,
-      engine: 'gpt-5.6-terra-reference-visual-adjudicator-v27',
+      engine: 'gpt-5.6-terra-reference-visual-adjudicator-v28-targeted-zones',
       overallConfidence: Number(parsed.overallConfidence) || 0,
-      findingCount: findings.length,
-      findings,
+      findingCount: merged.length,
+      findings: merged,
+      targetedFindingCount: targetedFindings.length,
     };
   } catch (error) {
     console.warn('REFERENCE VISUAL ADJUDICATOR HATASI:', error?.message || error);
     return null;
+  }
+}
+
+
+// =====================================================
+// TARGETED VISUAL ZONE ADJUDICATION V28
+// =====================================================
+// Full-page vision can miss small font substitutions because the reference and
+// target contain different transaction values. V28 therefore performs focused
+// comparisons on the major semantic zones as well. The model is explicitly told
+// that literal text differences are expected and must not be reported.
+async function runTargetedReferenceVisualZones({ targetPath, referenceInfo, bank }) {
+  if (!targetPath || !referenceInfo?.path || !bank || !sharp) return [];
+
+  try {
+    const loadImage = async (filePath, isReference = false) => {
+      const ext = path.extname(String(filePath)).toLowerCase();
+      if (ext === '.pdf') {
+        const raw = await fs.readFile(filePath);
+        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+        const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+        if (!rendered?.buffer) return null;
+        return rendered.buffer;
+      }
+      return fs.readFile(filePath);
+    };
+
+    const targetBuffer = await loadImage(targetPath, false);
+    const refBuffer = await loadImage(referenceInfo.path, true);
+    if (!targetBuffer || !refBuffer) return [];
+
+    const targetMeta = await sharp(targetBuffer).metadata();
+    const refMeta = await sharp(refBuffer).metadata();
+    const tw = Number(targetMeta.width) || 0, th = Number(targetMeta.height) || 0;
+    const rw = Number(refMeta.width) || 0, rh = Number(refMeta.height) || 0;
+    if (tw < 100 || th < 100 || rw < 100 || rh < 100) return [];
+
+    const zones = [
+      { id: 'left-transaction', title: 'Sol işlem/veri bölümü', x: 0.00, y: 0.30, w: 0.52, h: 0.46 },
+      { id: 'amount', title: 'Tutar ve yakın işlem alanı', x: 0.00, y: 0.36, w: 0.52, h: 0.27 },
+      { id: 'right-transaction', title: 'Sağ alıcı/işlem bölümü', x: 0.48, y: 0.08, w: 0.52, h: 0.64 },
+    ];
+
+    const cropData = async (buf, meta, z) => {
+      const W = Number(meta.width), H = Number(meta.height);
+      const left = Math.max(0, Math.min(W - 1, Math.round(W * z.x)));
+      const top = Math.max(0, Math.min(H - 1, Math.round(H * z.y)));
+      const width = Math.max(20, Math.min(W - left, Math.round(W * z.w)));
+      const height = Math.max(20, Math.min(H - top, Math.round(H * z.h)));
+      const out = await sharp(buf).extract({ left, top, width, height }).resize({ width: 900, withoutEnlargement: false }).jpeg({ quality: 94 }).toBuffer();
+      return `data:image/jpeg;base64,${out.toString('base64')}`;
+    };
+
+    const schema = {
+      type: 'object',
+      properties: {
+        findings: {
+          type: 'array', maxItems: 5,
+          items: {
+            type: 'object',
+            properties: {
+              field: { type: 'string' },
+              issueType: { type: 'string', enum: ['typography','local-render','layout','mixed'] },
+              confidence: { type: 'integer', minimum: 0, maximum: 100 },
+              evidence: { type: 'string' },
+            },
+            required: ['field','issueType','confidence','evidence'],
+            additionalProperties: false,
+          }
+        }
+      },
+      required: ['findings'], additionalProperties: false
+    };
+
+    const all = [];
+    for (const z of zones) {
+      const targetUrl = await cropData(targetBuffer, targetMeta, z);
+      const refUrl = await cropData(refBuffer, refMeta, z);
+      const prompt = `
+Sen banka dekontu görsellerini karşılaştıran çok sıkı bir görsel adli inceleme hakemisin.
+Bu turda SADECE '${z.title}' bölgesine bakıyorsun.
+
+TARGET ve REFERENCE aynı bankanın iki dekontudur. İşlem değerleri farklı olabilir.
+Görevin metinlerin farklı olmasını değil, sonradan değiştirilmiş olabilecek GÖRSEL YAZI
+ÜRETİMİNİ bulmaktır.
+
+MUTLAK KURALLAR:
+- Farklı isim, rakam, IBAN, tarih, referans, ETTN veya açıklama metni NORMALDİR.
+- Aynı kelime/rakam olmadığı için font farkı çıkarma.
+- Fotoğraf, JPEG, çözünürlük, ışık, perspektif ve bulanıklık farklarını NORMAL kabul et.
+- Etiketlerin tek başına farklı görünmesi bulgu değildir.
+- Bir alanın kendi içindeki karakter/stroke kalınlığı, harf/rakam yüksekliği, baseline,
+  karakter aralığı veya keskinlik davranışı komşu metinlerden belirgin biçimde ayrılıyorsa
+  ve bu ayrım lokal ise bulgu olabilir.
+- Özellikle TUTAR bölgesinde tek tek farklı rakam şekillerini font farkı sanma. Ancak aynı
+  dekontun diğer rakamlarıyla kıyaslandığında belirgin bir stil değişimi varsa bildir.
+- Sol işlem bölümü ve sağ işlem bölümü içinde sonradan eklenmiş/değiştirilmiş görünen
+  metin parçası varsa, yalnızca gerçekten görsel olarak güçlü olduğunda bildir.
+- Emin değilsen findings=[] döndür.
+- 80'in altında confidence verme.
+
+REFERENCE sadece stil/şablon davranışını anlamak içindir; literal içerik eşleşmesi arama.
+`;
+
+      const response = await openai.responses.create({
+        model: 'gpt-5.6-terra',
+        input: [{ role: 'user', content: [
+          { type: 'input_text', text: prompt },
+          { type: 'input_text', text: '=== TARGET ZONE ===' },
+          { type: 'input_image', image_url: targetUrl, detail: 'high' },
+          { type: 'input_text', text: '=== REFERENCE ZONE ===' },
+          { type: 'input_image', image_url: refUrl, detail: 'high' },
+        ]}],
+        text: { format: { type: 'json_schema', name: `reference_visual_zone_${z.id.replace(/[^a-z0-9]/gi,'_')}`, strict: true, schema } },
+      });
+      const parsed = parseAIResponse(response?.output_text || '');
+      for (const f of (parsed?.findings || [])) {
+        if (Number(f?.confidence) >= 80 && String(f?.evidence || '').trim().length >= 12) {
+          all.push({ ...f, zone: z.id });
+        }
+      }
+    }
+    return all;
+  } catch (error) {
+    console.warn('TARGETED VISUAL ZONES V28 HATASI:', error?.message || error);
+    return [];
   }
 }
 
@@ -13604,6 +13751,7 @@ async function buildAnnotatedReferenceDifferenceImage({
   referenceLocalCrop,
   azureReferenceGeometry,
   humanReport,
+  finalAdjudication = null,
 }) {
   // V25 PURPOSE:
   // Draw ONLY evidence-linked locations. A field label is never considered the
@@ -13708,8 +13856,13 @@ async function buildAnnotatedReferenceDifferenceImage({
     const gapMarkers = [];
     const seenBox = new Set();
 
+    // V28 FINAL GATE: if Terra is available, annotations may ONLY originate
+    // from Terra's final findings. Never show stale deterministic candidates when
+    // Terra explicitly decided that no strong visual difference exists.
+    const useFinalAdjudicationOnly = !!finalAdjudication?.available;
+
     // 1) Exact target boxes emitted by local forensic comparison.
-    for (const row of (referenceLocalCrop?.findings || [])) {
+    if (!useFinalAdjudicationOnly) for (const row of (referenceLocalCrop?.findings || [])) {
       const b = boxOf(row?.targetBox);
       if (!b) continue;
       const key = `local|${row.field||''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
@@ -13724,7 +13877,7 @@ async function buildAnnotatedReferenceDifferenceImage({
 
     // 2) Azure: mark ONLY the abnormal vertical gap. Do not draw boxes around
     // the before/after labels because those labels are not themselves the anomaly.
-    for (const row of (azureReferenceGeometry?.strongAnomalies || []).slice(0,4)) {
+    if (!useFinalAdjudicationOnly) for (const row of (azureReferenceGeometry?.strongAnomalies || []).slice(0,4)) {
       const before = findExactLabelRegion(row.beforeLabel) || null;
       const after = findExactLabelRegion(row.afterLabel) || null;
       if (!before || !after) continue;
@@ -13745,7 +13898,7 @@ async function buildAnnotatedReferenceDifferenceImage({
     // 3) Typography: FIRST choice is the exact targetValueBox emitted by the
     // finding itself. This guarantees that the red box follows the evidence.
     // SECOND choice is an OCR value region resolved from the exact label.
-    for (const row of (referenceForensics?.characterFindings || []).slice(0,20)) {
+    if (!useFinalAdjudicationOnly) for (const row of (referenceForensics?.characterFindings || []).slice(0,20)) {
       let b = boxOf(row?.targetValueBox || row?.targetBox);
 
       if (!b) {
@@ -13767,6 +13920,30 @@ async function buildAnnotatedReferenceDifferenceImage({
         label:row?.labelText || row?.targetLabelText || field || 'tipografi farkı',
         source:'typography-value'
       });
+    }
+
+    // 4) FINAL TERRA FINDINGS: resolve each finding to the nearest OCR field/value.
+    if (useFinalAdjudicationOnly) {
+      const fieldAliases = {
+        'Gönderen Hesap':'Gönderen Hesap', 'Açıklama':'Açıklama', 'İşlem Tutarı':'İşlem Tutarı',
+        'Tutar':'İşlem Tutarı', 'Doküman Numarası':'Doküman Numarası', 'İşlem Yeri':'İşlem Yeri',
+        'İşlem Zam./Valör':'İşlem Zam./Valör', 'Referans Numarası':'Referans Numarası',
+        'ETTN':'ETTN', 'Senaryo/Dekont Tipi':'Senaryo/Dekont Tipi', 'Alıcı Hesap':'Alıcı Hesap',
+        'Sorgu Numarası':'Sorgu Numarası', 'Toplam Tutar':'Toplam Tutar', 'İşlem Türü':'İşlem Türü',
+        'IBAN':'IBAN', 'Alıcı İsim/Unvan':'Alıcı İsim/Unvan'
+      };
+      for (const row of (finalAdjudication.findings || []).slice(0,8)) {
+        const label = fieldAliases[String(row?.field || '').trim()] || String(row?.field || '').trim();
+        if (!label) continue;
+        const labelBox = findExactLabelRegion(label);
+        const valueBox = findValueNearLabel(labelBox, label);
+        const b = valueBox || labelBox;
+        if (!b) continue;
+        const key = `terra|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+        if (seenBox.has(key)) continue;
+        seenBox.add(key);
+        boxes.push({ box:b, label, source:'terra-final' });
+      }
     }
 
     // 4) Human-readable report items are intentionally NOT used as a generic
