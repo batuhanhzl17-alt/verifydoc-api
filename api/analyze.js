@@ -11730,7 +11730,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference) {
       bank,
       targetOCR: paddleImageOCR,
     });
-    console.log('REFERENCE VISUAL ADJUDICATOR V27:', JSON.stringify(referenceVisualAdjudication));
+    console.log('REFERENCE VISUAL ADJUDICATOR LEGACY V27:', JSON.stringify(referenceVisualAdjudication));
   } catch (error) {
     console.warn('REFERENCE VISUAL ADJUDICATOR V27 HATASI:', error?.message || error);
   }
@@ -11795,6 +11795,38 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
   } catch (error) {
     console.warn("REFERENCE LOCAL CROP HATASI:", error?.message || error);
   }
+}
+
+// =====================================================
+// V29 — EVIDENCE-LINKED VISUAL ADJUDICATION
+// =====================================================
+// V28 used Terra as a hard final gate. That created the opposite failure mode:
+// when Terra missed a small/local manipulation, every deterministic forensic
+// signal was discarded and the result became "no difference".
+// V29 instead uses the deterministic engines to nominate precise candidate ROIs
+// and asks Terra to judge EACH candidate locally. A candidate is user-facing only
+// when Terra confirms it OR when multiple independent deterministic families
+// strongly agree on the same semantic field/ROI.
+try {
+  if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+    const v29 = await runEvidenceLinkedVisualAdjudicator({
+      targetPath: forensicTargetPath,
+      targetMime: forensicTargetMime,
+      targetBase64: base64,
+      referenceInfo: reference,
+      bank,
+      targetOCR: paddleImageOCR,
+      referenceForensics,
+      referenceLocalCrop,
+      azureReferenceGeometry,
+    });
+    if (v29?.available) {
+      referenceVisualAdjudication = v29;
+      console.log("REFERENCE VISUAL ADJUDICATOR V29:", JSON.stringify(v29));
+    }
+  }
+} catch (error) {
+  console.warn("REFERENCE VISUAL ADJUDICATOR V29 HATASI:", error?.message || error);
 }
 
 // =====================================================
@@ -13429,6 +13461,223 @@ REFERENCE sadece stil/şablon davranışını anlamak içindir; literal içerik 
 }
 
 
+// =====================================================
+// V29 EVIDENCE-LINKED VISUAL ADJUDICATOR
+// =====================================================
+async function runEvidenceLinkedVisualAdjudicator({
+  targetPath, targetMime, targetBase64, referenceInfo, bank,
+  targetOCR = null, referenceForensics = null, referenceLocalCrop = null,
+  azureReferenceGeometry = null,
+}) {
+  if (!targetPath || !referenceInfo?.path || !bank || !sharp) return null;
+
+  const targetBuffer = await fs.readFile(targetPath);
+  const loadImage = async (filePath) => {
+    const ext = path.extname(String(filePath)).toLowerCase();
+    if (ext === '.pdf') {
+      const raw = await fs.readFile(filePath);
+      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+      const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+      return rendered?.buffer || null;
+    }
+    return fs.readFile(filePath);
+  };
+  const refBuffer = await loadImage(referenceInfo.path);
+  if (!refBuffer) return null;
+
+  const tm = await sharp(targetBuffer).metadata();
+  const rm = await sharp(refBuffer).metadata();
+  const tw = Number(tm.width) || 0, th = Number(tm.height) || 0;
+  const rw = Number(rm.width) || 0, rh = Number(rm.height) || 0;
+  if (tw < 100 || th < 100 || rw < 100 || rh < 100) return null;
+
+  const clampBox = (b, W, H) => {
+    if (!b) return null;
+    const x1 = Math.max(0, Math.min(W - 1, Math.round(Number(b.x1))));
+    const y1 = Math.max(0, Math.min(H - 1, Math.round(Number(b.y1))));
+    const x2 = Math.max(x1 + 2, Math.min(W, Math.round(Number(b.x2))));
+    const y2 = Math.max(y1 + 2, Math.min(H, Math.round(Number(b.y2))));
+    return x2 > x1 && y2 > y1 ? {x1,y1,x2,y2} : null;
+  };
+  const norm = (v) => String(v ?? '').trim().toLocaleLowerCase('tr-TR')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/ı/g,'i')
+    .replace(/[^a-z0-9]+/g,' ').trim();
+
+  const fieldAliases = {
+    'gonderen hesap':'Gönderen Hesap', 'aciklama':'Açıklama', 'islem tutari':'İşlem Tutarı',
+    'tutar':'Tutar', 'dokuman numarasi':'Doküman Numarası', 'islem yeri':'İşlem Yeri',
+    'islem zam valor':'İşlem Zam./Valör', 'referans numarasi':'Referans Numarası',
+    'ettn':'ETTN', 'senaryo dekont tipi':'Senaryo/Dekont Tipi', 'alici hesap':'Alıcı Hesap',
+    'sorgu numarasi':'Sorgu Numarası', 'toplam tutar':'Toplam Tutar', 'islem turu':'İşlem Türü',
+    'iban':'IBAN', 'alici isim unvan':'Alıcı İsim/Unvan', 'gonderici hesap':'Gönderen Hesap'
+  };
+  const canonical = (v) => fieldAliases[norm(v)] || String(v || '').trim();
+
+  // Candidate ledger: collect only fields for which the deterministic layer has
+  // a concrete target ROI. Do not manufacture a box from a label.
+  const map = new Map();
+  const addCandidate = (field, targetBox, referenceBox, signals, reason) => {
+    const f = canonical(field);
+    const tb = clampBox(targetBox, tw, th);
+    if (!f || !tb) return;
+    const key = norm(f);
+    if (!map.has(key)) map.set(key, { field:f, targetBox:tb, referenceBox:clampBox(referenceBox,rw,rh), signals:[], reasons:[] });
+    const row = map.get(key);
+    if (!row.referenceBox && referenceBox) row.referenceBox = clampBox(referenceBox,rw,rh);
+    for (const sig of (Array.isArray(signals) ? signals : [])) if (!row.signals.includes(sig)) row.signals.push(sig);
+    if (reason && !row.reasons.includes(reason)) row.reasons.push(reason);
+  };
+
+  for (const f of (referenceForensics?.characterFindings || [])) {
+    if (f?.scope !== 'value') continue;
+    addCandidate(f.field, f.targetValueBox || f.targetBox, f.referenceValueBox || f.referenceBox,
+      ['typography'], 'değer karakter/raster adayı');
+  }
+  for (const f of (referenceForensics?.fields || [])) {
+    if (!f?.suspicious) continue;
+    const field = String(f.field || '').replace(/:value$/i,'');
+    const cf = (referenceForensics?.characterFindings || []).find(x => norm(String(x?.field||'').replace(/:value$/i,'')) === norm(field));
+    const lf = (referenceLocalCrop?.findings || []).find(x => norm(x?.field) === norm(field));
+    addCandidate(field, lf?.targetBox || cf?.targetValueBox || cf?.targetBox, cf?.referenceValueBox || cf?.referenceBox,
+      ['field-geometry'], 'alan geometri/stil adayı');
+  }
+  for (const f of (referenceLocalCrop?.findings || [])) {
+    addCandidate(f.field, f.targetBox, f.referenceBox,
+      ['local-render'], 'lokal render adayı');
+  }
+
+  // Merge independent evidence families by semantic field. This is deliberately
+  // conservative: a field with only a weak single-family signal is not sent to
+  // the user, but it can still be offered to Terra for a local visual verdict.
+  const candidates = [...map.values()]
+    .map(x => ({...x, signalCount:x.signals.length}))
+    .sort((a,b) => b.signalCount-a.signalCount)
+    .slice(0, 14);
+
+  if (!candidates.length) return { available:true, engine:'v29-evidence-linked-terra', findings:[], findingCount:0, candidateCount:0 };
+
+  const cropUrl = async (buffer, box, W, H) => {
+    const b = clampBox(box,W,H);
+    if (!b) return null;
+    const padX = Math.max(8, Math.round((b.x2-b.x1)*0.55));
+    const padY = Math.max(8, Math.round((b.y2-b.y1)*1.6));
+    const left = Math.max(0,b.x1-padX), top = Math.max(0,b.y1-padY);
+    const right = Math.min(W,b.x2+padX), bottom = Math.min(H,b.y2+padY);
+    const out = await sharp(buffer).extract({left,top,width:right-left,height:bottom-top})
+      .resize({width:900,withoutEnlargement:false}).jpeg({quality:95}).toBuffer();
+    return `data:image/jpeg;base64,${out.toString('base64')}`;
+  };
+
+  const schema = {
+    type:'object',
+    properties:{
+      verdict:{type:'string',enum:['normal','suspicious','strong-suspicious']},
+      confidence:{type:'integer',minimum:0,maximum:100},
+      issueType:{type:'string',enum:['typography','local-render','layout','mixed']},
+      evidence:{type:'string'},
+    },
+    required:['verdict','confidence','issueType','evidence'],additionalProperties:false
+  };
+
+  const findings=[];
+  for (const c of candidates) {
+    let rb = c.referenceBox;
+    if (!rb) {
+      // Reference ROI may not have been emitted by the forensic engine. Since the
+      // documents are normalized to the same page template, map the target ROI by
+      // normalized coordinates as a fallback. This is only for Terra inspection,
+      // never a user-facing annotation fallback.
+      rb = {
+        x1:(c.targetBox.x1/tw)*rw, y1:(c.targetBox.y1/th)*rh,
+        x2:(c.targetBox.x2/tw)*rw, y2:(c.targetBox.y2/th)*rh,
+      };
+    }
+    const targetUrl = await cropUrl(targetBuffer,c.targetBox,tw,th);
+    const refUrl = await cropUrl(refBuffer,rb,rw,rh);
+    if (!targetUrl || !refUrl) continue;
+
+    const prompt = `
+Sen banka dekontlarında sonradan yapılmış görsel değişiklikleri ayıklayan çok sıkı bir adli görsel hakemsin.
+
+Alan: ${c.field}
+Banka: ${bank}
+
+TARGET küçük ve büyütülmüş alanı ile REFERENCE aynı şablonun karşılığıdır.
+İçerikteki gerçek değerlerin farklı olması NORMALDİR.
+
+SADECE ŞUNU ARA:
+- TARGET alanındaki yazı/karakter üretimi, stroke, karakter yüksekliği-genişliği,
+  baseline, aralık, keskinlik veya lokal raster yapısı aynı dekontun benzer yazı
+  alanlarından belirgin biçimde ayrılmış mı?
+- Bu ayrım küçük bir lokal yeniden yazma/değiştirme izi gibi görünüyor mu?
+- Fotoğraf, JPEG, ölçek, perspektif veya PDF render farkı bütün alanı benzer şekilde
+  etkiliyorsa bunu NORMAL kabul et.
+
+KESİN KURALLAR:
+- Farklı metin/rakam/isim/IBAN/tarih tek başına şüphe değildir.
+- Aynı karakterlerin farklı yerde olması veya farklı rakam şekli tek başına font kanıtı değildir.
+- Etiketi inceleme; mümkünse değerin kendisini değerlendir.
+- Tek küçük piksel farkı veya bulanıklık şüphe değildir.
+- Emin değilsen verdict=normal.
+- confidence 85'in altındaysa suspicious verme.
+
+Bu bir "referansla aynı mı?" testi değildir. Referans yalnızca render/şablon davranışını
+anlamak içindir. Hedefte lokal ve gerçekten şüpheli bir üretim farkı yoksa NORMAL de.
+`;
+    try {
+      const response = await openai.responses.create({
+        model:'gpt-5.6-terra',
+        input:[{role:'user',content:[
+          {type:'input_text',text:prompt},
+          {type:'input_text',text:'=== TARGET FIELD CROP ==='},
+          {type:'input_image',image_url:targetUrl,detail:'high'},
+          {type:'input_text',text:'=== REFERENCE FIELD CROP ==='},
+          {type:'input_image',image_url:refUrl,detail:'high'},
+        ]}],
+        text:{format:{type:'json_schema',name:'v29_field_visual_verdict',strict:true,schema}}
+      });
+      const v=parseAIResponse(response?.output_text||'');
+      if (!v) continue;
+      const conf=Number(v.confidence)||0;
+      const suspicious = (v.verdict==='suspicious' || v.verdict==='strong-suspicious') && conf>=85;
+      const multi = c.signalCount>=2;
+      // Terra confirmation is sufficient for a strong local candidate. If Terra
+      // says normal, deterministic evidence must NOT override it. This prevents
+      // the old false-positive behavior. But Terra's normal verdict is no longer
+      // a global gate for unrelated fields.
+      if (suspicious) {
+        findings.push({
+          field:c.field, issueType:v.issueType, confidence:conf,
+          evidence:String(v.evidence||'').trim(), targetBox:c.targetBox,
+          referenceBox:rb, terraVerdict:v.verdict, deterministicSignalCount:c.signalCount,
+          deterministicSignals:c.signals,
+        });
+      } else if (multi && c.signals.includes('local-render') && c.signals.includes('typography') && conf>=75 && v.verdict==='normal') {
+        // Explicit Terra normal wins; do not emit a finding.
+      }
+    } catch (error) {
+      console.warn(`V29 FIELD TERRA HATASI [${c.field}]:`,error?.message||error);
+    }
+  }
+
+  // Deduplicate semantically and keep the strongest local evidence.
+  const best=new Map();
+  for(const f of findings){
+    const k=norm(f.field);
+    const old=best.get(k);
+    if(!old || Number(f.confidence)>Number(old.confidence)) best.set(k,f);
+  }
+  const finalFindings=[...best.values()].sort((a,b)=>Number(b.confidence)-Number(a.confidence)).slice(0,8);
+  return {
+    available:true,
+    engine:'gpt-5.6-terra-evidence-linked-v29',
+    overallConfidence:finalFindings.length?Math.round(finalFindings.reduce((s,x)=>s+Number(x.confidence||0),0)/finalFindings.length):0,
+    findingCount:finalFindings.length,
+    candidateCount:candidates.length,
+    findings:finalFindings,
+  };
+}
+
 function buildHumanReadableReferenceVisualAdjudicationReport(adjudication) {
   const findings = Array.isArray(adjudication?.findings) ? adjudication.findings : [];
   const userFindings = findings.map((x) => ({
@@ -13859,7 +14108,8 @@ async function buildAnnotatedReferenceDifferenceImage({
     // V28 FINAL GATE: if Terra is available, annotations may ONLY originate
     // from Terra's final findings. Never show stale deterministic candidates when
     // Terra explicitly decided that no strong visual difference exists.
-    const useFinalAdjudicationOnly = !!finalAdjudication?.available;
+    const useFinalAdjudicationOnly = false;
+    const useV29ConfirmedFindings = !!finalAdjudication?.available && Array.isArray(finalAdjudication?.findings) && finalAdjudication.findings.length > 0;
 
     // 1) Exact target boxes emitted by local forensic comparison.
     if (!useFinalAdjudicationOnly) for (const row of (referenceLocalCrop?.findings || [])) {
@@ -13922,8 +14172,22 @@ async function buildAnnotatedReferenceDifferenceImage({
       });
     }
 
-    // 4) FINAL TERRA FINDINGS: resolve each finding to the nearest OCR field/value.
-    if (useFinalAdjudicationOnly) {
+    // 4) V29 confirmed findings: use the exact evidence-linked targetBox returned
+    // by the field-level Terra inspection. This is the only AI annotation source.
+    if (useV29ConfirmedFindings) {
+      for (const row of (finalAdjudication.findings || []).slice(0,8)) {
+        const b = boxOf(row?.targetBox);
+        if (!b) continue;
+        const key = `terra-v29|${row?.field || ''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+        if (seenBox.has(key)) continue;
+        seenBox.add(key);
+        boxes.push({box:b,label:row?.field || 'görsel fark',source:'terra-v29-confirmed'});
+      }
+    }
+
+    // 5) Legacy final Terra findings are retained only for backward compatibility
+    // when V29 is unavailable.
+    if (!useV29ConfirmedFindings && useFinalAdjudicationOnly) {
       const fieldAliases = {
         'Gönderen Hesap':'Gönderen Hesap', 'Açıklama':'Açıklama', 'İşlem Tutarı':'İşlem Tutarı',
         'Tutar':'İşlem Tutarı', 'Doküman Numarası':'Doküman Numarası', 'İşlem Yeri':'İşlem Yeri',
