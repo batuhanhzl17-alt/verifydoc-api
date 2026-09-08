@@ -5776,7 +5776,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         for(const m of matches){
           const key=String(m?.rl?.rule?.key||'');
           if(!tpAllowedFieldKey(key))continue;
-          if(String(key).startsWith('generic:'))continue;
 
           const refLabelText=tpLabelClean(m?.rl?.labelText || m?.rl?.text);
           const tarLabelText=tpLabelClean(m?.tl?.labelText || m?.tl?.text);
@@ -5805,8 +5804,14 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
 
           const refLabelRegion=rfFocusLabelRegion(m.rl.region,refLabelText);
           const tarLabelRegion=rfFocusLabelRegion(m.tl.region,tarLabelText);
-          const refChar=await rfCharacterMetrics(refBuffer,refLabelRegion,refSize);
-          const tarChar=await rfCharacterMetrics(targetBuffer,tarLabelRegion,targetSize);
+          let refChar=await rfCharacterMetrics(refBuffer,refLabelRegion,refSize);
+          let tarChar=await rfCharacterMetrics(targetBuffer,tarLabelRegion,targetSize);
+          // OCR boxes can differ between PDF-derived reference and camera/JPG target.
+          // If the tight label ROI cannot yield a stable raster profile, retry on the
+          // complete OCR region before abandoning the field. This is especially
+          // important for bank-specific generic labels such as SENARYO/DEKONT TIPI.
+          if(!refChar) refChar=await rfCharacterMetrics(refBuffer,m.rl.region,refSize);
+          if(!tarChar) tarChar=await rfCharacterMetrics(targetBuffer,m.tl.region,targetSize);
           if(!refChar||!tarChar)continue;
 
           const labelCharDistance=rfCharacterDistance(refChar,tarChar);
@@ -5829,6 +5834,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
               const tr=rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key);
               refValueChar=await rfCharacterMetrics(refBuffer,rr,refSize);
               tarValueChar=await rfCharacterMetrics(targetBuffer,tr,targetSize);
+              if(!refValueChar) refValueChar=await rfCharacterMetrics(refBuffer,valueRefRaw.region,refSize);
+              if(!tarValueChar) tarValueChar=await rfCharacterMetrics(targetBuffer,valueTarRaw.region,targetSize);
               if(refValueChar&&tarValueChar){
                 valueDistance=rfCharacterDistance(refValueChar,tarValueChar);
                 valueDiaDistance=rfDiacriticDistance(refValueChar,tarValueChar,valueRefText,valueTarText);
@@ -5877,7 +5884,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           if(valueFinding)typographyFindings.push({...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText});
         }
 
-        console.log('TYPOGRAPHY PRECISION GATE:',JSON.stringify({
+        console.log('TYPOGRAPHY PRECISION GATE V19:',JSON.stringify({
           matchedFields:matches.length,
           allowedFieldCandidates:matches.filter(m=>tpAllowedFieldKey(String(m?.rl?.rule?.key||''))).length,
           profilesBeforeDedup:typographyFieldProfiles.length,
@@ -12459,7 +12466,7 @@ if (referenceForensics) {
   result.referenceForensics = referenceForensics;
 
   // =============================================================
-  // TYPOGRAPHY FORENSICS PIPELINE OUTPUT
+  // TYPOGRAPHY FORENSICS V19 PIPELINE OUTPUT
   // =============================================================
   // Typography motoru referenceForensicEngine'in içinde çalışır.
   // Burada çıktıyı ayrı ve açık biçimde loglayarak gerçekten pipeline'a
@@ -12481,7 +12488,7 @@ if (referenceForensics) {
       : []
   };
   result.typographyForensics = typographyForensics;
-  console.log('TYPOGRAPHY FORENSICS:', JSON.stringify(typographyForensics));
+  console.log('TYPOGRAPHY FORENSICS V19:', JSON.stringify(typographyForensics));
 }
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
