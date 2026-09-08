@@ -1766,7 +1766,7 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   let editingRisk = Number.isFinite(referenceForensicScore)
     ? Math.max(0, Math.min(100, Math.round(referenceForensicScore)))
     : 0;
-  // V20: feed only corroborated typography into deterministic risk. This prevents
+  // V21: feed only dynamic-value same-character typography into deterministic risk. This prevents
   // normal PDF/JPEG label rendering differences from inflating risk, while still
   // allowing repeated value-render anomalies to support an editing signal.
   const typographyCredibleCount = Number(forensic?.referenceForensics?.typographyCredibleFieldCount) || 0;
@@ -4864,6 +4864,112 @@ function rfNumericGlyphDistance(a,b){
   return parts.length>=2 ? parts.reduce((x,y)=>x+y,0)/parts.length : null;
 }
 
+
+// =====================================================
+// V21 DYNAMIC-VALUE GLYPH COMPARISON
+// =====================================================
+// Dynamic values are often legitimately different between a trusted reference
+// and the incoming receipt. Therefore whole-string connected-component geometry
+// is NOT sufficient: "451890001600" vs "320067009135" naturally has different
+// glyph shapes. V21 compares only characters that occur on both sides, using
+// normalized per-glyph raster proxies. This makes the comparison about the
+// rendering/font of the same character rather than the literal value.
+async function rfGeneralGlyphSequence(imageBuffer, region, imageSize, text) {
+  if (!imageBuffer || !region || !imageSize?.width || !imageSize?.height) return null;
+  const rawText = String(text || '').trim();
+  const chars = [...rawText].filter(ch => /[0-9A-Za-zÇĞİÖŞÜçğıöşü]/.test(ch));
+  if (chars.length < 3) return null;
+  try {
+    const x0=Math.max(0,Math.floor(Number(region.x1))), y0=Math.max(0,Math.floor(Number(region.y1)));
+    const x2=Math.min(imageSize.width,Math.ceil(Number(region.x2))), y2=Math.min(imageSize.height,Math.ceil(Number(region.y2)));
+    const w=Math.max(3,x2-x0), h=Math.max(3,y2-y0);
+    const mx=Math.max(2,Math.round(w*.04)), my=Math.max(2,Math.round(h*.18));
+    const left=Math.max(0,x0-mx), top=Math.max(0,y0-my);
+    const width=Math.min(imageSize.width-left,w+mx*2), height=Math.min(imageSize.height-top,h+my*2);
+    const {data,info}=await sharp(imageBuffer).extract({left,top,width,height})
+      .resize({width:420,height:110,fit:'fill'}).grayscale().raw().toBuffer({resolveWithObject:true});
+    const W=info.width,H=info.height,threshold=185,mask=new Uint8Array(W*H),seen=new Uint8Array(W*H),comps=[];
+    for(let i=0;i<data.length;i++)if(data[i]<threshold)mask[i]=1;
+    const qx=new Int32Array(W*H),qy=new Int32Array(W*H);
+    for(let sy=0;sy<H;sy++)for(let sx=0;sx<W;sx++){
+      const si=sy*W+sx;if(!mask[si]||seen[si])continue;
+      let head=0,tail=0;qx[tail]=sx;qy[tail]=sy;tail++;seen[si]=1;
+      let minX=sx,maxX=sx,minY=sy,maxY=sy,area=0;
+      while(head<tail){const cx=qx[head],cy=qy[head++];area++;minX=Math.min(minX,cx);maxX=Math.max(maxX,cx);minY=Math.min(minY,cy);maxY=Math.max(maxY,cy);
+        for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){if(!dx&&!dy)continue;const nx=cx+dx,ny=cy+dy;if(nx<0||ny<0||nx>=W||ny>=H)continue;const ni=ny*W+nx;if(mask[ni]&&!seen[ni]){seen[ni]=1;qx[tail]=nx;qy[tail]=ny;tail++;}}}
+      const cw=maxX-minX+1,ch=maxY-minY+1;
+      if(area>=5&&ch>=8&&ch<=H*.72&&cw<=W*.28)comps.push({minX,maxX,minY,maxY,width:cw,height:ch,area});
+    }
+    const body=comps.sort((a,b)=>a.minX-b.minX);
+    if(body.length<3)return null;
+    const medianH=rfMedian(body.map(c=>c.height));
+    const glyphs=body.filter(c=>c.height>=Math.max(8,medianH*.55));
+    if(glyphs.length<3)return null;
+    const slots=glyphs.slice(0,Math.min(80,glyphs.length)).map(c=>({
+      x:(c.minX+c.maxX)/2,width:c.width,height:c.height,
+      fill:c.area/Math.max(1,c.width*c.height),
+      aspect:c.width/Math.max(1,c.height)
+    }));
+    return {text:rawText,chars,slots,medianH};
+  } catch { return null; }
+}
+
+function rfSharedCharacterGlyphDistance(a,b) {
+  if(!a||!b)return null;
+  const ca=a.chars||[], cb=b.chars||[], sa=a.slots||[], sb=b.slots||[];
+  if(ca.length<3||cb.length<3||sa.length<3||sb.length<3)return null;
+  const nA=ca.length, nB=cb.length;
+  // Align character sequences by normalized position. We intentionally compare
+  // only the same character; different legitimate values therefore contribute
+  // nothing to the distance.
+  const parts=[];
+  const shared=[];
+  for(let i=0;i<Math.min(nA,80);i++){
+    const pa=i/Math.max(1,nA-1);
+    const j=Math.round(pa*Math.max(0,nB-1));
+    const ch=ca[i], target=cb[j];
+    if(ch.toLocaleLowerCase('tr-TR')!==target.toLocaleLowerCase('tr-TR'))continue;
+    const gi=Math.min(sa.length-1,Math.round((i/Math.max(1,nA-1))*Math.max(0,sa.length-1)));
+    const gj=Math.min(sb.length-1,Math.round((j/Math.max(1,nB-1))*Math.max(0,sb.length-1)));
+    const ga=sa[gi],gb=sb[gj];
+    if(!ga||!gb)continue;
+    const vals=[
+      rfSafeRel(ga.width/Math.max(1,ga.height),gb.width/Math.max(1,gb.height),.28),
+      rfSafeRel(ga.fill,gb.fill,.13),
+      rfSafeRel(ga.height/Math.max(1,a.medianH),gb.height/Math.max(1,b.medianH),.16),
+      rfSafeRel(ga.aspect,gb.aspect,.28),
+    ].filter(Number.isFinite);
+    if(vals.length){parts.push(vals.reduce((x,y)=>x+y,0)/vals.length);shared.push(ch);}
+  }
+  if(parts.length<3)return null;
+  const distance=parts.reduce((x,y)=>x+y,0)/parts.length;
+  return {distance,sharedCount:parts.length,sharedCharacters:[...new Set(shared)].slice(0,20)};
+}
+
+function rfDynamicValueFinding(field, labelText, valueText, sameGlyph) {
+  if(!sameGlyph||!Number.isFinite(Number(sameGlyph.distance)))return null;
+  const d=Number(sameGlyph.distance);
+  const count=Number(sameGlyph.sharedCount)||0;
+  // Require at least three same-character observations. A single matching glyph
+  // is too easy to distort through OCR segmentation or JPEG artifacts.
+  if(count<3)return null;
+  const strong=d>=0.58 && count>=4;
+  const medium=d>=0.46 && count>=3;
+  if(!medium)return null;
+  return {
+    field:`${field}:value`,
+    type:'dynamic-value-character-render-mismatch',
+    severity:strong?'strong':'medium',
+    characterDistance:Number(d.toFixed(4)),
+    diacriticDistance:null,
+    text:String(valueText||''),
+    labelText:String(labelText||''),
+    sharedCharacterCount:count,
+    sharedCharacters:sameGlyph.sharedCharacters,
+    evidence:`Aynı harf/rakamların raster karakter özellikleri referanstan belirgin ayrılıyor (${count} ortak karakter karşılaştırıldı).`
+  };
+}
+
 function rfCharacterFinding(field, refChar, targetChar, characterDistance, diacriticDistance, text = '', comparable = false, labelSimilarity = 1) {
   if (!refChar || !targetChar) return null;
   const cd = Number(characterDistance);
@@ -5832,6 +5938,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           let valueComparable=false,valueDistance=null,valueDiaDistance=null;
           let valueRefText='',valueTarText='';
           let refValueChar=null,tarValueChar=null;
+          let sameValueGlyph=null;
           const valueRefRaw=rfFindValueRegion(refRegions,m.rl);
           const valueTarRaw=rfFindValueRegion(targetRegions,m.tl);
           if(valueRefRaw&&valueTarRaw){
@@ -5861,6 +5968,13 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
                   const sameDigitDistance=rfNumericGlyphDistance(refGlyphs,tarGlyphs);
                   if(Number.isFinite(sameDigitDistance)) valueDistance=Math.max(Number(valueDistance)||0,sameDigitDistance);
                 }
+                // V21: for every dynamic value, compare only characters that
+                // actually occur on both sides. This removes the major V20
+                // false-positive source: different legitimate values have
+                // different connected-component shapes even with identical fonts.
+                const refGeneralGlyphs=await rfGeneralGlyphSequence(refBuffer,rr,refSize,valueRefText);
+                const tarGeneralGlyphs=await rfGeneralGlyphSequence(targetBuffer,tr,targetSize,valueTarText);
+                sameValueGlyph=rfSharedCharacterGlyphDistance(refGeneralGlyphs,tarGeneralGlyphs);
               }else valueComparable=false;
             }
           }
@@ -5869,10 +5983,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             key,refChar,tarChar,labelCharDistance,labelDiaDistance,tarLabelText,
             true,exactLabel?1:Math.max(.88,1-labelDistance)
           );
-          const valueFinding=rfCharacterFinding(
-            `${key}:value`,refValueChar,tarValueChar,valueDistance,valueDiaDistance,
-            valueTarText,valueComparable,1
-          );
+          // V21: do not use whole-value character geometry as the primary
+          // evidence. Use the same-character glyph comparison instead.
+          const valueFinding=rfDynamicValueFinding(key,refLabelText,valueTarText,sameValueGlyph);
 
           const profile={
             field:key,
@@ -5888,6 +6001,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             valueTarget:valueTarText||null,
             valueCharacterDistance:Number.isFinite(valueDistance)?Number(valueDistance.toFixed(4)):null,
             valueDiacriticDistance:Number.isFinite(valueDiaDistance)?Number(valueDiaDistance.toFixed(4)):null,
+            valueSharedCharacterCount:Number(sameValueGlyph?.sharedCount)||0,
+            valueSharedCharacters:Array.isArray(sameValueGlyph?.sharedCharacters)?sameValueGlyph.sharedCharacters:[],
             labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
             labelTargetProfile:{characterWidthToHeight:Number(tarChar.characterWidthToHeight?.toFixed?.(4) ?? tarChar.characterWidthToHeight),characterFillRatio:Number(tarChar.characterFillRatio?.toFixed?.(4) ?? tarChar.characterFillRatio),characterGapToHeight:Number(tarChar.characterGapToHeight?.toFixed?.(4) ?? tarChar.characterGapToHeight),diacriticCount:Number(tarChar.diacriticCount||0)},
           };
@@ -5908,7 +6023,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           }
         }
 
-        console.log('TYPOGRAPHY PRECISION GATE V20:',JSON.stringify({
+        console.log('TYPOGRAPHY PRECISION GATE V21:',JSON.stringify({
           matchedFields:matches.length,
           allowedFieldCandidates:matches.filter(m=>tpAllowedFieldKey(String(m?.rl?.rule?.key||''))).length,
           profilesBeforeDedup:typographyFieldProfiles.length,
@@ -12501,14 +12616,14 @@ if (referenceForensics) {
   result.referenceForensics = referenceForensics;
 
   // =============================================================
-  // TYPOGRAPHY FORENSICS V20 PIPELINE OUTPUT
+  // TYPOGRAPHY FORENSICS V21 PIPELINE OUTPUT
   // =============================================================
   // Typography motoru referenceForensicEngine'in içinde çalışır.
   // Burada çıktıyı ayrı ve açık biçimde loglayarak gerçekten pipeline'a
   // bağlandığını doğruluyoruz. Risk skoruna dahil edilmez.
   const typographyForensics = {
     available: true,
-    engine: 'reference-glyph-raster-typography-v3-calibrated',
+    engine: 'reference-glyph-raster-typography-v4-dynamic-shared-glyph',
     score: Number(referenceForensics.typographyScore || 0),
     severity: referenceForensics.typographySeverity || 'insufficient-data',
     credibility: referenceForensics.typographyCredibility || 'none',
@@ -12525,7 +12640,7 @@ if (referenceForensics) {
       : []
   };
   result.typographyForensics = typographyForensics;
-  console.log('TYPOGRAPHY FORENSICS V20:', JSON.stringify(typographyForensics));
+  console.log('TYPOGRAPHY FORENSICS V21:', JSON.stringify(typographyForensics));
 }
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
