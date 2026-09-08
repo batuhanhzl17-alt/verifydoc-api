@@ -132,6 +132,124 @@ async function sendMessage(
 
 
 // =====================================================
+// FOTOĞRAF GÖNDER
+// =====================================================
+// VerifyDoc analyze.js tarafından üretilen Base64 görüntüyü
+// Telegram'a gerçek fotoğraf olarak gönderir.
+// =====================================================
+
+async function sendPhoto(
+ chatId,
+ imageBase64,
+ caption = "",
+ replyToMessageId = null
+) {
+
+ if (
+ !imageBase64 ||
+ typeof imageBase64 !== "string"
+ ) {
+ return null;
+ }
+
+ let base64 = imageBase64;
+ let mimeType = "image/jpeg";
+
+ const dataUrlMatch =
+ base64.match(
+ /^data:([^;]+);base64,(.+)$/s
+ );
+
+ if (dataUrlMatch) {
+ mimeType = dataUrlMatch[1] || mimeType;
+ base64 = dataUrlMatch[2];
+ }
+
+ const buffer =
+ Buffer.from(
+ base64,
+ "base64"
+ );
+
+ if (!buffer.length) {
+ throw new Error(
+ "İşaretli dekont görüntüsü boş."
+ );
+ }
+
+ const extension =
+ mimeType.includes("png")
+ ? "png"
+ : "jpg";
+
+ const form =
+ new FormData();
+
+ form.append(
+ "chat_id",
+ String(chatId)
+ );
+
+ if (caption) {
+ form.append(
+ "caption",
+ String(caption)
+ );
+ }
+
+ if (
+ replyToMessageId !== null &&
+ replyToMessageId !== undefined
+ ) {
+ form.append(
+ "reply_parameters",
+ JSON.stringify({
+ message_id:
+ Number(replyToMessageId),
+ allow_sending_without_reply:
+ true,
+ })
+ );
+ }
+
+ form.append(
+ "photo",
+ new Blob(
+ [buffer],
+ { type: mimeType }
+ ),
+ `verifydoc-difference.${extension}`
+ );
+
+ const response =
+ await fetch(
+ `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`,
+ {
+ method: "POST",
+ body: form,
+ }
+ );
+
+ const data =
+ await response.json();
+
+ if (!response.ok || !data.ok) {
+ throw new Error(
+ data?.description ||
+ "Telegram işaretli dekont fotoğrafını gönderemedi."
+ );
+ }
+
+ console.log(
+ "TELEGRAM ANNOTATED PHOTO SENT"
+ );
+
+ return data.result;
+
+}
+
+
+// =====================================================
 // CALLBACK CEVAPLA
 // =====================================================
 
@@ -1986,6 +2104,11 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
  replyToMessageId
  );
 
+ await sendAnnotatedDifferenceIfAvailable(
+ chatId,
+ result,
+ replyToMessageId
+ );
 
  return;
 
@@ -2028,6 +2151,64 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
  text,
  replyToMessageId
  );
+
+ await sendAnnotatedDifferenceIfAvailable(
+ chatId,
+ result,
+ replyToMessageId
+ );
+
+}
+
+
+// =====================================================
+// İŞARETLİ DEKONTU GÖNDER
+// =====================================================
+
+async function sendAnnotatedDifferenceIfAvailable(
+ chatId,
+ result,
+ replyToMessageId
+) {
+
+ const annotated =
+ result?.annotatedReferenceDifference;
+
+ if (
+ annotated?.available !== true ||
+ !annotated?.imageBase64
+ ) {
+ return;
+ }
+
+ try {
+
+ await sendPhoto(
+ chatId,
+ annotated.imageBase64,
+ "🔴 Referans karşılaştırmasında tespit edilen farklar dekont üzerinde işaretlendi.",
+ replyToMessageId
+ );
+
+ console.log(
+ "ANNOTATED REFERENCE DIFFERENCE SENT:",
+ JSON.stringify({
+ boxCount:
+ annotated.boxCount || 0,
+ gapMarkerCount:
+ annotated.gapMarkerCount || 0,
+ })
+ );
+
+ }
+ catch (photoError) {
+
+ console.error(
+ "ANNOTATED PHOTO SEND ERROR:",
+ photoError
+ );
+
+ }
 
 }
 
