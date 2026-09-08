@@ -1766,6 +1766,18 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   let editingRisk = Number.isFinite(referenceForensicScore)
     ? Math.max(0, Math.min(100, Math.round(referenceForensicScore)))
     : 0;
+  // V20: feed only corroborated typography into deterministic risk. This prevents
+  // normal PDF/JPEG label rendering differences from inflating risk, while still
+  // allowing repeated value-render anomalies to support an editing signal.
+  const typographyCredibleCount = Number(forensic?.referenceForensics?.typographyCredibleFieldCount) || 0;
+  const typographyCredibility = String(forensic?.referenceForensics?.typographyCredibility || 'none');
+  if (typographyCredibleCount >= 3 && typographyCredibility === 'strong') {
+    editingRisk = Math.max(editingRisk, 65);
+  } else if (typographyCredibleCount >= 2 && typographyCredibility === 'medium') {
+    editingRisk = Math.max(editingRisk, 48);
+  } else if (typographyCredibleCount === 1 && typographyCredibility === 'weak') {
+    editingRisk = Math.max(editingRisk, 25);
+  }
   if (Number.isFinite(pixelScore)) {
     editingRisk = Math.max(editingRisk, Math.min(55, Math.round(pixelScore * 0.55)));
   }
@@ -5879,12 +5891,24 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
             labelTargetProfile:{characterWidthToHeight:Number(tarChar.characterWidthToHeight?.toFixed?.(4) ?? tarChar.characterWidthToHeight),characterFillRatio:Number(tarChar.characterFillRatio?.toFixed?.(4) ?? tarChar.characterFillRatio),characterGapToHeight:Number(tarChar.characterGapToHeight?.toFixed?.(4) ?? tarChar.characterGapToHeight),diacriticCount:Number(tarChar.diacriticCount||0)},
           };
-          typographyFieldProfiles.push(profile);
-          if(labelFinding)typographyFindings.push({...labelFinding,scope:'label',labelText:refLabelText,targetLabelText:tarLabelText});
-          if(valueFinding)typographyFindings.push({...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText});
+          // V20: label-only raster differences are not enough. PDF-vs-camera/JPEG
+          // rendering commonly changes label edges even when the document is genuine.
+          // A typography anomaly becomes credible when the value ROI independently
+          // supports the same rendering difference, or when a static label is backed
+          // by a second non-typographic local signal. Keep label findings internally
+          // for diagnostics/annotation, but do not treat them as user-facing evidence.
+          typographyFieldProfiles.push({
+            ...profile,
+            labelFinding: labelFinding ? {...labelFinding,scope:'label',labelText:refLabelText,targetLabelText:tarLabelText} : null,
+            valueFinding: valueFinding ? {...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText} : null,
+          });
+          if(valueFinding){
+            typographyFindings.push({...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText,
+              corroboration:'label+value'});
+          }
         }
 
-        console.log('TYPOGRAPHY PRECISION GATE V19:',JSON.stringify({
+        console.log('TYPOGRAPHY PRECISION GATE V20:',JSON.stringify({
           matchedFields:matches.length,
           allowedFieldCandidates:matches.filter(m=>tpAllowedFieldKey(String(m?.rl?.rule?.key||''))).length,
           profilesBeforeDedup:typographyFieldProfiles.length,
@@ -5916,11 +5940,16 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
         const typographyMedium=typographyFindings.filter(x=>x.severity==='medium');
         const typographyComparableCount=typographyFieldProfiles.length;
+        // V20 credibility: one isolated value mismatch is weak; repeated value
+        // rendering anomalies across distinct semantic fields are much stronger.
+        // Label-only differences are deliberately excluded from the score.
+        const credibleFieldCount=new Set(typographyFindings.map(x=>String(x.field||'').replace(/:value$/i,''))).size;
         const typographyScore=rfClamp100(
-          Math.min(45,typographyStrong.length*15)+
-          Math.min(35,typographyMedium.length*8)+
-          Math.min(20,typographyComparableCount>0?10:0)
+          Math.min(50,typographyStrong.length*18)+
+          Math.min(30,typographyMedium.length*9)+
+          Math.min(20,credibleFieldCount>=2?12:credibleFieldCount===1?5:0)
         );
+        const typographyCredibility = credibleFieldCount>=3 ? 'strong' : credibleFieldCount>=2 ? 'medium' : credibleFieldCount===1 ? 'weak' : 'none';
         const suspiciousFields=fieldResults.filter(x=>x.suspicious);
         const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
         const referenceQuality={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
@@ -5930,8 +5959,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
           localAnomalyScore:rfClamp100(suspiciousFields.length*18+strongSpacing.length*18),
           suspiciousFieldCount:suspiciousFields.length,suspiciousFields:[...new Set(suspiciousFields.map(x=>x.field))],
           spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies:spacingAnomalies.slice(0,20),
-          typographyScore,typographySeverity:typographyStrong.length>=2?'strong':typographyFindings.length?'medium':(typographyFieldProfiles.length?'low':'insufficient-data'),
-          characterFindingCount:typographyFindings.length,characterFindings:typographyFindings.slice(0,20),
+          typographyScore,
+          typographySeverity:typographyCredibility==='strong' ? 'strong' : typographyCredibility==='medium' ? 'medium' : typographyCredibility==='weak' ? 'low' : (typographyFieldProfiles.length?'insufficient-data':'insufficient-data'),
+          typographyCredibility,
+          typographyCredibleFieldCount:credibleFieldCount,
+          characterFindingCount:typographyFindings.length,
+          characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
           fields:fieldResults,referenceQuality,
         });
@@ -5996,14 +6029,16 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
     );
     const severity=(maxSpacingScore>=85 && strongSpacing.length>=1)?'strong':(strongSpacing.length>=1&&score>=45?'medium':(suspicious.length>=1&&score>=45?'medium':'low'));
     return {
-      available:true,engine:'reference-forensic-engine-v12-occurrence-semantic-spacing-typography-v4',bank:normalizedBank,
+      available:true,engine:'reference-forensic-engine-v20-occurrence-semantic-spacing-typography-v5',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
       spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,
       characterFindingCount:rfMedian(referenceResults.map(x=>Number(x.characterFindingCount)||0)),
       characterFindings:referenceResults.flatMap(x=>x.characterFindings||[]).slice(0,40),
       typographyScore:rfClamp100(rfMedian(referenceResults.map(x=>Number(x.typographyScore)||0))),
-      typographySeverity:referenceResults.some(x=>x.typographySeverity==='strong')?'strong':referenceResults.some(x=>x.typographySeverity==='medium')?'medium':(referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).length?'low':'insufficient-data'),
+      typographyCredibleFieldCount:Math.max(0,...referenceResults.map(x=>Number(x.typographyCredibleFieldCount)||0)),
+      typographyCredibility:referenceResults.some(x=>x.typographyCredibility==='strong')?'strong':referenceResults.some(x=>x.typographyCredibility==='medium')?'medium':referenceResults.some(x=>x.typographyCredibility==='weak')?'weak':'none',
+      typographySeverity:referenceResults.some(x=>x.typographySeverity==='strong')?'strong':referenceResults.some(x=>x.typographySeverity==='medium')?'medium':(referenceResults.some(x=>x.typographySeverity==='low')?'low':'insufficient-data'),
       typographyStatus:referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).length?'comparable-data':'insufficient-data',
       typographyFieldProfiles:referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).slice(0,60),
       localStructuralEdit:strongSpacing.length>=1,
@@ -12466,16 +12501,18 @@ if (referenceForensics) {
   result.referenceForensics = referenceForensics;
 
   // =============================================================
-  // TYPOGRAPHY FORENSICS V19 PIPELINE OUTPUT
+  // TYPOGRAPHY FORENSICS V20 PIPELINE OUTPUT
   // =============================================================
   // Typography motoru referenceForensicEngine'in içinde çalışır.
   // Burada çıktıyı ayrı ve açık biçimde loglayarak gerçekten pipeline'a
   // bağlandığını doğruluyoruz. Risk skoruna dahil edilmez.
   const typographyForensics = {
     available: true,
-    engine: 'reference-glyph-raster-typography-v2-precision',
+    engine: 'reference-glyph-raster-typography-v3-calibrated',
     score: Number(referenceForensics.typographyScore || 0),
     severity: referenceForensics.typographySeverity || 'insufficient-data',
+    credibility: referenceForensics.typographyCredibility || 'none',
+    credibleFieldCount: Number(referenceForensics.typographyCredibleFieldCount || 0),
     characterFindingCount: Number(referenceForensics.characterFindingCount || 0),
     characterFindings: Array.isArray(referenceForensics.characterFindings)
       ? referenceForensics.characterFindings.slice(0, 40)
@@ -12488,7 +12525,7 @@ if (referenceForensics) {
       : []
   };
   result.typographyForensics = typographyForensics;
-  console.log('TYPOGRAPHY FORENSICS V19:', JSON.stringify(typographyForensics));
+  console.log('TYPOGRAPHY FORENSICS V20:', JSON.stringify(typographyForensics));
 }
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
@@ -12932,6 +12969,10 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   // 2) Semantic typography/raster differences.
   // A diacritic-only difference is never enough.
   for (const row of (Array.isArray(forensic?.characterFindings) ? forensic.characterFindings : [])) {
+    // V20: only value-backed typography findings are user-facing. Label-only
+    // raster differences are expected between PDF references and photographed
+    // targets and therefore remain diagnostics rather than fraud evidence.
+    if (row?.scope !== 'value' || row?.corroboration !== 'label+value') continue;
     const cd = Number(row?.characterDistance);
     if (!Number.isFinite(cd) || cd < 0.42) continue;
 
