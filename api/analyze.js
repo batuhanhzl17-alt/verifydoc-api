@@ -12748,7 +12748,7 @@ if (referenceForensics) {
   // bağlandığını doğruluyoruz. Risk skoruna dahil edilmez.
   const typographyForensics = {
     available: true,
-    engine: 'reference-glyph-raster-typography-v5-v22-robust-shared-glyph',
+    engine: 'reference-glyph-raster-typography-v5-v23-internal-style-substitution-v24-annotated',
     score: Number(referenceForensics.typographyScore || 0),
     severity: referenceForensics.typographySeverity || 'insufficient-data',
     credibility: referenceForensics.typographyCredibility || 'none',
@@ -13419,11 +13419,13 @@ async function buildAnnotatedReferenceDifferenceImage({
     function findFieldRegion(field, preferredText='') {
       const candidates = [];
       const patterns = fieldPatterns[field] || [];
+      const preferredNorm = norm(preferredText);
       for (const item of regions) {
         const text = String(item.text || '');
         const t = norm(text);
         let score = regionTextScore(text, preferredText);
         if (patterns.some(re => re.test(t))) score += 55;
+        if (preferredNorm && t === preferredNorm) score += 70;
         if (field === 'amount' && /\d/.test(text)) score += 5;
         if (score > 0) {
           const b = boxOf(item);
@@ -13431,6 +13433,50 @@ async function buildAnnotatedReferenceDifferenceImage({
         }
       }
       candidates.sort((a,b)=>b.score-a.score || a.box.y1-b.box.y1);
+      return candidates[0]?.box || null;
+    }
+
+    // V24: bank-specific/generic labels are localized by their actual OCR label
+    // text instead of relying on a hard-coded field vocabulary. This lets the
+    // annotation layer mark fields such as DOKÜMAN NUMARASI, REFERANS NUMARASI,
+    // ETTN and SENARYO/DEKONT TİPİ even when they are not canonical fields.
+    function findExactLabelRegion(labelText='') {
+      const q = norm(labelText);
+      if (!q) return null;
+      const candidates=[];
+      for (const item of regions) {
+        const text=String(item.text||'');
+        const t=norm(text);
+        if (!t) continue;
+        let score=0;
+        if (t===q) score=120;
+        else if (t.includes(q) || q.includes(t)) score=95;
+        else score=regionTextScore(text,labelText);
+        if (score<75) continue;
+        const b=boxOf(item);
+        if (b && b.x2>b.x1 && b.y2>b.y1) candidates.push({score,box:b,text});
+      }
+      candidates.sort((a,b)=>b.score-a.score || a.box.y1-b.box.y1);
+      return candidates[0]?.box || null;
+    }
+
+    function findValueNearLabel(labelBox, labelText='') {
+      if (!labelBox) return null;
+      const q=norm(labelText);
+      const candidates=[];
+      for (const item of regions) {
+        const b=boxOf(item);
+        if (!b) continue;
+        const t=norm(item.text||'');
+        if (!t || (q && t===q)) continue;
+        const sameBand=Math.abs(((b.y1+b.y2)/2)-((labelBox.y1+labelBox.y2)/2)) <= Math.max(18,(labelBox.y2-labelBox.y1)*1.8);
+        const toRight=b.x1>=labelBox.x1-Math.max(10,(labelBox.x2-labelBox.x1)*0.25);
+        if (!sameBand || !toRight) continue;
+        const gap=b.x1-labelBox.x2;
+        if (gap>Math.max(900,labelBox.x2-labelBox.x1+900)) continue;
+        candidates.push({score:100-Math.min(90,Math.max(0,gap)/10),box:b,text:item.text});
+      }
+      candidates.sort((a,b)=>b.score-a.score);
       return candidates[0]?.box || null;
     }
 
@@ -13469,28 +13515,42 @@ async function buildAnnotatedReferenceDifferenceImage({
     }
 
     // 3) Typography findings: locate the corresponding field label/value in OCR.
-    for (const row of (referenceForensics?.characterFindings || []).slice(0,8)) {
+    for (const row of (referenceForensics?.characterFindings || []).slice(0,12)) {
       const field = String(row?.field || '').replace(/:value$/i,'');
-      const box = findFieldRegion(field, row?.targetText || fieldLabels[field] || '');
+      const preferred = row?.labelText || row?.targetLabelText || row?.targetText || fieldLabels[field] || '';
+      let box = findFieldRegion(field, preferred);
+      // Generic V23 fields do not have a hard-coded pattern; use the actual label.
+      if (!box) box = findExactLabelRegion(preferred);
       if (!box) continue;
       const key = `tp|${field}|${box.x1}|${box.y1}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
-      boxes.push({box, label:fieldLabels[field] || field, source:'typography'});
+      boxes.push({box, label:preferred || fieldLabels[field] || field, source:'typography'});
+      // V24: when the finding is a value style substitution, also mark the value
+      // immediately to the right of the label when OCR exposes it as a separate line/word.
+      const valueBox=findValueNearLabel(box,preferred);
+      if (valueBox) {
+        const vkey=`tp-value|${field}|${valueBox.x1}|${valueBox.y1}`;
+        if (!seenBox.has(vkey)) {
+          seenBox.add(vkey);
+          boxes.push({box:valueBox,label:`${preferred || field} değeri`,source:'typography-value'});
+        }
+      }
     }
 
     // 4) If the human report has a field finding not covered above, add a best-effort box.
+    // V24 also handles arbitrary bank-specific titles directly from the report text.
     const titleToField = Object.fromEntries(Object.entries(fieldLabels).map(([k,v])=>[v,k]));
     for (const row of humanReport.findings || []) {
       const title = norm(row?.title || '');
       const field = titleToField[title];
-      if (!field) continue;
-      const box = findFieldRegion(field, fieldLabels[field]);
+      let box = field ? findFieldRegion(field, fieldLabels[field]) : null;
+      if (!box && row?.title) box = findExactLabelRegion(row.title);
       if (!box) continue;
-      const key = `fallback|${field}|${box.x1}|${box.y1}`;
+      const key = `fallback|${title}|${box.x1}|${box.y1}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
-      boxes.push({box, label:fieldLabels[field] || field, source:'fallback'});
+      boxes.push({box, label:row.title || fieldLabels[field] || field, source:'fallback'});
     }
 
     if (!boxes.length && !gapMarkers.length) return null;
