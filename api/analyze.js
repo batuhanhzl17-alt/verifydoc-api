@@ -11855,7 +11855,11 @@ try {
 // The trusted bank reference is the visual baseline. Compare the target and
 // reference as documents, not as independent OCR fields. AI is used only to
 // interpret visible differences; OCR/Sharp remain supporting tools.
-async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo }) {
+async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo, targetOCR = null, bank = null }) {
+  // V37 — SEMANTIC REFERENCE DIFFERENCE ENGINE
+  // The reference is the visual truth. We do NOT compare page coordinates blindly.
+  // First align the same semantic fields/rows, then ask Terra to inspect enlarged
+  // TARGET/REFERENCE pairs. Literal value differences are expected and ignored.
   if (!targetPath || !referenceInfo?.path || !openai || !sharp) return null;
 
   try {
@@ -11873,174 +11877,182 @@ async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo })
     const [tb, rb] = await Promise.all([loadImage(targetPath), loadImage(referenceInfo.path)]);
     if (!tb || !rb) return null;
 
-    const tm = await sharp(tb).metadata();
-    const rm = await sharp(rb).metadata();
-    const tw = Number(tm.width)||0, th = Number(tm.height)||0;
-    const rw = Number(rm.width)||0, rh = Number(rm.height)||0;
+    const [tm, rm] = await Promise.all([sharp(tb).metadata(), sharp(rb).metadata()]);
+    const tw = Number(tm.width) || 0, th = Number(tm.height) || 0;
+    const rw = Number(rm.width) || 0, rh = Number(rm.height) || 0;
     if (tw < 400 || th < 400 || rw < 400 || rh < 400) return null;
 
-    const makeView = async (buf, box, W, H, width=1800) => {
-      const x1=Math.max(0,Math.min(W-1,Math.round(box.x1*W)));
-      const y1=Math.max(0,Math.min(H-1,Math.round(box.y1*H)));
-      const x2=Math.max(x1+2,Math.min(W,Math.round(box.x2*W)));
-      const y2=Math.max(y1+2,Math.min(H,Math.round(box.y2*H)));
-      const out=await sharp(buf).extract({left:x1,top:y1,width:x2-x1,height:y2-y1})
-        .resize({width,withoutEnlargement:false})
-        .jpeg({quality:95,mozjpeg:true}).toBuffer();
+    const targetRegions = Array.isArray(targetOCR?.regions)
+      ? targetOCR.regions.filter(x => x?.region && String(x.text || '').trim())
+      : [];
+    if (!targetRegions.length) return null;
+
+    // Exact reference-file profile. This is deliberately NOT the first matching
+    // coordinate on the page; it is the semantic field profile extracted from
+    // the trusted reference itself.
+    const refProfile = await extractReferenceTemplateProfile(referenceInfo.path, normalizeBank(bank || referenceInfo.bank || ''));
+    const fields = refProfile?.fields || {};
+    if (!Object.keys(fields).length) return null;
+
+    const wantedFields = [
+      'senderName','accountNo','amount','description','senderAddress',
+      'recipientName','recipientAddress','iban','transactionNo','date','time',
+      'branch','taxNo'
+    ];
+
+    const fieldDisplay = {
+      senderName:'Gönderen Adı', accountNo:'Gönderen Hesap', amount:'Tutar',
+      description:'Açıklama', senderAddress:'Gönderen Adresi', recipientName:'Alıcı İsim/Unvan',
+      recipientAddress:'Alıcı Adresi', iban:'IBAN', transactionNo:'İşlem/Referans No',
+      date:'Tarih', time:'Saat', branch:'İşlem Yeri/Şube', taxNo:'Vergi/TCKN'
+    };
+
+    const boxes = [];
+    for (const field of wantedFields) {
+      const ref = fields[field];
+      if (!ref) continue;
+      const candidates = referenceFieldTargetCandidates(field, ref, targetRegions, {width:tw,height:th});
+      if (!candidates.length) continue;
+      const best = candidates[0];
+      if (!best?.box) continue;
+      boxes.push({
+        field,
+        label: fieldDisplay[field] || field,
+        referenceBox: {
+          x:Number(ref.xNorm)||0, y:Number(ref.yNorm)||0,
+          w:Number(ref.widthNorm)||0.01, h:Number(ref.heightNorm)||0.01
+        },
+        targetBox: {
+          x:Number(best.box.xNorm)||0, y:Number(best.box.yNorm)||0,
+          w:Number(best.box.widthNorm)||0.01, h:Number(best.box.heightNorm)||0.01
+        },
+        targetText:String(best.item?.text||'').trim()
+      });
+    }
+
+    if (!boxes.length) return null;
+
+    const crop = async (buf, meta, box) => {
+      const W = Number(meta.width), H = Number(meta.height);
+      // Include the row label + surrounding local context, but never a giant page.
+      const cx = (Number(box.x)||0) * W;
+      const cy = (Number(box.y)||0) * H;
+      const bw = Math.max(18, Number(box.w||0.02) * W);
+      const bh = Math.max(14, Number(box.h||0.02) * H);
+      const padX = Math.max(45, Math.min(W*0.12, bw*1.45));
+      const padY = Math.max(24, Math.min(H*0.035, bh*2.8));
+      const left = Math.max(0, Math.min(W-20, Math.floor(cx-padX)));
+      const top = Math.max(0, Math.min(H-20, Math.floor(cy-padY)));
+      const right = Math.max(left+20, Math.min(W, Math.ceil(cx+bw+padX)));
+      const bottom = Math.max(top+20, Math.min(H, Math.ceil(cy+bh+padY)));
+      const out = await sharp(buf)
+        .extract({left, top, width:right-left, height:bottom-top})
+        .resize({width:1000, withoutEnlargement:false})
+        .jpeg({quality:96, mozjpeg:true})
+        .toBuffer();
       return `data:image/jpeg;base64,${out.toString('base64')}`;
     };
 
-    // Full page plus focused zones. Every view compares target and reference
-    // in the SAME normalized coordinates, so a finding can be mapped back to
-    // the target image for annotation.
-    // V35: broad crops alone made Terra spend its attention on the easiest
-    // visible difference (often a header/logo) and miss local edits inside the
-    // transaction blocks.  We therefore inspect the document at three scales:
-    // whole page, semantic blocks, and narrow row bands.  The row bands overlap
-    // intentionally so a changed line is seen in more than one context.
-    const views=[
-      {id:'full',title:'TÜM BELGE — genel şablon',box:{x1:0,y1:0,x2:1,y2:1}},
-      {id:'header',title:'ÜST / BAŞLIK / e-Dekont',box:{x1:0,y1:0,x2:1,y2:.30}},
-      {id:'left_block',title:'SOL İŞLEM BLOĞU — tüm bölüm',box:{x1:0,y1:.28,x2:.56,y2:.69}},
-      {id:'right_block',title:'SAĞ ALICI / İŞLEM BLOĞU — tüm bölüm',box:{x1:.45,y1:.25,x2:1,y2:.70}},
-      {id:'left_top',title:'SOL BLOK — başlık ve gönderici hesap',box:{x1:0,y1:.31,x2:.56,y2:.48}},
-      {id:'left_mid',title:'SOL BLOK — tutar / ücret / IBAN satırları',box:{x1:0,y1:.40,x2:.56,y2:.59}},
-      {id:'left_bottom',title:'SOL BLOK — açıklama ve alt satırlar',box:{x1:0,y1:.53,x2:.60,y2:.69}},
-      {id:'right_top',title:'SAĞ BLOK — alıcı hesap / banka',box:{x1:.43,y1:.30,x2:1,y2:.48}},
-      {id:'right_mid',title:'SAĞ BLOK — sorgu / toplam / işlem',box:{x1:.43,y1:.43,x2:1,y2:.61}},
-      {id:'right_bottom',title:'SAĞ BLOK — işlem türü ve alt satırlar',box:{x1:.43,y1:.54,x2:1,y2:.70}},
-      {id:'amount',title:'TUTAR — rakam karakterleri ve aynı satır içi font',box:{x1:.08,y1:.38,x2:.55,y2:.55}},
-      {id:'footer',title:'ALT BÖLÜM / FOOTER',box:{x1:0,y1:.67,x2:1,y2:1}},
-    ];
+    const groups = [
+      {id:'top', fields:boxes.filter(x=>['senderName','branch','date','time','transactionNo','taxNo'].includes(x.field))},
+      {id:'left', fields:boxes.filter(x=>['accountNo','amount','description','senderAddress'].includes(x.field))},
+      {id:'right', fields:boxes.filter(x=>['recipientName','recipientAddress','iban'].includes(x.field))},
+    ].filter(g=>g.fields.length);
 
-    const schema={type:'object',properties:{findings:{type:'array',items:{type:'object',properties:{
-      field:{type:'string'}, issueType:{type:'string',enum:['typography','layout','spacing','local-render','mixed']},
-      severity:{type:'string',enum:['strong','medium']}, evidence:{type:'string'}, confidence:{type:'integer',minimum:0,maximum:100},
-      box:{type:'object',properties:{x:{type:'number',minimum:0,maximum:1},y:{type:'number',minimum:0,maximum:1},w:{type:'number',minimum:0,maximum:1},h:{type:'number',minimum:0,maximum:1}},required:['x','y','w','h'],additionalProperties:false}
-    },required:['field','issueType','severity','evidence','confidence','box'],additionalProperties:false}},},required:['findings'],additionalProperties:false};
+    const schema = {
+      type:'object',
+      properties:{
+        findings:{type:'array',maxItems:8,items:{type:'object',properties:{
+          field:{type:'string'},
+          issueType:{type:'string',enum:['typography','layout','spacing','local-render','mixed']},
+          confidence:{type:'integer',minimum:0,maximum:100},
+          evidence:{type:'string'},
+          targetBox:{type:'object',properties:{x:{type:'number'},y:{type:'number'},w:{type:'number'},h:{type:'number'}},required:['x','y','w','h'],additionalProperties:false}
+        },required:['field','issueType','confidence','evidence','targetBox'],additionalProperties:false}}
+      },required:['findings'],additionalProperties:false
+    };
 
     const raw=[];
-    for (const view of views) {
-      const targetUrl=await makeView(tb,view.box,tw,th);
-      const refUrl=await makeView(rb,view.box,rw,rh);
-      const prompt=`
-Sen banka dekontlarının GÖRSEL REFERANS KARŞILAŞTIRMASINI yapan uzman bir inceleme motorusun.
+    for (const group of groups) {
+      const content=[{
+        type:'input_text',
+        text:`AYNI BANKANIN GÜVENİLİR REFERANSI ile TARGET dekontunu alan alan karşılaştır. BANKA: ${bank || 'bilinmiyor'}.
 
-TARGET = incelenen dekont.
-REFERENCE = aynı bankanın güvenilir ve ORİJİNAL referans dekontu.
-REFERENCE doğru kabul edilir.
+Bu görüntüler semantik olarak eşleştirilmiş aynı alanların yakın planlarıdır. TARGET ve REFERENCE içindeki gerçek değerlerin farklı olması NORMALDİR. İsim, IBAN, tarih, numara ve tutar farklılığını raporlama.
 
-Bu görev OCR metin eşitliği değildir. İki dekonttaki işlem bilgileri doğal olarak farklı
-olabilir. İsim, IBAN, tarih, saat, belge numarası, sorgu numarası veya tutarın farklı olması
-TEK BAŞINA bulgu değildir.
+SADECE gerçekten dekont üzerinde bulunan üretim farklarını ara: font/stroke yapısı, karakterlerin genişlik-yükseklik oranı, baseline, karakter aralığı, satır hizası, alan geometrisi, lokal yeniden yazım/silme izleri veya aynı alanın referansa göre belirgin farklı raster üretimi.
 
-${view.title} görünümünde TARGET ile REFERENCE'ı SATIR SATIR ve BLOK İÇİ YAPIYI dikkate alarak karşılaştır.
-Özellikle şu bölümlerde hiçbir satırı atlama: gönderici hesap, aktarılan/işlem tutarı, ücret/vergi, ücret tah IBAN, açıklama; sağ tarafta alıcı hesap, alıcı banka, sorgu numarası, toplam tutar ve işlem türü.
+Çok önemli: Fotoğraf bulanıklığı, JPEG, perspektif, ışık, ekran görüntüsü, gölge, Telegram/telefon arayüzü, bildirim veya dekont dışındaki nesneler BULGU DEĞİLDİR.
 
-Şunların tamamını kontrol et:
-- yazı karakteri/font görünümü ve stroke kalınlığı,
-- aynı satır içinde karakterlerin birbirine göre şekli ve genişliği, özellikle aynı rakamın farklı üretildiği durumlar,
-- harf/rakam yükseklik-genişlik oranı ve baseline,
-- karakter ve kelime aralıkları,
-- etiket ile değer arasındaki mesafe,
-- satırlar arası dikey boşluk ve satırların hizası,
-- değerlerin bulunduğu metin bloklarının genişliği ve başlangıç noktası,
-- metin yoğunluğu, keskinlik ve anti-aliasing/raster davranışı,
-- tek bir alanın çevresindeki özgün yazıdan farklı render edilmiş görünmesi,
-- silme/ekleme/yeniden yazma izleri,
-- bölümün genel geometrisi ve satır düzeni.
+Bir farkı yalnızca “farklı görünüyor” diye yazma. En az iki bağımsız görsel belirti aynı yönde olmalı veya çok açık bir lokal yeniden yazım/yerleşim farkı görülmeli. Tek karakter, tek piksel veya genel kalite farkı yeterli değildir.
 
-ÖZELLİKLE: TARGET'taki sol ve sağ işlem bloklarını tek bir büyük şekil olarak değil, içindeki her satırın yazı ve yerleşim davranışı olarak incele. Bir blokta birkaç farklı satır aynı referans davranışından sapıyorsa bunu tek bir 'işlem bilgileri bölümü' bulgusu altında birleştir.
+Özellikle aynı satırdaki rakamların birbirinden farklı font/stroke ile üretildiği durumları dikkatle kontrol et. Farklı rakam şekillerini doğal karakter farkıyla karıştırma.
 
-NORMAL FARKLARI YOK SAY:
-- kamera fotoğrafı, perspektif, döndürme, ölçek,
-- JPEG sıkıştırması, genel bulanıklık veya ışık farkı,
-- tüm belgeyi etkileyen kalite farkı,
-- Türkçe ş, ı, ğ, ö, ü, ç karakterlerinin doğal raster farkları,
-- TARGET ve REFERENCE'ın gerçek işlem değerlerinin farklı olması.
+Eğer yeterince güçlü fark yoksa o alanı findings'e hiç koyma.`
+      }];
 
-ÇOK ÖNEMLİ KARAR KURALI:
-Bir şeyi yalnızca “referanstan farklı görünüyor” diye bildirme.
-Farkın TARGET içinde lokal olarak anlamlı olması ve görsel olarak desteklenmesi gerekir.
+      for (const item of group.fields) {
+        const rcrop=await crop(rb,rm,item.referenceBox);
+        const tcrop=await crop(tb,tm,item.targetBox);
+        content.push({type:'input_text',text:`FIELD: ${item.label}\nTARGET (incelenen):`});
+        content.push({type:'input_image',image_url:tcrop,detail:'high'});
+        content.push({type:'input_text',text:`FIELD: ${item.label}\nREFERENCE (güvenilir):`});
+        content.push({type:'input_image',image_url:rcrop,detail:'high'});
+      }
 
-TİPOGRAFİ KARARI İÇİN EN AZ İKİ BAĞIMSIZ GÖRSEL İŞARET ARA: örneğin stroke + karakter genişliği,
-veya baseline + karakter aralığı, veya aynı blokta birden fazla satırın aynı farklı render davranışı.
-Tek başına JPEG bulanıklığı, fotoğraf açısı veya tek piksel farkı yeterli değildir.
-
-İÇERİK DEĞİŞİKLİĞİ NORMALDİR: TARGET'taki isim, IBAN, tarih, numara veya tutarın REFERENCE'tan farklı
-olması beklenebilir. Bu farklılığı değil, bu değerin NASIL YAZILDIĞINI ve bulunduğu satırın
-REFERANS YAPISINA göre nasıl üretildiğini değerlendir.
-Örneğin tek bir alanın yazısı çevresindeki normal yazılardan farklı kalınlıkta/şekildeyse
-bunu bildir. Aynı şekilde belirli bir bölümün satır aralıkları referans yapısından açıkça
-sapıyorsa bildir.
-
-SADECE gerçekten gördüğün güçlü veya orta seviyeli farkları döndür.
-Emin değilsen findings boş olsun.
-
-box, farkın TARGET içindeki konumudur. Koordinatlar bu gönderilen görünümün 0..1 aralığındadır.
-Kutuyu mümkün olduğunca yalnızca farklı görünen yazı/değer/bölüm üzerine koy; bütün sayfayı kutulama.
-`;
       try {
         const response=await openai.responses.create({
           model:'gpt-5.6-terra',
-          input:[{role:'user',content:[
-            {type:'input_text',text:prompt},
-            {type:'input_text',text:'=== TARGET ==='},
-            {type:'input_image',image_url:targetUrl,detail:'high'},
-            {type:'input_text',text:'=== REFERENCE ==='},
-            {type:'input_image',image_url:refUrl,detail:'high'},
-          ]}],
-          text:{format:{type:'json_schema',name:`v34_${view.id}`,strict:true,schema}},
+          input:[{role:'user',content}],
+          text:{format:{type:'json_schema',name:`v37_semantic_${group.id}`,strict:true,schema}}
         });
         const parsed=parseAIResponse(response?.output_text||'');
-        const fsx=Array.isArray(parsed?.findings)?parsed.findings:[];
-        console.log(`V34 DIRECT REFERENCE [${view.id}]:`,JSON.stringify({findingCount:fsx.length,findings:fsx}));
-        for(const f of fsx){
+        for(const f of (Array.isArray(parsed?.findings)?parsed.findings:[])) {
           const c=Number(f.confidence)||0;
-          if(c<82 || !String(f.evidence||'').trim()) continue;
-          const bx=f.box||{};
-          if(!(Number.isFinite(Number(bx.x))&&Number.isFinite(Number(bx.y))&&Number.isFinite(Number(bx.w))&&Number.isFinite(Number(bx.h)))) continue;
-          if(Number(bx.w)<=0 || Number(bx.h)<=0) continue;
-          // Convert view-local box to whole-target normalized coordinates.
-          const x=view.box.x1+Number(bx.x)*((view.box.x2-view.box.x1));
-          const y=view.box.y1+Number(bx.y)*((view.box.y2-view.box.y1));
-          const w=Number(bx.w)*((view.box.x2-view.box.x1));
-          const h=Number(bx.h)*((view.box.y2-view.box.y1));
-          raw.push({...f,view:view.id,confidence:c,box:{x:Math.max(0,Math.min(1,x)),y:Math.max(0,Math.min(1,y)),w:Math.max(.002,Math.min(1-x,w)),h:Math.max(.002,Math.min(1-y,h))}});
+          if(c<88 || String(f.evidence||'').trim().length<15) continue;
+          const fieldKey=String(f.field||'').trim().toLocaleLowerCase('tr-TR');
+          const match=group.fields.find(x=>String(x.label).toLocaleLowerCase('tr-TR')===fieldKey || String(x.field).toLocaleLowerCase('tr-TR')===fieldKey || String(x.label).toLocaleLowerCase('tr-TR').includes(fieldKey) || fieldKey.includes(String(x.label).toLocaleLowerCase('tr-TR')));
+          const tbx=match?.targetBox;
+          raw.push({
+            ...f,
+            field:match?.label || f.field,
+            targetBox:tbx || f.targetBox,
+            group:group.id,
+            confidence:c
+          });
         }
-      } catch(e) { console.warn(`V34 DIRECT REFERENCE HATASI [${view.id}]:`,e?.message||e); }
-    }
-
-    // Cluster overlapping findings. A local finding may legitimately appear in
-    // only one focused zone, but repeated support from another view strengthens
-    // it. We never merge unrelated distant findings just because the field name
-    // is the same.
-    const iou=(a,b)=>{const ax1=a.x,ay1=a.y,ax2=a.x+a.w,ay2=a.y+a.h,bx1=b.x,by1=b.y,bx2=b.x+b.w,by2=b.y+b.h;const ix1=Math.max(ax1,bx1),iy1=Math.max(ay1,by1),ix2=Math.min(ax2,bx2),iy2=Math.min(ay2,by2);const iw=Math.max(0,ix2-ix1),ih=Math.max(0,iy2-iy1);const inter=iw*ih,ua=a.w*a.h+b.w*b.h-inter;return ua>0?inter/ua:0;};
-    const clusters=[];
-    for(const f of raw.sort((a,b)=>b.confidence-a.confidence)){
-      let hit=null;
-      for(const c of clusters){
-        if(iou(f.box,c.best.box)>=.20 || (String(f.field).trim().toLocaleLowerCase('tr-TR')===String(c.best.field).trim().toLocaleLowerCase('tr-TR') && iou(f.box,c.best.box)>=.08)){hit=c;break;}
+      } catch(e) {
+        console.warn(`V37 SEMANTIC REFERENCE HATASI [${group.id}]:`,e?.message||e);
       }
-      if(hit) hit.items.push(f); else clusters.push({best:f,items:[f]});
     }
 
-    const final=[];
-    for(const c of clusters){
-      const best=c.items.slice().sort((a,b)=>b.confidence-a.confidence)[0];
-      const viewsSeen=new Set(c.items.map(x=>x.view));
-      const repeated=viewsSeen.size>=2;
-      const score=best.confidence+(repeated?5:0);
-      if(score<82) continue;
-      final.push({
-        field:best.field, issueType:best.issueType, severity:best.severity,
-        evidence:best.evidence, confidence:Math.min(99,score), targetBox:best.box,
-        supportingViews:[...viewsSeen], occurrenceCount:c.items.length
-      });
+    // Deterministic consensus: multiple suspicious fields in the same document
+    // block strengthen a block-level finding, but do not manufacture a finding
+    // when Terra did not see a concrete local difference.
+    const dedup=[];
+    const seen=new Set();
+    for(const f of raw.sort((a,b)=>b.confidence-a.confidence)) {
+      const key=String(f.field||'').toLocaleLowerCase('tr-TR');
+      if(seen.has(key)) continue;
+      seen.add(key); dedup.push(f);
     }
-    final.sort((a,b)=>b.confidence-a.confidence);
-    return {available:true,engine:'gpt-5.6-terra-direct-reference-v35-region-forensics',findingCount:Math.min(12,final.length),findings:final.slice(0,12)};
-  } catch(e){ console.warn('V34 DIRECT REFERENCE HATASI:',e?.message||e); return null; }
+
+    const blockCounts={top:0,left:0,right:0};
+    for(const f of dedup) if(blockCounts[f.group]!==undefined) blockCounts[f.group]++;
+
+    return {
+      available:true,
+      engine:'gpt-5.6-terra-semantic-reference-difference-v37',
+      referenceFile:path.basename(referenceInfo.path),
+      comparedFieldCount:boxes.length,
+      findingCount:Math.min(8,dedup.length),
+      findings:dedup.slice(0,8),
+      blockConsensus:Object.fromEntries(Object.entries(blockCounts).filter(([,v])=>v>0))
+    };
+  } catch(e) {
+    console.warn('V37 SEMANTIC REFERENCE DIFFERENCE HATASI:',e?.message||e);
+    return null;
+  }
 }
 
 // V35 is the sole user-facing reference comparison. Legacy forensic engines
@@ -12049,8 +12061,8 @@ Kutuyu mümkün olduğunca yalnızca farklı görünen yazı/değer/bölüm üze
 referenceVisualAdjudication = null;
 if ((type === 'image' || type === 'pdf') && bank && reference) {
   try {
-    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference});
-    console.log('REFERENCE VISUAL ADJUDICATOR V35:',JSON.stringify(referenceVisualAdjudication));
+    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference,targetOCR:paddleImageOCR,bank});
+    console.log('REFERENCE VISUAL ADJUDICATOR V36:',JSON.stringify(referenceVisualAdjudication));
   } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V34 HATASI:',e?.message||e); }
 }
 
