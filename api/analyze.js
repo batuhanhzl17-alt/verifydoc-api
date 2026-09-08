@@ -6139,8 +6139,20 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
             valueFinding: valueFinding ? {...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText} : null,
           });
           if(internalStyleFinding){
-            typographyFindings.push({...internalStyleFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText,
-              corroboration:'internal-label-value-style'});
+            // V25: the annotation must point to the SAME target value ROI that
+            // produced the typography evidence. Never annotate the label as the
+            // fraud location. Keep both target/reference boxes for traceability.
+            typographyFindings.push({
+              ...internalStyleFinding,
+              scope:'value',
+              labelText:refLabelText,
+              targetLabelText:tarLabelText,
+              targetValueBox: valueTarRaw?.region ? {...valueTarRaw.region} : null,
+              referenceValueBox: valueRefRaw?.region ? {...valueRefRaw.region} : null,
+              targetLabelBox: m.tl?.region ? {...m.tl.region} : null,
+              referenceLabelBox: m.rl?.region ? {...m.rl.region} : null,
+              corroboration:'internal-label-value-style'
+            });
           }
           // Keep V22 shared-glyph result only as diagnostics inside the profile.
           // It is intentionally NOT promoted to a finding in V23 because literal
@@ -6269,7 +6281,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
     );
     const severity=(maxSpacingScore>=85 && strongSpacing.length>=1)?'strong':(strongSpacing.length>=1&&score>=45?'medium':(suspicious.length>=1&&score>=45?'medium':'low'));
     return {
-      available:true,engine:'reference-forensic-engine-v22-dynamic-shared-glyph-robust',bank:normalizedBank,
+      available:true,engine:'reference-forensic-engine-v26-evidence-fusion',bank:normalizedBank,
       referenceCount:referenceResults.length,referenceFiles:referenceResults.map(x=>x.file),
       comparedFieldCount:fields.length,suspiciousFieldCount:suspicious.length,suspiciousFields:localized,
       spacingAnomalyCount:spacingAnomalies.length,spacingAnomalies,
@@ -12766,7 +12778,7 @@ if (referenceForensics) {
       : []
   };
   result.typographyForensics = typographyForensics;
-  console.log('TYPOGRAPHY FORENSICS V23:', JSON.stringify(typographyForensics));
+  console.log('TYPOGRAPHY FORENSICS V26:', JSON.stringify(typographyForensics));
 }
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
@@ -13009,6 +13021,89 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
   }
 }
 
+
+// =====================================================
+// REFERENCE EVIDENCE FUSION V26
+// =====================================================
+// Amaç: Her alt motorun "fark" demesini doğrudan kullanıcıya taşımamak.
+// Bir fark, mümkün olduğunca aynı alan üzerinde birbirinden bağımsız iki
+// kanıtla desteklenmeden sahtecilik/fark bulgusu olarak gösterilmez.
+// Global PDF->JPG / kamera / JPEG değişimleri tek başına kanıt değildir.
+function buildReferenceEvidenceLedger(forensic, layout = null, localCrop = null, azureGeometry = null) {
+  const ledger = new Map();
+  const add = (field, kind, strength, detail, box = null, meta = {}) => {
+    const f = String(field || '').trim();
+    if (!f) return;
+    const k = f.toLowerCase();
+    if (!ledger.has(k)) ledger.set(k, { field:f, signals:[], boxes:[] });
+    const row = ledger.get(k);
+    if (!row.signals.some(x => x.kind === kind)) row.signals.push({kind, strength:Number(strength)||0, detail, ...meta});
+    if (box && !row.boxes.some(b => JSON.stringify(b) === JSON.stringify(box))) row.boxes.push(box);
+  };
+
+  // Field-level structural/render suspicion from the forensic engine.
+  for (const f of (forensic?.fields || [])) {
+    if (!f?.suspicious) continue;
+    const key = String(f.field || '').replace(/:value$/i,'');
+    if (!key || key.startsWith('generic:')) continue;
+    add(key, 'field-geometry-style', Math.max(Number(f.combinedScore)||0, 70), f.evidence || 'Alan bazında bağımsız geometri/stil sapması.');
+  }
+
+  // Local crop is only a candidate until it is a genuine local outlier.
+  // Require both local style and character evidence, or an unusually strong
+  // single local metric. This prevents camera/JPEG baseline drift from winning.
+  for (const o of (localCrop?.findings || [])) {
+    const field = String(o?.field || '').trim();
+    if (!field) continue;
+    const se = Number(o?.localStyleExcess), ce = Number(o?.localCharacterExcess);
+    const sd = Number(o?.styleDistance), cd = Number(o?.characterDistance);
+    const both = Number.isFinite(se) && Number.isFinite(ce) && se >= 0.16 && ce >= 0.14;
+    const extreme = (Number.isFinite(se) && se >= 0.26 && Number.isFinite(sd) && sd >= 0.42) ||
+                    (Number.isFinite(ce) && ce >= 0.24 && Number.isFinite(cd) && cd >= 0.50);
+    if (!(both || extreme)) continue;
+    const strength = both ? 82 : 76;
+    add(field, 'local-render-outlier', strength, o.reason || 'Alan içinde lokal render/raster sapması.', o.targetBox || null, {
+      styleDistance:sd, characterDistance:cd, localStyleExcess:se, localCharacterExcess:ce
+    });
+  }
+
+  // Typography is deliberately secondary. It becomes evidence only if the same
+  // field has a separate field-geometry/style or local-render signal. Label-only
+  // typography is never promoted.
+  for (const f of (forensic?.characterFindings || [])) {
+    if (f?.scope !== 'value') continue;
+    const key = String(f.field || '').replace(/:value$/i,'');
+    if (!key || key.startsWith('generic:')) continue;
+    const d = Number(f.characterDistance);
+    if (!Number.isFinite(d) || d < 0.42) continue;
+    add(key, 'value-typography', Math.min(95, 55 + d*50), f.evidence || 'Değer alanında lokal karakter/raster sapması.', f.targetValueBox || f.targetBox || null);
+  }
+
+  // Pixel findings are accepted only when already localized to a semantic field.
+  for (const p of (forensic?.pixelFindings || [])) {
+    const field = String(p?.field || p?.semanticField || '').trim();
+    if (!field) continue;
+    add(field, 'localized-pixel', Number(p?.score) || 68, p?.evidence || 'Alanda lokal görüntü farkı.');
+  }
+
+  return [...ledger.values()].map(row => {
+    const kinds = new Set(row.signals.map(x => x.kind));
+    const hasLocal = kinds.has('local-render-outlier');
+    const hasTypo = kinds.has('value-typography');
+    const hasIndependent = kinds.has('field-geometry-style') || kinds.has('localized-pixel');
+    const independentCount = [hasLocal, hasTypo, hasIndependent].filter(Boolean).length;
+    // Typography alone is never enough. A local outlier can stand alone only if
+    // it is internally supported by both style+character measurements (already
+    // gated above). Otherwise require two independent families.
+    const credible = (hasLocal && hasTypo) || (hasLocal && hasIndependent) ||
+                     (hasTypo && hasIndependent) || (hasLocal && row.signals.find(x=>x.kind==='local-render-outlier')?.strength >= 90);
+    row.credible = credible;
+    row.independentSignalCount = independentCount;
+    row.strength = Math.max(...row.signals.map(x=>Number(x.strength)||0), 0);
+    return row;
+  });
+}
+
 function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
   // The reference is a whole-document fingerprint. Compare structure/spacing first,
@@ -13193,79 +13288,32 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 1) Local crop comparator: strongest source for answering "where?"
-  // It is already normalized against the page-wide render baseline.
-  for (const row of (Array.isArray(localCrop?.findings) ? localCrop.findings : [])) {
-    const key = `local-crop|${row.field}`;
+  // 2) Evidence fusion: do NOT expose a detector result unless the same
+  // semantic field has independent supporting evidence. This is the key V26 fix.
+  const evidenceLedger = buildReferenceEvidenceLedger(forensic, layout, localCrop, azureGeometry);
+  for (const row of evidenceLedger
+    .filter(x => x.credible)
+    .sort((a,b) => Number(b.strength||0) - Number(a.strength||0))) {
+    const key = `fused|${row.field}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    const typo = row.signals.some(x => x.kind === 'value-typography');
+    const local = row.signals.some(x => x.kind === 'local-render-outlier');
+    const geometry = row.signals.some(x => x.kind === 'field-geometry-style');
+    const pixel = row.signals.some(x => x.kind === 'localized-pixel');
+    let detail = 'Referans karşılaştırmasında bu alanda birbiriyle uyumlu birden fazla bağımsız fark kanıtı bulundu.';
+    if (typo && local) detail = 'Bu alanda referansa göre lokal yazı/karakter yapısı ve render görünümü birlikte farklı.';
+    else if (geometry && local) detail = 'Bu alanın konumu/geometrisi ile lokal görüntü yapısı referansa göre birlikte farklı.';
+    else if (geometry && typo) detail = 'Bu alanın geometri/stil yapısı ile değer karakter yapısı birlikte farklı.';
+    else if (local && pixel) detail = 'Bu alanda lokal render/raster ve piksel kanıtları aynı bölgeyi destekliyor.';
     findings.push({
       priority: row.field === 'amount' ? 1 : 2,
       title: fieldName(row.field),
-      detail: row.reason,
-      kind: 'local-crop'
-    });
-  }
-
-  // 2) Semantic typography/raster differences.
-  // A diacritic-only difference is never enough.
-  for (const row of (Array.isArray(forensic?.characterFindings) ? forensic.characterFindings : [])) {
-    // V20: only value-backed typography findings are user-facing. Label-only
-    // raster differences are expected between PDF references and photographed
-    // targets and therefore remain diagnostics rather than fraud evidence.
-    if (row?.scope !== 'value' || row?.corroboration !== 'label+value') continue;
-    const cd = Number(row?.characterDistance);
-    if (!Number.isFinite(cd) || cd < 0.42) continue;
-
-    const rawField = String(row?.field || '').replace(/:value$/i, '');
-    // Placeholder/administrative tax fields are not reliable typography evidence.
-    // Never surface a taxNo finding from raster differences alone.
-    if (rawField === 'taxNo') continue;
-    const genericField = rawField.startsWith('generic:');
-    const genericLabel = genericField
-      ? String(row?.labelText || row?.text || rawField.slice(8) || '').trim()
-      : '';
-    const field = genericLabel || fieldName(rawField);
-    const scope = /:value$/i.test(String(row?.field || '')) || row?.scope === 'value'
-      ? 'değer'
-      : 'yazı';
-    const key = `typography|${field}|${scope}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    const isAmount = rawField === 'amount';
-    findings.push({
-      priority: isAmount ? 1 : 2,
-      title: field,
-      detail: isAmount
-        ? 'Rakamların yazı/raster görünümü referanstan farklı.'
-        : 'Yazı/karakter görünümü referanstan farklı.'
-    });
-  }
-
-  // 3) Localized pixel findings only. Generic ELA/texture/clone findings
-  // without a field/region are deliberately hidden.
-  const pixelRows = Array.isArray(forensic?.pixelFindings)
-    ? forensic.pixelFindings
-    : [];
-
-  for (const row of pixelRows) {
-    const raw = `${row?.type || ''} ${row?.title || ''} ${row?.evidence || ''}`
-      .toLocaleLowerCase('tr-TR');
-    if (/clone|kopya|klon|copy/.test(raw)) continue;
-
-    const field = row?.field || row?.semanticField || null;
-    const region = row?.region || row?.box || null;
-    if (!field && !region) continue;
-
-    const key = `pixel|${field || JSON.stringify(region)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    findings.push({
-      priority: 3,
-      title: field ? fieldName(field) : 'Belirli görüntü bölgesi',
-      detail: 'Bu bölgede referansa göre lokal piksel/görüntü farkı tespit edildi.'
+      detail,
+      kind: 'fused-field',
+      evidenceField: row.field,
+      targetBox: row.boxes[0] || null,
+      independentSignalCount: row.independentSignalCount,
     });
   }
 
@@ -13341,7 +13389,13 @@ async function buildAnnotatedReferenceDifferenceImage({
   azureReferenceGeometry,
   humanReport,
 }) {
-  if (!targetPath || !humanReport?.findings?.length) return null;
+  // V25 PURPOSE:
+  // Draw ONLY evidence-linked locations. A field label is never considered the
+  // fraud location merely because its typography differs from the reference.
+  // The red box must point to the target VALUE ROI that produced the finding,
+  // or to an exact local-crop targetBox. Azure semantic spacing findings are
+  // represented only by the abnormal gap itself, not by boxing the anchor labels.
+  if (!targetPath) return null;
   if (!createCanvas || !sharp) return null;
 
   try {
@@ -13362,48 +13416,20 @@ async function buildAnnotatedReferenceDifferenceImage({
       .replace(/[^a-z0-9]+/g, ' ')
       .trim();
 
-    const fieldLabels = {
-      branch:'sube', date:'tarih', time:'saat', description:'aciklama',
-      transactionNo:'islem no', accountNo:'hesap no', taxNo:'vergi no',
-      amount:'tutar', iban:'iban', senderName:'gonderen adi',
-      recipientName:'alici adi', senderAddress:'gonderen adresi',
-      recipientAddress:'alici adresi', address:'adres'
-    };
-
-    const fieldPatterns = {
-      branch:[/\bsube\b/i, /sube kodu/i],
-      date:[/\btarih\b/i, /islem tarihi/i, /belge tarihi/i],
-      time:[/\bsaat\b/i],
-      description:[/aciklama/i],
-      transactionNo:[/islem no/i, /islem numar/i, /sorgu no/i, /fis no/i],
-      accountNo:[/hesap no/i, /hesap numar/i, /musteri no/i],
-      taxNo:[/vergi no/i, /vergi kimlik/i, /tckn/i, /vkn/i],
-      amount:[/tutar/i, /islem tutari/i, /giden fast tutari/i, /transfer tutari/i, /toplam.*tutar/i],
-      iban:[/iban/i, /alici hesap/i, /gonderen iban/i, /alici iban/i],
-      senderName:[/gonderen/i, /gonderici/i],
-      recipientName:[/alici/i],
-      senderAddress:[/gonderen adres/i],
-      recipientAddress:[/alici adres/i],
-      address:[/adres/i]
-    };
-
     const boxOf = (r) => {
-      if (!r?.region) return null;
-      const x1 = Number(r.region.x1), y1 = Number(r.region.y1);
-      const x2 = Number(r.region.x2), y2 = Number(r.region.y2);
+      const q = r?.region || r;
+      if (!q) return null;
+      const x1 = Number(q.x1), y1 = Number(q.y1);
+      const x2 = Number(q.x2), y2 = Number(q.y2);
       if (![x1,y1,x2,y2].every(Number.isFinite)) return null;
-      return {
+      const b = {
         x1: Math.max(0, Math.min(W, Math.round(x1))),
         y1: Math.max(0, Math.min(H, Math.round(y1))),
         x2: Math.max(0, Math.min(W, Math.round(x2))),
         y2: Math.max(0, Math.min(H, Math.round(y2)))
       };
+      return b.x2 > b.x1 && b.y2 > b.y1 ? b : null;
     };
-
-    const union = (a,b) => ({
-      x1: Math.min(a.x1,b.x1), y1: Math.min(a.y1,b.y1),
-      x2: Math.max(a.x2,b.x2), y2: Math.max(a.y2,b.y2)
-    });
 
     const regionTextScore = (text, query) => {
       const a = norm(text), b = norm(query);
@@ -13416,45 +13442,17 @@ async function buildAnnotatedReferenceDifferenceImage({
       return hit ? Math.min(75, 40 + hit * 15) : 0;
     };
 
-    function findFieldRegion(field, preferredText='') {
-      const candidates = [];
-      const patterns = fieldPatterns[field] || [];
-      const preferredNorm = norm(preferredText);
-      for (const item of regions) {
-        const text = String(item.text || '');
-        const t = norm(text);
-        let score = regionTextScore(text, preferredText);
-        if (patterns.some(re => re.test(t))) score += 55;
-        if (preferredNorm && t === preferredNorm) score += 70;
-        if (field === 'amount' && /\d/.test(text)) score += 5;
-        if (score > 0) {
-          const b = boxOf(item);
-          if (b && b.x2 > b.x1 && b.y2 > b.y1) candidates.push({score, box:b, text});
-        }
-      }
-      candidates.sort((a,b)=>b.score-a.score || a.box.y1-b.box.y1);
-      return candidates[0]?.box || null;
-    }
-
-    // V24: bank-specific/generic labels are localized by their actual OCR label
-    // text instead of relying on a hard-coded field vocabulary. This lets the
-    // annotation layer mark fields such as DOKÜMAN NUMARASI, REFERANS NUMARASI,
-    // ETTN and SENARYO/DEKONT TİPİ even when they are not canonical fields.
     function findExactLabelRegion(labelText='') {
       const q = norm(labelText);
       if (!q) return null;
-      const candidates=[];
+      const candidates = [];
       for (const item of regions) {
-        const text=String(item.text||'');
-        const t=norm(text);
+        const t = norm(item.text || '');
         if (!t) continue;
-        let score=0;
-        if (t===q) score=120;
-        else if (t.includes(q) || q.includes(t)) score=95;
-        else score=regionTextScore(text,labelText);
-        if (score<75) continue;
-        const b=boxOf(item);
-        if (b && b.x2>b.x1 && b.y2>b.y1) candidates.push({score,box:b,text});
+        let score = t === q ? 130 : (t.includes(q) || q.includes(t) ? 100 : regionTextScore(item.text,labelText));
+        if (score < 75) continue;
+        const b = boxOf(item);
+        if (b) candidates.push({score,box:b,text:item.text});
       }
       candidates.sort((a,b)=>b.score-a.score || a.box.y1-b.box.y1);
       return candidates[0]?.box || null;
@@ -13462,19 +13460,29 @@ async function buildAnnotatedReferenceDifferenceImage({
 
     function findValueNearLabel(labelBox, labelText='') {
       if (!labelBox) return null;
-      const q=norm(labelText);
-      const candidates=[];
+      const q = norm(labelText);
+      const lc = (labelBox.y1 + labelBox.y2) / 2;
+      const lh = Math.max(1,labelBox.y2-labelBox.y1);
+      const candidates = [];
+
       for (const item of regions) {
-        const b=boxOf(item);
+        const b = boxOf(item);
         if (!b) continue;
-        const t=norm(item.text||'');
-        if (!t || (q && t===q)) continue;
-        const sameBand=Math.abs(((b.y1+b.y2)/2)-((labelBox.y1+labelBox.y2)/2)) <= Math.max(18,(labelBox.y2-labelBox.y1)*1.8);
-        const toRight=b.x1>=labelBox.x1-Math.max(10,(labelBox.x2-labelBox.x1)*0.25);
-        if (!sameBand || !toRight) continue;
-        const gap=b.x1-labelBox.x2;
-        if (gap>Math.max(900,labelBox.x2-labelBox.x1+900)) continue;
-        candidates.push({score:100-Math.min(90,Math.max(0,gap)/10),box:b,text:item.text});
+        const t = norm(item.text || '');
+        if (!t || (q && t === q)) continue;
+
+        const yc = (b.y1+b.y2)/2;
+        const sameRow = Math.abs(yc-lc) <= Math.max(12, lh*1.75);
+        const rightSide = b.x1 >= labelBox.x2 - Math.max(6, lh*0.5);
+        if (!sameRow || !rightSide) continue;
+
+        const gap = Math.max(0,b.x1-labelBox.x2);
+        // Prefer the closest OCR item on the same row, but reject an item that
+        // is implausibly far away.
+        if (gap > Math.max(450, W*0.55)) continue;
+        const valueLike = /[0-9A-Za-zÇĞİÖŞÜçğıöşü]/.test(String(item.text||''));
+        const score = (valueLike ? 40 : 0) + 100 - Math.min(90,gap/8);
+        candidates.push({score,box:b,text:item.text});
       }
       candidates.sort((a,b)=>b.score-a.score);
       return candidates[0]?.box || null;
@@ -13484,101 +13492,101 @@ async function buildAnnotatedReferenceDifferenceImage({
     const gapMarkers = [];
     const seenBox = new Set();
 
-    // 1) Local crop findings already carry exact target boxes.
+    // 1) Exact target boxes emitted by local forensic comparison.
     for (const row of (referenceLocalCrop?.findings || [])) {
-      const b = row?.targetBox && boxOf({region:row.targetBox});
+      const b = boxOf(row?.targetBox);
       if (!b) continue;
-      const key = `box|${row.field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      const key = `local|${row.field||''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
-      boxes.push({box:b, label:fieldLabels[row.field] || row.field, source:'local-crop'});
+      boxes.push({
+        box:b,
+        label:row.field || 'lokal fark',
+        source:'local-crop'
+      });
     }
 
-    // 2) Strong Azure semantic gaps: mark both anchors and the blank interval.
+    // 2) Azure: mark ONLY the abnormal vertical gap. Do not draw boxes around
+    // the before/after labels because those labels are not themselves the anomaly.
     for (const row of (azureReferenceGeometry?.strongAnomalies || []).slice(0,4)) {
-      const before = findFieldRegion(row.beforeField, row.beforeLabel);
-      const after = findFieldRegion(row.afterField, row.afterLabel);
+      const before = findExactLabelRegion(row.beforeLabel) || null;
+      const after = findExactLabelRegion(row.afterLabel) || null;
       if (!before || !after) continue;
-      boxes.push({box:before, label:row.beforeLabel, source:'azure-anchor'});
-      boxes.push({box:after, label:row.afterLabel, source:'azure-anchor'});
+
       const top = Math.min(before.y2, after.y2);
       const bottom = Math.max(before.y1, after.y1);
-      if (bottom - top >= Math.max(8, H*0.01)) {
+      const x1 = Math.max(0, Math.min(before.x1, after.x1) - Math.round(W*0.008));
+      const x2 = Math.min(W, Math.max(before.x2, after.x2) + Math.round(W*0.008));
+      if (bottom-top >= Math.max(8,H*0.01)) {
         gapMarkers.push({
-          x1: Math.max(0, Math.min(before.x1, after.x1) - Math.round(W*0.01)),
-          x2: Math.min(W, Math.max(before.x2, after.x2) + Math.round(W*0.01)),
-          y1: top,
-          y2: bottom,
-          label: `${row.beforeLabel} ↔ ${row.afterLabel}`
+          x1,x2,y1:top,y2:bottom,
+          label:`${row.beforeLabel} ↔ ${row.afterLabel}`,
+          source:'azure-gap'
         });
       }
     }
 
-    // 3) Typography findings: locate the corresponding field label/value in OCR.
-    for (const row of (referenceForensics?.characterFindings || []).slice(0,12)) {
+    // 3) Typography: FIRST choice is the exact targetValueBox emitted by the
+    // finding itself. This guarantees that the red box follows the evidence.
+    // SECOND choice is an OCR value region resolved from the exact label.
+    for (const row of (referenceForensics?.characterFindings || []).slice(0,20)) {
+      let b = boxOf(row?.targetValueBox || row?.targetBox);
+
+      if (!b) {
+        const labelText = row?.targetLabelText || row?.labelText || '';
+        const labelBox = findExactLabelRegion(labelText);
+        b = findValueNearLabel(labelBox,labelText);
+      }
+
+      // V25: NEVER fall back to the label itself. If the value ROI cannot be
+      // located, omit the annotation rather than pointing at the wrong place.
+      if (!b) continue;
+
       const field = String(row?.field || '').replace(/:value$/i,'');
-      const preferred = row?.labelText || row?.targetLabelText || row?.targetText || fieldLabels[field] || '';
-      let box = findFieldRegion(field, preferred);
-      // Generic V23 fields do not have a hard-coded pattern; use the actual label.
-      if (!box) box = findExactLabelRegion(preferred);
-      if (!box) continue;
-      const key = `tp|${field}|${box.x1}|${box.y1}`;
+      const key = `tp-value|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
-      boxes.push({box, label:preferred || fieldLabels[field] || field, source:'typography'});
-      // V24: when the finding is a value style substitution, also mark the value
-      // immediately to the right of the label when OCR exposes it as a separate line/word.
-      const valueBox=findValueNearLabel(box,preferred);
-      if (valueBox) {
-        const vkey=`tp-value|${field}|${valueBox.x1}|${valueBox.y1}`;
-        if (!seenBox.has(vkey)) {
-          seenBox.add(vkey);
-          boxes.push({box:valueBox,label:`${preferred || field} değeri`,source:'typography-value'});
-        }
-      }
+      boxes.push({
+        box:b,
+        label:row?.labelText || row?.targetLabelText || field || 'tipografi farkı',
+        source:'typography-value'
+      });
     }
 
-    // 4) If the human report has a field finding not covered above, add a best-effort box.
-    // V24 also handles arbitrary bank-specific titles directly from the report text.
-    const titleToField = Object.fromEntries(Object.entries(fieldLabels).map(([k,v])=>[v,k]));
-    for (const row of humanReport.findings || []) {
-      const title = norm(row?.title || '');
-      const field = titleToField[title];
-      let box = field ? findFieldRegion(field, fieldLabels[field]) : null;
-      if (!box && row?.title) box = findExactLabelRegion(row.title);
-      if (!box) continue;
-      const key = `fallback|${title}|${box.x1}|${box.y1}`;
-      if (seenBox.has(key)) continue;
-      seenBox.add(key);
-      boxes.push({box, label:row.title || fieldLabels[field] || field, source:'fallback'});
-    }
+    // 4) Human-readable report items are intentionally NOT used as a generic
+    // annotation fallback. A report title alone is not evidence of a precise
+    // target location. This prevents the previous "wrong place" red boxes.
 
     if (!boxes.length && !gapMarkers.length) return null;
 
-    const esc = (v) => String(v ?? '')
-      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-      .replace(/"/g,'&quot;');
-
     const sw = Math.max(3, Math.round(Math.min(W,H)*0.004));
     const parts = [];
+
     for (const item of boxes.slice(0,14)) {
       const b=item.box;
-      const pad=Math.max(4,Math.round(Math.min(W,H)*0.006));
+      const pad=Math.max(4,Math.round(Math.min(W,H)*0.005));
       const x=Math.max(0,b.x1-pad), y=Math.max(0,b.y1-pad);
-      const w=Math.min(W-x,(b.x2-b.x1)+pad*2), h=Math.min(H-y,(b.y2-b.y1)+pad*2);
-      parts.push(`<rect x="${x}" y="${y}" width="${Math.max(2,w)}" height="${Math.max(2,h)}" rx="4" fill="none" stroke="#ff1f1f" stroke-width="${sw}"/>`);
-    }
-    for (const g of gapMarkers.slice(0,4)) {
-      const h=Math.max(4,g.y2-g.y1);
-      parts.push(`<rect x="${g.x1}" y="${g.y1}" width="${Math.max(2,g.x2-g.x1)}" height="${h}" rx="6" fill="#ff1f1f" fill-opacity="0.12" stroke="#ff1f1f" stroke-width="${sw}" stroke-dasharray="${sw*3} ${sw*2}"/>`);
-      parts.push(`<line x1="${g.x1}" y1="${g.y1}" x2="${g.x2}" y2="${g.y1}" stroke="#ff1f1f" stroke-width="${sw}"/>`);
-      parts.push(`<line x1="${g.x1}" y1="${g.y2}" x2="${g.x2}" y2="${g.y2}" stroke="#ff1f1f" stroke-width="${sw}"/>`);
+      const w=Math.min(W-x,(b.x2-b.x1)+pad*2);
+      const h=Math.min(H-y,(b.y2-b.y1)+pad*2);
+      parts.push(
+        `<rect x="${x}" y="${y}" width="${Math.max(2,w)}" height="${Math.max(2,h)}" rx="4" fill="none" stroke="#ff1f1f" stroke-width="${sw}"/>`
+      );
     }
 
-    const svg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${parts.join('')}</svg>`);
+    for (const g of gapMarkers.slice(0,4)) {
+      const h=Math.max(4,g.y2-g.y1);
+      parts.push(
+        `<rect x="${g.x1}" y="${g.y1}" width="${Math.max(2,g.x2-g.x1)}" height="${h}" rx="6" fill="#ff1f1f" fill-opacity="0.12" stroke="#ff1f1f" stroke-width="${sw}" stroke-dasharray="${sw*3} ${sw*2}"/>`
+      );
+    }
+
+    const svg = Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${parts.join('')}</svg>`
+    );
+
     const annotated = await sharp(original)
-      .composite([{input:svg, left:0, top:0}])
-      .jpeg({quality:92, mozjpeg:true})
+      .composite([{input:svg,left:0,top:0}])
+      .jpeg({quality:92,mozjpeg:true})
       .toBuffer();
 
     return {
@@ -13587,11 +13595,11 @@ async function buildAnnotatedReferenceDifferenceImage({
       imageBase64:annotated.toString('base64'),
       boxCount:boxes.length,
       gapMarkerCount:gapMarkers.length,
-      boxes:boxes.map(x=>({label:x.label, source:x.source, ...x.box})).slice(0,20),
+      boxes:boxes.map(x=>({label:x.label,source:x.source,...x.box})).slice(0,20),
       gaps:gapMarkers.slice(0,8)
     };
   } catch (error) {
-    console.warn('REFERENCE DIFFERENCE ANNOTATOR HATASI:', error?.message || error);
+    console.warn('REFERENCE DIFFERENCE ANNOTATOR V25 HATASI:', error?.message || error);
     return null;
   }
 }
