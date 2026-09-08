@@ -11898,7 +11898,7 @@ async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo, t
     // coordinate on the page; it is the semantic field profile extracted from
     // the trusted reference itself.
     const refProfile = await extractReferenceTemplateProfile(referenceInfo.path, normalizeBank(bank || referenceInfo.bank || ''));
-    const fields = refProfile?.fields || {};
+    let fields = refProfile?.fields || {};
     if (!Object.keys(fields).length) return null;
 
     // V39: choose the trusted reference that belongs to the SAME dekont family.
@@ -12209,8 +12209,8 @@ referenceVisualAdjudication = null;
 if ((type === 'image' || type === 'pdf') && bank && reference) {
   try {
     referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference,targetOCR:paddleImageOCR,bank});
-    console.log('REFERENCE VISUAL ADJUDICATOR V38:',JSON.stringify(referenceVisualAdjudication));
-  } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V34 HATASI:',e?.message||e); }
+    console.log('REFERENCE VISUAL ADJUDICATOR V39:',JSON.stringify(referenceVisualAdjudication));
+  } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V39 HATASI:',e?.message||e); }
 }
 
 // =====================================================
@@ -14666,7 +14666,7 @@ async function buildAnnotatedReferenceDifferenceImage({
     // 4) V29 confirmed findings: use the exact evidence-linked targetBox returned
     // by the field-level Terra inspection. This is the only AI annotation source.
     if (useV29ConfirmedFindings) {
-      for (const row of (finalAdjudication.findings || []).slice(0,8)) {
+      for (const row of (finalAdjudication?.findings || []).slice(0,8)) {
         const b = boxOf(row?.targetBox);
         if (!b) continue;
         const key = `terra-v29|${row?.field || ''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
@@ -14687,7 +14687,7 @@ async function buildAnnotatedReferenceDifferenceImage({
         'Sorgu Numarası':'Sorgu Numarası', 'Toplam Tutar':'Toplam Tutar', 'İşlem Türü':'İşlem Türü',
         'IBAN':'IBAN', 'Alıcı İsim/Unvan':'Alıcı İsim/Unvan'
       };
-      for (const row of (finalAdjudication.findings || []).slice(0,8)) {
+      for (const row of (finalAdjudication?.findings || []).slice(0,8)) {
         const label = fieldAliases[String(row?.field || '').trim()] || String(row?.field || '').trim();
         if (!label) continue;
         const labelBox = findExactLabelRegion(label);
