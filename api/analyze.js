@@ -12022,7 +12022,7 @@ Kutuyu mümkün olduğunca yalnızca farklı görünen yazı/değer/bölüm üze
 // V34 is the sole user-facing reference comparison. Legacy forensic engines
 // remain available for internal diagnostics, but their noisy individual field
 // messages do not override the direct reference comparison.
-let referenceVisualAdjudication = null;
+referenceVisualAdjudication = null;
 if ((type === 'image' || type === 'pdf') && bank && reference) {
   try {
     referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference});
