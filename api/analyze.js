@@ -11863,21 +11863,32 @@ try {
 // reference as documents, not as independent OCR fields. AI is used only to
 // interpret visible differences; OCR/Sharp remain supporting tools.
 async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo, targetOCR = null, bank = null }) {
-  // V42 — ALIGNED MULTI-ZONE REFERENCE COMPARISON
-  // The previous whole-page judge saw the two documents, but it effectively asked
-  // one model pass to find tiny glyph/field differences in a large image. That is
-  // too easy to miss. V42 therefore compares the same normalized document zones
-  // side-by-side, then performs one independent verification pass over the actual
-  // candidate crops. The AI is used to interpret visual evidence, not OCR guesses.
-  if (!targetPath || !referenceInfo?.path || !openai || !sharp) return null;
-
+  /*
+   * V43 — FOCUSED REFERENCE COMPARISON
+   *
+   * V42 problem:
+   *   - 18 images were sent in one giant visual request.
+   *   - The model returned candidateCount=0 even though the deterministic
+   *     typography engine had strong localized evidence.
+   *   - The normalized zone coordinates were treated as if target/reference
+   *     were perfectly aligned.
+   *
+   * V43:
+   *   - Compare ONE semantic page zone at a time (exactly 2 images/request).
+   *   - Ask the visual model to reason about small translation/scale differences
+   *     inside the pair instead of assuming pixel-perfect alignment.
+   *   - Keep the request focused on rendering differences, not OCR content.
+   *   - Run the eight zone reviews concurrently.
+   *   - Run a separate adjudication pass over the resulting candidates.
+   *   - Preserve target-relative normalized boxes for the annotator.
+   */
   try {
+    if (!referenceInfo?.path || !targetPath) return null;
+
     const loadImage = async (filePath) => {
-      const ext = path.extname(String(filePath)).toLowerCase();
-      if (ext === '.pdf') {
-        const raw = await fs.readFile(filePath);
-        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
-        const rendered = await renderPdfPagePng(pdf, 1, 2.8);
+      const ext = path.extname(filePath).toLowerCase();
+      if (ext === ".pdf") {
+        const rendered = await renderPdfPagePng(filePath, 1, 2.8);
         return rendered?.buffer || null;
       }
       return fs.readFile(filePath);
@@ -11893,126 +11904,254 @@ async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo, t
       sharp(targetBuffer).metadata(),
       sharp(referenceBuffer).metadata()
     ]);
+
     const tw = Number(targetMeta.width) || 0;
     const th = Number(targetMeta.height) || 0;
     const rw = Number(referenceMeta.width) || 0;
     const rh = Number(referenceMeta.height) || 0;
     if (tw < 400 || th < 400 || rw < 400 || rh < 400) return null;
 
-    // The document is divided into overlapping semantic-neutral zones. The
-    // overlap prevents a field crossing a zone boundary from disappearing.
-    // Coordinates are normalized to the page, so different pixel dimensions are OK.
+    // Overlapping zones deliberately cover the whole document.  They are not
+    // semantic fields; they are visual inspection windows.
     const zones = [
-      { id:'header',       label:'Üst bölüm',       x:0.00, y:0.00, w:1.00, h:0.24 },
-      { id:'left_upper',   label:'Sol üst blok',   x:0.00, y:0.18, w:0.54, h:0.25 },
-      { id:'right_upper',  label:'Sağ üst blok',   x:0.46, y:0.18, w:0.54, h:0.25 },
-      { id:'left_middle',  label:'Sol orta blok',  x:0.00, y:0.36, w:0.54, h:0.25 },
-      { id:'right_middle', label:'Sağ orta blok',  x:0.46, y:0.36, w:0.54, h:0.25 },
-      { id:'left_lower',   label:'Sol alt blok',   x:0.00, y:0.55, w:0.54, h:0.25 },
-      { id:'right_lower',  label:'Sağ alt blok',   x:0.46, y:0.55, w:0.54, h:0.25 },
-      { id:'footer',       label:'Alt bölüm',      x:0.00, y:0.73, w:1.00, h:0.27 }
+      { id:"header",       label:"Üst bölüm",       x:0.00, y:0.00, w:1.00, h:0.25 },
+      { id:"left_upper",   label:"Sol üst blok",   x:0.00, y:0.16, w:0.56, h:0.28 },
+      { id:"right_upper",  label:"Sağ üst blok",   x:0.44, y:0.16, w:0.56, h:0.28 },
+      { id:"left_middle",  label:"Sol orta blok",  x:0.00, y:0.34, w:0.56, h:0.30 },
+      { id:"right_middle", label:"Sağ orta blok",  x:0.44, y:0.34, w:0.56, h:0.30 },
+      { id:"left_lower",   label:"Sol alt blok",   x:0.00, y:0.54, w:0.56, h:0.27 },
+      { id:"right_lower",  label:"Sağ alt blok",   x:0.44, y:0.54, w:0.56, h:0.27 },
+      { id:"footer",       label:"Alt bölüm",      x:0.00, y:0.70, w:1.00, h:0.30 }
     ];
 
-    const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
-
-    const cropZone = async (buffer, meta, zone, width = 1700) => {
+    const cropZone = async (buffer, meta, zone, width = 1800) => {
       const W = Number(meta.width) || 1;
       const H = Number(meta.height) || 1;
       const left = Math.max(0, Math.min(W - 2, Math.round(zone.x * W)));
       const top = Math.max(0, Math.min(H - 2, Math.round(zone.y * H)));
       const right = Math.max(left + 2, Math.min(W, Math.round((zone.x + zone.w) * W)));
       const bottom = Math.max(top + 2, Math.min(H, Math.round((zone.y + zone.h) * H)));
+
       const out = await sharp(buffer)
-        .extract({ left, top, width:right-left, height:bottom-top })
-        .resize({ width, withoutEnlargement:false, fit:'contain', background:{r:255,g:255,b:255,alpha:1} })
-        .jpeg({ quality:97, mozjpeg:true })
+        .extract({ left, top, width: right - left, height: bottom - top })
+        .resize({
+          width,
+          withoutEnlargement: false,
+          fit: "contain",
+          background: { r:255, g:255, b:255, alpha:1 }
+        })
+        .jpeg({ quality: 98, mozjpeg: true })
         .toBuffer();
-      return `data:image/jpeg;base64,${out.toString('base64')}`;
+
+      return `data:image/jpeg;base64,${out.toString("base64")}`;
     };
-
-    const fullTarget = await cropZone(targetBuffer, targetMeta, {x:0,y:0,w:1,h:1}, 1900);
-    const fullReference = await cropZone(referenceBuffer, referenceMeta, {x:0,y:0,w:1,h:1}, 1900);
-
-    // Pass 1: all zones in one structured visual review. Each finding is local to
-    // one zone, which gives the model enough pixels to inspect typography while
-    // still forcing complete page coverage.
-    const zoneContent = [
-      { type:'input_text', text:`VERIFYDOC V42 — ORİJİNAL REFERANS vs HEDEF DEKONT\n\nBANKA: ${bank || 'bilinmiyor'}\n\nREFERENCE = bankanın güvenilir/orijinal dekontu.\nTARGET = incelenen dekont.\n\nGÖREV: TARGET ile REFERENCE'ı görsel olarak karşılaştır. OCR metnini karar kaynağı yapma. Önce belgenin üretim biçimini, sonra alanları ve karakterleri incele. Bu bir sahtecilik kararı değil; yalnızca referanstan somut görsel sapmaları bulma görevidir.\n\nMUTLAKA İNCELE:\n- header ve e-Dekont/başlık bölümü\n- sol taraftaki tüm alanlar: gönderen hesap, isim, IBAN, tutar, ücret, açıklama vb.\n- sağ taraftaki tüm alanlar: alıcı hesap, sorgu, toplam tutar, işlem türü vb.\n- alt bölüm/footer\n- aynı satır içindeki rakam ve harflerin font/stroke yapısı\n- karakter genişliği/yüksekliği, kalınlık, koyuluk, baseline ve spacing\n- birden fazla alanın aynı blok içinde farklı render edilmesi\n- silme/yeniden yazma, ekleme, lokal yapıştırma veya farklı raster üretimi belirtileri\n\nŞUNLARI FARK SAYMA:\n- fotoğraf açısı/perspektif\n- ışık, gölge, ekran yansıması\n- JPEG sıkıştırması\n- çözünürlük/ölçek\n- hafif bulanıklık veya tarama farkı\n- tüm belgeye yayılan küçük anti-aliasing farkları\n- tek başına Türkçe diakritik raster farkları\n\nİÇERİK KURALI: Sadece metnin farklı olması tek başına bulgu değildir. Ancak bir alanın yeni değeri referansın doğal belge renderından açıkça farklı font/stroke/raster ile üretilmişse bunu görsel üretim farkı olarak bildir.\n\nEN ÖNEMLİ KURAL: Bir farkı ancak TARGET ve REFERENCE görüntülerinde açıkça aynı bölgeye karşılık gelen somut bir görsel kanıt görüyorsan yaz. Tahmin etme. Emin değilsen atla.\n\nHer bulgu için o zone içindeki lokal targetBox ver. Kutuyu mümkün olduğunca SADECE farklı değer/alan üzerinde tut; tüm zone'u kutulama. Aynı büyük bloktaki birbirinin tekrarı olan farkları tek bulguda birleştir.\n\nTam sayfa görseli de genel hizalama ve belge tipini anlamak için aşağıda veriyorum.` },
-      { type:'input_text', text:'REFERENCE — TAM SAYFA:' },
-      { type:'input_image', image_url:fullReference, detail:'high' },
-      { type:'input_text', text:'TARGET — TAM SAYFA:' },
-      { type:'input_image', image_url:fullTarget, detail:'high' }
-    ];
-
-    for (const z of zones) {
-      const [r, t] = await Promise.all([
-        cropZone(referenceBuffer, referenceMeta, z, 1700),
-        cropZone(targetBuffer, targetMeta, z, 1700)
-      ]);
-      zoneContent.push({ type:'input_text', text:`\n=== ${z.id} / ${z.label} ===\nREFERENCE BU ZONE:` });
-      zoneContent.push({ type:'input_image', image_url:r, detail:'high' });
-      zoneContent.push({ type:'input_text', text:'TARGET AYNI ZONE:' });
-      zoneContent.push({ type:'input_image', image_url:t, detail:'high' });
-    }
 
     const schema = {
-      type:'object',
+      type:"object",
       properties:{
-        findings:{type:'array',maxItems:16,items:{type:'object',properties:{
-          zoneId:{type:'string'},
-          field:{type:'string'},
-          issueType:{type:'string',enum:['content','typography','layout','spacing','local-render','mixed']},
-          confidence:{type:'integer',minimum:0,maximum:100},
-          evidence:{type:'string'},
-          targetBox:{type:'object',properties:{x:{type:'number'},y:{type:'number'},w:{type:'number'},h:{type:'number'}},required:['x','y','w','h'],additionalProperties:false}
-        },required:['zoneId','field','issueType','confidence','evidence','targetBox'],additionalProperties:false}}
+        findings:{
+          type:"array",
+          maxItems:6,
+          items:{
+            type:"object",
+            properties:{
+              field:{type:"string"},
+              issueType:{
+                type:"string",
+                enum:["content","typography","layout","spacing","local-render","mixed"]
+              },
+              confidence:{type:"integer",minimum:0,maximum:100},
+              evidence:{type:"string"},
+              // Coordinates are relative to THIS zone.
+              targetBox:{
+                type:"object",
+                properties:{
+                  x:{type:"number"}, y:{type:"number"},
+                  w:{type:"number"}, h:{type:"number"}
+                },
+                required:["x","y","w","h"],
+                additionalProperties:false
+              }
+            },
+            required:["field","issueType","confidence","evidence","targetBox"],
+            additionalProperties:false
+          }
+        }
       },
-      required:['findings'],additionalProperties:false
+      required:["findings"],
+      additionalProperties:false
     };
 
-    let firstPass = null;
-    try {
-      const response = await openai.responses.create({
-        model:'gpt-5.6-terra',
-        input:[{role:'user',content:zoneContent}],
-        text:{format:{type:'json_schema',name:'v42_zone_reference_compare',strict:true,schema}}
-      });
-      firstPass = parseAIResponse(response?.output_text || '');
-    } catch (e) {
-      console.warn('V42 ZONE REFERANS HAKEM HATASI:', e?.message || e);
+    const reviewZone = async (zone) => {
+      try {
+        const [referenceImage, targetImage] = await Promise.all([
+          cropZone(referenceBuffer, referenceMeta, zone, 1800),
+          cropZone(targetBuffer, targetMeta, zone, 1800)
+        ]);
+
+        const content = [
+          {
+            type:"input_text",
+            text:`VERIFYDOC V43 — REFERANS BÖLGE KARŞILAŞTIRMASI
+
+BANKA: ${bank || "bilinmiyor"}
+
+REFERENCE = bankanın güvenilir/orijinal dekontu.
+TARGET = incelenen dekont.
+
+Bu istekte yalnızca ${zone.label} bölgesini inceliyorsun.
+
+AMAÇ:
+TARGET ile REFERENCE arasındaki GERÇEK belge üretim farklarını bulmak.
+Bu bir OCR görevi değildir. OCR'daki yazı farklılığına değil, görüntüdeki
+yazının/alanın nasıl üretildiğine bak.
+
+ÖNCE iki görüntüde aynı belge bölgesini zihinsel olarak hizala.
+Birkaç piksel yatay/dikey kayma veya küçük ölçek farkı NORMALDİR.
+Bunları fark olarak raporlama.
+
+ÖZELLİKLE ARA:
+- aynı alanın fontunun değişmesi
+- harf/rakam şeklinin değişmesi
+- aynı sayı içinde tek tek rakamların farklı font/stroke üretimi
+- yazının kalınlığı/koyuluğu/silikliği
+- karakter genişliği ve aralığı
+- baseline ve satır hizası
+- aynı bloktaki değerlerin diğer değerlerden farklı raster üretilmesi
+- bir alanın eklenmiş, silinmiş veya yeniden yazılmış görünmesi
+- gerçek layout/spacing değişikliği
+- lokal yapıştırma/yeniden üretim izleri
+
+ŞUNLARI RAPORLAMA:
+- fotoğraf perspektifi
+- ışık/gölge
+- ekran yansıması
+- JPEG sıkıştırması
+- çözünürlük farkı
+- hafif blur/anti-aliasing
+- tüm sayfaya yayılan küçük kalite farkları
+- Türkçe karakterlerin tek başına raster farkı
+- yalnızca değer/metin farklı diye content farkı
+
+ÇOK ÖNEMLİ:
+Bir alanın içeriği farklı olsa bile bu tek başına sahtecilik bulgusu değildir.
+Ancak o alanın TARGET'taki görsel üretimi REFERENCE'tan açıkça farklıysa
+typography/local-render/layout bulgusu üret.
+
+Aynı büyük değişikliği birkaç ayrı bulguya bölme.
+Örneğin bir sol blokta birkaç değer aynı farklı fontla üretilmişse bunu
+tek güçlü bulguda "Sol işlem bilgileri / değer alanları" olarak birleştir.
+
+Bulgu yoksa findings boş olsun.
+Tahmin etme.
+
+targetBox yalnızca farklı görünen TARGET alanını kapsasın.
+Koordinatlar bu zone görüntüsüne göre 0..1 arasındadır.`
+          },
+          {type:"input_text", text:"REFERENCE:"},
+          {type:"input_image", image_url:referenceImage, detail:"high"},
+          {type:"input_text", text:"TARGET:"},
+          {type:"input_image", image_url:targetImage, detail:"high"}
+        ];
+
+        const response = await openai.responses.create({
+          model:"gpt-5.6-terra",
+          input:[{role:"user",content}],
+          text:{
+            format:{
+              type:"json_schema",
+              name:`v43_zone_${zone.id.replace(/[^a-z0-9_]/gi,"_")}`,
+              strict:true,
+              schema
+            }
+          }
+        });
+
+        const parsed = parseAIResponse(response?.output_text || "");
+        return {
+          zone,
+          findings:Array.isArray(parsed?.findings) ? parsed.findings : []
+        };
+      } catch (error) {
+        console.warn(`V43 ZONE ${zone.id} HATASI:`, error?.message || error);
+        return {zone, findings:[]};
+      }
+    };
+
+    // Eight small visual comparisons are much more reliable than one huge
+    // 18-image attention-heavy request.
+    const zoneResults = await Promise.all(zones.map(reviewZone));
+
+    const candidates = [];
+    for (const zr of zoneResults) {
+      const z = zr.zone;
+      for (const f of zr.findings) {
+        const b = f?.targetBox;
+        const lx = Number(b?.x), ly = Number(b?.y);
+        const lw = Number(b?.w), lh = Number(b?.h);
+
+        if (![lx,ly,lw,lh].every(Number.isFinite)) continue;
+        if (lw <= 0 || lh <= 0 || lx < 0 || ly < 0 || lx + lw > 1.001 || ly + lh > 1.001) continue;
+
+        const confidence = Number(f.confidence) || 0;
+        const evidence = String(f.evidence || "").trim();
+
+        // Avoid weak visual guesses.  78 is intentionally lower than the
+        // final verification threshold because the second pass decides.
+        if (confidence < 78 || evidence.length < 20) continue;
+
+        const gx = z.x + lx * z.w;
+        const gy = z.y + ly * z.h;
+        const gw = Math.min(lw * z.w, 1 - gx);
+        const gh = Math.min(lh * z.h, 1 - gy);
+
+        candidates.push({
+          zoneId:z.id,
+          zoneLabel:z.label,
+          field:String(f.field || "Belge bölümü"),
+          issueType:String(f.issueType || "mixed"),
+          confidence,
+          evidence,
+          targetBox:{
+            x:Math.max(0,Math.min(1,gx)),
+            y:Math.max(0,Math.min(1,gy)),
+            w:Math.max(0,Math.min(gw,1)),
+            h:Math.max(0,Math.min(gh,1))
+          }
+        });
+      }
     }
 
-    const zoneMap = new Map(zones.map(z => [z.id, z]));
-    const candidates = (Array.isArray(firstPass?.findings) ? firstPass.findings : [])
-      .map(f => {
-        const z = zoneMap.get(String(f.zoneId || ''));
-        const b = f?.targetBox;
-        if (!z || !b) return null;
-        const lx=Number(b.x), ly=Number(b.y), lw=Number(b.w), lh=Number(b.h);
-        if (![lx,ly,lw,lh].every(Number.isFinite) || lw<=0 || lh<=0) return null;
-        if (lx<0 || ly<0 || lx+lw>1.001 || ly+lh>1.001) return null;
-        return {
-          ...f,
-          confidence:Number(f.confidence)||0,
-          zone:z,
-          localBox:{x:clamp01(lx),y:clamp01(ly),w:Math.min(lw,1-lx),h:Math.min(lh,1-ly)},
-          targetBox:{
-            x:clamp01(z.x + lx*z.w),
-            y:clamp01(z.y + ly*z.h),
-            w:Math.min(lw*z.w,1-(z.x+lx*z.w)),
-            h:Math.min(lh*z.h,1-(z.y+ly*z.h))
-          }
-        };
-      })
-      .filter(Boolean)
-      .filter(f => f.confidence >= 70 && String(f.evidence||'').trim().length >= 20)
-      .sort((a,b)=>b.confidence-a.confidence)
-      .slice(0,10);
+    // Deduplicate overlapping candidates before verification.
+    candidates.sort((a,b)=>b.confidence-a.confidence);
+    const uniqueCandidates = [];
+    for (const c of candidates) {
+      const b=c.targetBox;
+      const duplicate=uniqueCandidates.some(d=>{
+        const db=d.targetBox;
+        const ix=Math.max(
+          0,
+          Math.min(b.x+b.w,db.x+db.w)-Math.max(b.x,db.x)
+        );
+        const iy=Math.max(
+          0,
+          Math.min(b.y+b.h,db.y+db.h)-Math.max(b.y,db.y)
+        );
+        const inter=ix*iy;
+        const minArea=Math.min(b.w*b.h,db.w*db.h);
+        const sameCenter=
+          Math.abs((b.x+b.w/2)-(db.x+db.w/2))<0.025 &&
+          Math.abs((b.y+b.h/2)-(db.y+db.h/2))<0.020;
+        return (minArea>0 && inter/minArea>0.50) || sameCenter;
+      });
+      if (!duplicate) uniqueCandidates.push(c);
+      if (uniqueCandidates.length >= 18) break;
+    }
 
-    if (!candidates.length) {
+    if (!uniqueCandidates.length) {
       return {
         available:true,
-        engine:'gpt-5.6-terra-aligned-zones-v42',
+        engine:"gpt-5.6-terra-focused-zones-v43",
         referenceFile:path.basename(referenceInfo.path),
         findingCount:0,
         findings:[],
@@ -12022,104 +12161,177 @@ async function runDirectReferenceDifferenceEngine({ targetPath, referenceInfo, t
       };
     }
 
-    // Pass 2: independent verification. Unlike V41, this does NOT crop the same
-    // raw normalized coordinate from the reference blindly. The verifier receives
-    // the full zone context plus the candidate's local region, so a slight layout
-    // shift cannot turn an unrelated reference area into evidence.
-    const verifyContent = [
-      {type:'input_text',text:`VERIFYDOC V42 — BAĞIMSIZ BULGU DOĞRULAMA\n\nAşağıdaki adaylar ilk görsel taramada bulundu. Her adayı TARGET ve REFERENCE bağlamında tekrar incele.\n\nSADECE açıkça görülen, lokal ve belge üretim biçimiyle açıklanabilecek farkları doğrula. Fotoğraf/perspektif/ışık/JPEG/ölçek farklarını reddet. Sadece metin içeriği farklı diye onaylama. Font, stroke, karakter geometrisi, spacing, baseline, alan yerleşimi veya lokal yeniden üretim farkı açıkça görünüyorsa onayla.\n\nBir aday zayıfsa confirm=false. Birbirinin tekrarı olan adayları onaylama.\n\nAdaylar:`}
-    ];
-
-    for (let i=0;i<candidates.length;i++) {
-      const c=candidates[i], z=c.zone, b=c.localBox;
-      // Give verifier a wider context crop than the proposed box, while retaining
-      // the original global zone pair. This is the key anti-misalignment change.
-      const padX=Math.min(0.12, Math.max(0.035,b.w*0.9));
-      const padY=Math.min(0.10, Math.max(0.045,b.h*1.6));
-      const cx=Math.max(0,b.x-padX), cy=Math.max(0,b.y-padY);
-      const cw=Math.min(1-cx,b.w+2*padX), ch=Math.min(1-cy,b.h+2*padY);
-      const ctxZone={x:z.x+cx*z.w,y:z.y+cy*z.h,w:Math.min(cw*z.w,1-(z.x+cx*z.w)),h:Math.min(ch*z.h,1-(z.y+cy*z.h))};
-      const [rc,tc]=await Promise.all([
-        cropZone(referenceBuffer,referenceMeta,ctxZone,1500),
-        cropZone(targetBuffer,targetMeta,ctxZone,1500)
-      ]);
-      verifyContent.push({type:'input_text',text:`\nCANDIDATE ${i+1}\nZone: ${z.label}\nAlan: ${String(c.field||'Belge bölümü')}\nİlk kanıt: ${String(c.evidence||'')}\nREFERENCE BAĞLAM:`});
-      verifyContent.push({type:'input_image',image_url:rc,detail:'high'});
-      verifyContent.push({type:'input_text',text:'TARGET BAĞLAM:'});
-      verifyContent.push({type:'input_image',image_url:tc,detail:'high'});
-    }
-
-    const verifySchema={
-      type:'object',
+    // Independent verification.  Each candidate gets a wider context window.
+    // The verifier is explicitly forbidden from accepting a difference caused
+    // only by alignment, photography or compression.
+    const verifySchema = {
+      type:"object",
       properties:{
-        results:{type:'array',maxItems:10,items:{type:'object',properties:{
-          candidateIndex:{type:'integer',minimum:1,maximum:10},
-          confirm:{type:'boolean'},
-          confidence:{type:'integer',minimum:0,maximum:100},
-          reason:{type:'string'}
-        },required:['candidateIndex','confirm','confidence','reason'],additionalProperties:false}}
+        results:{
+          type:"array",
+          maxItems:18,
+          items:{
+            type:"object",
+            properties:{
+              candidateIndex:{type:"integer",minimum:1,maximum:18},
+              confirm:{type:"boolean"},
+              confidence:{type:"integer",minimum:0,maximum:100},
+              reason:{type:"string"}
+            },
+            required:["candidateIndex","confirm","confidence","reason"],
+            additionalProperties:false
+          }
+        }
       },
-      required:['results'],additionalProperties:false
+      required:["results"],
+      additionalProperties:false
     };
 
-    let verifiedPass=null;
-    try {
-      const vr=await openai.responses.create({
-        model:'gpt-5.6-terra',
-        input:[{role:'user',content:verifyContent}],
-        text:{format:{type:'json_schema',name:'v42_verify_reference_candidates',strict:true,schema:verifySchema}}
-      });
-      verifiedPass=parseAIResponse(vr?.output_text||'');
-    } catch(e) {
-      console.warn('V42 BULGU TOPLU DOĞRULAMA HATASI:',e?.message||e);
+    const verifyTasks = uniqueCandidates.map(async (c, index) => {
+      try {
+        const padX=Math.min(0.10,Math.max(0.035,c.targetBox.w*1.25));
+        const padY=Math.min(0.09,Math.max(0.045,c.targetBox.h*1.8));
+
+        const cx=Math.max(0,c.targetBox.x-padX);
+        const cy=Math.max(0,c.targetBox.y-padY);
+        const cw=Math.min(1-cx,c.targetBox.w+2*padX);
+        const ch=Math.min(1-cy,c.targetBox.h+2*padY);
+
+        const contextZone={x:cx,y:cy,w:cw,h:ch};
+        const [referenceContext,targetContext]=await Promise.all([
+          cropZone(referenceBuffer,referenceMeta,contextZone,1500),
+          cropZone(targetBuffer,targetMeta,contextZone,1500)
+        ]);
+
+        return [
+          {type:"input_text",text:`ADAY ${index+1}
+Alan: ${c.field}
+İlk bulgu: ${c.evidence}
+
+Bu adayın gerçek bir referans farkı olup olmadığını bağımsız olarak kontrol et.
+TARGET ve REFERENCE aynı belgeye ait karşılık gelen bölge olarak düşün.
+Küçük kaymaları zihinsel olarak tolere et.
+
+ONAYLA ancak:
+- lokal bir görsel üretim farkı açıkça görülüyorsa,
+- fark font/rakam geometrisi/stroke/koyuluk/spacing/layout/yeniden üretim gibi
+  belgeye özgü bir nedene dayanıyorsa.
+
+REDDET:
+- yalnızca fotoğraf açısı/ışık/blur/JPEG/ölçek,
+- yalnızca OCR veya metin içeriği farkı,
+- tüm sayfaya yayılmış kalite farkı,
+- Türkçe diakritik farkı,
+- belirsiz veya gözle doğrulanamayan fark.
+
+Bu aday gerçekten görünür mü?`},
+          {type:"input_text",text:"REFERENCE BAĞLAM:"},
+          {type:"input_image",image_url:referenceContext,detail:"high"},
+          {type:"input_text",text:"TARGET BAĞLAM:"},
+          {type:"input_image",image_url:targetContext,detail:"high"}
+        ];
+      } catch (error) {
+        return null;
+      }
+    });
+
+    const verifyInputs = (await Promise.all(verifyTasks)).filter(Boolean);
+
+    const verified = [];
+    // Verify in batches of four to keep each request visually focused.
+    for (let offset=0; offset<verifyInputs.length; offset+=4) {
+      const batch = verifyInputs.slice(offset,offset+4);
+      const content=[
+        {
+          type:"input_text",
+          text:`VERIFYDOC V43 — BAĞIMSIZ REFERANS FARKI DOĞRULAMA
+
+Aşağıda ilk taramada bulunan adaylar var.
+Her adayın TARGET ve REFERENCE görüntüsünü karşılaştır.
+
+Amaç, SADECE gerçek ve lokal referans farklarını bırakmak.
+Bir aday fotoğraf kaynaklıysa veya yalnızca içerik farklıysa confirm=false.
+
+Aynı görsel farkı tekrar eden adayları onaylama.
+
+Sonuçları aday numarasıyla döndür.`
+        }
+      ];
+
+      for (let i=0;i<batch.length;i++) {
+        const item=batch[i];
+        content.push(...item);
+      }
+
+      try {
+        const vr=await openai.responses.create({
+          model:"gpt-5.6-terra",
+          input:[{role:"user",content}],
+          text:{
+            format:{
+              type:"json_schema",
+              name:`v43_verify_batch_${Math.floor(offset/4)+1}`,
+              strict:true,
+              schema:verifySchema
+            }
+          }
+        });
+
+        const parsed=parseAIResponse(vr?.output_text || "");
+        for (const r of (Array.isArray(parsed?.results)?parsed.results:[])) {
+          const localIndex=Number(r?.candidateIndex)-1;
+          const globalIndex=offset+localIndex;
+          const c=uniqueCandidates[globalIndex];
+          if (!c) continue;
+          if (r?.confirm!==true) continue;
+          if (Number(r?.confidence)<84) continue;
+
+          verified.push({
+            field:c.field,
+            issueType:c.issueType,
+            confidence:Number(r.confidence),
+            evidence:String(r.reason || c.evidence).trim(),
+            targetBox:c.targetBox
+          });
+        }
+      } catch(error) {
+        console.warn("V43 DOĞRULAMA BATCH HATASI:",error?.message || error);
+      }
     }
 
-    const verifiedResults=Array.isArray(verifiedPass?.results) ? verifiedPass.results : [];
-    const verified=[];
-    for (const r of verifiedResults) {
-      const idx=Number(r?.candidateIndex)-1;
-      const c=candidates[idx];
-      if (!c || r?.confirm!==true || Number(r?.confidence)<84) continue;
-      verified.push({
-        field:String(c.field||'Belge bölümü'),
-        issueType:String(c.issueType||'mixed'),
-        confidence:Number(r.confidence),
-        evidence:String(r.reason||c.evidence||'').trim(),
-        targetBox:c.targetBox
-      });
-    }
-
-    // Semantic/geometry deduplication: overlapping findings in the same area are
-    // merged, while distinct left/right blocks remain separate.
-    const dedup=[];
+    // Final spatial deduplication.
+    const finalFindings=[];
     for (const f of verified.sort((a,b)=>b.confidence-a.confidence)) {
       const b=f.targetBox;
-      const cx=Number(b.x)+Number(b.w)/2, cy=Number(b.y)+Number(b.h)/2;
-      const duplicate=dedup.some(d=>{
+      const duplicate=finalFindings.some(d=>{
         const db=d.targetBox;
-        const dcx=Number(db.x)+Number(db.w)/2, dcy=Number(db.y)+Number(db.h)/2;
-        const dx=Math.abs(cx-dcx), dy=Math.abs(cy-dcy);
-        const overlapX=Math.max(0,Math.min(Number(b.x)+Number(b.w),Number(db.x)+Number(db.w))-Math.max(Number(b.x),Number(db.x)));
-        const overlapY=Math.max(0,Math.min(Number(b.y)+Number(b.h),Number(db.y)+Number(db.h))-Math.max(Number(b.y),Number(db.y)));
-        const inter=overlapX*overlapY;
-        const area=Math.min(Number(b.w)*Number(b.h),Number(db.w)*Number(db.h));
-        return (area>0 && inter/area>0.45) || (dx<0.025 && dy<0.018);
+        const ix=Math.max(
+          0,
+          Math.min(b.x+b.w,db.x+db.w)-Math.max(b.x,db.x)
+        );
+        const iy=Math.max(
+          0,
+          Math.min(b.y+b.h,db.y+db.h)-Math.max(b.y,db.y)
+        );
+        const inter=ix*iy;
+        const minArea=Math.min(b.w*b.h,db.w*db.h);
+        return (minArea>0 && inter/minArea>0.45);
       });
-      if (!duplicate) dedup.push(f);
+      if (!duplicate) finalFindings.push(f);
     }
 
     return {
       available:true,
-      engine:'gpt-5.6-terra-aligned-zones-v42',
+      engine:"gpt-5.6-terra-focused-zones-v43",
       referenceFile:path.basename(referenceInfo.path),
-      findingCount:dedup.length,
-      findings:dedup.slice(0,10),
+      findingCount:finalFindings.length,
+      findings:finalFindings.slice(0,12),
       zonesChecked:zones.map(z=>z.id),
-      candidateCount:candidates.length,
-      verifiedCount:dedup.length
+      candidateCount:uniqueCandidates.length,
+      verifiedCount:finalFindings.length
     };
-  } catch (e) {
-    console.warn('V42 ALIGNED ZONE REFERENCE DIFFERENCE HATASI:',e?.message||e);
+  } catch (error) {
+    console.warn("V43 FOCUSED REFERENCE DIFFERENCE HATASI:",error?.message || error);
     return null;
   }
 }
