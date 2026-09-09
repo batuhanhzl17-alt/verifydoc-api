@@ -13333,6 +13333,20 @@ if (referenceForensics) {
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
 // "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
+let referenceLocalCrop = null;
+if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+  try {
+    referenceLocalCrop = await runReferenceLocalCropComparator(
+      forensicTargetPath,
+      bank,
+      paddleImageOCR
+    );
+    console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
+  } catch (error) {
+    console.warn("REFERENCE LOCAL CROP HATASI:", error?.message || error);
+  }
+}
+
 if (referenceForensics || layoutForensics?.available || referenceVisualAdjudication?.available) {
   // V44: the deterministic reference forensic engine is the primary source of
   // user-facing findings. The visual AI adjudicator is supplementary; it must
