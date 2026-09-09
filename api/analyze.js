@@ -6500,7 +6500,7 @@ function detectReferenceVariantFromText(text) {
   const t = normalizeFieldTextForMatch(text || '');
   if (!t) return null;
   const hasHvl = /DEKONT\s*\/\s*HVL|\bHVL\b|HAVALE UCRETI|PARA AKTARMA/.test(t);
-  const hasEftFast = /DEKONT\s*\/\s*EFT|\bEFT\b|GIDEN FAST|FAST UCRETI|GIDEN FAST ISLEMI/.test(t);
+  const hasEftFast = /DEKONT\s*\/\s*EFT|\bEFT\b|GIDEN FAST|FAST UCRETI|GIDEN FAST ISLEMI|HESAPTAN FAST|FAST MESAJ KODU|FAST SORGU NO|FAST ISLEMI/.test(t);
   if (hasHvl && !hasEftFast) return 'hvl';
   if (hasEftFast && !hasHvl) return 'eft';
   if (hasHvl && hasEftFast) return 'mixed';
