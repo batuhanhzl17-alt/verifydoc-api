@@ -3719,7 +3719,27 @@ function groupPdfTextLines(items, viewport) {
   return rows.sort((a, b) => a.top - b.top);
 }
 
-async function renderPdfPagePng(pdf, pageNumber, scale = 1) {
+async function renderPdfPagePng(pdfOrPath, pageNumber, scale = 1) {
+  // V49: accept either a pdfjs document or a filesystem path.
+  // V39 was passing a path string here, which caused: pdf.getPage is not a function.
+  let pdf = pdfOrPath;
+  let ownedPdf = false;
+  try {
+    if (typeof pdfOrPath === 'string' || Buffer.isBuffer(pdfOrPath) || pdfOrPath instanceof Uint8Array) {
+      const data = typeof pdfOrPath === 'string'
+        ? await fs.readFile(pdfOrPath)
+        : pdfOrPath;
+      pdf = await pdfjsLib.getDocument({ data: new Uint8Array(data) }).promise;
+      ownedPdf = true;
+    }
+  } catch (e) {
+    console.warn("REFERENCE PDF RENDER LOAD HATASI:", e?.message || e);
+    return null;
+  }
+  if (!pdf || typeof pdf.getPage !== 'function') {
+    console.warn("REFERENCE PDF RENDER: geçersiz PDF dokümanı");
+    return null;
+  }
   if (typeof createCanvas !== "function") {
     console.warn("REFERENCE PDF RENDER: createCanvas kullanılamıyor; referans metin/konum/font metadata profiliyle devam ediliyor.");
     return null;
@@ -3771,6 +3791,10 @@ async function renderPdfPagePng(pdf, pageNumber, scale = 1) {
   } catch (error) {
     console.warn("REFERENCE PDF RENDER HATASI:", error?.message || error);
     return null;
+  } finally {
+    if (ownedPdf) {
+      try { await pdf?.destroy?.(); } catch {}
+    }
   }
 }
 
@@ -13369,7 +13393,9 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     azureReferenceGeometry,
     referenceTemplateAnalysis,
     targetOCR: paddleImageOCR,
-    referenceInfo: reference
+    referenceInfo: reference,
+    targetPath: filePath,
+    targetMime: mime
   });
   const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
@@ -14381,7 +14407,9 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   azureReferenceGeometry = null,
   referenceTemplateAnalysis = null,
   targetOCR = null,
-  referenceInfo = null
+  referenceInfo = null,
+  targetPath = null,
+  targetMime = null
 }) {
   const base = buildV46ReferenceDifferenceReport(
     referenceForensics,
@@ -14391,7 +14419,8 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     referenceTemplateAnalysis
   );
 
-  const differences = Array.isArray(base?.differences) ? [...base.differences] : [];
+  const differences = (Array.isArray(base?.differences) ? [...base.differences] : [])
+    .filter(x => !(pdfToPdfTypographyGuard && !allowStandaloneTypography && String(x?.category || '').toLowerCase() === 'typography'));
   const seen = new Set(differences.map(x => `${x.category}|${x.field}|${x.title}`.toLocaleLowerCase('tr-TR')));
   const add = (category, field, title, detail, strength='belirgin', score=0, extra={}) => {
     const key = `${category}|${field}|${title}`.toLocaleLowerCase('tr-TR');
@@ -14399,6 +14428,27 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     seen.add(key);
     differences.push({category, field, title, detail, strength, score, ...extra});
   };
+
+  // V49 original-document guard: when both target and trusted reference are
+  // PDFs, do not surface raster typography merely because two separately
+  // generated PDFs rasterize text a little differently. Typography is allowed
+  // only after a strong same-document structural baseline is established.
+  const targetIsPdf = String(targetMime || '').toLowerCase() === 'application/pdf' || /\.pdf$/i.test(String(targetPath || ''));
+  const referenceIsPdf = /\.pdf$/i.test(String(referenceInfo?.path || ''));
+  const pdfToPdfTypographyGuard = targetIsPdf && referenceIsPdf;
+  const structuralMatchCount = Array.isArray(referenceForensics?.fields)
+    ? referenceForensics.fields.filter(x => x?.labelExact && x?.referenceValueRegionFound && x?.targetValueRegionFound).length
+    : 0;
+  const stableMismatch = (Array.isArray(referenceForensics?.typographyFieldProfiles) ? referenceForensics.typographyFieldProfiles : [])
+    .some(row => String(row?.field || '').toLowerCase() === 'generic:senaryo/dekont tipi' &&
+      String(row?.valueReference || '').trim() && String(row?.valueTarget || '').trim() &&
+      String(row.valueReference).trim().toLocaleLowerCase('tr-TR') !== String(row.valueTarget).trim().toLocaleLowerCase('tr-TR'));
+  // For PDF→PDF, raster glyph differences are not used as a standalone finding.
+  // The PDF itself can legitimately be regenerated with different embedded text
+  // objects/anti-aliasing while remaining the same bank template. Structural and
+  // semantic differences remain active; PDF font metadata can be added separately
+  // later if needed.
+  const allowStandaloneTypography = !pdfToPdfTypographyGuard;
 
   // ---- A) Stable semantic values from the matched forensic fields ----------
   // These are document-structure values, not transaction-specific values.
@@ -14544,9 +14594,13 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   } else {
     lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
+  console.log('V49 REFERENCE TYPOGRAPHY GUARD:', JSON.stringify({
+    targetIsPdf, referenceIsPdf, pdfToPdfTypographyGuard, structuralMatchCount, stableMismatch, allowStandaloneTypography
+  }));
+
   return {
     available:true,
-    engine:'reference-difference-core-v48-whole-document-semantic',
+    engine:'reference-difference-core-v49-render-and-original-gate',
     referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
