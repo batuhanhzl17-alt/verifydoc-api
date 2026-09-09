@@ -6828,7 +6828,9 @@ function isAdministrativeLabelText(text) {
     "ALICI", "GONDEREN", "GONDERICI", "ALICI ADI", "GONDEREN ADI",
     "ALICI UNVAN", "GONDEREN UNVAN", "VERGI NO", "TCKN", "VKN",
     "TUTAR", "ISLEM TUTARI", "GIDEN FAST TUTARI", "TOPLAM ISLEM TUTARI",
-    "TOPLAM TAHSILAT TUTARI", "MESAJ", "MESAJ TURU"
+    "TOPLAM TAHSILAT TUTARI", "MESAJ", "MESAJ TURU",
+    "SENARYO/DEKONT TIPI", "SENARYO DEKONT TIPI", "ISLEM ZAM VALOR",
+    "ISLEM ZAM VALOR", "DEKONT/EFT", "DEKONT/HVL"
   ];
   if (labelOnly.includes(t)) return true;
 
@@ -13360,7 +13362,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   // V44: the deterministic reference forensic engine is the primary source of
   // user-facing findings. The visual AI adjudicator is supplementary; it must
   // never erase concrete deterministic evidence by returning findings=[].
-  const deterministicReport = buildV45ReferenceDifferenceReport(
+  const deterministicReport = buildV46ReferenceDifferenceReport(
     referenceForensics,
     layoutForensics,
     referenceLocalCrop,
@@ -13375,7 +13377,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
-    console.log("HUMAN READABLE FORENSIC REPORT V44:", JSON.stringify(humanForensicReport));
+    console.log("HUMAN READABLE FORENSIC REPORT V46:", JSON.stringify(humanForensicReport));
 
     try {
       const annotatedReferenceDifference = await buildAnnotatedReferenceDifferenceImage({
@@ -14359,7 +14361,11 @@ function buildHumanReadableReferenceVisualAdjudicationReport(adjudication) {
 //  - Internal value-vs-label style sonucu ancak güçlü ve aynı alan üzerinde
 //    ikinci bir kanıt varsa kullanıcıya taşınır.
 //  - Güçlü semantik boşluk/yerleşim farkı tek başına raporlanabilir.
-function buildV45ReferenceDifferenceReport(forensic, layout = null, localCrop = null, azureGeometry = null, templateAnalysis = null) {
+function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = null, azureGeometry = null, templateAnalysis = null) {
+  // V46: conservative reference comparison.
+  // Do NOT promote generic template geometry or internal label/value style by itself.
+  // Prefer evidence that is (a) semantically the same field, (b) locally observed,
+  // and (c) not merely caused by changed transaction content.
   if (!forensic?.available && !layout?.available && !templateAnalysis?.referenceCount) return null;
 
   const fieldName = (value) => {
@@ -14382,6 +14388,25 @@ function buildV45ReferenceDifferenceReport(forensic, layout = null, localCrop = 
     return map[key] || (key.startsWith('generic:') ? key.slice(8).replace(/_/g,' ') : key) || 'Alan';
   };
 
+  const norm = (v) => normalizeFieldTextForMatch(String(v || ''))
+    .replace(/\s+/g,' ').trim();
+  const isAdmin = (v) => {
+    try { return isAdministrativeLabelText(v); } catch { return false; }
+  };
+  const isValueLike = (v) => {
+    const t = norm(v);
+    if (!t || isAdmin(t)) return false;
+    // Known field labels should never be treated as a value in a typography finding.
+    const labels = [
+      'SENARYO/DEKONT TIPI','SENARYO DEKONT TIPI','ISLEM ZAM/VALOR','ISLEM ZAM VALOR',
+      'ETTN','SORGU NUMARASI','SORGU NO','REFERANS NUMARASI','DOKUMAN NUMARASI',
+      'DEKONT TARIHI','ISLEM TARIHI','ACIKLAMA','TUTAR','ALICI ADI','GONDEREN ADI'
+    ];
+    return !labels.some(x => t === norm(x));
+  };
+  const canonicalField = (v) => norm(v).replace(/:value$/,'');
+  const sameField = (a,b) => canonicalField(a) === canonicalField(b);
+
   const differences=[];
   const compatible=[];
   const seen=new Set();
@@ -14393,122 +14418,121 @@ function buildV45ReferenceDifferenceReport(forensic, layout = null, localCrop = 
     seen.add(k);
     differences.push({category,field:f,title:t,detail:d,strength,score:Number(score)||0,...extra});
   };
-  const addCompatible=(field,detail)=>{
-    const f=fieldName(field); if(!detail)return;
-    if(!compatible.some(x=>x.field===f&&x.detail===detail))compatible.push({field:f,detail});
+  const addCompatible=(field,detail='yerleşim referansla uyumlu')=>{
+    const f=fieldName(field); if(!f)return;
+    if(!compatible.some(x=>x.field===f))compatible.push({field:f,detail});
   };
 
-  // 1) Reference-template geometry: similarity score düşükse gerçek yerleşim farkı.
-  for(const row of (Array.isArray(templateAnalysis?.fields)?templateAnalysis.fields:[])){
+  // 1) DO NOT use referenceTemplateAnalysis.geometryScore as a direct finding.
+  // That score is affected by photo normalization / OCR coordinate systems and
+  // was the source of the false "Tarih" and "Açıklama" findings in V45.
+  // Only use it for compatibility when explicitly high.
+  for (const row of (Array.isArray(templateAnalysis?.fields)?templateAnalysis.fields:[])) {
     const score=Number(row?.geometryScore);
-    if(!Number.isFinite(score))continue;
     const field=row?.field||row?.label||row?.referenceLabel;
-    if(score<=42) add('shape',field,`${fieldName(field)} alanında yerleşim farkı`,
-      'Bu alanın konumu veya ölçüsü referans dekonttan belirgin biçimde farklı.',score<=25?'güçlü':'belirgin',100-score);
-    else if(score>=82) addCompatible(field,'yerleşim referansla uyumlu');
+    if(Number.isFinite(score) && score>=82) addCompatible(field);
   }
 
-  // 2) Semantic spacing: yalnızca güçlü, semantik olarak eşleşmiş aralıklar.
-  const spacing=[
-    ...(Array.isArray(forensic?.spacingAnomalies)?forensic.spacingAnomalies:[]),
-    ...(Array.isArray(layout?.localGapAnomalies)?layout.localGapAnomalies:[])
-  ];
+  // 2) Semantic spacing can be a real difference, but only when both labels are
+  // genuinely matched fields in the same target/reference pair. Never invent a
+  // field from OCR order alone.
+  const matched = new Set((Array.isArray(forensic?.fields)?forensic.fields:[])
+    .filter(x=>x?.referenceValueRegionFound!==false && x?.targetValueRegionFound!==false)
+    .map(x=>canonicalField(x?.field)));
+  const spacing=[...(Array.isArray(forensic?.spacingAnomalies)?forensic.spacingAnomalies:[])];
   for(const row of spacing.sort((a,b)=>Number(b?.score||0)-Number(a?.score||0))){
     const score=Number(row?.score);
-    if(!Number.isFinite(score)||score<78)continue;
+    if(!Number.isFinite(score)||score<88)continue;
     const before=String(row?.beforeLabel||row?.beforeField||'').trim();
     const after=String(row?.afterLabel||row?.afterField||'').trim();
     if(!before||!after)continue;
+    if(!matched.has(canonicalField(before)) || !matched.has(canonicalField(after))) continue;
     add('shape',`${before}/${after}`,`${before} ile ${after} arasında yerleşim farkı`,
-      'Bu iki alan arasındaki boşluk veya hizalama referans dekonttan belirgin biçimde farklı.',score>=90?'güçlü':'belirgin',score);
-    if(differences.filter(x=>x.category==='shape').length>=3)break;
+      'Bu iki alan arasındaki boşluk veya hizalama referans dekonttan belirgin biçimde farklı.',
+      score>=90?'güçlü':'belirgin',score);
+    break;
   }
 
-  // 3) Lokal crop comparator: zaten global render farkını baseline'dan ayırmış
-  // sonuçları kullan. Burada tekrar bir ikinci güvenlik kapısı var.
+  // 3) Local crop is allowed only when it names a real semantic field and has
+  // two local signals. Global render differences are never enough.
   for(const row of (Array.isArray(localCrop?.findings)?localCrop.findings:[])){
+    const field=String(row?.field||'').replace(/:value$/i,'').trim();
+    if(!field || !isValueLike(row?.text || row?.value || field)) continue;
     const se=Number(row?.localStyleExcess), ce=Number(row?.localCharacterExcess);
     const sd=Number(row?.styleDistance), cd=Number(row?.characterDistance);
-    const both=Number.isFinite(se)&&Number.isFinite(ce)&&se>=0.16&&ce>=0.14;
-    const extreme=(Number.isFinite(se)&&se>=0.26&&Number.isFinite(sd)&&sd>=0.42)||
-                  (Number.isFinite(ce)&&ce>=0.24&&Number.isFinite(cd)&&cd>=0.50);
+    const both=Number.isFinite(se)&&Number.isFinite(ce)&&se>=0.18&&ce>=0.16;
+    const extreme=(Number.isFinite(se)&&se>=0.28&&Number.isFinite(sd)&&sd>=0.46)||
+                  (Number.isFinite(ce)&&ce>=0.26&&Number.isFinite(cd)&&cd>=0.55);
     if(!(both||extreme))continue;
-    const field=String(row?.field||'').trim(); if(!field)continue;
     add('typography',field,`${fieldName(field)} alanında yazı/render farkı`,
-      'Bu alanın lokal yazı/karakter raster görünümü referans dekonttan belirgin biçimde farklı.',both?'güçlü':'belirgin',both?88:82,{targetBox:row?.targetBox||null});
+      'Bu alanın lokal yazı/karakter raster görünümü referans dekonttan belirgin biçimde farklı.',
+      both?'güçlü':'belirgin',both?90:84,{targetBox:row?.targetBox||null,localEvidence:true});
   }
 
-  // 4) V21/V23 aynı-karakter çekirdeği.
-  // Whole-value farkını değil, aynı karakterlerin tekrar eden raster farkını
-  // öne al. Özellikle tutar için 0-0 / 1-1 gibi eşleşmeler değerlidir.
+  // 4) Shared-glyph evidence from field profiles is the safest deterministic
+  // typography route. IMPORTANT: changed transaction values are not evidence.
+  // We accept a strong same-character raster mismatch only when the semantic
+  // field itself is valid and the compared values are literally the same, or
+  // when a local crop independently corroborates it.
+  const profiles=Array.isArray(forensic?.typographyFieldProfiles)?forensic.typographyFieldProfiles:[];
+  for(const p of profiles){
+    const field=String(p?.field||'').replace(/:value$/i,'').trim();
+    if(!field || !isValueLike(p?.valueTarget) || !isValueLike(p?.valueReference)) continue;
+    const vf=p?.valueFinding || p?.legacySharedGlyphFinding;
+    if(!vf || String(vf?.severity||'').toLowerCase()!=='strong') continue;
+    const shared=Number(p?.valueSharedCharacterCount||vf?.sharedCharacterCount||0);
+    const repeated=Number(p?.valueRepeatedHighDistanceGlyphCount||vf?.repeatedHighDistanceGlyphCount||0);
+    const strongRepeated=Number(p?.valueRepeatedStrongDistanceGlyphCount||vf?.repeatedStrongDistanceGlyphCount||0);
+    const dist=Number(vf?.characterDistance ?? p?.valueCharacterDistance ?? 0);
+    const sameContent=norm(p?.valueReference)===norm(p?.valueTarget);
+    const localCorroboration=differences.some(x=>x.field===fieldName(field)&&x.category==='typography'&&x.localEvidence);
+    if(!sameContent && !localCorroboration) continue;
+    if(shared<2 || repeated<2 || dist<0.55) continue;
+    add('typography',field,`${fieldName(field)} alanında karakter/raster farkı`,
+      'Aynı içerikteki karakterlerin yazı/raster görünümü referans dekonttaki karşılığından belirgin biçimde farklı.',
+      'güçlü',Math.max(88,Math.min(97,dist*60)),{
+        targetBox:vf?.targetValueBox||null,
+        sameCharacterEvidence:true
+      });
+  }
+
+  // 5) Character findings: internal value-vs-label substitution is NOT a user
+  // finding by itself. If it is backed by a same-content profile, allow it;
+  // otherwise it is too prone to cross-field OCR assignment errors.
   for(const f of (Array.isArray(forensic?.characterFindings)?forensic.characterFindings:[])){
     if(String(f?.scope||'')!=='value')continue;
-    const field=String(f?.field||'').replace(/:value$/i,'').trim(); if(!field)continue;
+    const field=String(f?.field||'').replace(/:value$/i,'').trim();
+    if(!field || !isValueLike(f?.text)) continue;
+    if(f?.type==='internal-value-style-substitution-v23') continue;
     const severity=String(f?.severity||'').toLowerCase();
     if(severity!=='strong')continue;
-    const d=Number(f?.characterDistance);
     const repeated=Number(f?.repeatedHighDistanceGlyphCount||0);
     const strongRepeated=Number(f?.repeatedStrongDistanceGlyphCount||0);
-    const shared=Number(f?.sharedCharacterCount||f?.valueSharedCharacterCount||0);
-    const internal=f?.type==='internal-value-style-substitution-v23';
-    // En güvenilir durum: aynı karakterlerin birden fazlası belirgin şekilde
-    // ayrışıyor. Bu, farklı işlem değerlerini yanlışlıkla kıyaslamaz.
-    const sameCharStrong = repeated>=2 || strongRepeated>=2;
-    // Tutar için iki aynı rakam yeterli olabilir; diğer alanlarda biraz daha
-    // muhafazakar davranıyoruz.
-    const amountSameChar = field==='amount' && (repeated>=2 || strongRepeated>=1) && shared>=2;
-    if(sameCharStrong || amountSameChar){
+    const shared=Number(f?.sharedCharacterCount||0);
+    const d=Number(f?.characterDistance||0);
+    if(repeated>=2 && strongRepeated>=1 && shared>=2 && d>=0.55){
       add('typography',field,`${fieldName(field)} alanında karakter/raster farkı`,
         'Aynı karakterlerin tekrarlanan yazı/raster görünümü referans dekonttaki karşılıklarından belirgin biçimde farklı.',
-        'güçlü',Math.max(88,Number.isFinite(d)?Math.min(96,d*55):88),{
-          targetBox:f?.targetValueBox||f?.targetBox||null,
-          sameCharacterEvidence:true
-        });
-      continue;
-    }
-
-    // Internal style substitution dün işe yarayan ikinci yol olabilir; ancak
-    // tek başına generic alanları raporlamıyoruz. Aynı alan için lokal crop veya
-    // field-geometry desteği varsa aşağıdaki blok bunu alır.
-    if(internal){
-      const profile=(Array.isArray(forensic?.typographyFieldProfiles)?forensic.typographyFieldProfiles:[])
-        .find(x=>String(x?.field||'').replace(/:value$/i,'')===field);
-      const local=(Array.isArray(localCrop?.findings)?localCrop.findings:[]).some(x=>String(x?.field||'')===field);
-      const geom=(Array.isArray(forensic?.fields)?forensic.fields:[]).some(x=>String(x?.field||'').replace(/:value$/i,'')===field && Number(x?.positionScore||0)>=62);
-      if(profile && (local||geom)){
-        add('typography',field,`${fieldName(field)} alanında yazı/render farkı`,
-          'Değer alanının yazı karakter yapısı, referans dekonttaki aynı alanla lokal olarak farklı ve alan konum/render kanıtı da bunu destekliyor.',
-          'güçlü',90,{targetBox:f?.targetValueBox||f?.targetBox||null});
-      }
+        'güçlü',Math.max(88,Math.min(97,d*60)),{targetBox:f?.targetValueBox||f?.targetBox||null,sameCharacterEvidence:true});
     }
   }
 
-  // 5) Strong field geometry only if the engine has explicit suspicious evidence.
-  // Position alone is weaker than the two routes above, so it is not allowed to
-  // flood the report with unrelated Sorgu No / administrative fields.
-  for(const f of (Array.isArray(forensic?.fields)?forensic.fields:[])){
-    const field=String(f?.field||'').replace(/:value$/i,'').trim();
-    if(!field)continue;
-    const pos=Number(f?.positionScore||0), combined=Number(f?.combinedScore||0);
-    if(pos<78 || combined<70)continue;
-    const existing=differences.some(x=>x.field===fieldName(field));
-    if(existing)continue;
-    // Dynamic administrative identifiers are not promoted from position alone.
-    if(String(field).startsWith('generic:') && !/DOKUMAN|REFERANS|ETTN|BANKASI/i.test(field))continue;
-    add('shape',field,`${fieldName(field)} alanında yerleşim farkı`,
-      'Bu alanın referansa göre konumu belirgin biçimde farklı.', 'belirgin',Math.max(pos,combined));
-  }
+  // 6) Strong position-only generic fields are deliberately excluded. This is
+  // where V45 generated noisy Sorgu No / Tarih / Açıklama style findings.
+  // Layout is reported only through the validated semantic spacing route above.
 
-  // 6) Eski clone/global pixel skorlarını bilerek kullanıcı farkına çevirmiyoruz.
-  // Lokal pixel bulgusu varsa yalnızca semantik alanla birlikte kullan.
+  // 7) Localized pixel evidence only; global clone/ELA/texture scores are not
+  // user-facing evidence.
   for(const p of (Array.isArray(forensic?.pixelFindings)?forensic.pixelFindings:[])){
-    const score=Number(p?.score); const field=p?.field||p?.semanticField;
-    if(!field||!Number.isFinite(score)||score<82)continue;
+    const score=Number(p?.score), field=p?.field||p?.semanticField;
+    if(!field||!Number.isFinite(score)||score<88)continue;
+    if(!isValueLike(field))continue;
     add('pixel',field,`${fieldName(field)} bölgesinde lokal piksel farkı`,
-      'Bu bölgede referansa göre lokal görüntü/piksel yapısı farklı.',score>=90?'güçlü':'belirgin',score);
+      'Bu bölgede referansa göre lokal görüntü/piksel yapısı farklı.',score>=94?'güçlü':'belirgin',score,
+      {targetBox:p?.targetBox||p?.box||null,localEvidence:true});
   }
 
-  differences.sort((a,b)=>({güçlü:3,belirgin:2,orta:1}[b.strength]||0)-({güçlü:3,belirgin:2,orta:1}[a.strength]||0) || Number(b.score||0)-Number(a.score||0));
+  differences.sort((a,b)=>({güçlü:3,belirgin:2,orta:1}[b.strength]||0)-({güçlü:3,belirgin:2,orta:1}[a.strength]||0)||Number(b.score||0)-Number(a.score||0));
   const material=differences.filter(x=>x.strength==='güçlü'||x.strength==='belirgin').slice(0,8);
   const lines=['🔎 REFERANS KARŞILAŞTIRMASI'];
   if(material.length){
@@ -14525,7 +14549,7 @@ function buildV45ReferenceDifferenceReport(forensic, layout = null, localCrop = 
   }
   return {
     available:true,
-    engine:'reference-difference-core-v45-isbankasi-derived',
+    engine:'reference-difference-core-v46-conservative',
     referenceCount:Number(forensic?.referenceCount||templateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
