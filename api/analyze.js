@@ -72,6 +72,50 @@ const paddleOCRCache = new Map();
 
 let paddleOCRClient = null;
 
+// V60 FIX: keep OCR amount normalization in module scope so the final handler can use it.
+function normalizeOCRAmountLiteral(value) {
+  let raw = String(value ?? "").trim();
+  if (!raw) return raw;
+
+  raw = raw
+    .replace(/[₺]/g, "")
+    .replace(/\b(?:TL|TRY|EUR|USD|GBP)\b/gi, "")
+    .replace(/\s+/g, "")
+    .replace(/[^0-9,.-]/g, "");
+
+  if (!raw) return raw;
+
+  const sign = /^[+-]/.test(raw) ? raw[0] : "";
+  raw = raw.replace(/^[+-]/, "");
+  if (!raw) return sign;
+
+  const commas = [...raw].filter(c => c === ",").length;
+  const dots = [...raw].filter(c => c === ".").length;
+  const separators = commas + dots;
+
+  if (!separators) return sign + raw;
+
+  // The final separator is a decimal separator only when exactly 1–2 digits
+  // follow it. Earlier separators are then thousands separators.
+  const lastSep = Math.max(raw.lastIndexOf(","), raw.lastIndexOf("."));
+  const digitsAfter = raw.length - lastSep - 1;
+  const hasDecimalTail = digitsAfter >= 1 && digitsAfter <= 2;
+
+  if (hasDecimalTail) {
+    const integerPart = raw.slice(0, lastSep).replace(/[.,]/g, "");
+    const decimalPart = raw.slice(lastSep + 1).replace(/[.,]/g, "");
+    return sign + (integerPart || "0") + "," + decimalPart;
+  }
+
+  // No decimal tail: every separator is a thousands separator.
+  return sign + raw.replace(/[.,]/g, "");
+}
+
+// V56: PaddleOCR sometimes produces mixed thousands/decimal separators such as
+// "1.004.19" or "1,004.19".  These are OCR formatting artifacts, not amount
+// mismatches. Normalize only the numeric literal while preserving the actual
+// numeric value. Turkish-style output uses comma for the decimal separator.
+
 function getPaddleOCRClient() {
 
 if (
@@ -7336,48 +7380,6 @@ function cleanAmountText(value) {
 return String(value || "")
 .replace(/\s+/g, " ")
 .trim();
-}
-
-// V56: PaddleOCR sometimes produces mixed thousands/decimal separators such as
-// "1.004.19" or "1,004.19".  These are OCR formatting artifacts, not amount
-// mismatches. Normalize only the numeric literal while preserving the actual
-// numeric value. Turkish-style output uses comma for the decimal separator.
-function normalizeOCRAmountLiteral(value) {
-  let raw = String(value ?? "").trim();
-  if (!raw) return raw;
-
-  raw = raw
-    .replace(/[₺]/g, "")
-    .replace(/\b(?:TL|TRY|EUR|USD|GBP)\b/gi, "")
-    .replace(/\s+/g, "")
-    .replace(/[^0-9,.-]/g, "");
-
-  if (!raw) return raw;
-
-  const sign = /^[+-]/.test(raw) ? raw[0] : "";
-  raw = raw.replace(/^[+-]/, "");
-  if (!raw) return sign;
-
-  const commas = [...raw].filter(c => c === ",").length;
-  const dots = [...raw].filter(c => c === ".").length;
-  const separators = commas + dots;
-
-  if (!separators) return sign + raw;
-
-  // The final separator is a decimal separator only when exactly 1–2 digits
-  // follow it. Earlier separators are then thousands separators.
-  const lastSep = Math.max(raw.lastIndexOf(","), raw.lastIndexOf("."));
-  const digitsAfter = raw.length - lastSep - 1;
-  const hasDecimalTail = digitsAfter >= 1 && digitsAfter <= 2;
-
-  if (hasDecimalTail) {
-    const integerPart = raw.slice(0, lastSep).replace(/[.,]/g, "");
-    const decimalPart = raw.slice(lastSep + 1).replace(/[.,]/g, "");
-    return sign + (integerPart || "0") + "," + decimalPart;
-  }
-
-  // No decimal tail: every separator is a thousands separator.
-  return sign + raw.replace(/[.,]/g, "");
 }
 
 function numericSignal(text) {
