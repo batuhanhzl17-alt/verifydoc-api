@@ -13430,15 +13430,68 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     targetPath: filePath,
     targetMime: mime
   });
+  const detailedDeterministicReport = buildHumanReadableReferenceForensicReport(
+    referenceForensics,
+    layoutForensics,
+    referenceLocalCrop,
+    azureReferenceGeometry
+  );
   const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
     : null;
 
-  const humanForensicReport = deterministicReport || aiReport;
+  // V64: Tek bir nihai referans bulgu listesi kullan. V63'te V48 raporu
+  // muhafazakâr eşleştirme nedeniyle boş kalabildiği halde, aynı çalışmada
+  // ayrıntılı deterministic rapor veya görsel adjudicator somut bir lokal
+  // bulgu üretebiliyordu. Bu durumda Telegram üst özeti ile REFERANS
+  // KARŞILAŞTIRMASI çelişiyordu. Artık tüm güvenilir raporlar tek listede
+  // birleştiriliyor; tekrarlar başlık+detay bazında temizleniyor.
+  const mergeReferenceReports = (reports) => {
+    const all = [];
+    const seen = new Set();
+    for (const report of reports.filter(Boolean)) {
+      const rows = Array.isArray(report.findings) ? report.findings : [];
+      for (const row of rows) {
+        const title = String(row?.title || '').trim();
+        const detail = String(row?.detail || '').trim();
+        if (!title || !detail) continue;
+        const key = `${title}|${detail}`.toLocaleLowerCase('tr-TR');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        all.push({ ...row });
+      }
+    }
+    all.sort((a, b) => Number(a.priority || 9) - Number(b.priority || 9));
+    const unique = all.slice(0, 8);
+    const userText = unique.length
+      ? [
+          '🔎 REFERANS KARŞILAŞTIRMASI',
+          '',
+          '🔴 FARKLAR',
+          ...unique.map(x => `• ${x.title}: ${x.detail}`)
+        ].join('\n')
+      : '🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.';
+    return {
+      ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
+      available: true,
+      findings: unique,
+      differenceCount: unique.length,
+      strongDifferenceCount: unique.length,
+      status: unique.length ? 'differences-found' : 'no-material-difference-found',
+      userText,
+      mergedSources: reports.filter(Boolean).map(x => x.engine || 'unknown')
+    };
+  };
+
+  const humanForensicReport = mergeReferenceReports([
+    deterministicReport,
+    detailedDeterministicReport,
+    aiReport
+  ]);
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
-    console.log("HUMAN READABLE FORENSIC REPORT V47:", JSON.stringify(humanForensicReport));
+    console.log("HUMAN READABLE FORENSIC REPORT V64:", JSON.stringify(humanForensicReport));
 
     try {
       const annotatedReferenceDifference = await buildAnnotatedReferenceDifferenceImage({
@@ -13452,7 +13505,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
       });
       if (annotatedReferenceDifference?.available) {
         result.annotatedReferenceDifference = annotatedReferenceDifference;
-        console.log("ANNOTATED REFERENCE DIFFERENCE V44:", JSON.stringify({
+        console.log("ANNOTATED REFERENCE DIFFERENCE V64:", JSON.stringify({
           available: true,
           boxCount: annotatedReferenceDifference.boxCount,
           gapMarkerCount: annotatedReferenceDifference.gapMarkerCount
