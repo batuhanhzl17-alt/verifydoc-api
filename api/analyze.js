@@ -3969,10 +3969,11 @@ async function extractWholePageStructureSignature(buffer) {
 }
 
 
-async function runReferenceLayoutForensics(targetPath, bank) {
+async function runReferenceLayoutForensics(targetPath, bank, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath) return null;
-  const cacheKey = `layout:v2:${normalizedBank}`;
+  const selectedKey = selectedReferencePath ? path.resolve(selectedReferencePath) : "ALL";
+  const cacheKey = `layout:v3:${normalizedBank}:${selectedKey}`;
 
   try {
     const targetBuffer = await fs.readFile(targetPath);
@@ -3982,7 +3983,10 @@ async function runReferenceLayoutForensics(targetPath, bank) {
 
     let ensemble = referenceLayoutForensicsCache.get(cacheKey);
     if (!ensemble) {
-      const referencePaths = await getReferenceFiles(normalizedBank);
+      const allReferencePaths = await getReferenceFiles(normalizedBank);
+      const referencePaths = selectedReferencePath && allReferencePaths.includes(selectedReferencePath)
+        ? [selectedReferencePath]
+        : allReferencePaths;
       if (!referencePaths.length) return null;
       const fingerprints = [];
       for (const referencePath of referencePaths) {
@@ -5521,7 +5525,7 @@ function rfFieldLabelText(label){
   return String(label?.labelText || label?.text || '').toLocaleLowerCase('tr-TR').replace(/\s+/g,' ').trim();
 }
 
-async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
+async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath || !targetOCR?.success) return null;
   try {
@@ -5530,7 +5534,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR) {
     const targetSize = { width:Number(targetMeta.width)||0, height:Number(targetMeta.height)||0 };
     if (!targetSize.width || !targetSize.height) return null;
 
-    const referencePaths = await getReferenceFiles(normalizedBank);
+    const allReferencePaths = await getReferenceFiles(normalizedBank);
+    const referencePaths = selectedReferencePath && allReferencePaths.includes(selectedReferencePath)
+      ? [selectedReferencePath]
+      : allReferencePaths;
     if (!referencePaths.length) return null;
 
     // IMPORTANT: preserve every semantic field occurrence. The previous engine
@@ -6758,12 +6765,16 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
 async function buildReferenceTemplateProfile(bank, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
-  const referencePaths = await getReferenceFiles(normalizedBank);
+  const allReferencePaths = await getReferenceFiles(normalizedBank);
+  const referencePaths = selectedReferencePath && allReferencePaths.includes(selectedReferencePath)
+    ? [selectedReferencePath]
+    : allReferencePaths;
   const statParts = [];
   for (const referencePath of referencePaths) {
     try { const st = await fs.stat(referencePath); statParts.push(`${referencePath}:${st.mtimeMs}:${st.size}`); } catch {}
   }
-  const cacheKey = `${normalizedBank}|${statParts.sort().join('|')}`;
+  const selectedKey = selectedReferencePath ? path.resolve(selectedReferencePath) : "ALL";
+  const cacheKey = `${normalizedBank}|${selectedKey}|${statParts.sort().join('|')}`;
   if (referenceTemplateProfileCache.has(cacheKey)) return referenceTemplateProfileCache.get(cacheKey);
 
   if (!referencePaths.length) {
@@ -12313,15 +12324,65 @@ Sonuçları aday numarasıyla döndür.`
   }
 }
 
-// V39 is the sole user-facing reference comparison. Legacy forensic engines
-// remain available for internal diagnostics, but their noisy individual field
-// messages do not override the direct reference comparison.
+// V59: Calculate the cheap local/reference evidence BEFORE Terra.
+// Terra is now conditional: clean documents do not pay the ~96s model cost.
+let referenceLocalCrop = null;
+if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+  try {
+    referenceLocalCrop = await runReferenceLocalCropComparator(
+      forensicTargetPath,
+      bank,
+      paddleImageOCR,
+      reference.path
+    );
+    console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
+  } catch (error) {
+    console.warn("REFERENCE LOCAL CROP HATASI:", error?.message || error);
+  }
+}
+
+// V59: Only invoke the expensive Terra visual adjudicator when a cheap
+// deterministic/reference layer has already found a concrete localized signal.
+// This keeps Terra available for genuinely interesting cases while making
+// normal clean receipts fast.
+const terraGateReasons = [];
+if ((azureReferenceGeometry?.strongAnomalies || []).length > 0) terraGateReasons.push("azure-strong-anomaly");
+if (Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0) terraGateReasons.push("template-strong-geometry");
+if ((referenceLocalCrop?.findings || []).length > 0) terraGateReasons.push("local-render-outlier");
+if (referenceForensics?.available === true && (
+  String(referenceForensics.severity || "").toLowerCase() === "strong" ||
+  Number(referenceForensics.maxSpacingScore || 0) >= 85 ||
+  Number(referenceForensics.suspiciousFieldCount || 0) >= 1
+)) terraGateReasons.push("forensic-strong-signal");
+
+const shouldRunTerra = terraGateReasons.length > 0;
+console.log("TERRA CONDITIONAL GATE:", JSON.stringify({
+  shouldRunTerra,
+  reasons: terraGateReasons,
+  referenceFile: reference?.fileName || null,
+  variant: reference?.variant || null
+}));
+
 referenceVisualAdjudication = null;
-if ((type === 'image' || type === 'pdf') && bank && reference) {
+if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra) {
   try {
     referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference,targetOCR:paddleImageOCR,bank});
     console.log('REFERENCE VISUAL ADJUDICATOR V39:',JSON.stringify(referenceVisualAdjudication));
   } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V39 HATASI:',e?.message||e); }
+} else if ((type === 'image' || type === 'pdf') && bank && reference) {
+  referenceVisualAdjudication = {
+    available:true,
+    skipped:true,
+    engine:"gpt-5.6-terra-focused-zones-v43",
+    referenceFile:path.basename(reference.path),
+    findingCount:0,
+    findings:[],
+    zonesChecked:[],
+    candidateCount:0,
+    verifiedCount:0,
+    skipReason:"No concrete pre-Terra localized signal; expensive visual adjudication skipped."
+  };
+  console.log('REFERENCE VISUAL ADJUDICATOR V39 SKIPPED:', JSON.stringify(referenceVisualAdjudication));
 }
 
 // =====================================================
@@ -13333,20 +13394,6 @@ if (referenceForensics) {
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
 // "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
-let referenceLocalCrop = null;
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
-  try {
-    referenceLocalCrop = await runReferenceLocalCropComparator(
-      forensicTargetPath,
-      bank,
-      paddleImageOCR
-    );
-    console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
-  } catch (error) {
-    console.warn("REFERENCE LOCAL CROP HATASI:", error?.message || error);
-  }
-}
-
 if (referenceForensics || layoutForensics?.available || referenceVisualAdjudication?.available) {
   // V44: the deterministic reference forensic engine is the primary source of
   // user-facing findings. The visual AI adjudicator is supplementary; it must
@@ -13426,11 +13473,11 @@ if (amountForensics) {
 // Aynı semantic alanın referans ve hedef crop'larını normalize edip,
 // yerel render/karakter ölçümlerini karşılaştırır.
 // Bu bir sahtecilik kararı değil, lokal görsel karşılaştırma kanıtıdır.
-async function runReferenceLocalCropComparator(targetPath, bank, targetOCR) {
+async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, selectedReferencePath = null) {
   if (!targetPath || !bank || !targetOCR?.success) return null;
 
   try {
-    const profile = await buildReferenceTemplateProfile(bank);
+    const profile = await buildReferenceTemplateProfile(bank, selectedReferencePath);
     if (!profile?.fields || !Object.keys(profile.fields).length) return null;
 
     // profile.referenceFiles intentionally stores only basenames (security boundary).
@@ -15709,7 +15756,7 @@ informationCheck
 );
 
 
-console.log("ENSEMBLE FORENSICS ACTIVE: all same-bank references + PDF raster + tolerant layout scoring");
+console.log("ENSEMBLE FORENSICS ACTIVE: selected reference variant only + PDF raster + tolerant layout scoring");
 if (paddleCriticalFailure) {
   console.error("ANALYSIS INCOMPLETE: PaddleOCR unavailable; refusing to return a clean/low-risk forensic result.");
   return res.status(503).json({
