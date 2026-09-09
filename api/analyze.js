@@ -1195,7 +1195,8 @@ akbank: "akbank.pdf",
 enpara: "enpara.pdf",
 vakifbank: "vakifbank.pdf",
 isbankasi: "isbankasi.pdf",
-ziraat: "ziraat-havale.pdf",
+// Ziraat canonical referans: Havale. FAST ayrı varyant olarak seçilir.
+  ziraat: "ziraat-havale.pdf",
 denizbank: "denizbank.pdf",
 halkbank: "halkbank.pdf",
 yapikredi: "yapikredi.pdf",
@@ -1332,6 +1333,9 @@ fileName
 // REFERANS PDF OKUMA
 // =====================================================
 async function loadReferenceFile(bank, targetOCR = null) {
+// V63 ZIRAAT/VARIANT FIX: Her analiz isteği kendi referans varyantını baştan seçsin.
+// Önceki isteğin activeReferenceVariant değeri yeni isteğin adaylarını filtrelemesin.
+activeReferenceVariant = null;
 const normalizedBank = normalizeBank(bank);
 if (!normalizedBank) {
   console.log("REFERENCE BANK TANINMADI:", bank);
