@@ -14391,7 +14391,7 @@ function buildHumanReadableReferenceVisualAdjudicationReport(adjudication) {
 //  - Güçlü semantik boşluk/yerleşim farkı tek başına raporlanabilir.
 
 // =====================================================
-// V48 — WHOLE DOCUMENT / SEMANTIC BLOCK DIFFERENCE CORE
+// V52 — WHOLE DOCUMENT / CAMERA-RASTER SAFE REFERENCE DIFFERENCE CORE
 // =====================================================
 // V47 was still too field-centric: it could see a strong spacing anomaly but
 // miss the larger structural/content substitutions around it. V48 adds a
@@ -14441,7 +14441,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     console.log('V51 IDENTICAL REFERENCE GUARD: target and trusted reference are byte-identical; no reference difference reported.');
     return {
       available: true,
-      engine: 'reference-difference-core-v51-identical-reference-guard',
+      engine: 'reference-difference-core-v52-camera-raster-guard',
       referenceCount: Number(referenceForensics?.referenceCount || referenceTemplateAnalysis?.referenceCount || 0),
       differenceCount: 0,
       strongDifferenceCount: 0,
@@ -14453,12 +14453,20 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     };
   }
 
-  // V50: initialize the PDF→PDF typography guard BEFORE it is referenced.
+  // V52/V50: initialize format guards BEFORE they are referenced.
   // V49 evaluated these constants inside the differences initializer, causing
   // a JavaScript TDZ ReferenceError and a POST 500.
-  const targetIsPdf = String(targetMime || '').toLowerCase() === 'application/pdf' || /\.pdf$/i.test(String(targetPath || ''));
+  const targetMimeLower = String(targetMime || '').toLowerCase();
+  const targetIsPdf = targetMimeLower === 'application/pdf' || /\.pdf$/i.test(String(targetPath || ''));
+  const targetIsRasterImage = /^image\/(jpeg|jpg|png|webp|bmp|tiff?)$/i.test(targetMimeLower) || /\.(?:jpe?g|png|webp|bmp|tiff?)$/i.test(String(targetPath || ''));
   const referenceIsPdf = /\.pdf$/i.test(String(referenceInfo?.path || ''));
   const pdfToPdfTypographyGuard = targetIsPdf && referenceIsPdf;
+  // V52: A camera/screenshot/JPEG target is expected to have different
+  // character edge pixels from a trusted PDF raster. Those raster differences
+  // are not user-facing evidence by themselves. Keep the forensic evidence
+  // internally, but require a separate semantic/local corroboration before
+  // typography can become a reference-difference finding.
+  const cameraRasterTypographyGuard = targetIsRasterImage;
   const structuralMatchCount = Array.isArray(referenceForensics?.fields)
     ? referenceForensics.fields.filter(x => x?.labelExact && x?.referenceValueRegionFound && x?.targetValueRegionFound).length
     : 0;
@@ -14471,7 +14479,15 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   // For PDF→PDF, raster glyph differences are not used as a standalone finding.
   // Structural and semantic differences remain active.
   const differences = (Array.isArray(base?.differences) ? [...base.differences] : [])
-    .filter(x => !(pdfToPdfTypographyGuard && !allowStandaloneTypography && String(x?.category || '').toLowerCase() === 'typography'));
+    .filter(x => {
+      const category = String(x?.category || '').toLowerCase();
+      // V52: image targets (JPG/PNG/photo/screenshot) must not produce a
+      // standalone typography/raster difference. This is the exact false
+      // positive class exposed by real original İş Bankası JPG testing.
+      if (cameraRasterTypographyGuard && category === 'typography') return false;
+      if (pdfToPdfTypographyGuard && !allowStandaloneTypography && category === 'typography') return false;
+      return true;
+    });
   const seen = new Set(differences.map(x => `${x.category}|${x.field}|${x.title}`.toLocaleLowerCase('tr-TR')));
   const add = (category, field, title, detail, strength='belirgin', score=0, extra={}) => {
     const key = `${category}|${field}|${title}`.toLocaleLowerCase('tr-TR');
@@ -14624,13 +14640,13 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   } else {
     lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
-  console.log('V51 REFERENCE TYPOGRAPHY GUARD:', JSON.stringify({
-    targetIsPdf, referenceIsPdf, pdfToPdfTypographyGuard, structuralMatchCount, stableMismatch, allowStandaloneTypography
+  console.log('V52 REFERENCE RASTER GUARD:', JSON.stringify({
+    targetIsPdf, targetIsRasterImage, referenceIsPdf, pdfToPdfTypographyGuard, cameraRasterTypographyGuard, structuralMatchCount, stableMismatch, allowStandaloneTypography
   }));
 
   return {
     available:true,
-    engine:'reference-difference-core-v51-identical-reference-guard',
+    engine:'reference-difference-core-v52-camera-raster-guard',
     referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
