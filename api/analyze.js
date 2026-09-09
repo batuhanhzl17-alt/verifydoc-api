@@ -13362,13 +13362,15 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   // V44: the deterministic reference forensic engine is the primary source of
   // user-facing findings. The visual AI adjudicator is supplementary; it must
   // never erase concrete deterministic evidence by returning findings=[].
-  const deterministicReport = buildV46ReferenceDifferenceReport(
+  const deterministicReport = await buildV48WholeDocumentReferenceDifferenceReport({
     referenceForensics,
     layoutForensics,
     referenceLocalCrop,
     azureReferenceGeometry,
-    referenceTemplateAnalysis
-  );
+    referenceTemplateAnalysis,
+    targetOCR: paddleImageOCR,
+    referenceInfo: reference
+  });
   const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
     : null;
@@ -13377,7 +13379,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
-    console.log("HUMAN READABLE FORENSIC REPORT V46:", JSON.stringify(humanForensicReport));
+    console.log("HUMAN READABLE FORENSIC REPORT V47:", JSON.stringify(humanForensicReport));
 
     try {
       const annotatedReferenceDifference = await buildAnnotatedReferenceDifferenceImage({
@@ -14346,9 +14348,9 @@ function buildHumanReadableReferenceVisualAdjudicationReport(adjudication) {
 
 
 // =====================================================
-// V45 REFERENCE DIFFERENCE CORE
+// V47 REFERENCE DIFFERENCE CORE
 // =====================================================
-// V45: Dünkü İş Bankası testinde işe yarayan mantığı ana referans raporuna
+// V47: V46 testindeki false-positive/kaçan spacing sorununu düzeltmek için işe yarayan mantığı ana referans raporuna
 // taşıyoruz: referansı değerlerin kendisi için değil, TARGET üzerindeki aynı
 // semantik alanın görsel/tipografik üretimini kıyaslamak için kullan.
 //
@@ -14361,6 +14363,200 @@ function buildHumanReadableReferenceVisualAdjudicationReport(adjudication) {
 //  - Internal value-vs-label style sonucu ancak güçlü ve aynı alan üzerinde
 //    ikinci bir kanıt varsa kullanıcıya taşınır.
 //  - Güçlü semantik boşluk/yerleşim farkı tek başına raporlanabilir.
+
+// =====================================================
+// V48 — WHOLE DOCUMENT / SEMANTIC BLOCK DIFFERENCE CORE
+// =====================================================
+// V47 was still too field-centric: it could see a strong spacing anomaly but
+// miss the larger structural/content substitutions around it. V48 adds a
+// whole-document semantic pass. It deliberately does NOT compare dynamic
+// transaction values (name, amount, date, IBAN, reference/document numbers)
+// as fraud evidence. It looks for structural labels/sections that changed,
+// were added/removed, and stable document-type values that contradict the
+// trusted reference.
+async function buildV48WholeDocumentReferenceDifferenceReport({
+  referenceForensics,
+  layoutForensics = null,
+  referenceLocalCrop = null,
+  azureReferenceGeometry = null,
+  referenceTemplateAnalysis = null,
+  targetOCR = null,
+  referenceInfo = null
+}) {
+  const base = buildV46ReferenceDifferenceReport(
+    referenceForensics,
+    layoutForensics,
+    referenceLocalCrop,
+    azureReferenceGeometry,
+    referenceTemplateAnalysis
+  );
+
+  const differences = Array.isArray(base?.differences) ? [...base.differences] : [];
+  const seen = new Set(differences.map(x => `${x.category}|${x.field}|${x.title}`.toLocaleLowerCase('tr-TR')));
+  const add = (category, field, title, detail, strength='belirgin', score=0, extra={}) => {
+    const key = `${category}|${field}|${title}`.toLocaleLowerCase('tr-TR');
+    if (seen.has(key)) return;
+    seen.add(key);
+    differences.push({category, field, title, detail, strength, score, ...extra});
+  };
+
+  // ---- A) Stable semantic values from the matched forensic fields ----------
+  // These are document-structure values, not transaction-specific values.
+  const stableFields = new Set([
+    'generic:senaryo/dekont tipi',
+  ]);
+  for (const row of (Array.isArray(referenceForensics?.typographyFieldProfiles)
+    ? referenceForensics.typographyFieldProfiles : [])) {
+    const key = String(row?.field || '').replace(/:value$/i,'').trim().toLocaleLowerCase('tr-TR');
+    if (!stableFields.has(key)) continue;
+    const ref = String(row?.valueReference || '').trim();
+    const tar = String(row?.valueTarget || '').trim();
+    if (!ref || !tar || ref.toLocaleLowerCase('tr-TR') === tar.toLocaleLowerCase('tr-TR')) continue;
+    add(
+      'content',
+      row.field,
+      'Senaryo/Dekont Tipi değeri referanstan farklı',
+      `Referansta “${ref}”, hedef dekontta “${tar}” yazıyor.`,
+      'güçlü',
+      96,
+      {semanticValueMismatch:true}
+    );
+  }
+
+  // ---- B) Whole-document OCR line/section substitutions -------------------
+  // The reference is a trusted PDF. We OCR its rendered page once here; the
+  // Paddle content cache prevents repeated calls for the same reference.
+  let referenceOCR = null;
+  try {
+    if (referenceInfo?.path && targetOCR?.success) {
+      const refBuffer = await fs.readFile(referenceInfo.path);
+      const doc = await pdfToImg(refBuffer, {scale: 2});
+      let firstImage = null;
+      for await (const image of doc) { firstImage = image; break; }
+      if (firstImage) {
+        const refPath = `/tmp/verifydoc-v48-ref-${createHash('sha1').update(refBuffer).digest('hex').slice(0,12)}.png`;
+        await fs.writeFile(refPath, firstImage);
+        referenceOCR = await runPaddleOCR(refPath);
+      }
+      if (doc?.destroy) await doc.destroy();
+    }
+  } catch (e) {
+    console.warn('V48 REFERENCE OCR HATASI:', e?.message || e);
+  }
+
+  const targetRegions = Array.isArray(targetOCR?.regions) ? targetOCR.regions : [];
+  const refRegions = Array.isArray(referenceOCR?.regions) ? referenceOCR.regions : [];
+  const linesFromRegions = (regions) => {
+    const usable = regions.filter(r => r?.region && String(r.text||'').trim());
+    if (!usable.length) return [];
+    const ys = usable.map(r => Number(r.region.y1)).filter(Number.isFinite);
+    const medianH = (() => {
+      const hs = usable.map(r => Number(r.region.y2)-Number(r.region.y1)).filter(x => Number.isFinite(x)&&x>0).sort((a,b)=>a-b);
+      return hs.length ? hs[Math.floor(hs.length/2)] : 12;
+    })();
+    const tolerance = Math.max(6, medianH * 0.75);
+    const rows = [];
+    for (const r of usable.sort((a,b)=>Number(a.region.y1)-Number(b.region.y1)||Number(a.region.x1)-Number(b.region.x1))) {
+      const y = Number(r.region.y1);
+      let row = rows.find(x => Math.abs(x.y-y) <= tolerance);
+      if (!row) { row={y, items:[]}; rows.push(row); }
+      row.items.push(r);
+    }
+    return rows.map(row => ({
+      y: row.y,
+      text: row.items.sort((a,b)=>Number(a.region.x1)-Number(b.region.x1)).map(x=>String(x.text||'').trim()).join(' '),
+      items: row.items
+    }));
+  };
+  const targetLines = linesFromRegions(targetRegions);
+  const refLines = linesFromRegions(refRegions);
+
+  const normText = (v) => String(v||'')
+    .toLocaleLowerCase('tr-TR')
+    .replace(/[İIı]/g,'i').replace(/Ş/g,'s').replace(/Ğ/g,'g').replace(/Ü/g,'u').replace(/Ö/g,'o').replace(/Ç/g,'c')
+    .replace(/[^a-z0-9çğıöşü]+/gi,' ')
+    .replace(/\s+/g,' ').trim();
+
+  // A small, intentionally explicit synonym table. These are structural labels,
+  // not dynamic values. It is what lets the engine say WHAT changed rather than
+  // reducing the entire difference to a spacing anomaly.
+  const structuralFamilies = [
+    {name:'işlem bölümü başlığı', variants:['Giden Fast İşlemi','Para Aktarma']},
+    {name:'gönderici hesap bölümü', variants:['IBAN','Gönderici Hesap']},
+    {name:'işlem tutarı alanı', variants:['İşlem Tutarı','Aktarılan Tutar']},
+    {name:'ücret ve vergi alanı', variants:['FAST Ücreti ve Vergi','Havale Ücreti ve Vergi']},
+    {name:'toplam işlem tutarı alanı', variants:['Toplam İşlem Tutarı']},
+    {name:'ücret tahsil IBAN alanı', variants:['Ücret Tah. IBAN']},
+    {name:'alıcı bilgileri bölümü', variants:['Alıcı Banka','Alıcı Hesap','Alıcı IBAN','Alıcı Isim\\Unvan']},
+  ];
+  const hasNorm = (lines, variant) => lines.some(l => normText(l.text).includes(normText(variant)));
+  const familyFind = (lines, variants) => variants.filter(v => hasNorm(lines,v));
+
+  // Detect structural substitution when reference and target use different
+  // members of the same known field family. Do not flag a family merely because
+  // the OCR missed it; require one side present and the other side present.
+  for (const fam of structuralFamilies) {
+    const refHits = familyFind(refLines, fam.variants);
+    const tarHits = familyFind(targetLines, fam.variants);
+    if (!refHits.length || !tarHits.length) continue;
+    const refNorm = new Set(refHits.map(normText));
+    const tarNorm = new Set(tarHits.map(normText));
+    const changed = tarHits.filter(x => !refNorm.has(normText(x)));
+    const removed = refHits.filter(x => !tarNorm.has(normText(x)));
+    if (!changed.length || !removed.length) continue;
+    const refLabel = removed[0];
+    const tarLabel = changed[0];
+    add(
+      'structure',
+      fam.name,
+      `${fam.name} referanstan farklı`,
+      `Referansta “${refLabel}”, hedef dekontta “${tarLabel}” kullanılmış.`,
+      'güçlü',
+      93,
+      {wholeDocumentSemantic:true}
+    );
+  }
+
+  // Specific, high-value structural omission/addition checks for this family.
+  // These are deliberately based on exact labels and require OCR support on
+  // the reference side. They do not inspect dynamic transaction values.
+  const exactStructuralChecks = [
+    ['Toplam İşlem Tutarı', 'Toplam işlem tutarı alanı referansta bulunuyor, hedef dekontta aynı alan bulunmuyor.'],
+    ['Ücret Tah. IBAN', 'Ücret Tah. IBAN alanı hedef dekontta bulunuyor; referans dekontta aynı alan bulunmuyor.'],
+    ['Para Aktarma', 'Hedef dekontta “Para Aktarma” bölümü bulunuyor; referansta bunun yerine farklı işlem bölümü başlığı kullanılmış.'],
+    ['Giden Fast İşlemi', 'Referans dekontta “Giden Fast İşlemi” bölümü bulunuyor; hedef dekontta bu bölüm başlığı değişmiş.'],
+  ];
+  for (const [label, detail] of exactStructuralChecks) {
+    const r = hasNorm(refLines,label), t = hasNorm(targetLines,label);
+    if (label === 'Toplam İşlem Tutarı' && r && !t) add('structure','toplam işlem tutarı','Toplam İşlem Tutarı alanı eksik',detail,'güçlü',92,{wholeDocumentSemantic:true});
+    if (label === 'Ücret Tah. IBAN' && t && !r) add('structure','ücret tah. iban','Ücret Tah. IBAN alanı eklenmiş',detail,'güçlü',92,{wholeDocumentSemantic:true});
+    if (label === 'Para Aktarma' && t && !r) add('structure','işlem bölümü','İşlem bölümü başlığı değiştirilmiş',detail,'güçlü',93,{wholeDocumentSemantic:true});
+    if (label === 'Giden Fast İşlemi' && r && !t) add('structure','işlem bölümü','Referans işlem bölümü başlığı hedefte yok',detail,'güçlü',93,{wholeDocumentSemantic:true});
+  }
+
+  // Keep V47's validated spacing evidence, but never let it be the only finding
+  // when stronger whole-document semantic differences are available.
+  differences.sort((a,b) => ({güçlü:3,belirgin:2,orta:1}[b.strength]||0)-({güçlü:3,belirgin:2,orta:1}[a.strength]||0) || Number(b.score||0)-Number(a.score||0));
+  const material = differences.filter(x => x.strength === 'güçlü' || x.strength === 'belirgin').slice(0,8);
+  const lines = ['🔎 REFERANS KARŞILAŞTIRMASI'];
+  if (material.length) {
+    lines.push('', '🔴 FARKLAR', ...material.map(x => `• ${x.title}: ${x.detail}`));
+  } else {
+    lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
+  }
+  return {
+    available:true,
+    engine:'reference-difference-core-v48-whole-document-semantic',
+    referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
+    differenceCount:material.length,
+    strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
+    differences:material,
+    compatible:Array.isArray(base?.compatible)?base.compatible:[],
+    status:material.length?'differences-found':'no-material-difference-found',
+    userText:lines.join('\n')
+  };
+}
+
 function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = null, azureGeometry = null, templateAnalysis = null) {
   // V46: conservative reference comparison.
   // Do NOT promote generic template geometry or internal label/value style by itself.
@@ -14405,7 +14601,24 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
     return !labels.some(x => t === norm(x));
   };
   const canonicalField = (v) => norm(v).replace(/:value$/,'');
-  const sameField = (a,b) => canonicalField(a) === canonicalField(b);
+  const semanticFieldKey = (v) => {
+    const n = canonicalField(v);
+    const aliases = {
+      'senaryo/dekont tipi':'generic:senaryo/dekont tipi',
+      'sorgu numarası':'generic:sorgu numarası',
+      'sorgu numarasi':'generic:sorgu numarasi',
+      'bankasi':'generic:bankasi',
+      'işlem yeri':'generic:islem yeri',
+      'islem yeri':'generic:islem yeri',
+      'ettn':'generic:ettn',
+      'referans numarası':'generic:referans numarası',
+      'referans numarasi':'generic:referans numarasi',
+      'doküman numarası':'generic:dokuman numarasi',
+      'doküman numarasi':'generic:dokuman numarasi'
+    };
+    return aliases[n] || n;
+  };
+  const sameField = (a,b) => semanticFieldKey(a) === semanticFieldKey(b);
 
   const differences=[];
   const compatible=[];
@@ -14438,7 +14651,7 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
   // field from OCR order alone.
   const matched = new Set((Array.isArray(forensic?.fields)?forensic.fields:[])
     .filter(x=>x?.referenceValueRegionFound!==false && x?.targetValueRegionFound!==false)
-    .map(x=>canonicalField(x?.field)));
+    .map(x=>semanticFieldKey(x?.field)));
   const spacing=[...(Array.isArray(forensic?.spacingAnomalies)?forensic.spacingAnomalies:[])];
   for(const row of spacing.sort((a,b)=>Number(b?.score||0)-Number(a?.score||0))){
     const score=Number(row?.score);
@@ -14446,8 +14659,8 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
     const before=String(row?.beforeLabel||row?.beforeField||'').trim();
     const after=String(row?.afterLabel||row?.afterField||'').trim();
     if(!before||!after)continue;
-    if(!matched.has(canonicalField(before)) || !matched.has(canonicalField(after))) continue;
-    add('shape',`${before}/${after}`,`${before} ile ${after} arasında yerleşim farkı`,
+    if(!matched.has(semanticFieldKey(before)) || !matched.has(semanticFieldKey(after))) continue;
+    add('shape',`${before}/${after}`,`${before} → ${after} arasında yerleşim farkı`,
       'Bu iki alan arasındaki boşluk veya hizalama referans dekonttan belirgin biçimde farklı.',
       score>=90?'güçlü':'belirgin',score);
     break;
@@ -14486,8 +14699,15 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
     const dist=Number(vf?.characterDistance ?? p?.valueCharacterDistance ?? 0);
     const sameContent=norm(p?.valueReference)===norm(p?.valueTarget);
     const localCorroboration=differences.some(x=>x.field===fieldName(field)&&x.category==='typography'&&x.localEvidence);
+    // Same OCR content is necessary but not sufficient: photographed JPG vs PDF
+    // rasterization can change glyph metrics globally. Require either a local
+    // crop corroboration or an unusually strong repeated-glyph signal.
     if(!sameContent && !localCorroboration) continue;
     if(shared<2 || repeated<2 || dist<0.55) continue;
+    if(!localCorroboration && !(strongRepeated>=6 && dist>=0.85)) continue;
+    // Short static header values are especially sensitive to PDF/JPG font and
+    // rasterization differences; do not surface them without local corroboration.
+    if(!localCorroboration && ['generic:bankasi','generic:ettn'].includes(semanticFieldKey(field))) continue;
     add('typography',field,`${fieldName(field)} alanında karakter/raster farkı`,
       'Aynı içerikteki karakterlerin yazı/raster görünümü referans dekonttaki karşılığından belirgin biçimde farklı.',
       'güçlü',Math.max(88,Math.min(97,dist*60)),{
@@ -14549,7 +14769,7 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
   }
   return {
     available:true,
-    engine:'reference-difference-core-v46-conservative',
+    engine:'reference-difference-core-v47-spacing-typo-gates',
     referenceCount:Number(forensic?.referenceCount||templateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
