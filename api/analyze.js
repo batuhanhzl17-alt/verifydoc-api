@@ -14419,6 +14419,40 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     referenceTemplateAnalysis
   );
 
+  // V51: If the submitted target file is byte-for-byte identical to the
+  // selected trusted reference file, there is no reference difference to
+  // report. This is the strongest possible test for the exact-reference case
+  // and prevents OCR/render nondeterminism from inventing missing-field errors.
+  let identicalReferenceFile = false;
+  try {
+    if (referenceInfo?.path && targetPath) {
+      const [refBuf, tarBuf] = await Promise.all([
+        fs.readFile(referenceInfo.path),
+        fs.readFile(targetPath)
+      ]);
+      identicalReferenceFile = createHash('sha256').update(refBuf).digest('hex') ===
+        createHash('sha256').update(tarBuf).digest('hex');
+    }
+  } catch (e) {
+    console.warn('V51 IDENTICAL REFERENCE HASH HATASI:', e?.message || e);
+  }
+
+  if (identicalReferenceFile) {
+    console.log('V51 IDENTICAL REFERENCE GUARD: target and trusted reference are byte-identical; no reference difference reported.');
+    return {
+      available: true,
+      engine: 'reference-difference-core-v51-identical-reference-guard',
+      referenceCount: Number(referenceForensics?.referenceCount || referenceTemplateAnalysis?.referenceCount || 0),
+      differenceCount: 0,
+      strongDifferenceCount: 0,
+      differences: [],
+      compatible: Array.isArray(base?.compatible) ? base.compatible : [],
+      status: 'identical-reference',
+      identicalReferenceFile: true,
+      userText: '🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Gönderilen dekont seçilen referans dekontla aynı. Belirgin bir fark tespit edilmedi.'
+    };
+  }
+
   // V50: initialize the PDF→PDF typography guard BEFORE it is referenced.
   // V49 evaluated these constants inside the differences initializer, causing
   // a JavaScript TDZ ReferenceError and a POST 500.
@@ -14590,13 +14624,13 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   } else {
     lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
-  console.log('V50 REFERENCE TYPOGRAPHY GUARD:', JSON.stringify({
+  console.log('V51 REFERENCE TYPOGRAPHY GUARD:', JSON.stringify({
     targetIsPdf, referenceIsPdf, pdfToPdfTypographyGuard, structuralMatchCount, stableMismatch, allowStandaloneTypography
   }));
 
   return {
     available:true,
-    engine:'reference-difference-core-v50-tdz-render-fix',
+    engine:'reference-difference-core-v51-identical-reference-guard',
     referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
