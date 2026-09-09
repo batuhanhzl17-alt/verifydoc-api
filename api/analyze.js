@@ -13357,51 +13357,46 @@ if (referenceForensics) {
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
 // "yapısal sapma" dediyse Telegram'a bunun nerede olduğunu yaz.
 if (referenceForensics || layoutForensics?.available || referenceVisualAdjudication?.available) {
-  // V38 HARD GATE: the trusted-reference comparison is the only source of
-  // user-facing reference findings. If the direct visual adjudicator has no
-  // sufficiently strong finding, report CLEAN rather than falling back to
-  // Azure gaps, line geometry, OCR artifacts, or legacy forensic scores.
-  const hasDirectReferenceFindings = Array.isArray(referenceVisualAdjudication?.findings)
-    && referenceVisualAdjudication.findings.length > 0;
-  const humanForensicReport = hasDirectReferenceFindings
+  // V44: the deterministic reference forensic engine is the primary source of
+  // user-facing findings. The visual AI adjudicator is supplementary; it must
+  // never erase concrete deterministic evidence by returning findings=[].
+  const deterministicReport = buildV45ReferenceDifferenceReport(
+    referenceForensics,
+    layoutForensics,
+    referenceLocalCrop,
+    azureReferenceGeometry,
+    referenceTemplateAnalysis
+  );
+  const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
-    : {
-        headline: 'Referans karşılaştırmasında belirgin fark bulunmadı.',
-        findings: [],
-        findingCount: 0,
-        strongFindingCount: 0,
-        userText: '🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.'
-      };
+    : null;
+
+  const humanForensicReport = deterministicReport || aiReport;
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
-    // Telegram/UI için teknik engine cümlesi yerine anlaşılır bulgu metnini kullan.
-    result.summary = [result.summary, humanForensicReport.userText]
-      .filter(Boolean)
-      .join("\n\n");
-    console.log("HUMAN READABLE FORENSIC REPORT:", JSON.stringify(humanForensicReport));
+    result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
+    console.log("HUMAN READABLE FORENSIC REPORT V44:", JSON.stringify(humanForensicReport));
 
-    // Somut referans farklarını hedef dekont üzerinde görselleştir.
-    // Bu katman yalnızca sunum içindir; risk/karar mantığını değiştirmez.
     try {
       const annotatedReferenceDifference = await buildAnnotatedReferenceDifferenceImage({
         targetPath: forensicTargetPath,
         targetOCR: paddleImageOCR,
-        referenceForensics: null,
-        referenceLocalCrop: null,
-        azureReferenceGeometry: null,
+        referenceForensics,
+        referenceLocalCrop,
+        azureReferenceGeometry,
         humanReport: humanForensicReport,
         finalAdjudication: referenceVisualAdjudication,
       });
       if (annotatedReferenceDifference?.available) {
         result.annotatedReferenceDifference = annotatedReferenceDifference;
-        console.log("ANNOTATED REFERENCE DIFFERENCE:", JSON.stringify({
+        console.log("ANNOTATED REFERENCE DIFFERENCE V44:", JSON.stringify({
           available: true,
           boxCount: annotatedReferenceDifference.boxCount,
           gapMarkerCount: annotatedReferenceDifference.gapMarkerCount
         }));
       }
     } catch (error) {
-      console.warn("ANNOTATED REFERENCE DIFFERENCE HATASI:", error?.message || error);
+      console.warn("ANNOTATED REFERENCE DIFFERENCE V44 HATASI:", error?.message || error);
     }
   }
 }
@@ -13633,8 +13628,15 @@ function buildReferenceEvidenceLedger(forensic, layout = null, localCrop = null,
   for (const f of (forensic?.fields || [])) {
     if (!f?.suspicious) continue;
     const key = String(f.field || '').replace(/:value$/i,'');
-    if (!key || key.startsWith('generic:')) continue;
-    add(key, 'field-geometry-style', Math.max(Number(f.combinedScore)||0, 70), f.evidence || 'Alan bazında bağımsız geometri/stil sapması.');
+    if (!key) continue;
+    // Generic semantic fields are valid reference anchors too. Older versions
+    // excluded them here, which discarded the exact BANKASI / ETTN / SORGU
+    // NUMARASI evidence already produced by the forensic engine.
+    if (Number(f.positionScore) >= 70) {
+      add(key, 'field-geometry-style', Math.max(Number(f.combinedScore)||0, Number(f.positionScore)||0, 70), f.evidence || 'Alan konumu referansa göre belirgin şekilde sapıyor.', f.targetValueRegion || f.targetBox || null);
+    } else if (f.suspicious) {
+      add(key, 'field-geometry-style', Math.max(Number(f.combinedScore)||0, 70), f.evidence || 'Alan bazında bağımsız geometri/stil sapması.', f.targetValueRegion || f.targetBox || null);
+    }
   }
 
   // Local crop is only a candidate until it is a genuine local outlier.
@@ -13661,10 +13663,17 @@ function buildReferenceEvidenceLedger(forensic, layout = null, localCrop = null,
   for (const f of (forensic?.characterFindings || [])) {
     if (f?.scope !== 'value') continue;
     const key = String(f.field || '').replace(/:value$/i,'');
-    if (!key || key.startsWith('generic:')) continue;
+    if (!key) continue;
     const d = Number(f.characterDistance);
-    if (!Number.isFinite(d) || d < 0.42) continue;
-    add(key, 'value-typography', Math.min(95, 55 + d*50), f.evidence || 'Değer alanında lokal karakter/raster sapması.', f.targetValueBox || f.targetBox || null);
+    const repeated = Number(f.repeatedHighDistanceGlyphCount || 0);
+    const internal = f?.type === 'internal-value-style-substitution-v23' || !!f?.corroboration;
+    // Promote only strong, repeated value-render evidence. This is deliberately
+    // independent of literal transaction values and tolerant of Turkish diacritics.
+    if (!Number.isFinite(d) || (d < 0.75 && repeated < 5 && !internal)) continue;
+    const strength = Math.min(95, Math.max(78, 55 + d*50, repeated >= 5 ? 82 : 0));
+    add(key, 'value-typography', strength, f.evidence || 'Değer alanında lokal karakter/raster sapması.', f.targetValueBox || f.targetBox || null, {
+      repeatedHighDistanceGlyphCount: repeated, internalStyleFinding: internal
+    });
   }
 
   // Pixel findings are accepted only when already localized to a semantic field.
@@ -14333,6 +14342,200 @@ function buildHumanReadableReferenceVisualAdjudicationReport(adjudication) {
   };
 }
 
+
+// =====================================================
+// V45 REFERENCE DIFFERENCE CORE
+// =====================================================
+// V45: Dünkü İş Bankası testinde işe yarayan mantığı ana referans raporuna
+// taşıyoruz: referansı değerlerin kendisi için değil, TARGET üzerindeki aynı
+// semantik alanın görsel/tipografik üretimini kıyaslamak için kullan.
+//
+// Kritik kurallar:
+//  - Farklı işlem değeri tek başına fark değildir.
+//  - Aynı karakter (özellikle 0/1 gibi rakamlar) mümkün olduğunda aynı karakter
+//    olarak karşılaştırılır.
+//  - Global kamera/JPEG/PDF render farkı yerine lokal sapma aranır.
+//  - Etiketin tek başına farklı görünmesi raporlanmaz.
+//  - Internal value-vs-label style sonucu ancak güçlü ve aynı alan üzerinde
+//    ikinci bir kanıt varsa kullanıcıya taşınır.
+//  - Güçlü semantik boşluk/yerleşim farkı tek başına raporlanabilir.
+function buildV45ReferenceDifferenceReport(forensic, layout = null, localCrop = null, azureGeometry = null, templateAnalysis = null) {
+  if (!forensic?.available && !layout?.available && !templateAnalysis?.referenceCount) return null;
+
+  const fieldName = (value) => {
+    const key = String(value || '').trim();
+    const map = {
+      amount:'Tutar', iban:'IBAN', senderName:'Gönderen Adı', recipientName:'Alıcı Adı',
+      senderAddress:'Gönderen Adresi', recipientAddress:'Alıcı Adresi', address:'Adres',
+      branch:'Şube', date:'Tarih', time:'Saat', description:'Açıklama',
+      transactionNo:'İşlem No', accountNo:'Hesap No', taxNo:'Vergi No',
+      'generic:BANKASI':'Banka Bilgisi',
+      'generic:DOKUMAN NUMARASI':'Doküman Numarası',
+      'generic:ISLEM YERI':'İşlem Yeri',
+      'generic:REFERANS NUMARASI':'Referans Numarası',
+      'generic:ETTN':'ETTN',
+      'generic:SENARYO/DEKONT TIPI':'Senaryo/Dekont Tipi',
+      'generic:SORGU NUMARASI':'Sorgu Numarası',
+      'generic:SIRKET MERKEZI':'Şirket Merkezi',
+      'generic:MOBÍL BANKACILIK':'Mobil Bankacılık'
+    };
+    return map[key] || (key.startsWith('generic:') ? key.slice(8).replace(/_/g,' ') : key) || 'Alan';
+  };
+
+  const differences=[];
+  const compatible=[];
+  const seen=new Set();
+  const add=(category,field,title,detail,strength='belirgin',score=0,extra={})=>{
+    const f=fieldName(field), t=String(title||'').trim(), d=String(detail||'').trim();
+    if(!t||!d)return;
+    const k=`${category}|${f}|${t}`.toLocaleLowerCase('tr-TR');
+    if(seen.has(k))return;
+    seen.add(k);
+    differences.push({category,field:f,title:t,detail:d,strength,score:Number(score)||0,...extra});
+  };
+  const addCompatible=(field,detail)=>{
+    const f=fieldName(field); if(!detail)return;
+    if(!compatible.some(x=>x.field===f&&x.detail===detail))compatible.push({field:f,detail});
+  };
+
+  // 1) Reference-template geometry: similarity score düşükse gerçek yerleşim farkı.
+  for(const row of (Array.isArray(templateAnalysis?.fields)?templateAnalysis.fields:[])){
+    const score=Number(row?.geometryScore);
+    if(!Number.isFinite(score))continue;
+    const field=row?.field||row?.label||row?.referenceLabel;
+    if(score<=42) add('shape',field,`${fieldName(field)} alanında yerleşim farkı`,
+      'Bu alanın konumu veya ölçüsü referans dekonttan belirgin biçimde farklı.',score<=25?'güçlü':'belirgin',100-score);
+    else if(score>=82) addCompatible(field,'yerleşim referansla uyumlu');
+  }
+
+  // 2) Semantic spacing: yalnızca güçlü, semantik olarak eşleşmiş aralıklar.
+  const spacing=[
+    ...(Array.isArray(forensic?.spacingAnomalies)?forensic.spacingAnomalies:[]),
+    ...(Array.isArray(layout?.localGapAnomalies)?layout.localGapAnomalies:[])
+  ];
+  for(const row of spacing.sort((a,b)=>Number(b?.score||0)-Number(a?.score||0))){
+    const score=Number(row?.score);
+    if(!Number.isFinite(score)||score<78)continue;
+    const before=String(row?.beforeLabel||row?.beforeField||'').trim();
+    const after=String(row?.afterLabel||row?.afterField||'').trim();
+    if(!before||!after)continue;
+    add('shape',`${before}/${after}`,`${before} ile ${after} arasında yerleşim farkı`,
+      'Bu iki alan arasındaki boşluk veya hizalama referans dekonttan belirgin biçimde farklı.',score>=90?'güçlü':'belirgin',score);
+    if(differences.filter(x=>x.category==='shape').length>=3)break;
+  }
+
+  // 3) Lokal crop comparator: zaten global render farkını baseline'dan ayırmış
+  // sonuçları kullan. Burada tekrar bir ikinci güvenlik kapısı var.
+  for(const row of (Array.isArray(localCrop?.findings)?localCrop.findings:[])){
+    const se=Number(row?.localStyleExcess), ce=Number(row?.localCharacterExcess);
+    const sd=Number(row?.styleDistance), cd=Number(row?.characterDistance);
+    const both=Number.isFinite(se)&&Number.isFinite(ce)&&se>=0.16&&ce>=0.14;
+    const extreme=(Number.isFinite(se)&&se>=0.26&&Number.isFinite(sd)&&sd>=0.42)||
+                  (Number.isFinite(ce)&&ce>=0.24&&Number.isFinite(cd)&&cd>=0.50);
+    if(!(both||extreme))continue;
+    const field=String(row?.field||'').trim(); if(!field)continue;
+    add('typography',field,`${fieldName(field)} alanında yazı/render farkı`,
+      'Bu alanın lokal yazı/karakter raster görünümü referans dekonttan belirgin biçimde farklı.',both?'güçlü':'belirgin',both?88:82,{targetBox:row?.targetBox||null});
+  }
+
+  // 4) V21/V23 aynı-karakter çekirdeği.
+  // Whole-value farkını değil, aynı karakterlerin tekrar eden raster farkını
+  // öne al. Özellikle tutar için 0-0 / 1-1 gibi eşleşmeler değerlidir.
+  for(const f of (Array.isArray(forensic?.characterFindings)?forensic.characterFindings:[])){
+    if(String(f?.scope||'')!=='value')continue;
+    const field=String(f?.field||'').replace(/:value$/i,'').trim(); if(!field)continue;
+    const severity=String(f?.severity||'').toLowerCase();
+    if(severity!=='strong')continue;
+    const d=Number(f?.characterDistance);
+    const repeated=Number(f?.repeatedHighDistanceGlyphCount||0);
+    const strongRepeated=Number(f?.repeatedStrongDistanceGlyphCount||0);
+    const shared=Number(f?.sharedCharacterCount||f?.valueSharedCharacterCount||0);
+    const internal=f?.type==='internal-value-style-substitution-v23';
+    // En güvenilir durum: aynı karakterlerin birden fazlası belirgin şekilde
+    // ayrışıyor. Bu, farklı işlem değerlerini yanlışlıkla kıyaslamaz.
+    const sameCharStrong = repeated>=2 || strongRepeated>=2;
+    // Tutar için iki aynı rakam yeterli olabilir; diğer alanlarda biraz daha
+    // muhafazakar davranıyoruz.
+    const amountSameChar = field==='amount' && (repeated>=2 || strongRepeated>=1) && shared>=2;
+    if(sameCharStrong || amountSameChar){
+      add('typography',field,`${fieldName(field)} alanında karakter/raster farkı`,
+        'Aynı karakterlerin tekrarlanan yazı/raster görünümü referans dekonttaki karşılıklarından belirgin biçimde farklı.',
+        'güçlü',Math.max(88,Number.isFinite(d)?Math.min(96,d*55):88),{
+          targetBox:f?.targetValueBox||f?.targetBox||null,
+          sameCharacterEvidence:true
+        });
+      continue;
+    }
+
+    // Internal style substitution dün işe yarayan ikinci yol olabilir; ancak
+    // tek başına generic alanları raporlamıyoruz. Aynı alan için lokal crop veya
+    // field-geometry desteği varsa aşağıdaki blok bunu alır.
+    if(internal){
+      const profile=(Array.isArray(forensic?.typographyFieldProfiles)?forensic.typographyFieldProfiles:[])
+        .find(x=>String(x?.field||'').replace(/:value$/i,'')===field);
+      const local=(Array.isArray(localCrop?.findings)?localCrop.findings:[]).some(x=>String(x?.field||'')===field);
+      const geom=(Array.isArray(forensic?.fields)?forensic.fields:[]).some(x=>String(x?.field||'').replace(/:value$/i,'')===field && Number(x?.positionScore||0)>=62);
+      if(profile && (local||geom)){
+        add('typography',field,`${fieldName(field)} alanında yazı/render farkı`,
+          'Değer alanının yazı karakter yapısı, referans dekonttaki aynı alanla lokal olarak farklı ve alan konum/render kanıtı da bunu destekliyor.',
+          'güçlü',90,{targetBox:f?.targetValueBox||f?.targetBox||null});
+      }
+    }
+  }
+
+  // 5) Strong field geometry only if the engine has explicit suspicious evidence.
+  // Position alone is weaker than the two routes above, so it is not allowed to
+  // flood the report with unrelated Sorgu No / administrative fields.
+  for(const f of (Array.isArray(forensic?.fields)?forensic.fields:[])){
+    const field=String(f?.field||'').replace(/:value$/i,'').trim();
+    if(!field)continue;
+    const pos=Number(f?.positionScore||0), combined=Number(f?.combinedScore||0);
+    if(pos<78 || combined<70)continue;
+    const existing=differences.some(x=>x.field===fieldName(field));
+    if(existing)continue;
+    // Dynamic administrative identifiers are not promoted from position alone.
+    if(String(field).startsWith('generic:') && !/DOKUMAN|REFERANS|ETTN|BANKASI/i.test(field))continue;
+    add('shape',field,`${fieldName(field)} alanında yerleşim farkı`,
+      'Bu alanın referansa göre konumu belirgin biçimde farklı.', 'belirgin',Math.max(pos,combined));
+  }
+
+  // 6) Eski clone/global pixel skorlarını bilerek kullanıcı farkına çevirmiyoruz.
+  // Lokal pixel bulgusu varsa yalnızca semantik alanla birlikte kullan.
+  for(const p of (Array.isArray(forensic?.pixelFindings)?forensic.pixelFindings:[])){
+    const score=Number(p?.score); const field=p?.field||p?.semanticField;
+    if(!field||!Number.isFinite(score)||score<82)continue;
+    add('pixel',field,`${fieldName(field)} bölgesinde lokal piksel farkı`,
+      'Bu bölgede referansa göre lokal görüntü/piksel yapısı farklı.',score>=90?'güçlü':'belirgin',score);
+  }
+
+  differences.sort((a,b)=>({güçlü:3,belirgin:2,orta:1}[b.strength]||0)-({güçlü:3,belirgin:2,orta:1}[a.strength]||0) || Number(b.score||0)-Number(a.score||0));
+  const material=differences.filter(x=>x.strength==='güçlü'||x.strength==='belirgin').slice(0,8);
+  const lines=['🔎 REFERANS KARŞILAŞTIRMASI'];
+  if(material.length){
+    lines.push('','🔴 FARKLAR',...material.map(x=>`• ${x.title}: ${x.detail}`));
+    const preferred=['Tutar','Alıcı Adı','Gönderen Adı','IBAN','Tarih'];
+    const compat=[];
+    for(const pref of preferred){
+      const hit=compatible.find(x=>x.field.toLocaleLowerCase('tr-TR').includes(pref.toLocaleLowerCase('tr-TR')));
+      if(hit&&!compat.some(x=>x.field===hit.field))compat.push(hit);
+    }
+    if(compat.length)lines.push('','🟢 UYUMLU',...compat.slice(0,5).map(x=>`• ${x.field}`));
+  } else {
+    lines.push('','🟢 Belirgin bir fark tespit edilmedi.');
+  }
+  return {
+    available:true,
+    engine:'reference-difference-core-v45-isbankasi-derived',
+    referenceCount:Number(forensic?.referenceCount||templateAnalysis?.referenceCount||0),
+    differenceCount:material.length,
+    strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
+    differences:material,
+    compatible:compatible.slice(0,12),
+    status:material.length?'differences-found':'no-material-difference-found',
+    userText:lines.join('\n')
+  };
+}
+
 function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
   // The reference is a whole-document fingerprint. Compare structure/spacing first,
@@ -14343,22 +14546,21 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   const fieldName = (value) => {
     const key = String(value || '').trim();
     const map = {
-      branch: 'Şube',
-      date: 'Tarih',
-      time: 'Saat',
-      description: 'Açıklama',
-      transactionNo: 'İşlem No',
-      accountNo: 'Hesap No',
-      taxNo: 'Vergi No',
-      amount: 'Tutar',
-      iban: 'IBAN',
-      senderName: 'Gönderen Adı',
-      recipientName: 'Alıcı Adı',
-      senderAddress: 'Gönderen Adresi',
-      recipientAddress: 'Alıcı Adresi',
-      address: 'Adres'
+      branch: 'Şube', date: 'Tarih', time: 'Saat', description: 'Açıklama',
+      transactionNo: 'İşlem No', accountNo: 'Hesap No', taxNo: 'Vergi No', amount: 'Tutar',
+      iban: 'IBAN', senderName: 'Gönderen Adı', recipientName: 'Alıcı Adı',
+      senderAddress: 'Gönderen Adresi', recipientAddress: 'Alıcı Adresi', address: 'Adres',
+      'generic:BANKASI': 'Banka Bilgisi',
+      'generic:DOKUMAN NUMARASI': 'Doküman Numarası',
+      'generic:ISLEM YERI': 'İşlem Yeri',
+      'generic:REFERANS NUMARASI': 'Referans Numarası',
+      'generic:ETTN': 'ETTN',
+      'generic:SENARYO/DEKONT TIPI': 'Senaryo/Dekont Tipi',
+      'generic:SORGU NUMARASI': 'Sorgu Numarası',
+      'generic:SIRKET MERKEZI': 'Şirket Merkezi',
+      'generic:MOBÍL BANKACILIK': 'Mobil Bankacılık'
     };
-    return map[key] || key || 'Alan';
+    return map[key] || (key.startsWith('generic:') ? key.slice(8).replace(/_/g,' ') : key) || 'Alan';
   };
 
   const findings = [];
@@ -14546,8 +14748,51 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 4) Generic layout/spacing remains hidden unless the dedicated whole-page
-  // layout engine has produced a concrete, sufficiently strong local finding.
+  // 4) Strong typography evidence can stand on its own when it is a repeated
+  // value-level render mismatch. V43 lost these findings because generic:*
+  // fields were filtered out and the AI visual gate returned zero findings.
+  // These are already localized by the forensic engine to targetValueBox.
+  for (const f of (Array.isArray(forensic?.characterFindings) ? forensic.characterFindings : [])) {
+    if (String(f?.scope || '') !== 'value') continue;
+    const d = Number(f?.characterDistance);
+    const repeated = Number(f?.repeatedHighDistanceGlyphCount || 0);
+    const internal = f?.type === 'internal-value-style-substitution-v23' || !!f?.corroboration;
+    if (String(f?.severity || '').toLowerCase() !== 'strong') continue;
+    if (!internal && (!Number.isFinite(d) || (d < 0.75 && repeated < 5))) continue;
+    const field = String(f?.field || '').replace(/:value$/i,'');
+    if (!field) continue;
+    const key = `strong-typography|${field}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    findings.push({
+      priority: 2,
+      title: fieldName(field),
+      detail: 'Değer alanındaki yazı/karakter raster görünümü referans dekonttaki aynı alanla belirgin şekilde farklı.',
+      kind: 'strong-typography',
+      evidenceField: field,
+      targetBox: f?.targetValueBox || f?.targetBox || null
+    });
+  }
+
+  // 5) Strong field placement is concrete even when no local pixel crop is
+  // available. Sorgu Numarası gibi fields can be located from their OCR label.
+  for (const f of (Array.isArray(forensic?.fields) ? forensic.fields : [])) {
+    if (Number(f?.positionScore || 0) < 70) continue;
+    const field = String(f?.field || '').replace(/:value$/i,'');
+    if (!field) continue;
+    const title = fieldName(field);
+    const key = `strong-position|${field}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    findings.push({
+      priority: 1,
+      title,
+      detail: 'Bu alanın referansa göre dikey konumu belirgin şekilde farklı.',
+      kind: 'field-position',
+      evidenceField: field,
+      targetBox: null
+    });
+  }
 
   // Final quality gate: a reference difference is user-facing only when it is
   // concrete and independently supported. This prevents normal camera/resize
@@ -14730,10 +14975,10 @@ async function buildAnnotatedReferenceDifferenceImage({
     const gapMarkers = [];
     const seenBox = new Set();
 
-    // V31 FINAL GATE: annotations may ONLY originate from Terra-confirmed
-    // evidence-linked findings. Deterministic candidates are never drawn. Never show stale deterministic candidates when
-    // Terra explicitly decided that no strong visual difference exists.
-    const useFinalAdjudicationOnly = true;
+    // V44: deterministic reference findings are valid annotation sources because
+    // they are already evidence-linked to semantic fields / target value boxes.
+    // AI adjudication remains supplementary and never vetoes deterministic evidence.
+    const useFinalAdjudicationOnly = false;
     const useV29ConfirmedFindings = !!finalAdjudication?.available && Array.isArray(finalAdjudication?.findings) && finalAdjudication.findings.length > 0;
 
     // 1) Exact target boxes emitted by local forensic comparison.
@@ -14770,11 +15015,12 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 3) Typography: FIRST choice is the exact targetValueBox emitted by the
-    // finding itself. This guarantees that the red box follows the evidence.
-    // SECOND choice is an OCR value region resolved from the exact label.
-    if (!useFinalAdjudicationOnly) for (const row of (referenceForensics?.characterFindings || []).slice(0,20)) {
-      let b = boxOf(row?.targetValueBox || row?.targetBox);
+    // 3) Typography: V45 uses ONLY the evidence-linked findings selected by the
+    // new reference-difference core. Raw characterFindings are diagnostics and
+    // must not create stale/unreported red boxes.
+    if (!useFinalAdjudicationOnly) for (const row of ((humanReport?.findings || []).filter(x =>
+      x?.category === 'typography' && x?.targetBox) || [])) {
+      let b = boxOf(row?.targetBox);
 
       if (!b) {
         const labelText = row?.targetLabelText || row?.labelText || '';
@@ -14787,7 +15033,7 @@ async function buildAnnotatedReferenceDifferenceImage({
       if (!b) continue;
 
       const field = String(row?.field || '').replace(/:value$/i,'');
-      const key = `tp-value|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      const key = `tp-value-v45|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
       boxes.push({
@@ -14835,9 +15081,23 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 4) Human-readable report items are intentionally NOT used as a generic
-    // annotation fallback. A report title alone is not evidence of a precise
-    // target location. This prevents the previous "wrong place" red boxes.
+    // 6) V44 human-report findings. If a deterministic finding has an exact
+    // targetBox use it; otherwise resolve the semantic title against OCR.
+    // This is the fallback that V43 deliberately disabled and is what allows
+    // proven forensic differences to be shown even when Terra returns zero.
+    for (const row of (humanReport?.findings || []).slice(0,12)) {
+      let b = boxOf(row?.targetBox);
+      const label = String(row?.title || '').trim();
+      if (!b && label) {
+        const labelBox = findExactLabelRegion(label);
+        b = findValueNearLabel(labelBox, label) || labelBox;
+      }
+      if (!b) continue;
+      const key = `human|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({box:b,label:label || 'referans farkı',source:'deterministic-reference'});
+    }
 
     if (!boxes.length && !gapMarkers.length) return null;
 
