@@ -1767,12 +1767,20 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   // allowing repeated value-render anomalies to support an editing signal.
   const typographyCredibleCount = Number(forensic?.referenceForensics?.typographyCredibleFieldCount) || 0;
   const typographyCredibility = String(forensic?.referenceForensics?.typographyCredibility || 'none');
-  if (typographyCredibleCount >= 3 && typographyCredibility === 'strong') {
-    editingRisk = Math.max(editingRisk, 65);
-  } else if (typographyCredibleCount >= 2 && typographyCredibility === 'medium') {
-    editingRisk = Math.max(editingRisk, 48);
-  } else if (typographyCredibleCount === 1 && typographyCredibility === 'weak') {
-    editingRisk = Math.max(editingRisk, 25);
+  const targetMimeForRisk = String(forensic?.targetMime || result?.file?.mimeType || '').toLowerCase();
+  const targetIsRasterForRisk = /^image\/(?:jpe?g|png|webp|bmp|tiff?)$/i.test(targetMimeForRisk);
+  // Camera/JPEG/PNG targets naturally produce many glyph-edge/raster differences
+  // against a PDF reference. Do not convert those generic character findings
+  // into editing risk. A localized direct-reference/Terra finding remains an
+  // independent path and is intentionally untouched here.
+  if (!targetIsRasterForRisk) {
+    if (typographyCredibleCount >= 3 && typographyCredibility === 'strong') {
+      editingRisk = Math.max(editingRisk, 65);
+    } else if (typographyCredibleCount >= 2 && typographyCredibility === 'medium') {
+      editingRisk = Math.max(editingRisk, 48);
+    } else if (typographyCredibleCount === 1 && typographyCredibility === 'weak') {
+      editingRisk = Math.max(editingRisk, 25);
+    }
   }
   if (Number.isFinite(pixelScore)) {
     editingRisk = Math.max(editingRisk, Math.min(55, Math.round(pixelScore * 0.55)));
@@ -7319,6 +7327,48 @@ return String(value || "")
 .trim();
 }
 
+// V56: PaddleOCR sometimes produces mixed thousands/decimal separators such as
+// "1.004.19" or "1,004.19".  These are OCR formatting artifacts, not amount
+// mismatches. Normalize only the numeric literal while preserving the actual
+// numeric value. Turkish-style output uses comma for the decimal separator.
+function normalizeOCRAmountLiteral(value) {
+  let raw = String(value ?? "").trim();
+  if (!raw) return raw;
+
+  raw = raw
+    .replace(/[₺]/g, "")
+    .replace(/\b(?:TL|TRY|EUR|USD|GBP)\b/gi, "")
+    .replace(/\s+/g, "")
+    .replace(/[^0-9,.-]/g, "");
+
+  if (!raw) return raw;
+
+  const sign = /^[+-]/.test(raw) ? raw[0] : "";
+  raw = raw.replace(/^[+-]/, "");
+  if (!raw) return sign;
+
+  const commas = [...raw].filter(c => c === ",").length;
+  const dots = [...raw].filter(c => c === ".").length;
+  const separators = commas + dots;
+
+  if (!separators) return sign + raw;
+
+  // The final separator is a decimal separator only when exactly 1–2 digits
+  // follow it. Earlier separators are then thousands separators.
+  const lastSep = Math.max(raw.lastIndexOf(","), raw.lastIndexOf("."));
+  const digitsAfter = raw.length - lastSep - 1;
+  const hasDecimalTail = digitsAfter >= 1 && digitsAfter <= 2;
+
+  if (hasDecimalTail) {
+    const integerPart = raw.slice(0, lastSep).replace(/[.,]/g, "");
+    const decimalPart = raw.slice(lastSep + 1).replace(/[.,]/g, "");
+    return sign + (integerPart || "0") + "," + decimalPart;
+  }
+
+  // No decimal tail: every separator is a thousands separator.
+  return sign + raw.replace(/[.,]/g, "");
+}
+
 function numericSignal(text) {
 const value = cleanAmountText(text);
 if (!value) return 0;
@@ -9331,7 +9381,7 @@ directAmountLabelScore: Number(candidate.directLabelEvidence?.score || 0),
 directAmountLabel: candidate.directLabelEvidence?.label || null,
 },
 selectionMethod,
-selectedAmountText: candidate.text,
+selectedAmountText: normalizeOCRAmountLiteral(candidate.text),
 referenceAmountText: null,
 segmentFeatures: features.map((feature, index) => ({
 index,
@@ -10875,54 +10925,16 @@ Number.isFinite(value)
 return value;
 }
 
-let raw =
-String(value)
-.trim()
-.replace(/\s/g, "")
-.replace(/[₺]/g, "")
-.replace(/TL/gi, "")
-.replace(/TRY/gi, "");
+let raw = normalizeOCRAmountLiteral(String(value));
 
 if (!raw) {
-
-return null;
-}
-if (
-raw.includes(",") &&
-raw.includes(".")
-) {
-
-raw =
-raw.replace(/\./g, "")
-.replace(",", ".");
-
-}
-else if (
-raw.includes(",")
-) {
-raw =
-raw.replace(",", ".");
-
+  return null;
 }
 
-else {
+// normalizeOCRAmountLiteral emits Turkish decimal notation (comma).
+raw = raw.replace(/,/g, ".");
 
-const parts =
-raw.split(".");
-if (
-parts.length === 2 &&
-parts[1].length === 3
-) {
-
-raw =
-raw.replace(/\./g, "");
-
-}
-
-}
-
-const number =
-Number(raw);
+const number = Number(raw);
 
 return Number.isFinite(number)
 ? number
@@ -11809,120 +11821,10 @@ if (
   }
 }
 
-// =====================================================
-// TERRA REFERANS GÖRSEL HAKEMİ — FINAL REFERENCE DECISION SUPPORT
-// =====================================================
-let referenceVisualAdjudication = null;
-if ((type === 'image' || type === 'pdf') && bank && reference) {
-  try {
-    referenceVisualAdjudication = await runReferenceVisualAdjudicator({
-      targetPath: forensicTargetPath,
-      targetMime: forensicTargetMime,
-      targetBase64: base64,
-      referenceInfo: reference,
-      bank,
-      targetOCR: paddleImageOCR,
-    });
-    console.log('REFERENCE VISUAL ADJUDICATOR LEGACY V27:', JSON.stringify(referenceVisualAdjudication));
-  } catch (error) {
-    console.warn('REFERENCE VISUAL ADJUDICATOR V27 HATASI:', error?.message || error);
-  }
-}
-
-// =====================================================
-// GÖRSEL FORENSICS — BÜTÜN SAYFA REFERANS KARŞILAŞTIRMASI
-// =====================================================
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
-  try {
-    const trustedReferencePaths = await getReferenceFiles(bank);
-    visualForensics = await runVisualForensics({
-      targetPath: forensicTargetPath,
-      referencePaths: trustedReferencePaths,
-      bank,
-      tempDir: "/tmp",
-    });
-    console.log("VISUAL FORENSICS:", JSON.stringify(visualForensics));
-  } catch (error) {
-    console.warn("VISUAL FORENSICS HATASI:", error?.message || error);
-  }
-}
-
-// =====================================================
-// YAPISAL KUTU / ÇİZGİ GEOMETRİSİ FORENSICS
-// =====================================================
-if ((type === "image" || type === "pdf") && bank && reference) {
-  try {
-    layoutForensics = await runReferenceLayoutForensics(forensicTargetPath, bank);
-    console.log("REFERENCE LAYOUT FORENSICS:", JSON.stringify(layoutForensics));
-  } catch (error) {
-    console.warn("REFERENCE LAYOUT FORENSICS HATASI:", error?.message || error);
-  }
-}
-
-// =====================================================
-// REFERENCE FORENSIC ENGINE — ALAN BAZLI PİKSEL/TİPOGRAFİ
-// =====================================================
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
-  try {
-    referenceForensics = await runReferenceForensicEngine(
-      forensicTargetPath,
-      bank,
-      paddleImageOCR
-    );
-    referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
-    console.log("REFERENCE FORENSIC ENGINE:", JSON.stringify(referenceForensics));
-  } catch (error) {
-    console.warn("REFERENCE FORENSIC ENGINE HATASI:", error?.message || error);
-  }
-}
-
-let referenceLocalCrop = null;
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
-  try {
-    referenceLocalCrop = await runReferenceLocalCropComparator(
-      forensicTargetPath,
-      bank,
-      paddleImageOCR
-    );
-    console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
-  } catch (error) {
-    console.warn("REFERENCE LOCAL CROP HATASI:", error?.message || error);
-  }
-}
-
-// =====================================================
-// V29 — EVIDENCE-LINKED VISUAL ADJUDICATION
-// =====================================================
-// V28 used Terra as a hard final gate. That created the opposite failure mode:
-// when Terra missed a small/local manipulation, every deterministic forensic
-// signal was discarded and the result became "no difference".
-// V29 instead uses the deterministic engines to nominate precise candidate ROIs
-// and asks Terra to judge EACH candidate locally. A candidate is user-facing only
-// when Terra confirms it OR when multiple independent deterministic families
-// strongly agree on the same semantic field/ROI.
-try {
-  if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
-    const v29 = await runEvidenceLinkedVisualAdjudicator({
-      targetPath: forensicTargetPath,
-      targetMime: forensicTargetMime,
-      targetBase64: base64,
-      referenceInfo: reference,
-      bank,
-      targetOCR: paddleImageOCR,
-      referenceForensics,
-      referenceLocalCrop,
-      azureReferenceGeometry,
-    });
-    if (v29?.available) {
-      referenceVisualAdjudication = v29;
-      console.log("REFERENCE VISUAL ADJUDICATOR V29:", JSON.stringify(v29));
-    }
-  }
-} catch (error) {
-  console.warn("REFERENCE VISUAL ADJUDICATOR V29 HATASI:", error?.message || error);
-}
-
-
+// V56: Duplicate Terra passes V27 and V29 were diagnostic/legacy paths.
+// The V39 focused direct-reference pass below is the sole Terra reference
+// comparison. Skipping the duplicate calls removes many serial model requests
+// without changing V39/Terra itself.
 // =====================================================
 // V38 — DIRECT REFERENCE TRUTH GATE
 // =====================================================
@@ -12426,7 +12328,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference) {
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
-    const trustedReferencePaths = await getReferenceFiles(bank);
+    const trustedReferencePaths = reference?.path ? [reference.path] : [];
     pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
@@ -13369,7 +13271,7 @@ if (
   ["reference-roi-and-direct-label", "direct-amount-label-roi", "reference-roi", "reference-position-and-label", "reference-position", "reference-nearest", "amount-label", "reconstructed-amount-label", "inline-primary-amount-label", "inline-primary-amount-label-no-anchor", "same-region-strong-amount-label", "same-region-strong-amount-label-no-anchor", "direct-amount-label-no-anchor", "reconstructed-amount-label-no-anchor", "amount-label-no-anchor"].includes(amountForensics?.selectionMethod) &&
   amountForensics?.selectedAmountText
 ) {
-  const selected = String(amountForensics.selectedAmountText)
+  const selected = normalizeOCRAmountLiteral(String(amountForensics.selectedAmountText))
     .trim()
     .replace(/^[+]+/, "")
     .replace(/[)]+$/, "")
@@ -14694,7 +14596,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
 
   return {
     available:true,
-    engine:'reference-difference-core-v52-camera-raster-guard',
+    engine:'reference-difference-core-v56-camera-raster-amount-guard',
     referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
@@ -15609,6 +15511,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   pixelForensics,
   azureLayout,
   azureReferenceGeometry,
+  targetMime: forensicTargetMime,
 });
 console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
 
