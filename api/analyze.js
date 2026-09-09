@@ -367,7 +367,10 @@ async function getAzureReferenceLayouts(bank) {
     return azureReferenceLayoutCache.get(cacheKey);
   }
 
-  const referencePaths = await getReferenceFiles(normalizedBank);
+  const allReferencePaths = await getReferenceFiles(normalizedBank);
+  const referencePaths = selectedReferencePath && allReferencePaths.includes(selectedReferencePath)
+    ? [selectedReferencePath]
+    : allReferencePaths;
   const layouts = [];
 
   for (const referencePath of referencePaths) {
@@ -1281,87 +1284,67 @@ fileName
 // =====================================================
 // REFERANS PDF OKUMA
 // =====================================================
-async function loadReferenceFile(bank) {
-const normalizedBank =
-normalizeBank(bank);
-
+async function loadReferenceFile(bank, targetOCR = null) {
+const normalizedBank = normalizeBank(bank);
 if (!normalizedBank) {
-
-console.log(
-"REFERENCE BANK TANINMADI:",
-bank
-);
-
-return null;
+  console.log("REFERENCE BANK TANINMADI:", bank);
+  return null;
 }
-const referencePath =
-getReferenceFile(
-normalizedBank
-);
 
-if (!referencePath) {
-
-console.log(
-"REFERENCE PATH BULUNAMADI:",
-normalizedBank
-);
-
-return null;
+// Bankaya ait tüm aday referansları al. Variant filtresi henüz aktif değil.
+const candidatePaths = await getReferenceFiles(normalizedBank);
+if (!candidatePaths.length) {
+  console.log("REFERENCE PATH BULUNAMADI:", normalizedBank);
+  return null;
 }
+
+const targetText = String(targetOCR?.text || '');
+const detectedVariant = detectReferenceVariantFromText(targetText);
+let selectedPath = null;
+
+if (detectedVariant && detectedVariant !== 'mixed') {
+  const variants = await Promise.all(candidatePaths.map(async p => ({
+    path: p,
+    variant: await readReferenceVariant(p)
+  })));
+  selectedPath = variants.find(x => x.variant === detectedVariant)?.path || null;
+}
+
+if (!selectedPath) {
+  const canonical = getReferenceFile(normalizedBank);
+  selectedPath = candidatePaths.includes(canonical) ? canonical : candidatePaths[0];
+}
+
+const selectedVariant = await readReferenceVariant(selectedPath);
+activeReferenceVariant = selectedVariant || detectedVariant || null;
+
+console.log("REFERENCE VARIANT SELECTION:", JSON.stringify({
+  bank: normalizedBank,
+  detectedTargetVariant: detectedVariant,
+  selectedVariant: selectedVariant || null,
+  candidateCount: candidatePaths.length,
+  candidates: candidatePaths.map(p => path.basename(p)),
+  selectedReference: path.basename(selectedPath)
+}));
 
 try {
-
-const buffer =
-await fs.readFile(
-referencePath
-);
-
-
-if (
-!buffer?.length
-) {
-
-console.log(
-"REFERENCE DOSYASI BOŞ:",
-referencePath
-);
-return null;
-}
-
-
-console.log(
-"REFERENCE LOADED:",
-referencePath
-);
-
-return {
-
-bank:
-normalizedBank,
-
-fileName:
-path.basename(
-referencePath
-),
-
-path:
-referencePath,
-
-base64:
-buffer.toString(
-"base64"
-),
-
-};
-
+  const buffer = await fs.readFile(selectedPath);
+  if (!buffer?.length) {
+    console.log("REFERENCE DOSYASI BOŞ:", selectedPath);
+    return null;
+  }
+  console.log("REFERENCE LOADED:", selectedPath);
+  return {
+    bank: normalizedBank,
+    fileName: path.basename(selectedPath),
+    path: selectedPath,
+    base64: buffer.toString("base64"),
+    variant: activeReferenceVariant || null,
+    referenceCandidates: candidatePaths.map(p => path.basename(p)),
+  };
 } catch (error) {
-
-console.error(
-"REFERENCE LOAD ERROR:",
-error
-);
-
-return null;
+  console.error("REFERENCE LOAD ERROR:", error);
+  return null;
 }
 }
 
@@ -6439,6 +6422,53 @@ function synchronizeReferenceForensicDecision(forensic) {
   };
 }
 
+
+// =====================================================
+// REFERANS VARYANTI SEÇİMİ (ÖRN. İŞ BANKASI EFT/FAST vs HVL)
+// =====================================================
+// Aynı banka farklı dekont ailelerine sahipse, hedef belgenin işlem ailesine
+// uygun referansı seçeriz. Tutar/isim/IBAN gibi dinamik değerler seçimde kullanılmaz.
+let activeReferenceVariant = null;
+
+function detectReferenceVariantFromText(text) {
+  const t = normalizeFieldTextForMatch(text || '');
+  if (!t) return null;
+  const hasHvl = /DEKONT\s*\/\s*HVL|\bHVL\b|HAVALE UCRETI|PARA AKTARMA/.test(t);
+  const hasEftFast = /DEKONT\s*\/\s*EFT|\bEFT\b|GIDEN FAST|FAST UCRETI|GIDEN FAST ISLEMI/.test(t);
+  if (hasHvl && !hasEftFast) return 'hvl';
+  if (hasEftFast && !hasHvl) return 'eft';
+  if (hasHvl && hasEftFast) return 'mixed';
+  return null;
+}
+
+function referenceVariantFromFileName(filePath) {
+  const name = normalizeFieldTextForMatch(path.basename(filePath || ''));
+  if (/HVL|HAVALE/.test(name)) return 'hvl';
+  if (/EFT|FAST/.test(name)) return 'eft';
+  return null;
+}
+
+async function readReferenceVariant(referencePath) {
+  const byName = referenceVariantFromFileName(referencePath);
+  if (byName) return byName;
+  try {
+    const ext = path.extname(referencePath).toLowerCase();
+    if (ext !== '.pdf') return null;
+    const buffer = await fs.readFile(referencePath);
+    if (!buffer?.length) return null;
+    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    let text = '';
+    for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 2); pageNumber++) {
+      const page = await pdf.getPage(pageNumber);
+      const content = await page.getTextContent();
+      text += ' ' + content.items.map(x => String(x?.str || '')).join(' ');
+    }
+    return detectReferenceVariantFromText(text);
+  } catch {
+    return null;
+  }
+}
+
 async function getReferenceFiles(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return [];
@@ -6475,7 +6505,20 @@ async function getReferenceFiles(bank) {
   const canonical = getReferenceFile(bank);
   if (canonical) files.push(canonical);
 
-  return [...new Set(files)];
+  const uniqueFiles = [...new Set(files)];
+
+  // Hedefin işlem ailesi belirlendiyse diğer aileyi referans karşılaştırmasına
+  // sokma. Böylece HVL dekontu EFT/FAST referansıyla karıştırılmaz.
+  if (activeReferenceVariant === 'hvl' || activeReferenceVariant === 'eft') {
+    const variantFiles = [];
+    for (const filePath of uniqueFiles) {
+      const v = await readReferenceVariant(filePath);
+      if (v === activeReferenceVariant) variantFiles.push(filePath);
+    }
+    if (variantFiles.length) return variantFiles;
+  }
+
+  return uniqueFiles;
 }
 
 function aggregateReferenceField(entries) {
@@ -6703,7 +6746,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
   };
 }
 
-async function buildReferenceTemplateProfile(bank) {
+async function buildReferenceTemplateProfile(bank, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
   const referencePaths = await getReferenceFiles(normalizedBank);
@@ -7088,8 +7131,8 @@ function sanitizeReferenceTemplateForOutput(analysis) {
   };
 }
 
-async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocrResult) {
-  const profile = await buildReferenceTemplateProfile(bank);
+async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocrResult, selectedReferencePath = null) {
+  const profile = await buildReferenceTemplateProfile(bank, selectedReferencePath);
   if (!profile || !Object.keys(profile.fields || {}).length || !ocrResult?.success) return null;
 
   const regions = Array.isArray(ocrResult.regions)
@@ -11715,11 +11758,13 @@ JSON.stringify(amountForensics)
 let reference = null;
 
 if (type !== "video" && type !== "statement") {
-  reference = await loadReferenceFile(bank);
+  reference = await loadReferenceFile(bank, paddleImageOCR);
 }
 
 console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
+console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidates || []));
+console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
 
 // Azure ikinci OCR/layout gözü: mevcut PaddleOCR ve forensic motoru korunur.
 // Referans karşılaştırması yapılacağı için reference önce yüklenmiş olmalıdır.
@@ -11753,7 +11798,8 @@ if (
       forensicTargetPath,
       forensicTargetMime,
       bank,
-      paddleImageOCR
+      paddleImageOCR,
+      reference.path
     );
     console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(referenceTemplateAnalysis));
   } catch (error) {
