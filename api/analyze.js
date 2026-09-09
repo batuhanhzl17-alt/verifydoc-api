@@ -684,7 +684,9 @@ console.log(
 );
 
 let result = null;
-const maxAttempts = 6;
+// V62 SPEED: Paddle queue yoğunluğunda gereksiz uzun beklemeyi azalt.
+// 4 deneme yeterli; son deneme yine hata verirse mevcut hata yönetimi çalışır.
+const maxAttempts = 4;
 for (let attempt = 1; attempt <= maxAttempts; attempt++) {
   try {
     result = await client.ocr({
@@ -696,7 +698,7 @@ for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const msg = String(ocrError?.message || ocrError || "");
     const queueFull = /queue|队列|task.*full|too many|busy|rate.?limit|429|kuyruk/i.test(msg);
     if (!queueFull || attempt === maxAttempts) throw ocrError;
-    const base = [1500, 3000, 5000, 8000, 12000][attempt - 1] || 12000;
+    const base = [1200, 2500, 4500][attempt - 1] || 6000;
     const waitMs = base + Math.floor(Math.random() * 750);
     console.warn(`PADDLEOCR KUYRUK DOLU — ${waitMs}ms bekleniyor (deneme ${attempt}/${maxAttempts})`);
     await new Promise(resolve => setTimeout(resolve, waitMs));
@@ -13246,6 +13248,13 @@ const response =
 await openai.responses.create({
 model:
 "gpt-5.6-terra",
+
+// V62 SPEED: Ana belge çıkarımı için derin reasoning gerekmiyor.
+// Asıl forensic karar deterministic/reference katmanlarından geliyor.
+// Bu nedenle ana Terra çağrısını düşük reasoning ile çalıştırıyoruz.
+reasoning: {
+  effort: "low",
+},
 
 input: [
 
