@@ -358,11 +358,12 @@ function azureFieldDisplayName(field) {
   return map[String(field || '')] || String(field || 'Alan');
 }
 
-async function getAzureReferenceLayouts(bank) {
+async function getAzureReferenceLayouts(bank, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return [];
 
-  const cacheKey = `azure-reference-layout:v1:${normalizedBank}`;
+  const selectedKey = selectedReferencePath ? path.resolve(selectedReferencePath) : "ALL";
+  const cacheKey = `azure-reference-layout:v2:${normalizedBank}:${selectedKey}`;
   if (azureReferenceLayoutCache.has(cacheKey)) {
     return azureReferenceLayoutCache.get(cacheKey);
   }
@@ -395,11 +396,11 @@ async function getAzureReferenceLayouts(bank) {
   return layouts;
 }
 
-async function runAzureReferenceGeometryComparison(targetAzureLayout, bank) {
+async function runAzureReferenceGeometryComparison(targetAzureLayout, bank, selectedReferencePath = null) {
   if (!targetAzureLayout?.available || !bank) return null;
 
   try {
-    const references = await getAzureReferenceLayouts(bank);
+    const references = await getAzureReferenceLayouts(bank, selectedReferencePath);
     if (!references.length) return null;
 
     const targetAnchors = azureReferenceAnchorLines(targetAzureLayout);
@@ -11773,7 +11774,8 @@ try {
   if (azureLayout?.available && bank && reference) {
     azureReferenceGeometry = await runAzureReferenceGeometryComparison(
       azureLayout,
-      bank
+      bank,
+      reference.path
     );
     console.log(
       "AZURE REFERENCE GEOMETRY:",
