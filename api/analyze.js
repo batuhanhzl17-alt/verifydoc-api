@@ -14419,20 +14419,9 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     referenceTemplateAnalysis
   );
 
-  const differences = (Array.isArray(base?.differences) ? [...base.differences] : [])
-    .filter(x => !(pdfToPdfTypographyGuard && !allowStandaloneTypography && String(x?.category || '').toLowerCase() === 'typography'));
-  const seen = new Set(differences.map(x => `${x.category}|${x.field}|${x.title}`.toLocaleLowerCase('tr-TR')));
-  const add = (category, field, title, detail, strength='belirgin', score=0, extra={}) => {
-    const key = `${category}|${field}|${title}`.toLocaleLowerCase('tr-TR');
-    if (seen.has(key)) return;
-    seen.add(key);
-    differences.push({category, field, title, detail, strength, score, ...extra});
-  };
-
-  // V49 original-document guard: when both target and trusted reference are
-  // PDFs, do not surface raster typography merely because two separately
-  // generated PDFs rasterize text a little differently. Typography is allowed
-  // only after a strong same-document structural baseline is established.
+  // V50: initialize the PDF→PDF typography guard BEFORE it is referenced.
+  // V49 evaluated these constants inside the differences initializer, causing
+  // a JavaScript TDZ ReferenceError and a POST 500.
   const targetIsPdf = String(targetMime || '').toLowerCase() === 'application/pdf' || /\.pdf$/i.test(String(targetPath || ''));
   const referenceIsPdf = /\.pdf$/i.test(String(referenceInfo?.path || ''));
   const pdfToPdfTypographyGuard = targetIsPdf && referenceIsPdf;
@@ -14443,12 +14432,19 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     .some(row => String(row?.field || '').toLowerCase() === 'generic:senaryo/dekont tipi' &&
       String(row?.valueReference || '').trim() && String(row?.valueTarget || '').trim() &&
       String(row.valueReference).trim().toLocaleLowerCase('tr-TR') !== String(row.valueTarget).trim().toLocaleLowerCase('tr-TR'));
-  // For PDF→PDF, raster glyph differences are not used as a standalone finding.
-  // The PDF itself can legitimately be regenerated with different embedded text
-  // objects/anti-aliasing while remaining the same bank template. Structural and
-  // semantic differences remain active; PDF font metadata can be added separately
-  // later if needed.
   const allowStandaloneTypography = !pdfToPdfTypographyGuard;
+
+  // For PDF→PDF, raster glyph differences are not used as a standalone finding.
+  // Structural and semantic differences remain active.
+  const differences = (Array.isArray(base?.differences) ? [...base.differences] : [])
+    .filter(x => !(pdfToPdfTypographyGuard && !allowStandaloneTypography && String(x?.category || '').toLowerCase() === 'typography'));
+  const seen = new Set(differences.map(x => `${x.category}|${x.field}|${x.title}`.toLocaleLowerCase('tr-TR')));
+  const add = (category, field, title, detail, strength='belirgin', score=0, extra={}) => {
+    const key = `${category}|${field}|${title}`.toLocaleLowerCase('tr-TR');
+    if (seen.has(key)) return;
+    seen.add(key);
+    differences.push({category, field, title, detail, strength, score, ...extra});
+  };
 
   // ---- A) Stable semantic values from the matched forensic fields ----------
   // These are document-structure values, not transaction-specific values.
@@ -14594,13 +14590,13 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   } else {
     lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
-  console.log('V49 REFERENCE TYPOGRAPHY GUARD:', JSON.stringify({
+  console.log('V50 REFERENCE TYPOGRAPHY GUARD:', JSON.stringify({
     targetIsPdf, referenceIsPdf, pdfToPdfTypographyGuard, structuralMatchCount, stableMismatch, allowStandaloneTypography
   }));
 
   return {
     available:true,
-    engine:'reference-difference-core-v49-render-and-original-gate',
+    engine:'reference-difference-core-v50-tdz-render-fix',
     referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
