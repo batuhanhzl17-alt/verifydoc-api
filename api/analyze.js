@@ -11682,6 +11682,7 @@ let referenceTemplateAnalysis = null;
 let visualForensics = null;
 let layoutForensics = null;
 let referenceForensics = null;
+let referenceVisualAdjudication = null;
 let pixelForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
