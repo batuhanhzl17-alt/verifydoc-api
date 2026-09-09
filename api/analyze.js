@@ -11790,52 +11790,57 @@ if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR);
 }
 
+const prepStartTime = Date.now();
 console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
 console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidates || []));
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
 
-// Azure ikinci OCR/layout gözü: mevcut PaddleOCR ve forensic motoru korunur.
-// Referans karşılaştırması yapılacağı için reference önce yüklenmiş olmalıdır.
-try {
-  azureLayout = await runAzureDocumentLayout(forensicTargetPath);
-  if (azureLayout?.available && bank && reference) {
-    azureReferenceGeometry = await runAzureReferenceGeometryComparison(
-      azureLayout,
-      bank,
-      reference.path
-    );
-    console.log(
-      "AZURE REFERENCE GEOMETRY:",
-      JSON.stringify(azureReferenceGeometry)
-    );
+// V63 SPEED: Azure, referans şablonu ve lokal referans karşılaştırması
+// birbirinden bağımsız hazırlık işleridir; mümkün olduğunca paralel yürütülür.
+// Böylece ağ beklemeleri ve CPU hazırlıkları seri olarak üst üste binmez.
+const prepTasks = [];
+
+prepTasks.push((async () => {
+  try {
+    const al = await runAzureDocumentLayout(forensicTargetPath);
+    if (al?.available && bank && reference) {
+      const arg = await runAzureReferenceGeometryComparison(al, bank, reference.path);
+      console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
+      return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
+    }
+    return { kind:"azure", azureLayout:al, azureReferenceGeometry:null };
+  } catch (error) {
+    console.warn("AZURE LAYOUT ÇAĞRISI HATASI:", error?.message || error);
+    return { kind:"azure", azureLayout:null, azureReferenceGeometry:null };
   }
-} catch (error) {
-  console.warn("AZURE LAYOUT ÇAĞRISI HATASI:", error?.message || error);
+})());
+
+if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+  prepTasks.push((async () => {
+    try {
+      const ta = await analyzeReferenceTemplateAgainstDocument(
+        forensicTargetPath, forensicTargetMime, bank, paddleImageOCR, reference.path
+      );
+      console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(ta));
+      return { kind:"template", referenceTemplateAnalysis:ta };
+    } catch (error) {
+      console.warn("REFERENCE TEMPLATE ANALYSIS HATASI:", error?.message || error);
+      return { kind:"template", referenceTemplateAnalysis:null };
+    }
+  })());
 }
 
-// =====================================================
-// REFERANS ŞABLON KALİBRASYONU
-// =====================================================
-if (
-  (type === "image" || type === "pdf") &&
-  bank &&
-  reference &&
-  paddleImageOCR?.success
-) {
-  try {
-    referenceTemplateAnalysis = await analyzeReferenceTemplateAgainstDocument(
-      forensicTargetPath,
-      forensicTargetMime,
-      bank,
-      paddleImageOCR,
-      reference.path
-    );
-    console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(referenceTemplateAnalysis));
-  } catch (error) {
-    console.warn("REFERENCE TEMPLATE ANALYSIS HATASI:", error?.message || error);
+const prepResults = await Promise.all(prepTasks);
+for (const pr of prepResults) {
+  if (pr.kind === "azure") {
+    azureLayout = pr.azureLayout;
+    azureReferenceGeometry = pr.azureReferenceGeometry;
+  } else if (pr.kind === "template") {
+    referenceTemplateAnalysis = pr.referenceTemplateAnalysis;
   }
 }
+console.log("V63 PREP SURE:", ((Date.now() - prepStartTime) / 1000).toFixed(2), "seconds");
 
 // V56: Duplicate Terra passes V27 and V29 were diagnostic/legacy paths.
 // The V39 focused direct-reference pass below is the sole Terra reference
@@ -12331,6 +12336,7 @@ Sonuçları aday numarasıyla döndür.`
 // V59: Calculate the cheap local/reference evidence BEFORE Terra.
 // Terra is now conditional: clean documents do not pay the ~96s model cost.
 let referenceLocalCrop = null;
+const localCropStartTime = Date.now();
 if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
   try {
     referenceLocalCrop = await runReferenceLocalCropComparator(
@@ -12344,6 +12350,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
     console.warn("REFERENCE LOCAL CROP HATASI:", error?.message || error);
   }
 }
+console.log("V63 LOCAL CROP SURE:", ((Date.now() - localCropStartTime) / 1000).toFixed(2), "seconds");
 
 // V59: Only invoke the expensive Terra visual adjudicator when a cheap
 // deterministic/reference layer has already found a concrete localized signal.
@@ -13084,9 +13091,6 @@ Dosya SHA256: ${amountForensics.fileFingerprint || "unknown"}
 OCR tutar alanı: ${amountForensics.amountText || "unknown"}
 Karakter segment sayısı: ${amountForensics.characterCount || 0}
 
-Metrikler:
-${JSON.stringify(amountForensics.metrics || {})}
-
 Kanıt:
 ${amountForensics.evidence || "Yok"}
 
@@ -13120,8 +13124,12 @@ Eşleşen alan sayısı: ${referenceTemplateAnalysis.matchedFieldCount}
 Belirgin geometri farkı: ${referenceTemplateAnalysis.strongGeometryCount}
 Belirgin render/font yoğunluğu farkı: ${referenceTemplateAnalysis.strongStyleCount}
 
-Alanlar:
-${JSON.stringify(referenceTemplateAnalysis.fields || [], null, 2)}
+Alan etiketleri:
+${JSON.stringify((referenceTemplateAnalysis.fields || []).map(f => ({
+  field: f?.field || f?.label || null,
+  referenceBox: f?.referenceBox || f?.box || null,
+  targetBox: f?.targetBox || null
+})), null, 2)}
 
 ÖZELLİKLE GÖNDEREN/ALICI ADRES ALANLARINI KONTROL ET.
 Referansın konumu, alan ölçüsü ve render yoğunluğu gerçek dekonttaki karşılığıyla birlikte değerlendirilsin.
@@ -13156,8 +13164,10 @@ Paragraf sayısı: ${azureLayout.paragraphs.length}
 Azure OCR/LAYOUT özeti:
 ${JSON.stringify({
   pages: azureLayout.pages,
-  lines: azureLayout.lines.slice(0, 250),
-  paragraphs: azureLayout.paragraphs.slice(0, 120),
+  pageCount: azureLayout.pageCount,
+  lineCount: azureLayout.lines.length,
+  wordCount: azureLayout.words.length,
+  paragraphCount: azureLayout.paragraphs.length
 }, null, 2)}
 
 Azure ile PaddleOCR arasında küçük OCR/koordinat farklarını tek başına manipülasyon olarak değerlendirme.
@@ -13249,7 +13259,7 @@ await openai.responses.create({
 model:
 "gpt-5.6-terra",
 
-// V62 SPEED: Ana belge çıkarımı için derin reasoning gerekmiyor.
+// V63 SPEED: Ana belge çıkarımı için derin reasoning gerekmiyor.
 // Asıl forensic karar deterministic/reference katmanlarından geliyor.
 // Bu nedenle ana Terra çağrısını düşük reasoning ile çalıştırıyoruz.
 reasoning: {
