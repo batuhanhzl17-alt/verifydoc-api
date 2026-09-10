@@ -16015,6 +16015,56 @@ if (hasMajorAmountMismatch || hasSevereAmountMismatch) {
 const finalDeterministicRisk = calculateOverallRisk(result);
 finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
 result.categories = finalDeterministicRisk.categories;
+
+// =====================================================
+// V67: KANIT KORELASYON KÖPRÜSÜ
+// =====================================================
+// Tek başına Terra/reference bulgusu nihai riski yükseltmez; gerçek
+// dekontlarda OCR/render/layout farkları görülebilir. Ancak güçlü ve
+// lokal referans farkları, bağımsız bir forensic sinyalle (ör. strong
+// amount, güçlü Azure geometri veya anlamlı pixel/reference sapması)
+// aynı belgede birleşirse bu bulgu artık karar motoruna yansıtılır.
+const unifiedReferenceFindings = Array.isArray(result?.referenceForensicReport?.findings)
+  ? result.referenceForensicReport.findings
+  : [];
+const strongUnifiedReferenceCount = unifiedReferenceFindings.filter((x) =>
+  Number(x?.confidence) >= 90 || Number(x?.priority) === 1
+).length;
+const strongAmountSignal =
+  amountForensics?.available === true &&
+  amountForensics?.severity === 'strong' &&
+  Number(amountForensics?.score || 0) >= 80;
+const strongAzureSignal =
+  Array.isArray(azureReferenceGeometry?.strongAnomalies) &&
+  azureReferenceGeometry.strongAnomalies.some((x) => Number(x?.score) >= 90);
+const meaningfulPixelReferenceSignal =
+  pixelForensics?.available === true &&
+  Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 45 &&
+  Number(pixelForensics?.score || 0) >= 35;
+
+const independentForensicSupportCount = [
+  strongAmountSignal,
+  strongAzureSignal,
+  meaningfulPixelReferenceSignal
+].filter(Boolean).length;
+
+if (strongUnifiedReferenceCount >= 2 && independentForensicSupportCount >= 1) {
+  // Güçlü lokal referans farkı + bağımsız forensic destek: LOW/MODERATE
+  // ağırlıklı ortalamanın altında kalmasın. Bu bir "kesin sahte" hükmü değildir.
+  finalRiskScore = Math.max(finalRiskScore, 70);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 70)
+  };
+  console.log('V67 CORRELATED FORENSIC FLOOR:', JSON.stringify({
+    strongUnifiedReferenceCount,
+    independentForensicSupportCount,
+    strongAmountSignal,
+    strongAzureSignal,
+    meaningfulPixelReferenceSignal,
+    appliedFloor: 70
+  }));
+}
 console.log("FINAL RISK CONSISTENCY:", JSON.stringify({
   overallRisk: finalRiskScore,
   categories: result.categories,
@@ -16079,9 +16129,30 @@ result.overallRisk
 const finalSuspicious =
 finalScore >= 46;
 
-const finalEvidence =
-result?.referenceForensicReport?.userText ||
-"🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi."
+// =====================================================
+// V67: TELEGRAM / ANA EKRAN İÇİN KANONİK BULGU ALANI
+// =====================================================
+// UI tarafı farklı alanları tüketse bile somut referans farkları tek bir
+// standart alanda hazır bulunsun. Ham engine skorları burada gösterilmez.
+const primaryForensicFindings = Array.isArray(result?.referenceForensicReport?.findings)
+  ? result.referenceForensicReport.findings.slice(0, 8).map((x) => ({
+      title: String(x?.title || '').trim(),
+      detail: String(x?.detail || '').trim(),
+      confidence: Number(x?.confidence || 0)
+    })).filter((x) => x.title && x.detail)
+  : [];
+
+const canonicalReferenceText = result?.referenceForensicReport?.userText ||
+  "🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.";
+
+// Ana ekranın kullanabileceği kısa, deterministik özet. Önce somut referans
+// farklarını verir; AI açıklaması varsa sonradan ayrıca kullanılabilir.
+const telegramForensicSummary = canonicalReferenceText;
+result.primaryForensicFindings = primaryForensicFindings;
+result.telegramForensicSummary = telegramForensicSummary;
+result.referenceDifferences = primaryForensicFindings;
+
+const finalEvidence = canonicalReferenceText;
 
 console.log(
 "FINAL SCORE:",
@@ -16159,6 +16230,11 @@ suspicious:
 finalSuspicious,
 evidence:
 finalEvidence,
+
+// V67 canonical UI fields: Telegram/web clients can consume these directly.
+primaryForensicFindings,
+telegramForensicSummary,
+referenceDifferences,
 
 });
 
