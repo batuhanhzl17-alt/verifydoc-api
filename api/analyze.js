@@ -2888,6 +2888,201 @@ async function runPixelForensics(targetPath, referencePaths = []) {
 }
 
 // =====================================================
+// OPEN-SOURCE-STYLE FORENSIC LAYER V1
+// =====================================================
+// Deploy-safe forensic helpers inspired by the same classes of techniques
+// used by open-source document/image-forensics projects:
+//   1) PDF structural/revision indicators (byte-level, no external binary)
+//   2) localized copy-move candidate detection with displacement consensus
+//
+// IMPORTANT:
+// These are corroborating signals. They never declare a document fake alone.
+// Background/line/repeated-template regions are deliberately filtered out.
+// =====================================================
+const openSourceForensicsCache = new Map();
+
+function osfSafeString(v) {
+  return String(v ?? '').replace(/\s+/g, ' ').trim();
+}
+
+async function runPdfStructuralForensics(filePath, rawBuffer = null) {
+  try {
+    const buffer = rawBuffer || await fs.readFile(filePath);
+    const head = buffer.subarray(0, 8).toString('latin1');
+    if (!head.startsWith('%PDF-')) {
+      return { available:false, type:'non-pdf', status:'not-applicable', findings:[] };
+    }
+
+    const text = buffer.toString('latin1');
+    const eofCount = (text.match(/%%EOF/g) || []).length;
+    const startXrefCount = (text.match(/startxref/g) || []).length;
+    const objCount = (text.match(/\b\d+\s+\d+\s+obj\b/g) || []).length;
+    const streamCount = (text.match(/\bstream\r?\n/g) || []).length;
+    const hiddenTextCount = (text.match(/(?:^|\s)3\s+Tr(?:\s|$)/g) || []).length;
+    const jsCount = (text.match(/\/JavaScript\b|\/JS\b/g) || []).length;
+    const actionCount = (text.match(/\/OpenAction\b|\/AA\b/g) || []).length;
+    const attachmentCount = (text.match(/\/EmbeddedFile\b|\/Filespec\b/g) || []).length;
+    const producerMatch = text.match(/\/Producer\s*\(([^)]{1,160})\)/);
+    const creatorMatch = text.match(/\/Creator\s*\(([^)]{1,160})\)/);
+    const producer = osfSafeString(producerMatch?.[1] || '');
+    const creator = osfSafeString(creatorMatch?.[1] || '');
+
+    const suspiciousEditors = /(photoshop|illustrator|gimp|canva|nitro|foxit|updf|pdf[- ]?xchange|nitro pro)/i.test(`${producer} ${creator}`);
+    const findings = [];
+    if (eofCount > 1 || startXrefCount > 1) findings.push({ type:'revision-history', severity:'medium', detail:'PDF içinde birden fazla kaydetme/revizyon izi bulundu.' });
+    if (hiddenTextCount > 0) findings.push({ type:'hidden-text', severity:'medium', detail:'Görünmez metin katmanı izi bulundu.' });
+    if (jsCount > 0 || actionCount > 0) findings.push({ type:'actions', severity:'medium', detail:'PDF içinde script/otomatik action nesnesi bulundu.' });
+    if (attachmentCount > 0) findings.push({ type:'embedded-content', severity:'low', detail:'PDF içinde gömülü dosya/ek nesnesi bulundu.' });
+    if (suspiciousEditors) findings.push({ type:'producer-signature', severity:'low', detail:'PDF üretici/yazar bilgisinde düzenleme yazılımıyla uyumlu bir imza bulundu.' });
+
+    const strongRevision = eofCount > 1 && startXrefCount > 1;
+    const mediumSignals = findings.filter(x => x.severity === 'medium').length;
+    const status = strongRevision ? 'warning' : mediumSignals ? 'caution' : 'pass';
+
+    return {
+      available:true,
+      engine:'pdf-structural-forensics-v1',
+      status,
+      severity: strongRevision ? 'strong' : mediumSignals ? 'medium' : 'low',
+      metrics:{ eofCount, startXrefCount, objectCount:objCount, streamCount, hiddenTextCount, javascriptCount:jsCount, actionCount, attachmentCount },
+      metadata:{ producer:producer || null, creator:creator || null },
+      findings,
+      evidence: findings.length
+        ? 'PDF yapısında adli inceleme açısından dikkat gerektiren teknik izler bulundu. Bu izler tek başına belge sahteciliği kanıtı değildir.'
+        : 'PDF yapısında belirgin bir revizyon/gizli içerik sinyali görülmedi.'
+    };
+  } catch (error) {
+    return { available:false, engine:'pdf-structural-forensics-v1', status:'unknown', severity:'unknown', findings:[], error:error?.message || String(error) };
+  }
+}
+
+async function osfBuildSmallRaster(filePath, size=384) {
+  const loaded = await pfLoadVisualBuffer(filePath);
+  return sharp(loaded.buffer)
+    .rotate()
+    .resize({ width:size, height:size, fit:'fill' })
+    .removeAlpha()
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject:true });
+}
+
+function osfPatchSignature(data, width, height, x0, y0, size) {
+  const samples=[];
+  let sum=0, sum2=0, edge=0, count=0;
+  for (let sy=0; sy<4; sy++) for (let sx=0; sx<4; sx++) {
+    const x=Math.min(width-2, x0 + Math.floor((sx+0.5)*size/4));
+    const y=Math.min(height-2, y0 + Math.floor((sy+0.5)*size/4));
+    const i=y*width+x;
+    const v=data[i];
+    samples.push(v);
+    sum+=v; sum2+=v*v; count++;
+    edge += Math.abs(v-data[i+1]) + Math.abs(v-data[i+width]);
+  }
+  const mean=sum/count;
+  const variance=Math.max(0,sum2/count-mean*mean);
+  const normalized=samples.map(v=>(v-mean)/Math.max(8,Math.sqrt(variance)));
+  return { normalized, variance, edgeDensity:edge/(count*2) };
+}
+
+function osfSignatureSimilarity(a,b) {
+  let mae=0;
+  for(let i=0;i<a.length;i++) mae += Math.abs(a[i]-b[i]);
+  return 1/(1+mae/a.length);
+}
+
+async function runLocalizedCopyMoveForensics(targetPath) {
+  try {
+    const stat=await fs.stat(targetPath);
+    const cacheKey=`osf-cm-v1:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}`;
+    const cached=openSourceForensicsCache.get(cacheKey);
+    if(cached?.copyMove) return JSON.parse(JSON.stringify(cached.copyMove));
+
+    const {data,info}=await osfBuildSmallRaster(targetPath,384);
+    const grid=16, cell=24, blocks=[];
+    for(let gy=0;gy<grid;gy++) for(let gx=0;gx<grid;gx++) {
+      const x=gx*cell,y=gy*cell;
+      const sig=osfPatchSignature(data,info.width,info.height,x,y,cell);
+      // Blank/flat background and simple separator lines are excluded.
+      if(sig.variance < 45 || sig.edgeDensity < 5) continue;
+      blocks.push({gx,gy,x,y,...sig});
+    }
+
+    const matches=[];
+    for(let i=0;i<blocks.length;i++) for(let j=i+1;j<blocks.length;j++) {
+      const a=blocks[i],b=blocks[j];
+      const dx=b.gx-a.gx, dy=b.gy-a.gy;
+      if(Math.abs(dx)<=1 && Math.abs(dy)<=1) continue;
+      const similarity=osfSignatureSimilarity(a.normalized,b.normalized);
+      if(similarity < 0.965) continue;
+      matches.push({a,b,dx,dy,similarity});
+    }
+
+    const groups=new Map();
+    for(const m of matches) {
+      const key=`${m.dx}:${m.dy}`;
+      if(!groups.has(key)) groups.set(key,[]);
+      groups.get(key).push(m);
+    }
+
+    let best=null;
+    for(const [translation,pairs] of groups) {
+      if(pairs.length < 3) continue;
+      const uniqueCells=new Set();
+      for(const p of pairs) { uniqueCells.add(`${p.a.gx},${p.a.gy}`); uniqueCells.add(`${p.b.gx},${p.b.gy}`); }
+      const coverage=uniqueCells.size/(grid*grid);
+      const avg=pairs.reduce((s,p)=>s+p.similarity,0)/pairs.length;
+      if(!best || pairs.length>best.pairCount || (pairs.length===best.pairCount && avg>best.averageSimilarity)) {
+        best={translation,pairCount:pairs.length,averageSimilarity:avg,coverage,pairs};
+      }
+    }
+
+    const strong=Boolean(best && best.pairCount>=4 && best.averageSimilarity>=0.975 && best.coverage>=0.015);
+    const medium=Boolean(best && best.pairCount>=3 && best.averageSimilarity>=0.968);
+    const pairs=(best?.pairs||[]).slice(0,8);
+    const boxes=[];
+    for(const p of pairs) {
+      boxes.push({x1:p.a.x,y1:p.a.y,x2:p.a.x+cell,y2:p.a.y+cell});
+      boxes.push({x1:p.b.x,y1:p.b.y,x2:p.b.x+cell,y2:p.b.y+cell});
+    }
+    const output={
+      available:true,
+      engine:'localized-copy-move-forensics-v1',
+      status:strong?'warning':medium?'caution':'pass',
+      severity:strong?'strong':medium?'medium':'low',
+      metrics:{candidatePairs:best?.pairCount||0, averageSimilarity:best?Number(best.averageSimilarity.toFixed(4)):0, coverage:best?Number(best.coverage.toFixed(4)):0},
+      localized:strong || medium,
+      boxes,
+      evidence: strong
+        ? 'Belgede birbirinden uzakta ve aynı yönde taşınmış birden fazla benzer görüntü bölgesi bulundu.'
+        : medium
+          ? 'Belgede olası tekrar/kopyalama bölgeleri bulundu; ancak bulgu tek başına yeterince güçlü değil.'
+          : 'Belirgin ve yerel bir copy-move örüntüsü bulunmadı.'
+    };
+    openSourceForensicsCache.set(cacheKey,{copyMove:output});
+    return JSON.parse(JSON.stringify(output));
+  } catch(error) {
+    return {available:false,engine:'localized-copy-move-forensics-v1',status:'unknown',severity:'unknown',localized:false,boxes:[],metrics:{},error:error?.message||String(error)};
+  }
+}
+
+async function runOpenSourceForensics({ targetPath, targetBuffer=null, type='image' }) {
+  const pdfStructural = type === 'pdf' ? await runPdfStructuralForensics(targetPath,targetBuffer) : null;
+  const copyMove = (type === 'image' || type === 'pdf') ? await runLocalizedCopyMoveForensics(targetPath) : null;
+  const findings=[];
+  if(pdfStructural?.findings?.length) findings.push(...pdfStructural.findings.map(x=>({source:'pdf',...x})));
+  if(copyMove?.severity==='strong') findings.push({source:'copy-move',type:'copy-move',severity:'strong',detail:copyMove.evidence});
+  return {
+    available:Boolean(pdfStructural?.available || copyMove?.available),
+    engine:'open-source-forensics-layer-v1',
+    pdfStructural,
+    copyMove,
+    findings,
+    strongCorroboration:Boolean(copyMove?.severity==='strong' && (pdfStructural?.severity==='strong' || pdfStructural?.severity==='medium')),
+  };
+}
+
+// =====================================================
 // FORMIDABLE
 // =====================================================
 
@@ -11703,6 +11898,7 @@ let layoutForensics = null;
 let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let pixelForensics = null;
+let openSourceForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -11805,6 +12001,26 @@ console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
 // Böylece ağ beklemeleri ve CPU hazırlıkları seri olarak üst üste binmez.
 const prepTasks = [];
 
+// V66: deploy-safe open-source-style forensic layer runs in parallel with
+// existing Azure/reference preparation. It is advisory and does not replace
+// the trusted-reference engine.
+if (type === "image" || type === "pdf") {
+  prepTasks.push((async () => {
+    try {
+      const osf = await runOpenSourceForensics({
+        targetPath: forensicTargetPath,
+        targetBuffer: type === "pdf" ? buffer : null,
+        type
+      });
+      console.log("OPEN SOURCE FORENSICS V66:", JSON.stringify(osf));
+      return { kind:"open-source-forensics", openSourceForensics:osf };
+    } catch (error) {
+      console.warn("OPEN SOURCE FORENSICS HATASI:", error?.message || error);
+      return { kind:"open-source-forensics", openSourceForensics:null };
+    }
+  })());
+}
+
 prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
@@ -11837,7 +12053,9 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
 
 const prepResults = await Promise.all(prepTasks);
 for (const pr of prepResults) {
-  if (pr.kind === "azure") {
+  if (pr.kind === "open-source-forensics") {
+    openSourceForensics = pr.openSourceForensics;
+  } else if (pr.kind === "azure") {
     azureLayout = pr.azureLayout;
     azureReferenceGeometry = pr.azureReferenceGeometry;
   } else if (pr.kind === "template") {
@@ -13518,6 +13736,47 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     } catch (error) {
       console.warn("ANNOTATED REFERENCE DIFFERENCE V44 HATASI:", error?.message || error);
     }
+  }
+}
+
+if (openSourceForensics) {
+  result.openSourceForensics = openSourceForensics;
+
+  // Only strong, localized findings can enter the human-readable report.
+  // Generic PDF metadata/signature differences remain diagnostic only.
+  const osfRows = [];
+  if (openSourceForensics.copyMove?.severity === "strong") {
+    osfRows.push({
+      title: "Lokal kopyalama izi",
+      detail: "Belgede aynı yönde taşınmış ve birden fazla noktada tekrar eden lokal görüntü bölgeleri tespit edildi.",
+      priority: 2,
+      targetBox: openSourceForensics.copyMove.boxes?.[0] || null
+    });
+  }
+  if (openSourceForensics.pdfStructural?.severity === "strong") {
+    osfRows.push({
+      title: "PDF revizyon izi",
+      detail: "PDF yapısında birden fazla kaydetme/revizyon katmanıyla uyumlu teknik iz bulundu.",
+      priority: 3
+    });
+  }
+
+  if (osfRows.length && result.referenceForensicReport?.available) {
+    const existing = Array.isArray(result.referenceForensicReport.findings)
+      ? result.referenceForensicReport.findings.slice()
+      : [];
+    const merged = [...existing, ...osfRows]
+      .filter((row, index, arr) => index === arr.findIndex(x => String(x.title) === String(row.title) && String(x.detail) === String(row.detail)))
+      .sort((a,b) => Number(a.priority || 9) - Number(b.priority || 9))
+      .slice(0, 8);
+    result.referenceForensicReport.findings = merged;
+    result.referenceForensicReport.differenceCount = merged.length;
+    result.referenceForensicReport.strongDifferenceCount = merged.length;
+    result.referenceForensicReport.status = merged.length ? 'differences-found' : result.referenceForensicReport.status;
+    result.referenceForensicReport.userText = [
+      '🔎 REFERANS KARŞILAŞTIRMASI', '', '🔴 FARKLAR',
+      ...merged.map(x => `• ${x.title}: ${x.detail}`)
+    ].join('\n');
   }
 }
 
@@ -15649,10 +15908,19 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   referenceTemplateAnalysis,
   referenceForensics,
   pixelForensics,
+  openSourceForensics,
   azureLayout,
   azureReferenceGeometry,
   targetMime: forensicTargetMime,
 });
+if (openSourceForensics?.strongCorroboration) {
+  result.deterministicRisk = {
+    ...(result.deterministicRisk || {}),
+    corroboratedEditingSignal: true
+  };
+  console.log("OPEN SOURCE FORENSICS CORROBORATED EDITING SIGNAL: TRUE");
+}
+
 console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
 
 // Risk motorunu amount forensics değişikliğinden sonra tekrar hesapla.
