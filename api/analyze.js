@@ -16148,9 +16148,16 @@ const canonicalReferenceText = result?.referenceForensicReport?.userText ||
 // Ana ekranın kullanabileceği kısa, deterministik özet. Önce somut referans
 // farklarını verir; AI açıklaması varsa sonradan ayrıca kullanılabilir.
 const telegramForensicSummary = canonicalReferenceText;
+
+// V68: `referenceDifferences` was being used as a shorthand response
+// property without a lexical declaration, causing:
+// ReferenceError: referenceDifferences is not defined
+// Keep one canonical array for both the result object and response payload.
+const referenceDifferences = primaryForensicFindings;
+
 result.primaryForensicFindings = primaryForensicFindings;
 result.telegramForensicSummary = telegramForensicSummary;
-result.referenceDifferences = primaryForensicFindings;
+result.referenceDifferences = referenceDifferences;
 
 const finalEvidence = canonicalReferenceText;
 
