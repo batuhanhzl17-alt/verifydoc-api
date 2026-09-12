@@ -11059,22 +11059,10 @@ await openai.responses.create({
 model:
 "gpt-5.6-terra",
 input: [
-{
-role:
-"user",
-content: statementContent,
-
-{
-type:
-"input_text",
-
-text:
-STATEMENT_PROMPT,
-},
-
-
-},
-
+  {
+    role: "user",
+    content: statementContent,
+  },
 ],
 
 text: {
