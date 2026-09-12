@@ -10606,9 +10606,69 @@ kopyalama veya eksik bilgiyi tahmin etme.
 `;
 
 
+
+// =====================================================
+// HESAP ÖZETİ ÖZEL REFERANSI
+// =====================================================
+// Hesap özeti referansı, normal dekont referans sisteminden ayrıdır.
+// İş Bankası için frontend bank bilgisi gelmese bile PDF metninden
+// banka tespit edilerek references/isbankasi-hesap-ozeti.pdf kullanılır.
+const STATEMENT_REFERENCE_MAP = {
+  isbankasi: "isbankasi-hesap-ozeti.pdf",
+};
+
+function detectStatementBankFromText(text) {
+  const normalized = normalizeTurkishText(text || "");
+  if (
+    normalized.includes("turkiye is bankasi") ||
+    normalized.includes("turkiye is bank") ||
+    normalized.includes("hesap ozeti") && normalized.includes("is bankasi") ||
+    normalized.includes("is bankasi")
+  ) {
+    return "isbankasi";
+  }
+  return null;
+}
+
+async function loadStatementReferenceFile(bank, statementText = "") {
+  const normalizedBank = normalizeBank(bank) || detectStatementBankFromText(statementText);
+  if (!normalizedBank) {
+    console.log("HESAP ÖZETİ REFERANS BANKASI TESPİT EDİLEMEDİ");
+    return null;
+  }
+
+  const fileName = STATEMENT_REFERENCE_MAP[normalizedBank];
+  if (!fileName) {
+    console.log("HESAP ÖZETİ REFERANS MAP YOK:", normalizedBank);
+    return null;
+  }
+
+  const referencePath = path.join(REFERENCE_DIR, fileName);
+  try {
+    const stat = await fs.stat(referencePath);
+    if (!stat.isFile()) throw new Error("Referans yolu dosya değil.");
+    const referenceBuffer = await fs.readFile(referencePath);
+    if (!referenceBuffer.length) throw new Error("Referans PDF boş.");
+
+    console.log("HESAP ÖZETİ REFERANS BANKASI:", normalizedBank);
+    console.log("HESAP ÖZETİ REFERANS DOSYASI:", referencePath);
+    console.log("HESAP ÖZETİ REFERANS BOYUTU:", referenceBuffer.length);
+
+    return {
+      bank: normalizedBank,
+      fileName,
+      path: referencePath,
+      base64: referenceBuffer.toString("base64"),
+    };
+  } catch (error) {
+    console.error("HESAP ÖZETİ REFERANSI OKUNAMADI:", referencePath, error?.message || error);
+    return null;
+  }
+}
+
 // =====================================================
 // HESAP ÖZETİ PROMPT
-// REFERANS KULLANILMAZ
+// REFERANS, SADECE GÖRSEL/TEKNİK TABAN OLARAK KULLANILIR
 // =====================================================
 
 const STATEMENT_PROMPT = `
@@ -10619,14 +10679,24 @@ incelenmektedir.
 
 ÇOK ÖNEMLİ:
 
-Bu analizde banka referans PDF'i KULLANMA.
-Referans şablon kullanma.
+GÜVENİLİR HESAP ÖZETİ REFERANSI VERİLEBİLİR.
+Referans verildiyse onu yalnızca görsel/teknik baseline olarak kullan:
+- sayfa ölçüsü ve genel kompozisyon
+- banka başlığı/logo yerleşimi
+- müşteri-hesap bilgi kutusunun geometrisi
+- işlem bilgisi kutusu
+- tablo kolonları, hizalamalar ve satır aralıkları
+- yazı karakterinin görünümü, ağırlığı ve boyutu
+- karakter/rakam genişliği ve aralıkları
+- çizgiler, kutular ve tablo yoğunluğu
+- footer ve sayfa düzeni
+- lokal render, font veya stroke farklılıkları
 
-Referans belge kullanma.
+ÇOK ÖNEMLİ: Referansın müşteri adı, müşteri numarası, TCKN, IBAN, hesap numarası, tarih, dönem, bakiye, işlem tutarı, açıklama, işlem/sorgu numarası gibi dinamik değerlerini hedef belgenin beklenen değeri kabul etme.
+Hedefteki dinamik değerler referanstan farklı olabilir ve bu tek başına sahtecilik değildir.
+Referanstan hiçbir değeri hedef belgeye kopyalama veya tahmin etme.
 
-Başka banka belgesi ile karşılaştırma yapma.
-
-Yalnızca gönderilen hesap özeti üzerinden analiz yap.
+Yalnızca gönderilen hesap özeti üzerinden gerçek içerik ve finansal tutarlılık analizi yap; ardından varsa referansla görsel/teknik farklılıkları değerlendir.
 
 Bu analiz kesin gerçeklik veya sahtecilik kararı değildir.
 
@@ -10898,12 +10968,12 @@ Kesin gerçek veya kesin sahte kararı verme.
 
 // =====================================================
 // HESAP ÖZETİ ANALİZ FONKSİYONU
-// REFERANS KULLANILMAZ
 // =====================================================
 async function analyzeStatement(
 base64,
 mime,
-fileName
+fileName,
+statementReference = null
 ) {
 
 console.log(
@@ -10913,7 +10983,8 @@ console.log(
 "HESAP ÖZETİ ANALİZİ BAŞLADI"
 );
 console.log(
-"HESAP ÖZETİ REFERANS KULLANILMAYACAK"
+"HESAP ÖZETİ REFERANS:",
+statementReference?.fileName || "YOK"
 );
 console.log(
 "FILE:",
@@ -10982,6 +11053,17 @@ text:
 STATEMENT_PROMPT,
 },
 
+...(statementReference?.base64 ? [
+  {
+    type: "input_text",
+    text: `\n=====================================================\nGÜVENİLİR HESAP ÖZETİ REFERANSI\n=====================================================\nBanka: ${statementReference.bank}\nDosya: ${statementReference.fileName}\nBu PDF yalnızca görsel/teknik baseline'dır. Dinamik değerleri hedef belgeye aktarma.\n=====================================================\n`,
+  },
+  {
+    type: "input_file",
+    filename: statementReference.fileName,
+    file_data: `data:application/pdf;base64,${statementReference.base64}`,
+  },
+] : []),
 fileContent,
 ],
 },
@@ -12751,11 +12833,8 @@ mime
 // HESAP ÖZETİ
 // =====================================================
 
-// ÇOK ÖNEMLİ:
-//
-// Hesap özeti analizinde referans yüklenmez.
-//
-// Bu bölüm normal referans sisteminden tamamen bağımsızdır.
+// Hesap özeti referansı normal dekont referans sisteminden bağımsızdır.
+// Ancak İş Bankası hesap özetleri için özel referans yüklenir.
 
 if (
 type === "statement"
@@ -12765,15 +12844,34 @@ console.log(
 "HESAP ÖZETİ MODU"
 );
 
+// Frontend bankayı göndermese bile, yerel PDF metninden İş Bankası'nı
+// tespit ederek özel hesap özeti referansını yükle.
+const statementBank =
+normalizeBank(bank) ||
+detectStatementBankFromText(extractedPdfText);
+
 console.log(
-"REFERANS: KULLANILMIYOR"
+"HESAP ÖZETİ BANKA:",
+statementBank || "YOK"
+);
+
+const statementReference =
+await loadStatementReferenceFile(
+statementBank,
+extractedPdfText
+);
+
+console.log(
+"HESAP ÖZETİ REFERANS YÜKLENDİ:",
+statementReference?.fileName || "YOK"
 );
 
 const statementResult =
 await analyzeStatement(
 base64,
 mime,
-fileName
+fileName,
+statementReference
 );
 
 
@@ -12826,7 +12924,9 @@ bank ||
 null,
 
 reference:
-null,
+statementReference
+  ? { fileName: statementReference.fileName, type: "statement-reference", bank: statementReference.bank }
+  : null,
 ...statementResult,
 score:
 statementScore,
