@@ -10618,16 +10618,36 @@ const STATEMENT_REFERENCE_MAP = {
 };
 
 function detectStatementBankFromText(text) {
-  const normalized = normalizeTurkishText(text || "");
-  if (
-    normalized.includes("turkiye is bankasi") ||
-    normalized.includes("turkiye is bank") ||
-    normalized.includes("hesap ozeti") && normalized.includes("is bankasi") ||
-    normalized.includes("is bankasi")
-  ) {
-    return "isbankasi";
-  }
-  return null;
+  const raw = String(text || "");
+
+  // Hesap özeti OCR'ında "İş Bankası" ifadesi çoğu zaman
+  // "is bankası", "is bankasi", "IS BANKASI" veya benzeri
+  // Türkçe karakter varyantlarıyla gelebilir. Sadece
+  // normalizeTurkishText() kullanmak yeterli değildir çünkü o
+  // fonksiyon "ş" karakterini ASCII "s" yapmıyor.
+  const normalized = raw
+    .toLocaleLowerCase("tr-TR")
+    .replace(/[ıİ]/g, "i")
+    .replace(/[şŞ]/g, "s")
+    .replace(/[ğĞ]/g, "g")
+    .replace(/[üÜ]/g, "u")
+    .replace(/[öÖ]/g, "o")
+    .replace(/[çÇ]/g, "c")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const compact = normalized.replace(/\s+/g, " ");
+
+  const isbankMatch =
+    compact.includes("is bankasi") ||
+    compact.includes("turkiye is bankasi") ||
+    compact.includes("turkiye is bank") ||
+    (compact.includes("hesap ozeti") && compact.includes("is bank"));
+
+  console.log("HESAP ÖZETİ BANKA TESPİT METNİ:", normalized.slice(0, 500));
+  console.log("HESAP ÖZETİ İŞ BANKASI EŞLEŞMESİ:", isbankMatch);
+
+  return isbankMatch ? "isbankasi" : null;
 }
 
 async function loadStatementReferenceFile(bank, statementText = "") {
@@ -11059,10 +11079,22 @@ await openai.responses.create({
 model:
 "gpt-5.6-terra",
 input: [
-  {
-    role: "user",
-    content: statementContent,
-  },
+{
+role:
+"user",
+content: statementContent,
+
+{
+type:
+"input_text",
+
+text:
+STATEMENT_PROMPT,
+},
+
+
+},
+
 ],
 
 text: {
@@ -12843,7 +12875,8 @@ console.log(
 // tespit ederek özel hesap özeti referansını yükle.
 const statementBank =
 normalizeBank(bank) ||
-detectStatementBankFromText(extractedPdfText);
+detectStatementBankFromText(extractedPdfText) ||
+detectStatementBankFromText(paddleOcrText);
 
 console.log(
 "HESAP ÖZETİ BANKA:",
