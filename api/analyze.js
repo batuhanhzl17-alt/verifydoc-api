@@ -1224,6 +1224,7 @@ return value
 // =====================================================
 const STATEMENT_REFERENCE_MAP = {
   isbankasi: "isbankasi-hesap-ozeti.pdf",
+  enpara: "enpara-hesap-hareketleri.pdf",
 };
 
 function detectStatementBankFromText(text) {
