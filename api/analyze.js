@@ -1225,6 +1225,7 @@ return value
 const STATEMENT_REFERENCE_MAP = {
   isbankasi: "isbankasi-hesap-ozeti.pdf",
   enpara: "enpara-hesap-hareketleri.pdf",
+  vakifbank: "vakifbank-hesap-hareketleri.pdf",
 };
 
 function detectStatementBankFromText(text) {
@@ -1236,25 +1237,19 @@ function detectStatementBankFromText(text) {
     .replace(/ü/g, "u")
     .replace(/ö/g, "o")
     .replace(/ç/g, "c")
-    .replace(/\s+/g, " ")
-    .trim();
-
+    .replace(/\s+/g, " ");
   if (
-    t.includes("enpara") ||
-    t.includes("enpara bank") ||
-    t.includes("enpara.com")
+    t.includes("vakifbank") ||
+    t.includes("vakif bank") ||
+    t.includes("turkiye vakiflar bankasi") ||
+    t.includes("vakiflar bankasi")
   ) {
-    return "enpara";
+    return "vakifbank";
   }
 
-  if (
-    t.includes("is bankasi") ||
-    t.includes("turkiye is bankasi") ||
-    t.includes("isbankasi")
-  ) {
+  if (t.includes("is bankasi") || t.includes("turkiye is bankasi") || t.includes("isbankasi")) {
     return "isbankasi";
   }
-
   return null;
 }
 
@@ -12837,20 +12832,26 @@ console.log(
 const statementBankCandidate = normalizeBank(bank);
 
 const statementDetectionText = [
-  extractedPdfText,
-  paddleOcrText,
-  paddleImageOCR?.text
+extractedPdfText,
+paddleOcrText,
+paddleImageOCR?.text
 ]
-  .filter(Boolean)
-  .join("\n");
+.filter(Boolean)
+.join("\n");
 
 const statementBank =
-  statementBankCandidate ||
-  detectStatementBankFromText(statementDetectionText);
+statementBankCandidate ||
+detectStatementBankFromText(statementDetectionText);
 
 console.log(
 "HESAP ÖZETİ BANKA:",
 statementBank || "YOK"
+);
+
+console.log(
+"HESAP ÖZETİ BANKA TESPİT METNİ:",
+statementDetectionText.length,
+"karakter"
 );
 
 const statementReference =
