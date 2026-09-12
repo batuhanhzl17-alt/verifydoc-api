@@ -1236,10 +1236,25 @@ function detectStatementBankFromText(text) {
     .replace(/ü/g, "u")
     .replace(/ö/g, "o")
     .replace(/ç/g, "c")
-    .replace(/\s+/g, " ");
-  if (t.includes("is bankasi") || t.includes("turkiye is bankasi") || t.includes("isbankasi")) {
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (
+    t.includes("enpara") ||
+    t.includes("enpara bank") ||
+    t.includes("enpara.com")
+  ) {
+    return "enpara";
+  }
+
+  if (
+    t.includes("is bankasi") ||
+    t.includes("turkiye is bankasi") ||
+    t.includes("isbankasi")
+  ) {
     return "isbankasi";
   }
+
   return null;
 }
 
@@ -12819,8 +12834,19 @@ console.log(
 "HESAP ÖZETİ MODU"
 );
 
+const statementBankCandidate = normalizeBank(bank);
+
+const statementDetectionText = [
+  extractedPdfText,
+  paddleOcrText,
+  paddleImageOCR?.text
+]
+  .filter(Boolean)
+  .join("\n");
+
 const statementBank =
-normalizeBank(bank) || detectStatementBankFromText(extractedPdfText);
+  statementBankCandidate ||
+  detectStatementBankFromText(statementDetectionText);
 
 console.log(
 "HESAP ÖZETİ BANKA:",
@@ -12830,7 +12856,7 @@ statementBank || "YOK"
 const statementReference =
 await loadStatementReferenceFile(
 statementBank,
-extractedPdfText
+statementDetectionText
 );
 
 console.log(
