@@ -10637,12 +10637,15 @@ function detectStatementBankFromText(text) {
     .trim();
 
   const compact = normalized.replace(/\s+/g, " ");
+  const compactNoSpaces = normalized.replace(/[^a-z0-9]+/g, "");
 
   const isbankMatch =
     compact.includes("is bankasi") ||
     compact.includes("turkiye is bankasi") ||
     compact.includes("turkiye is bank") ||
-    (compact.includes("hesap ozeti") && compact.includes("is bank"));
+    (compact.includes("hesap ozeti") && compact.includes("is bank")) ||
+    compactNoSpaces.includes("isbankasi") ||
+    compactNoSpaces.includes("turkiyeisbankasi");
 
   console.log("HESAP ÖZETİ BANKA TESPİT METNİ:", normalized.slice(0, 500));
   console.log("HESAP ÖZETİ İŞ BANKASI EŞLEŞMESİ:", isbankMatch);
@@ -10651,7 +10654,11 @@ function detectStatementBankFromText(text) {
 }
 
 async function loadStatementReferenceFile(bank, statementText = "") {
-  const normalizedBank = normalizeBank(bank) || detectStatementBankFromText(statementText);
+  const candidateBank = normalizeBank(bank);
+const normalizedBank =
+(candidateBank && candidateBank !== "yok" && candidateBank !== "unknown" && candidateBank !== "none")
+? candidateBank
+: detectStatementBankFromText(statementText);
   if (!normalizedBank) {
     console.log("HESAP ÖZETİ REFERANS BANKASI TESPİT EDİLEMEDİ");
     return null;
@@ -12873,11 +12880,23 @@ console.log(
 
 // Frontend bankayı göndermese bile, yerel PDF metninden İş Bankası'nı
 // tespit ederek özel hesap özeti referansını yükle.
-const statementBank =
-normalizeBank(bank) ||
-detectStatementBankFromText(extractedPdfText) ||
-detectStatementBankFromText(paddleOcrText);
+const statementBankCandidate = normalizeBank(bank);
+const statementDetectionText = [
+extractedPdfText,
+paddleOcrText,
+paddleImageOCR?.text
+]
+.filter(Boolean)
+.join("\n");
 
+const statementBank =
+statementBankCandidate ||
+detectStatementBankFromText(statementDetectionText);
+
+console.log(
+"HESAP ÖZETİ BANKA TESPİT ADAYI:",
+statementBankCandidate || "YOK"
+);
 console.log(
 "HESAP ÖZETİ BANKA:",
 statementBank || "YOK"
@@ -12886,7 +12905,7 @@ statementBank || "YOK"
 const statementReference =
 await loadStatementReferenceFile(
 statementBank,
-extractedPdfText
+statementDetectionText
 );
 
 console.log(
