@@ -1234,7 +1234,7 @@ const STATEMENT_REFERENCE_MAP = {
 };
 
 function detectStatementBankFromText(text) {
-  const t = String(text || "")
+  const fullText = String(text || "")
     .toLocaleLowerCase("tr-TR")
     .replace(/ı/g, "i")
     .replace(/ş/g, "s")
@@ -1242,87 +1242,76 @@ function detectStatementBankFromText(text) {
     .replace(/ü/g, "u")
     .replace(/ö/g, "o")
     .replace(/ç/g, "c")
-    .replace(/\s+/g, " ");
-  if (
-    t.includes("enpara") ||
-    t.includes("enpara bank") ||
-    t.includes("enpara.com")
-  ) {
-    return "enpara";
-  }
+    .replace(/\s+/g, " ")
+    .trim();
 
-  if (
-    t.includes("vakifbank") ||
-    t.includes("vakif bank") ||
-    t.includes("turkiye vakiflar bankasi") ||
-    t.includes("vakiflar bankasi")
-  ) {
-    return "vakifbank";
-  }
+  // İşlem açıklamalarında başka bankaların isimleri geçebilir.
+  // Bu yüzden yalnızca "ilk bulunan banka"yı seçme.
+  // Belgenin başındaki/header bölümündeki güçlü banka ifadelerine
+  // çok daha yüksek ağırlık ver; hareket satırlarındaki tekil
+  // banka adları yanlış referans seçmesin.
+  const header = fullText.slice(0, 3000);
+  const compact = fullText.replace(/\s+/g, "");
 
-  if (
-    t.includes("ziraat bankasi") ||
-    t.includes("ziraatbank") ||
-    t.includes("turkiye cumhuriyeti ziraat bankasi")
-  ) {
-    return "ziraat";
-  }
+  const scores = {
+    enpara: 0,
+    vakifbank: 0,
+    ziraat: 0,
+    garanti: 0,
+    halkbank: 0,
+    qnb: 0,
+    isbankasi: 0,
+  };
 
-  if (
-    t.includes("garanti bbva") ||
-    t.includes("garanti bankasi") ||
-    t.includes("garanti bank")
-  ) {
-    return "garanti";
-  }
+  const add = (bank, points) => {
+    scores[bank] += points;
+  };
 
-  if (
-    t.includes("halkbank") ||
-    t.includes("halk bankasi") ||
-    t.includes("turkiye halk bankasi")
-  ) {
-    return "halkbank";
-  }
+  // Güçlü/header göstergeleri
+  if (header.includes("enpara")) add("enpara", 100);
+  if (header.includes("enpara bank")) add("enpara", 40);
+  if (header.includes("enpara.com")) add("enpara", 40);
 
-  if (
-    t.includes("qnb") ||
-    t.includes("qnb bank") ||
-    t.includes("qnb finansbank") ||
-    t.includes("finansbank")
-  ) {
-    return "qnb";
-  }
+  if (header.includes("vakifbank")) add("vakifbank", 100);
+  if (header.includes("vakif bank")) add("vakifbank", 80);
+  if (header.includes("turkiye vakiflar bankasi")) add("vakifbank", 100);
+  if (header.includes("vakiflar bankasi")) add("vakifbank", 90);
 
-  if (
-    t.includes("is bankasi") ||
-    t.includes("turkiye is bankasi") ||
-    t.includes("isbankasi")
-  ) {
-    return "isbankasi";
-  }
+  if (header.includes("ziraat bankasi")) add("ziraat", 100);
+  if (header.includes("ziraatbank")) add("ziraat", 100);
+  if (header.includes("turkiye cumhuriyeti ziraat bankasi")) add("ziraat", 110);
 
-  return null;
-}
+  if (header.includes("garanti bbva")) add("garanti", 100);
+  if (header.includes("garanti bankasi")) add("garanti", 100);
+  if (header.includes("garanti bank")) add("garanti", 90);
 
-async function loadStatementReferenceFile(bank, statementText = "") {
-  const normalizedBank = normalizeBank(bank) || detectStatementBankFromText(statementText);
-  if (!normalizedBank) return null;
-  const fileName = STATEMENT_REFERENCE_MAP[normalizedBank];
-  if (!fileName) return null;
-  const referencePath = path.join(REFERENCE_DIR, fileName);
-  try {
-    const stat = await fs.stat(referencePath);
-    if (!stat.isFile()) return null;
-    const referenceBuffer = await fs.readFile(referencePath);
-    if (!referenceBuffer.length) return null;
-    console.log("HESAP ÖZETİ REFERANS BANKASI:", normalizedBank);
-    console.log("HESAP ÖZETİ REFERANS DOSYASI:", referencePath);
-    console.log("HESAP ÖZETİ REFERANS BOYUTU:", referenceBuffer.length);
-    return { bank: normalizedBank, fileName, path: referencePath, base64: referenceBuffer.toString("base64") };
-  } catch (error) {
-    console.error("HESAP ÖZETİ REFERANSI OKUNAMADI:", referencePath, error?.message || error);
-    return null;
-  }
+  if (header.includes("halkbank")) add("halkbank", 100);
+  if (header.includes("halk bankasi")) add("halkbank", 100);
+  if (header.includes("turkiye halk bankasi")) add("halkbank", 110);
+
+  if (header.includes("qnb finansbank")) add("qnb", 110);
+  if (header.includes("qnb bank")) add("qnb", 100);
+  if (header.includes("qnb bank a")) add("qnb", 100);
+  if (header.includes("qnb")) add("qnb", 80);
+  if (header.includes("finansbank")) add("qnb", 80);
+
+  if (header.includes("is bankasi")) add("isbankasi", 100);
+  if (header.includes("turkiye is bankasi")) add("isbankasi", 110);
+  if (header.includes("isbankasi")) add("isbankasi", 100);
+
+  // Header OCR'ı bozuk olsa bile compact metin üzerinden yardımcı sinyaller.
+  if (compact.includes("qnbbankas")) add("qnb", 70);
+  if (compact.includes("halkbank")) add("halkbank", 70);
+  if (compact.includes("vakifbank")) add("vakifbank", 70);
+  if (compact.includes("ziraatbankasi")) add("ziraat", 70);
+  if (compact.includes("garantibbva")) add("garanti", 70);
+  if (compact.includes("isbankasi")) add("isbankasi", 70);
+  if (compact.includes("enpara")) add("enpara", 70);
+
+  const best = Object.entries(scores)
+    .sort((a, b) => b[1] - a[1])[0];
+
+  return best && best[1] > 0 ? best[0] : null;
 }
 
 // =====================================================
