@@ -1223,6 +1223,114 @@ return value
 // =====================================================
 // HESAP ÖZETİ ÖZEL REFERANSI
 // =====================================================
+// =====================================================
+// SAHTE / NEGATIVE ORNEKLER
+// =====================================================
+// Bunlar gercek referans degildir. Yalnizca daha once manipule edilmis
+// orneklerde gorulen lokal izlerle benzerlik aramak icin kullanilir.
+const NEGATIVE_SAMPLE_MAP = {
+  vakifbank: ["vakifbank/sahte-1.jpg"],
+  ziraat: ["ziraat/sahte-1.jpg", "ziraat/sahte-2.jpg"],
+  yapikredi: ["yapikredi/sahte-1.jpg"],
+  garanti: ["garanti/sahte-hesap-ozeti-1.pdf"],
+  isbankasi: ["isbankasi/sahte-hesap-ozeti-1.pdf"],
+};
+
+async function loadNegativeSampleFiles(bank) {
+  const normalizedBank = normalizeBank(bank);
+  const names = NEGATIVE_SAMPLE_MAP[normalizedBank] || [];
+  if (!names.length) return [];
+  const out = [];
+  for (const name of names) {
+    const filePath = path.join(process.cwd(), "negative_samples", name);
+    try {
+      const buffer = await fs.readFile(filePath);
+      if (buffer?.length) {
+        out.push({ bank: normalizedBank, fileName: path.basename(filePath), path: filePath, base64: buffer.toString("base64") });
+      }
+    } catch {
+      console.log("NEGATIVE SAMPLE BULUNAMADI:", filePath);
+    }
+  }
+  return out;
+}
+
+async function runNegativeSampleComparison({ targetPath, negativeSamples = [], bank = null }) {
+  if (!targetPath || !Array.isArray(negativeSamples) || !negativeSamples.length) return null;
+
+  const loadImage = async (filePath) => {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === ".pdf") {
+      const rendered = await renderPdfPagePng(filePath, 1, 2.8);
+      return rendered?.buffer || null;
+    }
+    return fs.readFile(filePath);
+  };
+
+  const targetBuffer = await loadImage(targetPath);
+  if (!targetBuffer) return null;
+  const targetJpeg = await sharp(targetBuffer).jpeg({ quality: 98 }).toBuffer();
+  const targetImage = `data:image/jpeg;base64,${targetJpeg.toString("base64")}`;
+  const results = [];
+
+  for (const sample of negativeSamples.slice(0, 3)) {
+    try {
+      const sampleBuffer = await loadImage(sample.path);
+      if (!sampleBuffer) continue;
+      const sampleJpeg = await sharp(sampleBuffer).jpeg({ quality: 98 }).toBuffer();
+      const sampleImage = `data:image/jpeg;base64,${sampleJpeg.toString("base64")}`;
+
+      const response = await openai.responses.create({
+        model: "gpt-5.6-terra",
+        input: [{ role: "user", content: [
+          { type: "input_text", text: `VerifyDoc icin yardimci adli goruntusal karsilastirma katmanisin.
+
+BANKA: ${bank || "belirtilmedi"}
+TARGET = su anda incelenen belge.
+NEGATIVE SAMPLE = daha once manipule edilmis oldugu bilinen ornek.
+
+Amac: TARGET'in NEGATIVE SAMPLE ile ayni veya cok benzer LOKAL manipülasyon izlerini tasiyip tasimadigini degerlendir.
+
+Kurallar:
+1. Isim, tutar, IBAN, tarih, islem numarasi ve diger dinamik degerlerin farkli olmasi tek basina eslesme degildir.
+2. NEGATIVE SAMPLE guvenilir referans degildir; onun icerigini TARGET'a dayatma.
+3. Yalnizca ayni tur lokal duzenleme, ekleme, silme veya yeniden yazma izi goruluyorsa eslesme ver.
+4. Font, stroke, baseline, karakter rasteri, lokal arka plan bozulmasi, kopyala-yapistir izi ve belirli bir alanin cevresinden ayrismasi gibi birden fazla birlikte gorulen guclu isarete oncelik ver.
+5. Fotograf acisi, JPEG sikistirmasi, cozunurluk, global bulaniklik ve genel render farklarini eslesme sayma.
+6. Tek bir belirsiz karakter veya OCR farki yeterli degildir.
+7. Emin degilsen matchScore dusuk tut ve findings bos birak.
+8. Kesin sahte karari verme. Bu katman yalnizca bilinen manipülasyon ornegiyle benzerlik arar.
+
+Yalnizca JSON dondur.` },
+          { type: "input_text", text: "TARGET" },
+          { type: "input_image", image_url: targetImage, detail: "high" },
+          { type: "input_text", text: `NEGATIVE SAMPLE: ${sample.fileName}` },
+          { type: "input_image", image_url: sampleImage, detail: "high" },
+        ] }],
+        text: { format: { type: "json_schema", name: "verifydoc_negative_sample_comparison", strict: true, schema: {
+          type: "object", properties: {
+            matchScore: { type: "integer", minimum: 0, maximum: 100 },
+            findings: { type: "array", maxItems: 5, items: { type: "object", properties: {
+              field: { type: "string" }, issueType: { type: "string", enum: ["typography", "layout", "local-render", "mixed"] },
+              confidence: { type: "integer", minimum: 0, maximum: 100 }, evidence: { type: "string" }
+            }, required: ["field", "issueType", "confidence", "evidence"], additionalProperties: false } }
+          }, required: ["matchScore", "findings"], additionalProperties: false
+        } } }
+      });
+
+      const parsed = JSON.parse(response?.output_text || "{}");
+      results.push({ sample: sample.fileName, matchScore: Number(parsed.matchScore || 0), findings: Array.isArray(parsed.findings) ? parsed.findings : [] });
+    } catch (error) {
+      console.warn("NEGATIVE SAMPLE COMPARISON HATASI:", error?.message || error);
+    }
+  }
+
+  if (!results.length) return null;
+  results.sort((a, b) => b.matchScore - a.matchScore);
+  const best = results[0];
+  return { available: true, engine: "known-negative-sample-local-signature-v1", bank, sampleCount: results.length, bestMatchScore: best.matchScore, bestSample: best.sample, findings: best.findings.slice(0, 5), comparisons: results };
+}
+
 const STATEMENT_REFERENCE_MAP = {
   isbankasi: "isbankasi-hesap-ozeti.pdf",
   enpara: "enpara-hesap-hareketleri.pdf",
@@ -12096,6 +12204,7 @@ let visualForensics = null;
 let layoutForensics = null;
 let referenceForensics = null;
 let referenceVisualAdjudication = null;
+let negativeSampleForensics = null;
 let pixelForensics = null;
 let openSourceForensics = null;
 let azureLayout = null;
@@ -12194,6 +12303,20 @@ console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
 console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidates || []));
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
+
+// Known-negative sample comparison is advisory. It never replaces the
+// trusted reference engine and does not by itself declare a document fake.
+if ((type === "image" || type === "pdf") && bank) {
+  try {
+    const negativeSamples = await loadNegativeSampleFiles(bank);
+    if (negativeSamples.length) {
+      negativeSampleForensics = await runNegativeSampleComparison({ targetPath: forensicTargetPath, negativeSamples, bank });
+      console.log("NEGATIVE SAMPLE FORENSICS:", JSON.stringify(negativeSampleForensics));
+    }
+  } catch (error) {
+    console.warn("NEGATIVE SAMPLE FORENSICS HATASI:", error?.message || error);
+  }
+}
 
 // V63 SPEED: Azure, referans şablonu ve lokal referans karşılaştırması
 // birbirinden bağımsız hazırlık işleridir; mümkün olduğunca paralel yürütülür.
@@ -13853,6 +13976,13 @@ if (azureReferenceGeometry) {
 }
 if (referenceVisualAdjudication) {
   result.referenceVisualAdjudication = referenceVisualAdjudication;
+}
+if (negativeSampleForensics) {
+  result.negativeSampleForensics = negativeSampleForensics;
+  if (negativeSampleForensics.bestMatchScore >= 80 && Array.isArray(negativeSampleForensics.findings) && negativeSampleForensics.findings.length) {
+    const rows = negativeSampleForensics.findings.slice(0, 3).map(x => `• ${x.field}: ${x.evidence}`);
+    result.summary = [result.summary, "🟠 BİLİNEN SAHTE ÖRNEKLE BENZERLİK", ...rows].filter(Boolean).join("\n");
+  }
 }
 if (visualForensics) {
   result.visualForensics = visualForensics;
