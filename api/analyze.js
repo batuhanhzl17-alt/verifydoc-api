@@ -12861,9 +12861,25 @@ paddleImageOCR?.text
 .filter(Boolean)
 .join("\n");
 
-const statementBank =
-statementBankCandidate ||
+const detectedStatementBank =
 detectStatementBankFromText(statementDetectionText);
+
+// Hesap hareketlerinde belge üzerindeki banka adı önceliklidir.
+// Böylece önceki bir seçimden/stale parametreden gelen yanlış banka,
+// doğru referansın önüne geçemez.
+const statementBank =
+detectedStatementBank ||
+statementBankCandidate;
+
+console.log(
+"HESAP ÖZETİ BANKA ADAYI:",
+statementBankCandidate || "YOK"
+);
+
+console.log(
+"HESAP ÖZETİ BELGEDEN TESPİT:",
+detectedStatementBank || "YOK"
+);
 
 console.log(
 "HESAP ÖZETİ BANKA:",
