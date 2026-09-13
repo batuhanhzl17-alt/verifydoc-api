@@ -1226,6 +1226,7 @@ const STATEMENT_REFERENCE_MAP = {
   isbankasi: "isbankasi-hesap-ozeti.pdf",
   enpara: "enpara-hesap-hareketleri.pdf",
   vakifbank: "vakifbank-hesap-hareketleri.pdf",
+  ziraat: "ziraat-hesap-hareketleri.pdf",
 };
 
 function detectStatementBankFromText(text) {
@@ -1239,6 +1240,14 @@ function detectStatementBankFromText(text) {
     .replace(/ç/g, "c")
     .replace(/\s+/g, " ");
   if (
+    t.includes("enpara") ||
+    t.includes("enpara bank") ||
+    t.includes("enpara.com")
+  ) {
+    return "enpara";
+  }
+
+  if (
     t.includes("vakifbank") ||
     t.includes("vakif bank") ||
     t.includes("turkiye vakiflar bankasi") ||
@@ -1247,9 +1256,22 @@ function detectStatementBankFromText(text) {
     return "vakifbank";
   }
 
-  if (t.includes("is bankasi") || t.includes("turkiye is bankasi") || t.includes("isbankasi")) {
+  if (
+    t.includes("ziraat bankasi") ||
+    t.includes("ziraatbank") ||
+    t.includes("turkiye cumhuriyeti ziraat bankasi")
+  ) {
+    return "ziraat";
+  }
+
+  if (
+    t.includes("is bankasi") ||
+    t.includes("turkiye is bankasi") ||
+    t.includes("isbankasi")
+  ) {
     return "isbankasi";
   }
+
   return null;
 }
 
@@ -12846,12 +12868,6 @@ detectStatementBankFromText(statementDetectionText);
 console.log(
 "HESAP ÖZETİ BANKA:",
 statementBank || "YOK"
-);
-
-console.log(
-"HESAP ÖZETİ BANKA TESPİT METNİ:",
-statementDetectionText.length,
-"karakter"
 );
 
 const statementReference =
