@@ -1201,6 +1201,7 @@ denizbank: "denizbank.pdf",
 halkbank: "halkbank.pdf",
 yapikredi: "yapikredi.pdf",
 garanti: "garanti.pdf",
+qnb: "qnb1.pdf",
 };
 function normalizeTurkishText(value) {
 if (
@@ -1228,6 +1229,8 @@ const STATEMENT_REFERENCE_MAP = {
   vakifbank: "vakifbank-hesap-hareketleri.pdf",
   ziraat: "ziraat-hesap-hareketleri.pdf",
   garanti: "garanti-hesap-hareketleri.pdf",
+  halkbank: "halkbank-hesap-hareketleri.pdf",
+  qnb: "qnb-hesap-hareketleri.pdf",
 };
 
 function detectStatementBankFromText(text) {
@@ -1271,6 +1274,23 @@ function detectStatementBankFromText(text) {
     t.includes("garanti bank")
   ) {
     return "garanti";
+  }
+
+  if (
+    t.includes("halkbank") ||
+    t.includes("halk bankasi") ||
+    t.includes("turkiye halk bankasi")
+  ) {
+    return "halkbank";
+  }
+
+  if (
+    t.includes("qnb") ||
+    t.includes("qnb bank") ||
+    t.includes("qnb finansbank") ||
+    t.includes("finansbank")
+  ) {
+    return "qnb";
   }
 
   if (
@@ -1383,6 +1403,15 @@ value.includes("halkbank")
 ) {
 return "halkbank"
 }
+
+if (
+value === "qnb" ||
+value.includes("qnb") ||
+value.includes("finansbank")
+) {
+return "qnb"
+}
+
 if (
 value.includes("yapikredi")
 ) {
