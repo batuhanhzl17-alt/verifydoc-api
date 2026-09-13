@@ -1314,6 +1314,27 @@ function detectStatementBankFromText(text) {
   return best && best[1] > 0 ? best[0] : null;
 }
 
+async function loadStatementReferenceFile(bank, statementText = "") {
+  const normalizedBank = normalizeBank(bank) || detectStatementBankFromText(statementText);
+  if (!normalizedBank) return null;
+  const fileName = STATEMENT_REFERENCE_MAP[normalizedBank];
+  if (!fileName) return null;
+  const referencePath = path.join(REFERENCE_DIR, fileName);
+  try {
+    const stat = await fs.stat(referencePath);
+    if (!stat.isFile()) return null;
+    const referenceBuffer = await fs.readFile(referencePath);
+    if (!referenceBuffer.length) return null;
+    console.log("HESAP ÖZETİ REFERANS BANKASI:", normalizedBank);
+    console.log("HESAP ÖZETİ REFERANS DOSYASI:", referencePath);
+    console.log("HESAP ÖZETİ REFERANS BOYUTU:", referenceBuffer.length);
+    return { bank: normalizedBank, fileName, path: referencePath, base64: referenceBuffer.toString("base64") };
+  } catch (error) {
+    console.error("HESAP ÖZETİ REFERANSI OKUNAMADI:", referencePath, error?.message || error);
+    return null;
+  }
+}
+
 // =====================================================
 // BANKA NORMALİZASYONU
 // =====================================================
