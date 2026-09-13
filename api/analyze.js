@@ -1227,6 +1227,7 @@ const STATEMENT_REFERENCE_MAP = {
   enpara: "enpara-hesap-hareketleri.pdf",
   vakifbank: "vakifbank-hesap-hareketleri.pdf",
   ziraat: "ziraat-hesap-hareketleri.pdf",
+  garanti: "garanti-hesap-hareketleri.pdf",
 };
 
 function detectStatementBankFromText(text) {
@@ -1262,6 +1263,14 @@ function detectStatementBankFromText(text) {
     t.includes("turkiye cumhuriyeti ziraat bankasi")
   ) {
     return "ziraat";
+  }
+
+  if (
+    t.includes("garanti bbva") ||
+    t.includes("garanti bankasi") ||
+    t.includes("garanti bank")
+  ) {
+    return "garanti";
   }
 
   if (
