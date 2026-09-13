@@ -1231,6 +1231,7 @@ const STATEMENT_REFERENCE_MAP = {
   garanti: "garanti-hesap-hareketleri.pdf",
   halkbank: "halkbank-hesap-hareketleri.pdf",
   qnb: "qnb-hesap-hareketleri.pdf",
+  akbank: ["akbank-hesap-hareketleri-1.pdf", "akbank-hesap-hareketleri-2.pdf"],
 };
 
 function detectStatementBankFromText(text, fileName = "") {
@@ -1273,6 +1274,7 @@ function detectStatementBankFromText(text, fileName = "") {
     garanti: 0,
     halkbank: 0,
     qnb: 0,
+    akbank: 0,
     isbankasi: 0,
   };
 
@@ -1284,6 +1286,7 @@ function detectStatementBankFromText(text, fileName = "") {
   // Özellikle hesap ekstresi içindeki işlem açıklamalarında başka
   // bankaların isimleri bulunabildiği için dosya adı yanlış referans
   // seçimini engelleyen ek bir sinyal olarak kullanılır.
+  if (fileText.includes("akbank")) add("akbank", 220);
   if (fileText.includes("halkbank") || fileText.includes("halk bank")) {
     add("halkbank", 220);
   }
@@ -1297,6 +1300,8 @@ function detectStatementBankFromText(text, fileName = "") {
   if (fileText.includes("is bankasi") || fileText.includes("isbankasi")) add("isbankasi", 220);
 
   // Güçlü/header göstergeleri
+  if (header.includes("akbank")) add("akbank", 120);
+  if (header.includes("akbank tas")) add("akbank", 80);
   if (header.includes("enpara")) add("enpara", 100);
   if (header.includes("enpara bank")) add("enpara", 40);
   if (header.includes("enpara.com")) add("enpara", 40);
@@ -1329,6 +1334,7 @@ function detectStatementBankFromText(text, fileName = "") {
   if (header.includes("isbankasi")) add("isbankasi", 100);
 
   // Header OCR'ı bozuk olsa bile compact metin üzerinden yardımcı sinyaller.
+  if (compact.includes("akbank")) add("akbank", 70);
   if (compact.includes("qnbbankas")) add("qnb", 70);
   if (compact.includes("halkbank")) add("halkbank", 70);
   if (compact.includes("vakifbank")) add("vakifbank", 70);
@@ -1343,25 +1349,38 @@ function detectStatementBankFromText(text, fileName = "") {
   return best && best[1] > 0 ? best[0] : null;
 }
 
-async function loadStatementReferenceFile(bank, statementText = "") {
-  const normalizedBank = normalizeBank(bank) || detectStatementBankFromText(statementText);
+async function loadStatementReferenceFile(bank, statementText = "", fileName = "") {
+  const normalizedBank = normalizeBank(bank) || detectStatementBankFromText(statementText, fileName);
   if (!normalizedBank) return null;
-  const fileName = STATEMENT_REFERENCE_MAP[normalizedBank];
-  if (!fileName) return null;
-  const referencePath = path.join(REFERENCE_DIR, fileName);
-  try {
-    const stat = await fs.stat(referencePath);
-    if (!stat.isFile()) return null;
-    const referenceBuffer = await fs.readFile(referencePath);
-    if (!referenceBuffer.length) return null;
-    console.log("HESAP ÖZETİ REFERANS BANKASI:", normalizedBank);
-    console.log("HESAP ÖZETİ REFERANS DOSYASI:", referencePath);
-    console.log("HESAP ÖZETİ REFERANS BOYUTU:", referenceBuffer.length);
-    return { bank: normalizedBank, fileName, path: referencePath, base64: referenceBuffer.toString("base64") };
-  } catch (error) {
-    console.error("HESAP ÖZETİ REFERANSI OKUNAMADI:", referencePath, error?.message || error);
-    return null;
+  const configured = STATEMENT_REFERENCE_MAP[normalizedBank];
+  if (!configured) return null;
+
+  const fileNames = Array.isArray(configured) ? configured : [configured];
+  const references = [];
+
+  for (const fileName of fileNames) {
+    const referencePath = path.join(REFERENCE_DIR, fileName);
+    try {
+      const stat = await fs.stat(referencePath);
+      if (!stat.isFile()) continue;
+      const referenceBuffer = await fs.readFile(referencePath);
+      if (!referenceBuffer.length) continue;
+      console.log("HESAP ÖZETİ REFERANS BANKASI:", normalizedBank);
+      console.log("HESAP ÖZETİ REFERANS DOSYASI:", referencePath);
+      console.log("HESAP ÖZETİ REFERANS BOYUTU:", referenceBuffer.length);
+      references.push({
+        bank: normalizedBank,
+        fileName,
+        path: referencePath,
+        base64: referenceBuffer.toString("base64")
+      });
+    } catch (error) {
+      console.error("HESAP ÖZETİ REFERANSI OKUNAMADI:", referencePath, error?.message || error);
+    }
   }
+
+  if (!references.length) return null;
+  return references.length === 1 ? references[0] : references;
 }
 
 // =====================================================
@@ -11074,7 +11093,9 @@ console.log(
 );
 console.log(
 "HESAP ÖZETİ REFERANS:",
-referenceInfo?.fileName || "YOK"
+Array.isArray(referenceInfo)
+  ? referenceInfo.map((r) => r.fileName).join(", ")
+  : referenceInfo?.fileName || "YOK"
 );
 console.log(
 "FILE:",
@@ -11123,19 +11144,31 @@ detail:
 
 }
 
+const referenceList = Array.isArray(referenceInfo)
+  ? referenceInfo
+  : (referenceInfo ? [referenceInfo] : []);
+
 const statementContent = [
   {
     type: "input_text",
-    text: STATEMENT_PROMPT + (referenceInfo ? `\n\nGÜVENİLİR HESAP ÖZETİ REFERANSI AŞAĞIDADIR. SADECE GÖRSEL/TEKNİK BASELINE OLARAK KULLAN.\nReferans dosyası: ${referenceInfo.fileName}` : "\n\nBu analizde hesap özeti referansı yüklenemedi.")
+    text: STATEMENT_PROMPT + (referenceList.length
+      ? `\n\nGÜVENİLİR HESAP ÖZETİ REFERANSI/REFERANSLARI AŞAĞIDADIR. SADECE GÖRSEL/TEKNİK BASELINE OLARAK KULLAN. Dinamik müşteri/işlem verilerini referanstan KOPYALAMA. Eğer birden fazla referans varsa, yüklenen belgeye görsel ve teknik olarak EN ÇOK benzeyen referansı esas al; diğerini alternatif format olarak değerlendir.`
+      : "\n\nBu analizde hesap özeti referansı yüklenemedi.")
   }
 ];
 
-if (referenceInfo?.base64) {
-  statementContent.push({
-    type: "input_file",
-    filename: referenceInfo.fileName,
-    file_data: `data:application/pdf;base64,${referenceInfo.base64}`
-  });
+for (const ref of referenceList) {
+  if (ref?.base64) {
+    statementContent.push({
+      type: "input_text",
+      text: `Referans dosyası: ${ref.fileName}`
+    });
+    statementContent.push({
+      type: "input_file",
+      filename: ref.fileName,
+      file_data: `data:application/pdf;base64,${ref.base64}`
+    });
+  }
 }
 
 statementContent.push(fileContent);
@@ -12969,12 +13002,15 @@ statementBank || "YOK"
 const statementReference =
 await loadStatementReferenceFile(
 statementBank,
-statementDetectionText
+statementDetectionText,
+fileName
 );
 
 console.log(
 "HESAP ÖZETİ REFERANS YÜKLENDİ:",
-statementReference?.fileName || "YOK"
+Array.isArray(statementReference)
+  ? statementReference.map((r) => r.fileName).join(", ")
+  : statementReference?.fileName || "YOK"
 );
 
 const statementResult =
@@ -13036,7 +13072,17 @@ null,
 
 reference:
 statementReference
-  ? { fileName: statementReference.fileName, type: "statement-reference", bank: statementReference.bank }
+  ? (Array.isArray(statementReference)
+      ? {
+          fileName: statementReference.map((r) => r.fileName),
+          type: "statement-reference",
+          bank: statementReference[0]?.bank || statementBank
+        }
+      : {
+          fileName: statementReference.fileName,
+          type: "statement-reference",
+          bank: statementReference.bank
+        })
   : null,
 ...statementResult,
 score:
