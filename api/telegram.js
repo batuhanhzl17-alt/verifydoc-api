@@ -280,6 +280,14 @@ function getBankDisplayName(
  }
 
  if (
+ bank === "qnb"
+ ) {
+
+ return "QNB";
+
+ }
+
+ if (
  bank === "yapikredi"
  ) {
 
@@ -381,6 +389,14 @@ function getBankKeyboard() {
 
  callback_data:
  "bank:yapikredi",
+ },
+
+ {
+ text:
+ " QNB",
+
+ callback_data:
+ "bank:qnb",
  },
  ],
 
@@ -1958,33 +1974,27 @@ async function sendAnalysisResult(
  statementMode
  ) {
 
- // Kullanıcıya yalnızca somut hataları göster.
- // Risk skoru, risk seviyesi, güven ve teknik analiz ayrıntıları gösterilmez.
- const rawFindings = String(summary || "")
- .split(/\r?\n/)
- .map(line => line.trim())
- .filter(Boolean)
- .map(line => line.replace(/^[-•*]\s*/, "").replace(/^\d+[.)]\s*/, "").trim())
- .filter(line => line.length > 0);
-
- const noIssuePattern = /belirgin bir tutarsızlık veya manipülasyon göstergesi tespit edilmedi|sorun tespit edilmedi|tutarsızlık tespit edilmedi/i;
- const findings = rawFindings.filter(line => !noIssuePattern.test(line));
-
- let findingsText;
-
- if (findings.length) {
- findingsText = findings
- .slice(0, 10)
- .map((line, index) => `${index + 1}. ${line}`)
- .join("\n");
- } else {
- findingsText = "Belgede belirgin bir tutarsızlık veya manipülasyon göstergesi tespit edilmedi.";
- }
-
  const text =
- `🔎 HESAP ÖZETİ KONTROL SONUCU
 
-${findingsText}`;
+`${emoji} VERIFYDOC HESAP ÖZETİ ANALİZİ
+
+Risk Skoru: ${score}/100
+
+Risk Seviyesi:
+${riskLabel}
+
+Güven:
+${confidence}/100
+
+━━━━━━━━━━━━━━
+
+${summary}${comparisonWarning}
+
+━━━━━━━━━━━━━━
+
+Bu sonuç yalnızca otomatik ön inceleme sonucudur.
+Kesin gerçeklik veya sahtecilik kararı değildir.`;
+
 
  await sendMessage(
  chatId,
@@ -1992,9 +2002,11 @@ ${findingsText}`;
  replyToMessageId
  );
 
+
  return;
 
  }
+
 
  // ===================================================
  // NORMAL DEKONT
@@ -2525,6 +2537,7 @@ Belgeyi gönderdikten sonra:
  Denizbank
  Halkbank
  Yapı Kredi
+ QNB
  Hesap Özeti
 
 butonları otomatik çıkacak.
