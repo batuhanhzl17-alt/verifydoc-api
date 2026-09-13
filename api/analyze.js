@@ -1233,7 +1233,7 @@ const STATEMENT_REFERENCE_MAP = {
   qnb: "qnb-hesap-hareketleri.pdf",
 };
 
-function detectStatementBankFromText(text) {
+function detectStatementBankFromText(text, fileName = "") {
   const fullText = String(text || "")
     .toLocaleLowerCase("tr-TR")
     .replace(/ı/g, "i")
@@ -1253,6 +1253,19 @@ function detectStatementBankFromText(text) {
   const header = fullText.slice(0, 3000);
   const compact = fullText.replace(/\s+/g, "");
 
+  const fileText = String(fileName || "")
+    .toLocaleLowerCase("tr-TR")
+    .replace(/ı/g, "i")
+    .replace(/ş/g, "s")
+    .replace(/ğ/g, "g")
+    .replace(/ü/g, "u")
+    .replace(/ö/g, "o")
+    .replace(/ç/g, "c")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const fileCompact = fileText.replace(/\s+/g, "");
+
   const scores = {
     enpara: 0,
     vakifbank: 0,
@@ -1266,6 +1279,22 @@ function detectStatementBankFromText(text) {
   const add = (bank, points) => {
     scores[bank] += points;
   };
+
+  // Yüklenen dosya adı da güçlü bir yardımcı sinyaldir.
+  // Özellikle hesap ekstresi içindeki işlem açıklamalarında başka
+  // bankaların isimleri bulunabildiği için dosya adı yanlış referans
+  // seçimini engelleyen ek bir sinyal olarak kullanılır.
+  if (fileText.includes("halkbank") || fileText.includes("halk bank")) {
+    add("halkbank", 220);
+  }
+  if (fileText.includes("qnb") || fileText.includes("finansbank")) {
+    add("qnb", 220);
+  }
+  if (fileText.includes("enpara")) add("enpara", 220);
+  if (fileText.includes("vakifbank") || fileText.includes("vakif bank")) add("vakifbank", 220);
+  if (fileText.includes("ziraat")) add("ziraat", 220);
+  if (fileText.includes("garanti")) add("garanti", 220);
+  if (fileText.includes("is bankasi") || fileText.includes("isbankasi")) add("isbankasi", 220);
 
   // Güçlü/header göstergeleri
   if (header.includes("enpara")) add("enpara", 100);
@@ -12910,7 +12939,10 @@ paddleImageOCR?.text
 .join("\n");
 
 const detectedStatementBank =
-detectStatementBankFromText(statementDetectionText);
+detectStatementBankFromText(
+statementDetectionText,
+fileName
+);
 
 // Hesap hareketlerinde belge üzerindeki banka adı önceliklidir.
 // Böylece önceki bir seçimden/stale parametreden gelen yanlış banka,
