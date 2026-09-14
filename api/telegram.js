@@ -132,6 +132,124 @@ async function sendMessage(
 
 
 // =====================================================
+// FOTOĞRAF GÖNDER
+// =====================================================
+// VerifyDoc analyze.js tarafından üretilen Base64 görüntüyü
+// Telegram'a gerçek fotoğraf olarak gönderir.
+// =====================================================
+
+async function sendPhoto(
+ chatId,
+ imageBase64,
+ caption = "",
+ replyToMessageId = null
+) {
+
+ if (
+ !imageBase64 ||
+ typeof imageBase64 !== "string"
+ ) {
+ return null;
+ }
+
+ let base64 = imageBase64;
+ let mimeType = "image/jpeg";
+
+ const dataUrlMatch =
+ base64.match(
+ /^data:([^;]+);base64,(.+)$/s
+ );
+
+ if (dataUrlMatch) {
+ mimeType = dataUrlMatch[1] || mimeType;
+ base64 = dataUrlMatch[2];
+ }
+
+ const buffer =
+ Buffer.from(
+ base64,
+ "base64"
+ );
+
+ if (!buffer.length) {
+ throw new Error(
+ "İşaretli dekont görüntüsü boş."
+ );
+ }
+
+ const extension =
+ mimeType.includes("png")
+ ? "png"
+ : "jpg";
+
+ const form =
+ new FormData();
+
+ form.append(
+ "chat_id",
+ String(chatId)
+ );
+
+ if (caption) {
+ form.append(
+ "caption",
+ String(caption)
+ );
+ }
+
+ if (
+ replyToMessageId !== null &&
+ replyToMessageId !== undefined
+ ) {
+ form.append(
+ "reply_parameters",
+ JSON.stringify({
+ message_id:
+ Number(replyToMessageId),
+ allow_sending_without_reply:
+ true,
+ })
+ );
+ }
+
+ form.append(
+ "photo",
+ new Blob(
+ [buffer],
+ { type: mimeType }
+ ),
+ `verifydoc-difference.${extension}`
+ );
+
+ const response =
+ await fetch(
+ `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`,
+ {
+ method: "POST",
+ body: form,
+ }
+ );
+
+ const data =
+ await response.json();
+
+ if (!response.ok || !data.ok) {
+ throw new Error(
+ data?.description ||
+ "Telegram işaretli dekont fotoğrafını gönderemedi."
+ );
+ }
+
+ console.log(
+ "TELEGRAM ANNOTATED PHOTO SENT"
+ );
+
+ return data.result;
+
+}
+
+
+// =====================================================
 // CALLBACK CEVAPLA
 // =====================================================
 
@@ -280,14 +398,6 @@ function getBankDisplayName(
  }
 
  if (
- bank === "qnb"
- ) {
-
- return "QNB";
-
- }
-
- if (
  bank === "yapikredi"
  ) {
 
@@ -389,14 +499,6 @@ function getBankKeyboard() {
 
  callback_data:
  "bank:yapikredi",
- },
-
- {
- text:
- " QNB",
-
- callback_data:
- "bank:qnb",
  },
  ],
 
@@ -1974,27 +2076,96 @@ async function sendAnalysisResult(
  statementMode
  ) {
 
- const text =
+ // V25: Hesap özeti çıktısı normal dekont ile aynı kullanıcı
+ // mantığında olsun: yalnızca somut bulgular gösterilir.
+ // Risk skoru / seviye / güven korunur; uzun AI paragrafı gösterilmez.
+ const uniqueFindings = [];
+ const seenFindingKeys = new Set();
 
-`${emoji} VERIFYDOC HESAP ÖZETİ ANALİZİ
+ const addFinding = (title, detail) => {
+   const cleanTitle = String(title || '').replace(/^[•\-–—\d.)\s]+/, '').trim();
+   const cleanDetail = String(detail || '').trim();
+   if (!cleanDetail) return;
+   const key = `${cleanTitle}|${cleanDetail}`.toLocaleLowerCase('tr-TR');
+   if (seenFindingKeys.has(key)) return;
+   seenFindingKeys.add(key);
+   uniqueFindings.push({ title: cleanTitle, detail: cleanDetail });
+ };
 
-Risk Skoru: ${score}/100
+ // 1) Deterministik referans farkları.
+ const referenceFindings = Array.isArray(result?.primaryForensicFindings)
+   ? result.primaryForensicFindings
+   : (Array.isArray(result?.referenceForensicReport?.findings)
+       ? result.referenceForensicReport.findings
+       : []);
 
-Risk Seviyesi:
-${riskLabel}
+ // 2) Bakiye hesabı / işlem listesi gibi hesap özeti-specific bulguları.
+ const balanceAnalysis = result?.balanceAnalysis || {};
+ if (balanceAnalysis.calculationConsistent === false) {
+   addFinding('Bakiye hesaplaması', balanceAnalysis.evidence || 'İşlem ve bakiye değerleri arasında matematiksel tutarsızlık bulundu.');
+ }
 
-Güven:
-${confidence}/100
+ const transactionAnalysis = result?.transactionAnalysis || {};
+ for (const item of (Array.isArray(transactionAnalysis.suspiciousTransactions) ? transactionAnalysis.suspiciousTransactions : [])) {
+   addFinding('Şüpheli işlem', item);
+ }
+ for (const item of (Array.isArray(transactionAnalysis.duplicateTransactions) ? transactionAnalysis.duplicateTransactions : [])) {
+   addFinding('Tekrarlanan işlem', item);
+ }
 
-━━━━━━━━━━━━━━
+ // 3) Summary içindeki açık hata/şüphe cümlelerini al; temiz kontrol
+ // cümlelerini ve teknik/genel ifadeleri kullanıcıya taşımama.
+ const cleanPhrases = /belirgin bir tutarsızlık veya manipülasyon göstergesi tespit edilmedi|belirgin bir fark tespit edilmedi|belirgin bir fark bulunmadı|belirgin bir sorun tespit edilmedi|işlemler .* tutarlıdır|aritmetik olarak tutarlıdır|tek başına .* kanıtı değildir|kesin gerçek|otomatik ön inceleme/i;
+ const suspiciousSentence = /tutarsız|uyumsuz|olağandışı|şüpheli|manipül|düzensiz|hatalı|fark bulundu|fark tespit|boş kal|anormal|uyarı|sahte|kopya|aritmetik/i;
 
-${summary}${comparisonWarning}
+ String(summary || '')
+   .replace(/🔎\s*REFERANS KARŞILAŞTIRMASI[\s\S]*$/i, '')
+   .split(/(?<=[.!?])\s+|\n+/)
+   .map(x => x.trim())
+   .filter(x => x && suspiciousSentence.test(x) && !cleanPhrases.test(x))
+   .slice(0, 8)
+   .forEach(x => addFinding('Belge incelemesi', x));
 
-━━━━━━━━━━━━━━
+ // Referans bulgularını ayrı tut; ana bulgu listesinde tekrar etmeyelim.
+ const referenceDetailKeys = new Set(referenceFindings.map(x =>
+   String(x?.detail || '').trim().toLocaleLowerCase('tr-TR')
+ ));
+ const generalFindings = uniqueFindings.filter(x =>
+   !referenceDetailKeys.has(String(x.detail || '').trim().toLocaleLowerCase('tr-TR'))
+ );
 
-Bu sonuç yalnızca otomatik ön inceleme sonucudur.
-Kesin gerçeklik veya sahtecilik kararı değildir.`;
+ const lines = [
+   `${emoji} VERIFYDOC ANALİZ SONUCU`,
+   '',
+   `${result?.bank ? `Banka: ${getBankDisplayName(result.bank)}\n` : ''}Risk Skoru: ${score}/100`,
+   '',
+   'Risk Seviyesi:',
+   riskLabel,
+   '',
+   'Güven:',
+   `${confidence}/100`,
+   '',
+   '━━━━━━━━━━━━━━'
+ ];
 
+ if (generalFindings.length) {
+   lines.push('', ...generalFindings.slice(0, 8).map((x, i) => `• ${x.detail}`));
+ }
+
+ if (referenceFindings.length) {
+   lines.push('', '🔎 REFERANS KARŞILAŞTIRMASI', '', '🔴 FARKLAR');
+   referenceFindings.slice(0, 8).forEach(x => {
+     lines.push(`• ${x.title}: ${x.detail}`);
+   });
+ }
+
+ if (!generalFindings.length && !referenceFindings.length) {
+   lines.push('', 'Hatalı veya şüpheli bir kısım tespit edilmedi.');
+ }
+
+ lines.push('', '━━━━━━━━━━━━━━', '', 'Bu sonuç yalnızca otomatik ön inceleme sonucudur.', 'Kesin gerçeklik veya sahtecilik kararı değildir.');
+
+ const text = lines.join('\n');
 
  await sendMessage(
  chatId,
@@ -2002,6 +2173,11 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
  replyToMessageId
  );
 
+ await sendAnnotatedDifferenceIfAvailable(
+ chatId,
+ result,
+ replyToMessageId
+ );
 
  return;
 
@@ -2044,6 +2220,64 @@ Kesin gerçeklik veya sahtecilik kararı değildir.`;
  text,
  replyToMessageId
  );
+
+ await sendAnnotatedDifferenceIfAvailable(
+ chatId,
+ result,
+ replyToMessageId
+ );
+
+}
+
+
+// =====================================================
+// İŞARETLİ DEKONTU GÖNDER
+// =====================================================
+
+async function sendAnnotatedDifferenceIfAvailable(
+ chatId,
+ result,
+ replyToMessageId
+) {
+
+ const annotated =
+ result?.annotatedReferenceDifference;
+
+ if (
+ annotated?.available !== true ||
+ !annotated?.imageBase64
+ ) {
+ return;
+ }
+
+ try {
+
+ await sendPhoto(
+ chatId,
+ annotated.imageBase64,
+ "🔴 Referans karşılaştırmasında tespit edilen farklar dekont üzerinde işaretlendi.",
+ replyToMessageId
+ );
+
+ console.log(
+ "ANNOTATED REFERENCE DIFFERENCE SENT:",
+ JSON.stringify({
+ boxCount:
+ annotated.boxCount || 0,
+ gapMarkerCount:
+ annotated.gapMarkerCount || 0,
+ })
+ );
+
+ }
+ catch (photoError) {
+
+ console.error(
+ "ANNOTATED PHOTO SEND ERROR:",
+ photoError
+ );
+
+ }
 
 }
 
@@ -2537,7 +2771,6 @@ Belgeyi gönderdikten sonra:
  Denizbank
  Halkbank
  Yapı Kredi
- QNB
  Hesap Özeti
 
 butonları otomatik çıkacak.
