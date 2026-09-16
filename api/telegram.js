@@ -2048,6 +2048,45 @@ Bu kontrol risk skoruna dahil edilmemiştir.`;
 
 
 // =====================================================
+// GEÇMİŞ ŞÜPHELİ KAYIT UYARISI
+// =====================================================
+// Bu bölüm yalnızca Analyze API gerçekten güçlü bir geçmiş eşleşmesi
+// döndürdüğünde çalışır. Normal belgelerde hiçbir mesaj üretmez.
+function formatHistoricalWarning(historicalMatch) {
+  if (!historicalMatch?.matched) return '';
+
+  const score = Number(historicalMatch.matchScore) || 0;
+  const signals = Array.isArray(historicalMatch.matchedSignals)
+    ? historicalMatch.matchedSignals
+    : [];
+  const previousCases = Array.isArray(historicalMatch.previousCases)
+    ? historicalMatch.previousCases
+    : [];
+
+  const lines = [
+    '',
+    '⚠️ GEÇMİŞ ŞÜPHELİ KAYIT EŞLEŞMESİ',
+    '',
+    'Bu belge, daha önce şüpheli olarak kaydedilmiş bir kayıtla güçlü şekilde eşleşiyor.',
+    '',
+    signals.length ? `Eşleşen bilgiler: ${signals.join(', ')}` : 'Eşleşen güçlü kimlik/hesap bilgisi bulundu.',
+    `Eşleşme: %${score}`,
+    `Önceki şüpheli kayıt: ${Number(historicalMatch.previousCaseCount) || previousCases.length}`,
+  ];
+
+  const previousBank = previousCases[0]?.bank;
+  if (previousBank) lines.push(`Önceki kayıt bankası: ${previousBank}`);
+
+  lines.push(
+    '',
+    '⚠️ Bu eşleşme geçmişte şüpheli olarak işaretlenen kayıtlarla ilişki bulunduğunu gösterir.',
+    'Detaylı inceleme önerilir.'
+  );
+
+  return lines.join('\n');
+}
+
+// =====================================================
 // ANALİZ SONUCUNU GÖNDER
 // =====================================================
 
@@ -2231,6 +2270,7 @@ async function sendAnalysisResult(
    lines.push('', 'Hatalı veya şüpheli bir kısım tespit edilmedi.');
  }
 
+ lines.push(formatHistoricalWarning(result?.historicalMatch));
  lines.push('', '━━━━━━━━━━━━━━', '', 'Bu sonuç yalnızca otomatik ön inceleme sonucudur.', 'Kesin gerçeklik veya sahtecilik kararı değildir.');
 
  const text = lines.join('\n');
@@ -2275,7 +2315,7 @@ ${confidence}/100
 
 ━━━━━━━━━━━━━━
 
-${summary}${comparisonWarning}
+${summary}${comparisonWarning}${formatHistoricalWarning(result?.historicalMatch)}
 
 ━━━━━━━━━━━━━━
 
