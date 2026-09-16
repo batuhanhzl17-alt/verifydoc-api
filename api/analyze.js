@@ -2,7 +2,7 @@ import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
 import path from "path"
-import { createHash } from "crypto"
+import { createHash, createHmac } from "crypto"
 import { execFile } from "child_process"
 import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
@@ -65,6 +65,187 @@ const referenceAmountAnchorCache = new Map();
 // PaddleOCR pahalı bir uzak API çağrısıdır. Aynı dosya analiz hattında
 // birden fazla kez istendiğinde aynı OCR sonucunu yeniden üretme.
 const paddleOCRCache = new Map();
+
+
+// =====================================================
+// GEÇMİŞ ŞÜPHELİ KAYITLAR — SUPABASE REST
+// =====================================================
+// Yalnızca şüpheli olarak işaretlenen belgeler kalıcı kayda alınır.
+// Kimlik/hesap değerleri düz metin olarak saklanmaz; HMAC-SHA256 fingerprint kullanılır.
+
+function historyConfigReady() {
+  return Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.VERIFYDOC_HISTORY_SECRET);
+}
+
+function historyNormalize(value) {
+  return String(value ?? '')
+    .toLocaleUpperCase('tr-TR')
+    .replace(/İ/g, 'I').replace(/ı/g, 'I').replace(/Ş/g, 'S').replace(/ş/g, 'S')
+    .replace(/Ğ/g, 'G').replace(/ğ/g, 'G').replace(/Ü/g, 'U').replace(/ü/g, 'U')
+    .replace(/Ö/g, 'O').replace(/ö/g, 'O').replace(/Ç/g, 'C').replace(/ç/g, 'C')
+    .replace(/[^A-Z0-9]/g, '').trim();
+}
+
+function historyHash(value) {
+  const normalized = historyNormalize(value);
+  if (!normalized || !process.env.VERIFYDOC_HISTORY_SECRET) return null;
+  return createHmac('sha256', process.env.VERIFYDOC_HISTORY_SECRET).update(normalized).digest('hex');
+}
+
+function historyDocumentData(result = {}, type = '') {
+  const doc = result?.documentData || {};
+  return {
+    senderName: doc.senderName || doc.accountHolderName || null,
+    recipientName: doc.recipientName || null,
+    iban: doc.iban || doc.recipientIban || null,
+    accountNo: doc.accountNo || null,
+    branch: doc.branch || null,
+    taxNo: doc.taxNo || null,
+    address: doc.address || doc.senderAddress || doc.recipientAddress || null,
+    type,
+  };
+}
+
+function buildHistoryIdentifiers(result = {}, type = '') {
+  const d = historyDocumentData(result, type);
+  return {
+    sender_name_hash: historyHash(d.senderName),
+    recipient_name_hash: historyHash(d.recipientName),
+    iban_hash: historyHash(d.iban),
+    account_no_hash: historyHash(d.accountNo),
+    branch_hash: historyHash(d.branch),
+    tax_no_hash: historyHash(d.taxNo),
+    address_hash: historyHash(d.address),
+  };
+}
+
+async function historyRequest(method, query = '', body = null) {
+  if (!historyConfigReady()) return null;
+  const base = String(process.env.SUPABASE_URL).replace(/\/$/, '');
+  const url = `${base}/rest/v1/verifydoc_historical_cases${query ? `?${query}` : ''}`;
+  const headers = {
+    apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+    'Content-Type': 'application/json',
+  };
+  if (method === 'POST') headers.Prefer = 'return=representation';
+  const response = await fetch(url, { method, headers, body: body == null ? undefined : JSON.stringify(body) });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`History DB HTTP ${response.status}: ${text.slice(0, 500)}`);
+  if (!text) return [];
+  try { return JSON.parse(text); } catch { return []; }
+}
+
+async function findHistoryMatches(identifiers) {
+  if (!historyConfigReady()) return { available: false, matched: false, matches: [] };
+  const fields = [
+    ['iban_hash', identifiers.iban_hash],
+    ['tax_no_hash', identifiers.tax_no_hash],
+    ['account_no_hash', identifiers.account_no_hash],
+    ['sender_name_hash', identifiers.sender_name_hash],
+    ['recipient_name_hash', identifiers.recipient_name_hash],
+    ['address_hash', identifiers.address_hash],
+  ];
+  const byId = new Map();
+  for (const [column, hash] of fields) {
+    if (!hash) continue;
+    const query = new URLSearchParams({
+      select: 'id,created_at,bank,risk_score,document_type,document_fingerprint,sender_name_hash,recipient_name_hash,iban_hash,account_no_hash,branch_hash,tax_no_hash,address_hash',
+      [column]: `eq.${hash}`,
+      limit: '50',
+    }).toString();
+    const rows = await historyRequest('GET', query);
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!byId.has(row.id)) byId.set(row.id, { row, signals: new Set() });
+      byId.get(row.id).signals.add(column);
+    }
+  }
+
+  const matches = [];
+  for (const { row, signals } of byId.values()) {
+    let score = 0;
+    const matchedSignals = [];
+    if (signals.has('iban_hash')) { score = 100; matchedSignals.push('IBAN'); }
+    if (signals.has('tax_no_hash')) { score = Math.max(score, 95); matchedSignals.push('Vergi/TCKN'); }
+    if (signals.has('account_no_hash') && signals.has('branch_hash')) { score = Math.max(score, 90); matchedSignals.push('Hesap No + Şube'); }
+    else if (signals.has('account_no_hash')) { score = Math.max(score, 60); matchedSignals.push('Hesap No'); }
+    const hasName = signals.has('sender_name_hash') || signals.has('recipient_name_hash');
+    if (hasName && signals.has('address_hash')) { score = Math.max(score, 75); matchedSignals.push('Ad Soyad + Adres'); }
+    else if (hasName) { score = Math.max(score, 35); matchedSignals.push('Ad Soyad'); }
+    if (score >= 70) {
+      matches.push({
+        id: row.id, bank: row.bank || null, riskScore: Number(row.risk_score) || 0,
+        documentType: row.document_type || null, createdAt: row.created_at || null,
+        matchScore: score, matchedSignals: [...new Set(matchedSignals)],
+        documentFingerprint: row.document_fingerprint || null,
+      });
+    }
+  }
+  matches.sort((a, b) => b.matchScore - a.matchScore);
+  return { available: true, matched: matches.length > 0, matches: matches.slice(0, 5) };
+}
+
+async function saveHistoricalSuspiciousCase({ result, type, bank, fileFingerprint }) {
+  if (!historyConfigReady()) {
+    console.warn('GEÇMİŞ KAYIT DB DEVRE DIŞI: Supabase env değişkenleri eksik.');
+    return { available: false, saved: false, historicalMatch: null };
+  }
+  const identifiers = buildHistoryIdentifiers(result, type);
+  if (!Object.values(identifiers).some(Boolean)) {
+    return { available: true, saved: false, historicalMatch: { available: true, matched: false, matches: [] } };
+  }
+  const historicalMatch = await findHistoryMatches(identifiers);
+  const payload = {
+    bank: bank || null,
+    document_type: type || null,
+    risk_score: Number(result?.overallRisk ?? result?.score) || 0,
+    sender_name_hash: identifiers.sender_name_hash,
+    recipient_name_hash: identifiers.recipient_name_hash,
+    iban_hash: identifiers.iban_hash,
+    account_no_hash: identifiers.account_no_hash,
+    branch_hash: identifiers.branch_hash,
+    tax_no_hash: identifiers.tax_no_hash,
+    address_hash: identifiers.address_hash,
+    document_fingerprint: fileFingerprint || null,
+  };
+  try {
+    await historyRequest('POST', new URLSearchParams({ on_conflict: 'document_fingerprint' }).toString(), payload);
+  } catch (error) {
+    console.warn('GEÇMİŞ ŞÜPHELİ KAYIT KAYIT HATASI:', error?.message || error);
+  }
+  return {
+    available: true,
+    saved: true,
+    historicalMatch: {
+      available: true,
+      matched: historicalMatch.matched,
+      matchScore: historicalMatch.matches[0]?.matchScore || 0,
+      matchedSignals: historicalMatch.matches[0]?.matchedSignals || [],
+      previousCaseCount: historicalMatch.matches.length,
+      previousCases: historicalMatch.matches.slice(0, 3).map(x => ({
+        bank: x.bank, riskScore: x.riskScore, documentType: x.documentType,
+        createdAt: x.createdAt, matchScore: x.matchScore, matchedSignals: x.matchedSignals,
+      })),
+    },
+  };
+}
+
+function shouldSaveHistoricalCase(result, type) {
+  const score = Number(result?.overallRisk ?? result?.score) || 0;
+  return score >= 46 && ['image', 'pdf', 'statement', 'video'].includes(type);
+}
+
+async function applyHistoricalSuspicion(result, { type, bank, fileFingerprint }) {
+  if (!shouldSaveHistoricalCase(result, type)) return result;
+  try {
+    const history = await saveHistoricalSuspiciousCase({ result, type, bank, fileFingerprint });
+    // Normal belgelerde bu alan hiç oluşturulmaz. Yalnızca güçlü geçmiş eşleşmesinde döner.
+    if (history?.historicalMatch?.matched) result.historicalMatch = history.historicalMatch;
+  } catch (error) {
+    console.warn('GEÇMİŞ EŞLEŞME HATASI:', error?.message || error);
+  }
+  return result;
+}
 
 // =====================================================
 // PADDLEOCR CLIENT
@@ -2887,6 +3068,20 @@ false,
 
 },
 
+documentData: {
+type: "object",
+properties: {
+accountHolderName: { type: ["string", "null"] },
+iban: { type: ["string", "null"] },
+accountNo: { type: ["string", "null"] },
+branch: { type: ["string", "null"] },
+taxNo: { type: ["string", "null"] },
+address: { type: ["string", "null"] },
+},
+required: ["accountHolderName", "iban", "accountNo", "branch", "taxNo", "address"],
+additionalProperties: false,
+},
+
 limitations: {
 
 type:
@@ -2919,6 +3114,7 @@ required: [
 "riskLabel",
 "confidence",
 "summary",
+"documentData",
 "categories",
 "balanceAnalysis",
 "transactionAnalysis",
@@ -10944,6 +11140,15 @@ Görülebiliyorsa:
 - açılış bakiyesi
 - kapanış bakiyesi
 
+Ayrıca yalnızca belgede gerçekten görülen bilgileri documentData alanında çıkar:
+- accountHolderName
+- iban
+- accountNo
+- branch
+- taxNo
+- address
+Okunamayan veya bulunmayan alanlarda null kullan.
+
 bilgilerini incele.
 
 Banka adı kesin olarak görülemiyorsa banka adı uydurma.
@@ -13180,6 +13385,11 @@ console.log(
 "HESAP ÖZETİ ANALİZ TAMAMLANDI"
 );
 
+await applyHistoricalSuspicion(statementResult, {
+  type: "statement",
+  bank: statementBank || bank || null,
+  fileFingerprint,
+});
 
 return res
 .status(200)
@@ -13567,6 +13777,12 @@ videoScore >= 46;
 const videoEvidence =
 videoResult?.summary ||
 "Video analizi tamamlandı."
+
+await applyHistoricalSuspicion(videoResult, {
+  type: "video",
+  bank: bank || null,
+  fileFingerprint,
+});
 
 
 return res
@@ -16561,6 +16777,13 @@ console.log(
 "FINAL SUSPICIOUS:",
 finalSuspicious
 );
+
+await applyHistoricalSuspicion(result, {
+  type,
+  bank: bank || null,
+  fileFingerprint,
+});
+
 console.log(
 "INFORMATION CHECK:",
 JSON.stringify(
