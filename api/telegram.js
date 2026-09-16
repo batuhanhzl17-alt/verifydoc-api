@@ -405,6 +405,38 @@ function getBankDisplayName(
 
  }
 
+ if (
+ bank === "qnb"
+ ) {
+
+ return "QNB";
+
+ }
+
+ if (
+ bank === "ing"
+ ) {
+
+ return "ING";
+
+ }
+
+ if (
+ bank === "teb"
+ ) {
+
+ return "TEB";
+
+ }
+
+ if (
+ bank === "kuveytturk"
+ ) {
+
+ return "Kuveyt Türk";
+
+ }
+
  return bank;
 
 }
@@ -499,6 +531,42 @@ function getBankKeyboard() {
 
  callback_data:
  "bank:yapikredi",
+ },
+
+ {
+ text:
+ " QNB",
+
+ callback_data:
+ "bank:qnb",
+ },
+ ],
+
+ [
+ {
+ text:
+ " ING",
+
+ callback_data:
+ "bank:ing",
+ },
+
+ {
+ text:
+ " TEB",
+
+ callback_data:
+ "bank:teb",
+ },
+ ],
+
+ [
+ {
+ text:
+ " Kuveyt Türk",
+
+ callback_data:
+ "bank:kuveytturk",
  },
  ],
 
@@ -2771,6 +2839,10 @@ Belgeyi gönderdikten sonra:
  Denizbank
  Halkbank
  Yapı Kredi
+ QNB
+ ING
+ TEB
+ Kuveyt Türk
  Hesap Özeti
 
 butonları otomatik çıkacak.
