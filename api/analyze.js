@@ -1340,6 +1340,8 @@ const STATEMENT_REFERENCE_MAP = {
   halkbank: "halkbank-hesap-hareketleri.pdf",
   qnb: "qnb-hesap-hareketleri.pdf",
   akbank: ["akbank-hesap-hareketleri-1.pdf", "akbank-hesap-hareketleri-2.pdf"],
+  ing: ["ing-hesap-hareketi1.pdf", "ing-hesap-hareketi2.pdf"],
+  kuveytturk: ["kuveytturk-hesap-ozeti1.pdf", "kuveytturk-hesap-ozeti2.pdf"],
 };
 
 function detectStatementBankFromText(text, fileName = "") {
@@ -14098,48 +14100,6 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     aiReport
   ]);
   if (humanForensicReport) {
-    // V69: Somut ve lokal bir tutar-render uyarısı varsa bunu yalnızca
-    // üst özetinde bırakma. Aynı bulguyu referans karşılaştırmasına da
-    // taşı; böylece kullanıcı tek bir tutarsızlığı iki farklı yerde
-    // çelişkili biçimde görmez. Bu, referansın dinamik değerlerini
-    // kopyalamaz; yalnızca hedef belgedeki lokal forensic kanıtı işaretler.
-    const amountReferenceWarning =
-      amountForensics?.available === true &&
-      amountForensics?.status === 'warning' &&
-      ['moderate', 'strong'].includes(String(amountForensics?.severity || '').toLowerCase()) &&
-      String(amountForensics?.evidence || '').trim();
-
-    if (amountReferenceWarning) {
-      const existing = Array.isArray(humanForensicReport.findings)
-        ? humanForensicReport.findings
-        : [];
-      const alreadyPresent = existing.some((x) =>
-        /tutar|amount/i.test(String(x?.title || '')) &&
-        /render|karakter|piksel|mikro|görsel|tutarsız/i.test(String(x?.detail || ''))
-      );
-
-      if (!alreadyPresent) {
-        const amountFinding = {
-          title: 'Tutar alanı',
-          detail: String(amountForensics.evidence).trim(),
-          confidence: String(amountForensics.severity).toLowerCase() === 'strong' ? 92 : 82,
-          priority: String(amountForensics.severity).toLowerCase() === 'strong' ? 1 : 2,
-          source: 'amount-forensics-reference-corroboration'
-        };
-
-        humanForensicReport.findings = [amountFinding, ...existing].slice(0, 8);
-        humanForensicReport.differenceCount = humanForensicReport.findings.length;
-        humanForensicReport.strongDifferenceCount = humanForensicReport.findings.length;
-        humanForensicReport.status = 'differences-found';
-        humanForensicReport.userText = [
-          '🔎 REFERANS KARŞILAŞTIRMASI',
-          '',
-          '🔴 FARKLAR',
-          ...humanForensicReport.findings.map((x) => `• ${x.title}: ${x.detail}`)
-        ].join('\n');
-      }
-    }
-
     result.referenceForensicReport = humanForensicReport;
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
     console.log("HUMAN READABLE FORENSIC REPORT V64:", JSON.stringify(humanForensicReport));
@@ -16444,44 +16404,6 @@ if (hasMajorAmountMismatch || hasSevereAmountMismatch) {
 const finalDeterministicRisk = calculateOverallRisk(result);
 finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
 result.categories = finalDeterministicRisk.categories;
-
-// =====================================================
-// V69: REFERANS / LOKAL FORENSIC BULGU RİSK KATKISI
-// =====================================================
-// Referans karşılaştırmasında artık gerçekten somut bir fark bulunduysa
-// bunu risk skorundan tamamen bağımsız bırakma. Katkı kontrollüdür;
-// tek bir fark otomatik olarak HIGH/VERY HIGH RISK üretmez. Güçlü lokal
-// tutar-render bulgusu daha yüksek, diğer belirgin referans farkları daha
-// düşük katkı alır. Böylece üstteki forensic uyarı ile nihai skor aynı
-// yönde hareket eder.
-const finalReferenceFindings = Array.isArray(result?.referenceForensicReport?.findings)
-  ? result.referenceForensicReport.findings
-  : [];
-const hasStrongReferenceFinding = finalReferenceFindings.some((x) =>
-  Number(x?.confidence || 0) >= 90 || Number(x?.priority || 9) === 1
-);
-const amountReferenceWarningForRisk =
-  amountForensics?.available === true &&
-  amountForensics?.status === 'warning' &&
-  ['moderate', 'strong'].includes(String(amountForensics?.severity || '').toLowerCase());
-
-let referenceRiskBonus = 0;
-if (finalReferenceFindings.length > 0) {
-  referenceRiskBonus = hasStrongReferenceFinding ? 20 : 10;
-} else if (amountReferenceWarningForRisk) {
-  referenceRiskBonus = String(amountForensics?.severity || '').toLowerCase() === 'strong' ? 20 : 10;
-}
-
-if (referenceRiskBonus > 0) {
-  finalRiskScore = Math.min(100, finalRiskScore + referenceRiskBonus);
-  console.log('V69 REFERENCE RISK CONTRIBUTION:', JSON.stringify({
-    referenceFindingCount: finalReferenceFindings.length,
-    hasStrongReferenceFinding,
-    amountReferenceWarningForRisk,
-    referenceRiskBonus,
-    resultingRisk: finalRiskScore
-  }));
-}
 
 // =====================================================
 // V67: KANIT KORELASYON KÖPRÜSÜ
