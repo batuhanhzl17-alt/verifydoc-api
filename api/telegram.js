@@ -2367,13 +2367,7 @@ async function sendDocumentMenu(
 
 ` Belge alındı.
 
-Şimdi hangi analiz yapılacağını seç:
-
- Normal dekont için bankayı seç.
- Hesap özeti için "Hesap Özeti" seçeneğine bas.
-
-Seçtiğinde aynı gönderdiğin belge otomatik olarak analiz edilecek.
-Tekrar yüklemen gerekmeyecek.`;
+Analiz için banka seçin.`;
 
 
  return sendMessage(
@@ -2612,13 +2606,9 @@ Lütfen hesap özetini PDF veya fotoğraf olarak gönder.`,
 
  startText =
 
-` Hesap özeti seçildi.
+` Hesap Özeti seçildi.
 
- ${fileInfo.fileName}
-
- VerifyDoc hesap özetini analiz ediyor...
-
-Dosyayı tekrar göndermene gerek yok.`;
+Analiz ediliyor...`;
 
  }
 
@@ -2628,11 +2618,7 @@ Dosyayı tekrar göndermene gerek yok.`;
 
 ` ${getBankDisplayName(bank)} seçildi.
 
- ${fileInfo.fileName}
-
- VerifyDoc analiz ediyor...
-
-Dosyayı tekrar göndermene gerek yok.`;
+Analiz ediliyor...`;
 
  }
 
