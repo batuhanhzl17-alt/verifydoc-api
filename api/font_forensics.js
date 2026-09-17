@@ -114,6 +114,63 @@ function fontDescriptor(item, page) {
 
 const fontProfileCache = new Map();
 
+
+// PDF.js'in item.fontName değeri çoğu PDF'de gerçek font adı değildir
+// (örn. g_d3_f3). Referans PDF'lerde gerçek font adı PDF kaynaklarından
+// /BaseFont ve /FontName kayıtları üzerinden ayrıca çıkarılır.
+async function extractRawPdfFontNames(pdfPath) {
+  try {
+    const buf = await fs.readFile(pdfPath);
+    if (!buf?.length) return [];
+    const text = buf.toString("latin1");
+    const names = new Set();
+    const patterns = [
+      /\/BaseFont\s*\/([A-Za-z0-9._+\-#]+)/g,
+      /\/FontName\s*\/([A-Za-z0-9._+\-#]+)/g,
+    ];
+    for (const re of patterns) {
+      let m;
+      while ((m = re.exec(text))) {
+        const n = normalizeFontName(m[1]);
+        if (n && n.length < 160 && !/^Identity(?:-H|-V)?$/i.test(n)) names.add(n);
+      }
+    }
+    return [...names];
+  } catch (error) {
+    console.warn("RAW PDF FONT EXTRACTION HATASI:", path.basename(pdfPath), error?.message || error);
+    return [];
+  }
+}
+
+function mergeRawFonts(profile, rawNames = []) {
+  if (!profile) return profile;
+  const existing = new Set((profile.fonts || []).map(x => normalizeFontName(x.fontName || x.family)).filter(Boolean));
+  const additions = [];
+  for (const raw of rawNames) {
+    const n = normalizeFontName(raw);
+    if (!n || existing.has(n)) continue;
+    existing.add(n);
+    additions.push({
+      key: `${fontFamily(n) || n}|${fontStyle(n)}`,
+      fontName: n,
+      family: fontFamily(n) || n,
+      style: fontStyle(n),
+      rawFontNames: [n],
+      pdfFontFamilies: [fontFamily(n) || n],
+      itemCount: 0,
+      charCount: 0,
+      pages: [],
+      embedded: null,
+      source: "pdf-raw-font-dictionary",
+    });
+  }
+  if (!additions.length) return profile;
+  profile.fonts = [...profile.fonts, ...additions];
+  profile.fontCount = profile.fonts.length;
+  profile.rawFontNames = rawNames;
+  return profile;
+}
+
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
@@ -199,13 +256,18 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     embedded: x.embeddedValues.size === 1 ? [...x.embeddedValues][0] : null,
   })).sort((a,b) => b.charCount - a.charCount);
 
+  const rawFontNames = await extractRawPdfFontNames(pdfPath);
+  const mergedProfile = {fonts: fontList};
+  mergeRawFonts(mergedProfile, rawFontNames);
+  const finalFonts = mergedProfile.fonts;
+
   const result = {
     available: true,
     fileName: path.basename(pdfPath),
     pageCount: pdf.numPages,
     scannedPages: maxPages,
-    fonts: fontList,
-    fontCount: fontList.length,
+    fonts: finalFonts,
+    fontCount: finalFonts.length,
     textItemCount: items.length,
     pages,
     items,
