@@ -1,26 +1,28 @@
 import fs from "fs/promises";
 import path from "path";
+import { inflateSync } from "zlib";
 
 // =====================================================
-// VERIFYDOC FONT FORENSICS v1
+// VERIFYDOC FONT FORENSICS v2
 // =====================================================
-// Amaç:
-// 1) PDF içindeki gerçek text/font metadata'sını çıkarmak.
-// 2) Subset prefix'lerini temizleyip karşılaştırılabilir font adları üretmek.
-// 3) Referans PDF ile hedef PDF'nin font ailesi/stili/ölçüsünü karşılaştırmak.
-// 4) Aynı semantic alanın label/value tarafında font değişimini ayrı sinyal
-//    olarak raporlamak.
+// v2 fixes a critical limitation of v1:
+// PDF.js item.fontName can be an internal resource name (for example g_d3_f3)
+// and a simple /BaseFont regex misses names stored inside compressed/object
+// streams. v2 therefore uses four evidence layers:
+//   1) PDF.js text items + commonObjs
+//   2) raw PDF dictionaries
+//   3) FlateDecode/object-stream decompression
+//   4) embedded font binary name tables (TrueType/OpenType/CFF/Type1)
 //
-// Bu modül tek başına sahtecilik kararı vermez. Çıktı, VerifyDoc'un diğer
-// forensic motorlarıyla birlikte değerlendirilmek üzere tasarlanmıştır.
+// The module reports font evidence only. It does not decide authenticity.
 
 const FONT_STYLE_PATTERNS = [
   ["black", /(?:black|heavy|ultrablack|900)$/i],
-  ["bold", /(?:bold|semibold|demibold|mediumbold|700)$/i],
+  ["bold", /(?:bold|semibold|demibold|demi|mediumbold|700)$/i],
   ["medium", /(?:medium|500)$/i],
   ["light", /(?:light|thin|300)$/i],
   ["italic", /(?:italic|oblique)$/i],
-  ["regular", /(?:regular|roman|normal|book)$/i],
+  ["regular", /(?:regular|roman|normal|book|plain)$/i],
 ];
 
 function clean(value) {
@@ -30,20 +32,21 @@ function clean(value) {
 function normalizeFontName(value) {
   let s = clean(value);
   if (!s) return null;
-
+  s = s.replace(/^\//, "");
   // PDF subset prefix: ABCDEF+FontName
   s = s.replace(/^[A-Z]{3,8}\+/i, "");
-  s = s.replace(/^\//, "");
+  s = s.replace(/\\#([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
   s = s.replace(/\s+/g, "");
-  return s || null;
+  if (!s || /^Identity(?:-H|-V)?$/i.test(s)) return null;
+  return s;
 }
 
 function fontFamily(value) {
   const n = normalizeFontName(value);
   if (!n) return null;
   return n
-    .replace(/[-_](?:Bold|Black|Roman|Regular|Book|Medium|Light|Thin|Italic|Oblique|Semibold|DemiBold|Heavy|Normal)(?:MT|PS)?$/i, "")
-    .replace(/(?:Bold|Black|Roman|Regular|Book|Medium|Light|Thin|Italic|Oblique|Semibold|DemiBold|Heavy|Normal)(?:MT|PS)?$/i, "")
+    .replace(/[-_](?:Bold|Black|Roman|Regular|Book|Medium|Light|Thin|Italic|Oblique|Semibold|DemiBold|Heavy|Normal|Plain)(?:MT|PS|PSMT)?$/i, "")
+    .replace(/(?:Bold|Black|Roman|Regular|Book|Medium|Light|Thin|Italic|Oblique|Semibold|DemiBold|Heavy|Normal|Plain)(?:MT|PS|PSMT)?$/i, "")
     .replace(/(?:MT|PSMT)$/i, "") || n;
 }
 
@@ -54,7 +57,7 @@ function fontStyle(value) {
     if (re.test(n)) return style;
   }
   if (/(?:BoldMT|BoldPSMT)$/i.test(n)) return "bold";
-  if (/(?:Roman|Regular|Book|Normal)(?:MT|PSMT)?$/i.test(n)) return "regular";
+  if (/(?:Roman|Regular|Book|Normal|Plain)(?:MT|PSMT)?$/i.test(n)) return "regular";
   if (/PSMT$/i.test(n)) return "regular";
   return "unknown";
 }
@@ -72,119 +75,327 @@ function normalizeLabel(value) {
     .trim();
 }
 
+function isUsefulFontName(value) {
+  const n = normalizeFontName(value);
+  if (!n || n.length < 2 || n.length > 180) return false;
+  if (/^(unknown|none|null|undefined|g_d\d+_f\d+|font\d+)$/i.test(n)) return false;
+  if (/^(Identity|ArialMT|TimesNewRomanPSMT|Helvetica|Courier)$/i.test(n)) return true;
+  return /[A-Za-z]/.test(n);
+}
+
+function makeFontRecord(name, source, extra = {}) {
+  const n = normalizeFontName(name);
+  if (!isUsefulFontName(n)) return null;
+  return {
+    key: `${fontFamily(n) || n}|${fontStyle(n)}`,
+    fontName: n,
+    family: fontFamily(n) || n,
+    style: fontStyle(n),
+    rawFontNames: [n],
+    pdfFontFamilies: [fontFamily(n) || n],
+    itemCount: 0,
+    charCount: 0,
+    pages: [],
+    embedded: null,
+    source,
+    ...extra,
+  };
+}
+
+function addName(set, name) {
+  const n = normalizeFontName(name);
+  if (isUsefulFontName(n)) set.add(n);
+}
+
+// -----------------------------------------------------
+// PDF raw + compressed stream extraction
+// -----------------------------------------------------
+function scanFontTokens(text, names) {
+  if (!text) return;
+  const source = String(text);
+  const patterns = [
+    /\/BaseFont\s*\/([A-Za-z0-9._+\-#]+)/g,
+    /\/FontName\s*\/([A-Za-z0-9._+\-#]+)/g,
+    /\/Family\s*\/([A-Za-z0-9._+\-#]+)/g,
+    /\/Substitute\s*\/([A-Za-z0-9._+\-#]+)/g,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(source))) addName(names, m[1]);
+  }
+}
+
+function findPdfStreams(buffer) {
+  const streams = [];
+  const ascii = buffer.toString("latin1");
+  let pos = 0;
+  while (true) {
+    const start = ascii.indexOf("stream", pos);
+    if (start < 0) break;
+    const after = start + 6;
+    let dataStart = after;
+    if (ascii.startsWith("\r\n", dataStart)) dataStart += 2;
+    else if (ascii.startsWith("\n", dataStart)) dataStart += 1;
+    const end = ascii.indexOf("endstream", dataStart);
+    if (end < 0) break;
+    const dictStart = Math.max(0, ascii.lastIndexOf("<<", start));
+    const dictEnd = ascii.lastIndexOf(">>", start);
+    const dictionary = dictEnd > dictStart ? ascii.slice(dictStart, dictEnd + 2) : "";
+    streams.push({ dataStart, dataEnd: end, dictionary });
+    pos = end + 9;
+  }
+  return streams;
+}
+
+function tryInflate(data) {
+  try { return inflateSync(data); } catch {}
+  // Some malformed PDFs have harmless leading/trailing bytes around a zlib stream.
+  for (let trim = 1; trim <= Math.min(32, data.length - 1); trim++) {
+    try { return inflateSync(data.subarray(trim)); } catch {}
+  }
+  return null;
+}
+
+async function extractRawPdfFontNames(pdfPath) {
+  const names = new Set();
+  try {
+    const buf = await fs.readFile(pdfPath);
+    if (!buf?.length) return [];
+    const latin = buf.toString("latin1");
+    scanFontTokens(latin, names);
+
+    // Critical fix: inspect FlateDecode streams, including compressed object
+    // streams where the font dictionaries are invisible to a plain regex scan.
+    for (const stream of findPdfStreams(buf)) {
+      if (!/\/FlateDecode\b/i.test(stream.dictionary)) continue;
+      const inflated = tryInflate(buf.subarray(stream.dataStart, stream.dataEnd));
+      if (!inflated) continue;
+      const decoded = inflated.toString("latin1");
+      scanFontTokens(decoded, names);
+    }
+  } catch (error) {
+    console.warn("RAW PDF FONT EXTRACTION HATASI:", path.basename(pdfPath), error?.message || error);
+  }
+  return [...names];
+}
+
+// -----------------------------------------------------
+// Embedded font binary name extraction
+// -----------------------------------------------------
+function decodeUtf16BE(buf) {
+  if (!buf || buf.length < 2) return "";
+  let out = "";
+  for (let i = 0; i + 1 < buf.length; i += 2) out += String.fromCharCode((buf[i] << 8) | buf[i + 1]);
+  return out.replace(/\0/g, "").trim();
+}
+
+function decodeMacRomanLoose(buf) {
+  // Font names are overwhelmingly ASCII/Latin in bank PDFs. Keep bytes intact
+  // for ASCII and replace unsupported high bytes rather than inventing names.
+  let out = "";
+  for (const b of buf || []) out += b < 128 ? String.fromCharCode(b) : "?";
+  return out.replace(/\0/g, "").trim();
+}
+
+function parseSfntNames(data) {
+  const buf = Buffer.from(data || []);
+  if (buf.length < 12) return [];
+  const tag = buf.toString("ascii", 0, 4);
+  const isSfnt = tag === "\0\x01\0\0" || tag === "OTTO" || tag === "true" || tag === "typ1";
+  if (!isSfnt) return [];
+  const names = new Set();
+  try {
+    const numTables = buf.readUInt16BE(4);
+    for (let i = 0; i < numTables; i++) {
+      const off = 12 + i * 16;
+      if (off + 16 > buf.length) break;
+      const tableTag = buf.toString("ascii", off, off + 4);
+      const tableOffset = buf.readUInt32BE(off + 8);
+      const tableLength = buf.readUInt32BE(off + 12);
+      if (tableTag !== "name" || tableOffset + tableLength > buf.length || tableLength < 6) continue;
+      const p = tableOffset;
+      const count = buf.readUInt16BE(p + 2);
+      const stringOffset = buf.readUInt16BE(p + 4);
+      for (let j = 0; j < count; j++) {
+        const r = p + 6 + j * 12;
+        if (r + 12 > buf.length) break;
+        const platform = buf.readUInt16BE(r);
+        const nameId = buf.readUInt16BE(r + 6);
+        const len = buf.readUInt16BE(r + 8);
+        const rel = buf.readUInt16BE(r + 10);
+        if (![1, 2, 4, 6].includes(nameId)) continue;
+        const s = p + stringOffset + rel;
+        if (s < 0 || s + len > buf.length) continue;
+        const raw = buf.subarray(s, s + len);
+        const decoded = platform === 3 || platform === 0 ? decodeUtf16BE(raw) : decodeMacRomanLoose(raw);
+        if (decoded && decoded.length < 180) addName(names, decoded);
+      }
+    }
+  } catch {}
+  return [...names];
+}
+
+function parseCffNames(data) {
+  const buf = Buffer.from(data || []);
+  if (buf.length < 4 || buf[0] !== 1 || (buf[1] < 0 || buf[1] > 10)) return [];
+  const names = new Set();
+  try {
+    const headerSize = buf[2];
+    let p = headerSize;
+    const count = buf.readUInt16BE(p); p += 2;
+    if (!count) return [];
+    const offSize = buf[p++];
+    if (![1,2,3,4].includes(offSize)) return [];
+    const offsets = [];
+    for (let i = 0; i <= count; i++) {
+      let v = 0;
+      for (let k = 0; k < offSize; k++) v = (v << 8) | buf[p++];
+      offsets.push(v);
+    }
+    const dataStart = p;
+    for (let i = 0; i < count; i++) {
+      const a = dataStart + offsets[i] - 1;
+      const b = dataStart + offsets[i + 1] - 1;
+      if (a >= 0 && b > a && b <= buf.length) addName(names, buf.subarray(a, b).toString("latin1"));
+    }
+  } catch {}
+  return [...names];
+}
+
+function parseType1Names(data) {
+  const text = Buffer.from(data || []).toString("latin1");
+  const names = new Set();
+  const patterns = [
+    /\/FontName\s*\/([A-Za-z0-9._+\-#]+)/g,
+    /\/FullName\s*\(([^)]+)\)/g,
+    /\/FamilyName\s*\(([^)]+)\)/g,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(text))) addName(names, m[1]);
+  }
+  return [...names];
+}
+
+function embeddedFontNamesFromObject(obj) {
+  const names = new Set();
+  const binaries = [];
+  const seen = new Set();
+  const pushBinary = (value) => {
+    if (!value) return;
+    let b = null;
+    if (value instanceof Uint8Array || Buffer.isBuffer(value)) b = Buffer.from(value);
+    else if (value instanceof ArrayBuffer) b = Buffer.from(new Uint8Array(value));
+    else if (ArrayBuffer.isView(value)) b = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    if (!b || b.length < 16 || b.length > 50 * 1024 * 1024) return;
+    const key = `${b.length}:${b.subarray(0, 16).toString("hex")}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    binaries.push(b);
+  };
+
+  // PDF.js Font objects and their descriptors can expose the embedded bytes
+  // under different properties depending on version/build.
+  pushBinary(obj?.data);
+  pushBinary(obj?.file?.data);
+  pushBinary(obj?.fontData);
+  pushBinary(obj?.properties?.data);
+  pushBinary(obj?.properties?.file?.data);
+  pushBinary(obj?.dict?.data);
+  pushBinary(obj?.dict?.file?.data);
+
+  for (const b of binaries) {
+    for (const n of parseSfntNames(b)) addName(names, n);
+    for (const n of parseCffNames(b)) addName(names, n);
+    for (const n of parseType1Names(b)) addName(names, n);
+  }
+  return [...names];
+}
+
 function getFontObject(page, fontName) {
   if (!page?.commonObjs || !fontName) return null;
-  try {
-    if (typeof page.commonObjs.has === "function" && !page.commonObjs.has(fontName)) return null;
-  } catch {}
-  try {
-    return page.commonObjs.get(fontName) || null;
-  } catch {
-    return null;
-  }
+  try { return page.commonObjs.get(fontName) || null; } catch { return null; }
+}
+
+function collectObjectFontNames(obj) {
+  const names = new Set();
+  const candidates = [
+    obj?.fontFamily, obj?.name, obj?.loadedName, obj?.fallbackName,
+    obj?.properties?.fontFamily, obj?.properties?.name,
+    obj?.properties?.loadedName, obj?.properties?.fallbackName,
+    obj?.properties?.baseFont, obj?.properties?.BaseFont,
+    obj?.properties?.fontName, obj?.properties?.FontName,
+    obj?.dict?.fontName, obj?.dict?.FontName, obj?.dict?.baseFont,
+  ];
+  for (const c of candidates) addName(names, c);
+  for (const c of embeddedFontNamesFromObject(obj)) addName(names, c);
+  return [...names];
 }
 
 function fontDescriptor(item, page) {
   const raw = clean(item?.fontName);
   const obj = getFontObject(page, raw);
-  const candidates = [
-    obj?.fontFamily,
-    obj?.name,
-    obj?.loadedName,
-    obj?.fallbackName,
-    raw,
-  ].filter(Boolean);
-
-  const rawName = normalizeFontName(candidates[0]) || normalizeFontName(raw);
-  const family = fontFamily(rawName || candidates[0]);
-  const style = fontStyle(rawName || candidates[0]);
-
+  const objectNames = collectObjectFontNames(obj);
+  // Prefer an actual object/embedded name. Never treat g_d3_f3-style resource
+  // names as the canonical font family.
+  const preferred = objectNames.find(n => !/^g_d\d+_f\d+$/i.test(n)) || null;
+  const canonical = preferred || (isUsefulFontName(raw) ? normalizeFontName(raw) : null);
   return {
     rawFontName: raw || null,
-    fontName: rawName || null,
-    family: family || null,
-    style,
-    pdfFontFamily: clean(obj?.fontFamily) || null,
-    loadedName: clean(obj?.loadedName) || null,
+    fontName: canonical,
+    family: fontFamily(canonical),
+    style: fontStyle(canonical),
+    pdfFontFamilies: objectNames.map(x => fontFamily(x) || x).slice(0, 12),
     embedded: typeof obj?.isEmbedded === "boolean" ? obj.isEmbedded : null,
     type3: Boolean(obj?.isType3Font),
     vertical: Boolean(obj?.vertical),
+    objectFontNames: objectNames.slice(0, 20),
   };
 }
 
 const fontProfileCache = new Map();
 
-
-// PDF.js'in item.fontName değeri çoğu PDF'de gerçek font adı değildir
-// (örn. g_d3_f3). Referans PDF'lerde gerçek font adı PDF kaynaklarından
-// /BaseFont ve /FontName kayıtları üzerinden ayrıca çıkarılır.
-async function extractRawPdfFontNames(pdfPath) {
-  try {
-    const buf = await fs.readFile(pdfPath);
-    if (!buf?.length) return [];
-    const text = buf.toString("latin1");
-    const names = new Set();
-    const patterns = [
-      /\/BaseFont\s*\/([A-Za-z0-9._+\-#]+)/g,
-      /\/FontName\s*\/([A-Za-z0-9._+\-#]+)/g,
-    ];
-    for (const re of patterns) {
-      let m;
-      while ((m = re.exec(text))) {
-        const n = normalizeFontName(m[1]);
-        if (n && n.length < 160 && !/^Identity(?:-H|-V)?$/i.test(n)) names.add(n);
-      }
-    }
-    return [...names];
-  } catch (error) {
-    console.warn("RAW PDF FONT EXTRACTION HATASI:", path.basename(pdfPath), error?.message || error);
-    return [];
-  }
-}
-
-function mergeRawFonts(profile, rawNames = []) {
-  if (!profile) return profile;
-  const existing = new Set((profile.fonts || []).map(x => normalizeFontName(x.fontName || x.family)).filter(Boolean));
-  const additions = [];
-  for (const raw of rawNames) {
-    const n = normalizeFontName(raw);
-    if (!n || existing.has(n)) continue;
-    existing.add(n);
-    additions.push({
-      key: `${fontFamily(n) || n}|${fontStyle(n)}`,
-      fontName: n,
-      family: fontFamily(n) || n,
-      style: fontStyle(n),
-      rawFontNames: [n],
-      pdfFontFamilies: [fontFamily(n) || n],
-      itemCount: 0,
-      charCount: 0,
-      pages: [],
-      embedded: null,
-      source: "pdf-raw-font-dictionary",
-    });
-  }
-  if (!additions.length) return profile;
-  profile.fonts = [...profile.fonts, ...additions];
-  profile.fontCount = profile.fonts.length;
-  profile.rawFontNames = rawNames;
-  return profile;
+function mergeFontRecord(map, rec) {
+  if (!rec?.fontName) return;
+  const key = rec.key || `${rec.family || rec.fontName}|${rec.style || "unknown"}`;
+  const current = map.get(key) || {
+    key,
+    fontName: rec.fontName,
+    family: rec.family || fontFamily(rec.fontName) || rec.fontName,
+    style: rec.style || fontStyle(rec.fontName),
+    rawFontNames: new Set(),
+    pdfFontFamilies: new Set(),
+    itemCount: 0,
+    charCount: 0,
+    pages: new Set(),
+    embeddedValues: new Set(),
+    sources: new Set(),
+  };
+  if (rec.rawFontName) current.rawFontNames.add(rec.rawFontName);
+  for (const n of rec.rawFontNames || []) current.rawFontNames.add(n);
+  for (const n of rec.pdfFontFamilies || []) current.pdfFontFamilies.add(n);
+  if (rec.source) current.sources.add(rec.source);
+  if (rec.pageNumber) current.pages.add(rec.pageNumber);
+  current.itemCount += Number(rec.itemCount) || 0;
+  current.charCount += Number(rec.charCount) || 0;
+  if (rec.embedded !== null && rec.embedded !== undefined) current.embeddedValues.add(rec.embedded);
+  map.set(key, current);
 }
 
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}`;
-  const cached = fontProfileCache.get(cacheKey);
-  if (cached) return cached;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v2`;
+  if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
+
   const buffer = await fs.readFile(pdfPath);
   if (!buffer?.length) return null;
-
-  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer), useWorkerFetch: false, isEvalSupported: true }).promise;
   const maxPages = Math.min(Number(options.maxPages) || 5, pdf.numPages || 1);
   const fonts = new Map();
   const items = [];
   const pages = [];
+  const pdfObjectNames = new Set();
 
   try {
     for (let pageNumber = 1; pageNumber <= maxPages; pageNumber++) {
@@ -196,51 +407,45 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
       for (const item of content.items || []) {
         const text = clean(item?.str);
         if (!text || !item?.fontName) continue;
-
         const font = fontDescriptor(item, page);
-        const key = [font.family || font.fontName || "unknown", font.style].join("|");
-        const current = fonts.get(key) || {
-          key,
-          fontName: font.fontName,
-          family: font.family,
-          style: font.style,
-          rawFontNames: new Set(),
-          pdfFontFamilies: new Set(),
-          itemCount: 0,
-          charCount: 0,
-          pages: new Set(),
-          embeddedValues: new Set(),
-        };
-        current.itemCount++;
-        current.charCount += text.length;
-        current.pages.add(pageNumber);
-        if (font.rawFontName) current.rawFontNames.add(font.rawFontName);
-        if (font.pdfFontFamily) current.pdfFontFamilies.add(font.pdfFontFamily);
-        if (font.embedded !== null) current.embeddedValues.add(font.embedded);
-        fonts.set(key, current);
+        for (const n of font.objectFontNames || []) addName(pdfObjectNames, n);
+
+        // If canonical name is unavailable, keep the resource name as an
+        // internal observation but do NOT expose it as a reference font family.
+        if (font.fontName) {
+          mergeFontRecord(fonts, {
+            ...font,
+            source: font.objectFontNames?.length ? "pdfjs-font-object" : "pdfjs-text-layer",
+            pageNumber,
+            itemCount: 1,
+            charCount: text.length,
+          });
+        }
 
         const tr = Array.isArray(item.transform) ? item.transform : [];
         const x = Number(tr[4]);
         const y = Number(tr[5]);
         const width = Number(item.width) || 0;
         const height = Math.abs(Number(tr[3])) || Number(item.height) || 0;
-        const row = {
-          pageNumber,
-          text,
-          x: Number.isFinite(x) ? x : 0,
-          y: Number.isFinite(y) ? y : 0,
-          width,
-          height,
-          font,
-        };
+        const row = { pageNumber, text, x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0, width, height, font };
         pageItems.push(row);
         items.push(row);
       }
-
       pages.push({ pageNumber, width: viewport.width, height: viewport.height, itemCount: pageItems.length });
     }
   } finally {
     try { if (typeof pdf.destroy === "function") await pdf.destroy(); } catch {}
+  }
+
+  // Add names found in dictionaries and decompressed object streams.
+  const rawFontNames = await extractRawPdfFontNames(pdfPath);
+  for (const n of rawFontNames) addName(pdfObjectNames, n);
+
+  for (const n of rawFontNames) {
+    if (!fontsHasCanonical(fonts, n)) {
+      const rec = makeFontRecord(n, "pdf-dictionary-or-object-stream");
+      if (rec) mergeFontRecord(fonts, rec);
+    }
   }
 
   const fontList = [...fonts.values()].map(x => ({
@@ -248,32 +453,36 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     fontName: x.fontName,
     family: x.family,
     style: x.style,
-    rawFontNames: [...x.rawFontNames].slice(0, 12),
-    pdfFontFamilies: [...x.pdfFontFamilies].slice(0, 12),
+    rawFontNames: [...x.rawFontNames].slice(0, 20),
+    pdfFontFamilies: [...x.pdfFontFamilies].slice(0, 20),
     itemCount: x.itemCount,
     charCount: x.charCount,
     pages: [...x.pages].sort((a,b) => a-b),
     embedded: x.embeddedValues.size === 1 ? [...x.embeddedValues][0] : null,
-  })).sort((a,b) => b.charCount - a.charCount);
-
-  const rawFontNames = await extractRawPdfFontNames(pdfPath);
-  const mergedProfile = {fonts: fontList};
-  mergeRawFonts(mergedProfile, rawFontNames);
-  const finalFonts = mergedProfile.fonts;
+    sources: [...x.sources],
+  })).filter(x => isUsefulFontName(x.fontName)).sort((a,b) => b.charCount - a.charCount);
 
   const result = {
     available: true,
     fileName: path.basename(pdfPath),
     pageCount: pdf.numPages,
     scannedPages: maxPages,
-    fonts: finalFonts,
-    fontCount: finalFonts.length,
+    fonts: fontList,
+    fontCount: fontList.length,
+    rawPdfFontNames: rawFontNames,
+    pdfObjectFontNames: [...pdfObjectNames],
     textItemCount: items.length,
     pages,
     items,
   };
   fontProfileCache.set(cacheKey, result);
   return result;
+}
+
+function fontsHasCanonical(map, name) {
+  const n = normalizeFontName(name);
+  if (!n) return true;
+  return [...map.values()].some(x => normalizeFontName(x.fontName) === n || normalizeFontName(x.family) === n);
 }
 
 function isLikelyLabel(text) {
@@ -316,17 +525,14 @@ function fieldValueFontProfiles(profile) {
 function compareFontProfiles(reference, target) {
   const refFonts = Array.isArray(reference?.fonts) ? reference.fonts : [];
   const tarFonts = Array.isArray(target?.fonts) ? target.fonts : [];
-
   const refFamilies = new Set(refFonts.map(x => x.family || x.fontName).filter(Boolean));
   const tarFamilies = new Set(tarFonts.map(x => x.family || x.fontName).filter(Boolean));
   const refStyles = new Set(refFonts.map(x => x.style).filter(x => x && x !== "unknown"));
   const tarStyles = new Set(tarFonts.map(x => x.style).filter(x => x && x !== "unknown"));
-
   const familyOnlyTarget = [...tarFamilies].filter(x => !refFamilies.has(x));
   const familyOnlyReference = [...refFamilies].filter(x => !tarFamilies.has(x));
   const sharedFamilies = [...tarFamilies].filter(x => refFamilies.has(x));
   const styleOnlyTarget = [...tarStyles].filter(x => !refStyles.has(x));
-
   const familyDenom = Math.max(1, new Set([...refFamilies, ...tarFamilies]).size);
   const familySimilarity = Math.round((sharedFamilies.length / familyDenom) * 100);
 
@@ -334,28 +540,44 @@ function compareFontProfiles(reference, target) {
   const tarField = fieldValueFontProfiles(target);
   const targetByField = new Map(tarField.map(x => [x.field, x]));
   const fieldMismatches = [];
-
   for (const r of refField) {
     const t = targetByField.get(r.field);
     if (!t) continue;
     const rf = new Set(r.valueFonts);
     const tf = new Set(t.valueFonts);
     const mismatch = [...tf].filter(x => !rf.has(x));
-    if (mismatch.length) {
-      fieldMismatches.push({
-        field: r.field,
-        labelText: r.labelText,
-        referenceFonts: [...rf],
-        targetFonts: [...tf],
-        targetOnlyFonts: mismatch,
-        referenceStyles: r.valueStyles,
-        targetStyles: t.valueStyles,
-      });
-    }
+    if (mismatch.length) fieldMismatches.push({
+      field: r.field,
+      labelText: r.labelText,
+      referenceFonts: [...rf],
+      targetFonts: [...tf],
+      targetOnlyFonts: mismatch,
+      referenceStyles: r.valueStyles,
+      targetStyles: t.valueStyles,
+    });
   }
 
   let score = 0;
   const evidence = [];
+  if (!refFonts.length) {
+    return {
+      available: false,
+      score: 0,
+      severity: "unknown",
+      referenceFamilies: [],
+      targetFamilies: [...tarFamilies],
+      sharedFamilies: [],
+      targetOnlyFamilies: [],
+      referenceOnlyFamilies: [],
+      referenceStyles: [],
+      targetStyles: [...tarStyles],
+      targetOnlyStyles: [],
+      familySimilarity: null,
+      fieldMismatches: [],
+      evidence: ["Referans PDF'den güvenilir font profili çıkarılamadı; font farkı skoru üretilmedi."],
+    };
+  }
+
   if (familyOnlyTarget.length) {
     score += Math.min(45, familyOnlyTarget.length * 15);
     evidence.push(`Referansta bulunmayan ${familyOnlyTarget.length} font ailesi hedef PDF'de görüldü.`);
@@ -369,7 +591,6 @@ function compareFontProfiles(reference, target) {
     evidence.push(`${fieldMismatches.length} semantic alanda referans-hedef font farkı bulundu.`);
   }
   score = Math.min(100, score);
-
   return {
     available: true,
     score,
@@ -390,75 +611,72 @@ function compareFontProfiles(reference, target) {
 
 export async function analyzeFontForensics({ targetPath, referencePath, referencePaths = [], pdfjsLib, maxPages = 5 }) {
   if (!targetPath || !pdfjsLib) return { available: false, reason: "missing-target-or-pdf-engine" };
-  const targetExt = path.extname(targetPath).toLowerCase();
-  if (targetExt !== ".pdf") {
-    return {
-      available: false,
-      status: "unsupported",
-      reason: "font-metadata-analysis-requires-pdf-text-layer",
-      evidence: "JPG/PNG gibi raster belgelerde gerçek embedded PDF font adı çıkarılamaz; görsel tipografi motoru ayrı çalışır."
-    };
+  if (path.extname(targetPath).toLowerCase() !== ".pdf") {
+    return { available: false, status: "unsupported", reason: "font-metadata-analysis-requires-pdf", evidence: "JPG/PNG gibi raster belgelerde gerçek embedded PDF font adı çıkarılamaz; görsel tipografi motoru ayrı çalışır." };
   }
-
   const refs = [...new Set([referencePath, ...referencePaths].filter(Boolean))]
     .filter(p => path.extname(String(p)).toLowerCase() === ".pdf");
   if (!refs.length) return { available: false, status: "no-reference" };
 
-  let targetProfile = null;
-  try {
-    targetProfile = await extractPdfFontProfile(targetPath, pdfjsLib, { maxPages });
-  } catch (error) {
-    return { available: false, status: "error", error: error?.message || String(error) };
-  }
+  let targetProfile;
+  try { targetProfile = await extractPdfFontProfile(targetPath, pdfjsLib, { maxPages }); }
+  catch (error) { return { available: false, status: "error", error: error?.message || String(error) }; }
   if (!targetProfile) return { available: false, status: "no-target-profile" };
 
   const referenceProfiles = [];
   for (const refPath of refs) {
     try {
       const p = await extractPdfFontProfile(refPath, pdfjsLib, { maxPages });
-      if (p) referenceProfiles.push(p);
+      if (p && p.fonts?.length) referenceProfiles.push(p);
+      else console.warn("FONT REFERENCE PROFILE EMPTY:", path.basename(refPath));
     } catch (error) {
       console.warn("FONT REFERENCE EXTRACTION HATASI:", path.basename(refPath), error?.message || error);
     }
   }
-  if (!referenceProfiles.length) return { available: false, status: "no-reference-profile", target: targetProfile };
 
-  const comparisons = referenceProfiles.map(ref => ({
-    referenceFile: ref.fileName,
-    comparison: compareFontProfiles(ref, targetProfile),
-  }));
+  if (!referenceProfiles.length) {
+    return {
+      available: true,
+      engine: "verifydoc-pdf-font-forensics-v2",
+      status: "reference-font-profile-unavailable",
+      targetFile: targetProfile.fileName,
+      targetFonts: targetProfile.fonts,
+      targetFontCount: targetProfile.fontCount,
+      referenceFiles: refs.map(x => path.basename(x)),
+      referenceFontProfiles: [],
+      score: 0,
+      severity: "unknown",
+      familySimilarity: null,
+      comparisons: [],
+      evidence: ["Referans PDF mevcut ancak güvenilir gerçek font profili çıkarılamadı. Hedef fontları referanssız karşılaştırmak yerine font skoru devre dışı bırakıldı."],
+    };
+  }
+
+  const comparisons = referenceProfiles.map(ref => ({ referenceFile: ref.fileName, comparison: compareFontProfiles(ref, targetProfile) }));
   comparisons.sort((a,b) => Number(a.comparison.score) - Number(b.comparison.score));
   const best = comparisons[0];
-
-  // Ensemble: target-only fonts are more meaningful when they are absent from
-  // every trusted reference variant. Build the union of all reference families.
   const allReferenceFamilies = new Set(referenceProfiles.flatMap(p => p.fonts.map(x => x.family || x.fontName).filter(Boolean)));
   const allTargetFamilies = new Set(targetProfile.fonts.map(x => x.family || x.fontName).filter(Boolean));
   const ensembleTargetOnlyFamilies = [...allTargetFamilies].filter(x => !allReferenceFamilies.has(x));
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v1",
+    engine: "verifydoc-pdf-font-forensics-v2",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
     targetFontCount: targetProfile.fontCount,
     referenceFiles: referenceProfiles.map(x => x.fileName),
-    referenceFontProfiles: referenceProfiles.map(x => ({
-      fileName: x.fileName,
-      fonts: x.fonts,
-      fontCount: x.fontCount,
-    })),
+    referenceFontProfiles: referenceProfiles.map(x => ({ fileName: x.fileName, fonts: x.fonts, fontCount: x.fontCount, rawPdfFontNames: x.rawPdfFontNames })),
     targetOnlyFamiliesAcrossReferences: ensembleTargetOnlyFamilies,
     bestReference: best?.referenceFile || null,
     score: best?.comparison?.score || 0,
     severity: best?.comparison?.severity || "none",
-    familySimilarity: best?.comparison?.familySimilarity || 0,
+    familySimilarity: best?.comparison?.familySimilarity ?? null,
     comparisons,
     evidence: best?.comparison?.evidence || [],
-    // Raw item coordinates stay internal to the module; only semantic field
-    // mismatches are returned to the main result.
   };
 }
 
+export { extractPdfFontProfile, compareFontProfiles, normalizeFontName, fontFamily, fontStyle };
 export default analyzeFontForensics;
