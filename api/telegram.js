@@ -2087,6 +2087,36 @@ function formatHistoricalWarning(historicalMatch) {
 }
 
 // =====================================================
+// FONT FORENSICS UYARISI
+// =====================================================
+function formatFontForensicsWarning(fontForensics) {
+ const f = fontForensics || {};
+ if (f.available !== true) return '';
+ const score = Number(f.score) || 0;
+ if (score < 18) return '';
+ const targetOnly = Array.isArray(f.targetOnlyFamiliesAcrossReferences)
+   ? f.targetOnlyFamiliesAcrossReferences.filter(Boolean).slice(0, 5)
+   : [];
+ const fieldMismatches = Array.isArray(f.comparisons?.[0]?.comparison?.fieldMismatches)
+   ? f.comparisons[0].comparison.fieldMismatches.slice(0, 4)
+   : [];
+ const lines = ['\n🅰️ FONT ANALİZİ'];
+ if (targetOnly.length) {
+   lines.push(`• Referanslarda bulunmayan hedef font: ${targetOnly.join(', ')}`);
+ }
+ for (const item of fieldMismatches) {
+   const ref = Array.isArray(item.referenceFonts) ? item.referenceFonts.join(', ') : '';
+   const tar = Array.isArray(item.targetFonts) ? item.targetFonts.join(', ') : '';
+   lines.push(`• ${item.labelText || item.field}: referans [${ref}] → hedef [${tar}]`);
+ }
+ if (lines.length === 1) {
+   lines.push(`• Referans/hedef PDF font profili arasında farklılık sinyali bulundu (skor ${score}/100).`);
+ }
+ lines.push('• Font farkı tek başına sahtecilik kanıtı değildir; diğer forensic bulgularla birlikte değerlendirilir.');
+ return lines.join('\n');
+}
+
+// =====================================================
 // ANALİZ SONUCUNU GÖNDER
 // =====================================================
 
@@ -2315,7 +2345,7 @@ ${confidence}/100
 
 ━━━━━━━━━━━━━━
 
-${summary}${comparisonWarning}${formatHistoricalWarning(result?.historicalMatch)}
+${summary}${comparisonWarning}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
 
 ━━━━━━━━━━━━━━
 
