@@ -3,7 +3,7 @@ import path from "path";
 import { inflateSync } from "zlib";
 
 // =====================================================
-// VERIFYDOC FONT FORENSICS v2
+// VERIFYDOC FONT FORENSICS v3
 // =====================================================
 // v2 fixes a critical limitation of v1:
 // PDF.js item.fontName can be an internal resource name (for example g_d3_f3)
@@ -33,9 +33,11 @@ function normalizeFontName(value) {
   let s = clean(value);
   if (!s) return null;
   s = s.replace(/^\//, "");
+  // PDF name hex escapes (e.g. #2B = "+") must be decoded before
+  // removing the six-letter subset prefix.
+  s = s.replace(/#([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
   // PDF subset prefix: ABCDEF+FontName
   s = s.replace(/^[A-Z]{3,8}\+/i, "");
-  s = s.replace(/\\#([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
   s = s.replace(/\s+/g, "");
   if (!s || /^Identity(?:-H|-V)?$/i.test(s)) return null;
   return s;
@@ -125,35 +127,126 @@ function scanFontTokens(text, names) {
   }
 }
 
+function parsePdfFilterNames(dictionary) {
+  const m = String(dictionary || '').match(/\/Filter\s+(\[[^\]]+\]|\/[^\s<>\[\]]+)/i);
+  if (!m) return [];
+  const raw = m[1];
+  const names = [];
+  const re = /\/([A-Za-z0-9]+)/g;
+  let x;
+  while ((x = re.exec(raw))) names.push(x[1]);
+  return names;
+}
+
 function findPdfStreams(buffer) {
   const streams = [];
-  const ascii = buffer.toString("latin1");
+  const ascii = buffer.toString('latin1');
   let pos = 0;
   while (true) {
-    const start = ascii.indexOf("stream", pos);
+    const start = ascii.indexOf('stream', pos);
     if (start < 0) break;
-    const after = start + 6;
-    let dataStart = after;
-    if (ascii.startsWith("\r\n", dataStart)) dataStart += 2;
-    else if (ascii.startsWith("\n", dataStart)) dataStart += 1;
-    const end = ascii.indexOf("endstream", dataStart);
-    if (end < 0) break;
-    const dictStart = Math.max(0, ascii.lastIndexOf("<<", start));
-    const dictEnd = ascii.lastIndexOf(">>", start);
-    const dictionary = dictEnd > dictStart ? ascii.slice(dictStart, dictEnd + 2) : "";
-    streams.push({ dataStart, dataEnd: end, dictionary });
-    pos = end + 9;
+
+    // Only accept the PDF stream keyword, not occurrences inside arbitrary text.
+    const before = start > 0 ? ascii[start - 1] : '';
+    const afterChar = ascii[start + 6] || '';
+    if ((before && !/[\s\r\n]/.test(before)) || (afterChar && !/[\s\r\n]/.test(afterChar))) {
+      pos = start + 6;
+      continue;
+    }
+
+    const headerStart = Math.max(0, ascii.lastIndexOf('obj', start));
+    const dictStart = ascii.lastIndexOf('<<', start);
+    const dictEnd = ascii.lastIndexOf('>>', start);
+    if (dictStart < headerStart || dictEnd < dictStart) {
+      pos = start + 6;
+      continue;
+    }
+
+    let dataStart = start + 6;
+    if (ascii.startsWith('\r\n', dataStart)) dataStart += 2;
+    else if (ascii.startsWith('\n', dataStart)) dataStart += 1;
+
+    // Prefer /Length when it is a literal integer. This avoids accidentally
+    // stopping at the byte sequence "endstream" inside compressed data.
+    const dictionary = ascii.slice(dictStart, dictEnd + 2);
+    let dataEnd = -1;
+    const lenMatch = dictionary.match(/\/Length\s+(\d+)/i);
+    if (lenMatch) {
+      const length = Number(lenMatch[1]);
+      if (Number.isSafeInteger(length) && length >= 0 && dataStart + length <= buffer.length) {
+        dataEnd = dataStart + length;
+      }
+    }
+    if (dataEnd < 0) {
+      dataEnd = ascii.indexOf('endstream', dataStart);
+      if (dataEnd < 0) break;
+    }
+
+    streams.push({
+      dataStart,
+      dataEnd,
+      dictionary,
+      filters: parsePdfFilterNames(dictionary),
+    });
+    pos = Math.max(dataEnd + 1, start + 6);
   }
   return streams;
 }
 
-function tryInflate(data) {
-  try { return inflateSync(data); } catch {}
-  // Some malformed PDFs have harmless leading/trailing bytes around a zlib stream.
-  for (let trim = 1; trim <= Math.min(32, data.length - 1); trim++) {
-    try { return inflateSync(data.subarray(trim)); } catch {}
+function asciiHexDecode(data) {
+  const src = Buffer.from(data || []).toString('latin1').replace(/\s+/g, '');
+  const end = src.indexOf('>');
+  const body = (end >= 0 ? src.slice(0, end) : src).replace(/[^0-9A-Fa-f]/g, '');
+  const even = body.length % 2 ? body + '0' : body;
+  try { return Buffer.from(even, 'hex'); } catch { return null; }
+}
+
+function ascii85Decode(data) {
+  const src = Buffer.from(data || []).toString('latin1').replace(/\s+/g, '');
+  let text = src;
+  if (text.startsWith('<~')) text = text.slice(2);
+  const end = text.indexOf('~>');
+  if (end >= 0) text = text.slice(0, end);
+  const out = [];
+  let group = [];
+  const flush = (g, partial = false) => {
+    if (!g.length) return;
+    const originalLen = g.length;
+    while (g.length < 5) g.push('u');
+    let value = 0;
+    for (const ch of g) value = value * 85 + (ch === 'z' ? 0 : ch.charCodeAt(0) - 33);
+    const bytes = [(value >>> 24) & 255, (value >>> 16) & 255, (value >>> 8) & 255, value & 255];
+    const take = partial ? Math.max(0, originalLen - 1) : 4;
+    for (let i = 0; i < take; i++) out.push(bytes[i]);
+  };
+  for (const ch of text) {
+    if (ch === 'z' && group.length === 0) {
+      out.push(0,0,0,0);
+      continue;
+    }
+    const code = ch.charCodeAt(0);
+    if (code < 33 || code > 117) continue;
+    group.push(ch);
+    if (group.length === 5) { flush(group); group = []; }
   }
-  return null;
+  if (group.length) flush(group, true);
+  return Buffer.from(out);
+}
+
+function decodePdfStream(data, filters = []) {
+  let current = Buffer.from(data || []);
+  for (const filter of filters) {
+    const f = String(filter || '').toLowerCase();
+    try {
+      if (f === 'flatedecode' || f === 'fl') current = inflateSync(current);
+      else if (f === 'asciihexdecode' || f === 'ahx') current = asciiHexDecode(current) || current;
+      else if (f === 'ascii85decode' || f === 'a85') current = ascii85Decode(current);
+      else return null;
+    } catch {
+      return null;
+    }
+  }
+  return current;
 }
 
 async function extractRawPdfFontNames(pdfPath) {
@@ -161,20 +254,20 @@ async function extractRawPdfFontNames(pdfPath) {
   try {
     const buf = await fs.readFile(pdfPath);
     if (!buf?.length) return [];
-    const latin = buf.toString("latin1");
+    const latin = buf.toString('latin1');
     scanFontTokens(latin, names);
 
-    // Critical fix: inspect FlateDecode streams, including compressed object
-    // streams where the font dictionaries are invisible to a plain regex scan.
+    // Scan every PDF stream using its declared filter chain. This catches
+    // font dictionaries stored inside compressed /ObjStm objects, which a
+    // plain byte regex cannot see.
     for (const stream of findPdfStreams(buf)) {
-      if (!/\/FlateDecode\b/i.test(stream.dictionary)) continue;
-      const inflated = tryInflate(buf.subarray(stream.dataStart, stream.dataEnd));
-      if (!inflated) continue;
-      const decoded = inflated.toString("latin1");
-      scanFontTokens(decoded, names);
+      const raw = buf.subarray(stream.dataStart, stream.dataEnd);
+      const decoded = stream.filters?.length ? decodePdfStream(raw, stream.filters) : raw;
+      if (!decoded) continue;
+      scanFontTokens(decoded.toString('latin1'), names);
     }
   } catch (error) {
-    console.warn("RAW PDF FONT EXTRACTION HATASI:", path.basename(pdfPath), error?.message || error);
+    console.warn('RAW PDF FONT EXTRACTION HATASI:', path.basename(pdfPath), error?.message || error);
   }
   return [...names];
 }
@@ -385,7 +478,7 @@ function mergeFontRecord(map, rec) {
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v2`;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v3`;
   if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
 
   const buffer = await fs.readFile(pdfPath);
@@ -637,7 +730,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   if (!referenceProfiles.length) {
     return {
       available: true,
-      engine: "verifydoc-pdf-font-forensics-v2",
+      engine: "verifydoc-pdf-font-forensics-v3",
       status: "reference-font-profile-unavailable",
       targetFile: targetProfile.fileName,
       targetFonts: targetProfile.fonts,
@@ -661,7 +754,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v2",
+    engine: "verifydoc-pdf-font-forensics-v3",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
