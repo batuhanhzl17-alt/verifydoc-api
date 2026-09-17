@@ -8,6 +8,7 @@ import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
+import { analyzeFontForensics } from "./font_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -12458,6 +12459,7 @@ let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
 let pixelForensics = null;
+let fontForensics = null;
 let openSourceForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
@@ -12548,6 +12550,31 @@ let reference = null;
 
 if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR);
+}
+
+// =====================================================
+// PDF FONT FORENSICS
+// =====================================================
+// Gerçek PDF text/font metadata'sını referans dekontla karşılaştırır.
+// Bu motor bağımsız bir adli sinyaldir; tek başına sahtecilik kararı vermez
+// ve ilk entegrasyonda ana risk skorunu değiştirmez.
+if (type === "pdf" && reference?.path) {
+  try {
+    const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
+      ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
+      : [];
+    fontForensics = await analyzeFontForensics({
+      targetPath: filePath,
+      referencePath: reference.path,
+      referencePaths: candidateReferencePaths,
+      pdfjsLib,
+      maxPages: 5,
+    });
+    console.log("FONT FORENSICS:", JSON.stringify(fontForensics));
+  } catch (error) {
+    console.warn("FONT FORENSICS HATASI:", error?.message || error);
+    fontForensics = { available: false, status: "error", error: error?.message || String(error) };
+  }
 }
 
 const prepStartTime = Date.now();
@@ -14249,6 +14276,9 @@ if (negativeSampleForensics) {
 }
 if (visualForensics) {
   result.visualForensics = visualForensics;
+}
+if (fontForensics) {
+  result.fontForensics = fontForensics;
 }
 if (layoutForensics) {
   result.layoutForensics = layoutForensics;
