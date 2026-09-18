@@ -8367,10 +8367,7 @@ return {score, positive, negative};
 
 let image;
 try {
-// Yalnızca metadata okumasını düzelt: aynı dosyayı buffer olarak okuyup
-// Sharp'a veriyoruz. Amount Forensics'in geri kalan mantığına dokunma.
-const imageBuffer = await fs.readFile(filePath);
-const meta = await sharp(imageBuffer).metadata();
+const meta = await sharp(filePath).metadata();
 if (!meta?.width || !meta?.height) throw new Error("Görüntü boyutu alınamadı.");
 image = {width: meta.width, height: meta.height};
 } catch (error) {
@@ -9644,48 +9641,10 @@ segStart = null;
 
 // Çok dar noktaları temizle; fakat virgül/nokta gibi işaretlerin
 // tamamen kaybolmasına izin verme.
-let filteredSegments = segments.filter((segment) => {
+const filteredSegments = segments.filter((segment) => {
 const sw = segment.end - segment.start;
 return sw >= 2 && sw <= Math.max(4, Math.floor(w * 0.35));
 });
-
-// v3.5 Amount Forensics: düşük çözünürlüklü PDF rasterlarında birkaç rakam
-// tek connected component/ink bandı halinde birleşebilir. Bu durumda eski
-// <4 segment kapısı characterCount=0/unknown üretip analizi tamamen kesiyordu.
-// OCR'nin seçtiği tutarın beklenen sayısal karakter sayısını yalnızca bir
-// GEOMETRİK SLOT sayısı olarak kullanıyoruz. Slotlar gerçek OCR karakteri
-// değildir; bu nedenle sonuçta estimated=true olarak raporlanır ve bu fallback
-// tek başına yüksek risk üretmez.
-let estimatedCharacterSlots = false;
-const expectedCharacterCount = [...cleanAmountText(candidate.text)]
-  .filter((char) => /[0-9.,]/.test(char)).length;
-
-if (filteredSegments.length < Math.max(4, expectedCharacterCount) && expectedCharacterCount >= 4) {
-  const slotCount = Math.min(32, expectedCharacterCount);
-  const slotSegments = [];
-  for (let i = 0; i < slotCount; i++) {
-    const start = Math.floor((i * w) / slotCount);
-    const end = Math.max(start + 1, Math.floor(((i + 1) * w) / slotCount));
-    slotSegments.push({ start, end, estimated: true });
-  }
-  // Yalnızca slotların içinde yeterli ink varsa kullan. Böylece geniş beyaz
-  // padding veya yanlış ROI characterCount'i yapay biçimde doldurmaz.
-  const usable = slotSegments.filter((segment) => {
-    let ink = 0;
-    let pixels = 0;
-    for (let x = segment.start; x < segment.end; x++) {
-      for (let y = yStart; y < yEnd; y++) {
-        pixels++;
-        if (data[y * w + x] < 220) ink++;
-      }
-    }
-    return pixels > 0 && ink / pixels >= 0.01;
-  });
-  if (usable.length >= Math.max(4, Math.ceil(expectedCharacterCount * 0.6))) {
-    filteredSegments = usable;
-    estimatedCharacterSlots = true;
-  }
-}
 
 if (filteredSegments.length < 4) {
 return {
@@ -10097,7 +10056,7 @@ evidence =
 `Tutar alanında ${features.length} karakter bölgesi karşılaştırıldı. ${maxScore} ayrı mikro-görsel özellik aynı karakter bölgesinde diğer karakterlerden ayrıştı.${repeatedText} En belirgin fark; ink/stroke yoğunluğu, kenar yapısı veya karakter geometrisinde lokalize bir tutarsızlık olarak ölçüldü. Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
 } else {
 evidence =
-`Tutar alanında ${features.length} karakter bölgesi ${estimatedCharacterSlots ? "geometrik slotlar üzerinden yaklaşık olarak " : ""}mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
+`Tutar alanında ${features.length} karakter bölgesi mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
 }
 
 console.log(
@@ -10109,7 +10068,6 @@ templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
 templatePositionScore: candidate.templateScore || 0,
 characterCount: features.length,
-estimatedCharacterSlots,
 maxScore,
 maxInkDifference,
 maxStrokeProxyDifference,
@@ -10133,7 +10091,6 @@ region: {
 pageIndex: candidate.pageIndex,
 },
 characterCount: features.length,
-estimatedCharacterSlots,
 metrics: {
 medianInkRatio: Number(medInk.toFixed(4)),
 medianInkRatio200: Number(medInk200.toFixed(4)),
@@ -12502,8 +12459,8 @@ let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
 let pixelForensics = null;
-let openSourceForensics = null;
 let fontForensics = null;
+let openSourceForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -12567,7 +12524,7 @@ paddleImageOCR.confidence
 
 amountForensics =
 await analyzeAmountForensics(
-forensicTargetPath,
+filePath,
 paddleImageOCR,
 fileFingerprint,
 bank
@@ -12596,10 +12553,11 @@ if (type !== "video" && type !== "statement") {
 }
 
 // =====================================================
-// PDF FONT FORENSICS + DETERMINISTIC REFERENCE FORENSICS
+// PDF FONT FORENSICS
 // =====================================================
-// Font metadata is independent from raster/reference adjudication. Keep it
-// active for PDF targets so real embedded-font substitutions are not lost.
+// Gerçek PDF text/font metadata'sını referans dekontla karşılaştırır.
+// Bu motor bağımsız bir adli sinyaldir; tek başına sahtecilik kararı vermez
+// ve ilk entegrasyonda ana risk skorunu değiştirmez.
 if (type === "pdf" && reference?.path) {
   try {
     const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
@@ -12612,26 +12570,10 @@ if (type === "pdf" && reference?.path) {
       pdfjsLib,
       maxPages: 5,
     });
-    console.log("FONT FORENSICS V35:", JSON.stringify(fontForensics));
+    console.log("FONT FORENSICS:", JSON.stringify(fontForensics));
   } catch (error) {
-    console.warn("FONT FORENSICS V35 HATASI:", error?.message || error);
+    console.warn("FONT FORENSICS HATASI:", error?.message || error);
     fontForensics = { available: false, status: "error", error: error?.message || String(error) };
-  }
-}
-
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
-  try {
-    referenceForensics = await runReferenceForensicEngine(
-      forensicTargetPath,
-      bank,
-      paddleImageOCR,
-      reference.path
-    );
-    referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
-    console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
-  } catch (error) {
-    console.warn("REFERENCE FORENSIC ENGINE V26 HATASI:", error?.message || error);
-    referenceForensics = null;
   }
 }
 
@@ -13969,7 +13911,7 @@ paddleOcrAttempted = true;
 if (!amountForensics) {
 amountForensics =
 await analyzeAmountForensics(
-forensicTargetPath || filePath,
+filePath,
 paddleResult,
 fileFingerprint,
 bank
@@ -14335,20 +14277,11 @@ if (negativeSampleForensics) {
 if (visualForensics) {
   result.visualForensics = visualForensics;
 }
-if (layoutForensics) {
-  result.layoutForensics = layoutForensics;
-}
 if (fontForensics) {
   result.fontForensics = fontForensics;
-  console.log("FONT FORENSICS RESULT ATTACHED:", JSON.stringify({
-    available: fontForensics.available,
-    status: fontForensics.status,
-    engine: fontForensics.engine,
-    score: fontForensics.score,
-    severity: fontForensics.severity,
-    bestReference: fontForensics.bestReference,
-    targetActiveFontUsages: fontForensics.targetActiveFontUsages || []
-  }));
+}
+if (layoutForensics) {
+  result.layoutForensics = layoutForensics;
 }
 if (referenceForensics) {
   result.referenceForensics = referenceForensics;
@@ -15570,11 +15503,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     .some(row => String(row?.field || '').toLowerCase() === 'generic:senaryo/dekont tipi' &&
       String(row?.valueReference || '').trim() && String(row?.valueTarget || '').trim() &&
       String(row.valueReference).trim().toLocaleLowerCase('tr-TR') !== String(row.valueTarget).trim().toLocaleLowerCase('tr-TR'));
-  const allowStandaloneTypography = !pdfToPdfTypographyGuard || (
-    pdfToPdfTypographyGuard &&
-    (String(referenceForensics?.typographyCredibility || '').toLowerCase() === 'strong' ||
-     String(referenceForensics?.typographySeverity || '').toLowerCase() === 'strong')
-  );
+  const allowStandaloneTypography = !pdfToPdfTypographyGuard;
 
   // For PDF→PDF, raster glyph differences are not used as a standalone finding.
   // Structural and semantic differences remain active.
@@ -15746,7 +15675,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
 
   return {
     available:true,
-    engine:'reference-difference-core-v57-deterministic-reference-forensics',
+    engine:'reference-difference-core-v56-camera-raster-amount-guard',
     referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
