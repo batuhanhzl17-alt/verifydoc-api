@@ -272,6 +272,189 @@ async function extractRawPdfFontNames(pdfPath) {
   return [...names];
 }
 
+
+// -----------------------------------------------------
+// PDF indirect-object graph font extraction (v3.1)
+// -----------------------------------------------------
+// v3.1 keeps v3's approach intact and adds one narrow layer for PDFs where
+// /Font -> /FontDescriptor -> /FontFile references are indirect objects.
+// This is intentionally deterministic: it does not rasterize the document.
+function pdfIndirectRef(value) {
+  const m = String(value || '').match(/(\d+)\s+(\d+)\s+R/);
+  return m ? `${m[1]} ${m[2]}` : null;
+}
+
+function parsePdfIndirectObjects(buffer) {
+  const objects = new Map();
+  const text = Buffer.from(buffer || []).toString('latin1');
+  const re = /(?:^|\r?\n|\s)(\d+)\s+(\d+)\s+obj\b/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const key = `${m[1]} ${m[2]}`;
+    const bodyStart = re.lastIndex;
+    const end = text.indexOf('endobj', bodyStart);
+    if (end < 0) break;
+    const body = text.slice(bodyStart, end);
+    const streamPos = body.indexOf('stream');
+    let dictionary = body;
+    let stream = null;
+    if (streamPos >= 0) {
+      dictionary = body.slice(0, streamPos);
+      let dataStart = bodyStart + streamPos + 6;
+      if (text.startsWith('\r\n', dataStart)) dataStart += 2;
+      else if (text.startsWith('\n', dataStart)) dataStart += 1;
+      const lenMatch = dictionary.match(/\/Length\s+(\d+)\s+\d+\s+R/i) || dictionary.match(/\/Length\s+(\d+)/i);
+      let dataEnd = -1;
+      if (lenMatch && /^\d+$/.test(lenMatch[1])) {
+        const n = Number(lenMatch[1]);
+        if (Number.isSafeInteger(n) && dataStart + n <= buffer.length) dataEnd = dataStart + n;
+      }
+      if (dataEnd < 0) {
+        const localEnd = body.indexOf('endstream', streamPos + 6);
+        if (localEnd >= 0) dataEnd = bodyStart + localEnd;
+      }
+      if (dataEnd >= 0) stream = buffer.subarray(dataStart, dataEnd);
+    }
+    objects.set(key, { key, objectNumber:Number(m[1]), generation:Number(m[2]), dictionary, stream });
+    re.lastIndex = end + 6;
+  }
+  return objects;
+}
+
+function pdfDictRef(dictionary, key) {
+  const re = new RegExp(`\\/${key}\\s+(\\d+)\\s+(\\d+)\\s+R`, 'i');
+  const m = String(dictionary || '').match(re);
+  return m ? `${m[1]} ${m[2]}` : null;
+}
+
+function pdfDictName(dictionary, key) {
+  const re = new RegExp(`\\/${key}\\s+\\/([A-Za-z0-9._+#-]+)`, 'i');
+  const m = String(dictionary || '').match(re);
+  return m ? m[1] : null;
+}
+
+function pdfDictRefsInMap(dictionary) {
+  const out = new Map();
+  const re = /\/(F\d+|[A-Za-z][A-Za-z0-9._-]*)\s+(\d+)\s+(\d+)\s+R/g;
+  let m;
+  while ((m = re.exec(String(dictionary || '')))) out.set(m[1], `${m[2]} ${m[3]}`);
+  return out;
+}
+
+function parsePdfObjectStreams(objects) {
+  const embedded = new Map(objects);
+  for (const obj of objects.values()) {
+    if (!/\/Type\s+\/ObjStm\b/i.test(obj.dictionary) || !obj.stream) continue;
+    const filters = parsePdfFilterNames(obj.dictionary);
+    const decoded = filters.length ? decodePdfStream(obj.stream, filters) : obj.stream;
+    if (!decoded) continue;
+    const nMatch = obj.dictionary.match(/\/N\s+(\d+)/i);
+    const firstMatch = obj.dictionary.match(/\/First\s+(\d+)/i);
+    if (!nMatch || !firstMatch) continue;
+    const n = Number(nMatch[1]);
+    const first = Number(firstMatch[1]);
+    if (!Number.isSafeInteger(n) || !Number.isSafeInteger(first) || n <= 0 || first < 0 || first >= decoded.length) continue;
+    const head = decoded.subarray(0, first).toString('latin1').trim().split(/\s+/);
+    if (head.length < n * 2) continue;
+    for (let i = 0; i < n; i++) {
+      const objNum = Number(head[i * 2]);
+      const offset = Number(head[i * 2 + 1]);
+      const nextOffset = i + 1 < n ? Number(head[(i + 1) * 2 + 1]) : decoded.length - first;
+      if (!Number.isInteger(objNum) || !Number.isInteger(offset) || !Number.isInteger(nextOffset) || offset < 0 || nextOffset <= offset) continue;
+      const a = first + offset;
+      const b = Math.min(decoded.length, first + nextOffset);
+      if (a >= b || a >= decoded.length) continue;
+      embedded.set(`${objNum} 0`, { key:`${objNum} 0`, objectNumber:objNum, generation:0, dictionary:decoded.subarray(a,b).toString('latin1'), stream:null, fromObjectStream:obj.key });
+    }
+  }
+  return embedded;
+}
+
+function extractPdfObjectGraphFontNamesFromBuffer(buffer) {
+  const names = new Set();
+  const descriptorNames = new Set();
+  const embeddedFontFiles = new Set();
+  const objects = parsePdfObjectStreams(parsePdfIndirectObjects(buffer));
+  const visited = new Set();
+  const add = (value, target = names) => addName(target, value);
+
+  const inspectFont = (fontRef, depth = 0) => {
+    if (!fontRef || depth > 8 || visited.has(`font:${fontRef}`)) return;
+    visited.add(`font:${fontRef}`);
+    const font = objects.get(fontRef);
+    if (!font) return;
+    add(pdfDictName(font.dictionary, 'BaseFont'));
+    const descRef = pdfDictRef(font.dictionary, 'FontDescriptor');
+    if (descRef) inspectDescriptor(descRef, depth + 1);
+    const descendants = pdfDictRef(font.dictionary, 'DescendantFonts');
+    if (descendants) {
+      const dObj = objects.get(descendants);
+      if (dObj) {
+        const refs = [...dObj.dictionary.matchAll(/(\d+)\s+(\d+)\s+R/g)].map(x => `${x[1]} ${x[2]}`);
+        for (const r of refs.slice(0, 8)) inspectFont(r, depth + 1);
+      }
+    }
+  };
+
+  const inspectDescriptor = (ref, depth = 0) => {
+    if (!ref || depth > 8 || visited.has(`desc:${ref}`)) return;
+    visited.add(`desc:${ref}`);
+    const desc = objects.get(ref);
+    if (!desc) return;
+    const fontName = pdfDictName(desc.dictionary, 'FontName');
+    if (fontName) { add(fontName, names); add(fontName, descriptorNames); }
+    const fileKeys = ['FontFile','FontFile2','FontFile3'];
+    for (const key of fileKeys) {
+      const fileRef = pdfDictRef(desc.dictionary, key);
+      if (!fileRef) continue;
+      embeddedFontFiles.add(fileRef);
+      const fileObj = objects.get(fileRef);
+      if (!fileObj?.stream) continue;
+      const filters = parsePdfFilterNames(fileObj.dictionary);
+      const decoded = filters.length ? decodePdfStream(fileObj.stream, filters) : fileObj.stream;
+      if (!decoded) continue;
+      for (const n of parseSfntNames(decoded)) add(n, names);
+      for (const n of parseCffNames(decoded)) add(n, names);
+      for (const n of parseType1Names(decoded)) add(n, names);
+    }
+  };
+
+  // Inspect page resource dictionaries. Page-tree inheritance is handled by
+  // also examining any object with /Font or /Resources containing /Font refs.
+  for (const obj of objects.values()) {
+    const resourceRef = pdfDictRef(obj.dictionary, 'Resources');
+    const resources = resourceRef && objects.get(resourceRef) ? objects.get(resourceRef) : obj;
+    const fontRef = resources ? pdfDictRef(resources.dictionary, 'Font') : null;
+    if (fontRef) {
+      const fontObj = objects.get(fontRef);
+      if (fontObj) {
+        const refs = pdfDictRefsInMap(fontObj.dictionary);
+        for (const ref of refs.values()) inspectFont(ref);
+      }
+    }
+    if (/\/Type\s+\/Font\b/i.test(obj.dictionary)) {
+      inspectFont(obj.key);
+    }
+  }
+
+  return {
+    names:[...names],
+    descriptorNames:[...descriptorNames],
+    embeddedFontFiles:[...embeddedFontFiles],
+    objectCount:objects.size,
+  };
+}
+
+async function extractPdfObjectGraphFontNames(pdfPath) {
+  try {
+    const buffer = await fs.readFile(pdfPath);
+    return extractPdfObjectGraphFontNamesFromBuffer(buffer);
+  } catch (error) {
+    console.warn('PDF OBJECT GRAPH FONT EXTRACTION HATASI:', path.basename(pdfPath), error?.message || error);
+    return { names:[], descriptorNames:[], embeddedFontFiles:[], objectCount:0 };
+  }
+}
+
 // -----------------------------------------------------
 // Embedded font binary name extraction
 // -----------------------------------------------------
@@ -478,7 +661,7 @@ function mergeFontRecord(map, rec) {
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v3`;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v31`;
   if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
 
   const buffer = await fs.readFile(pdfPath);
@@ -534,7 +717,12 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   const rawFontNames = await extractRawPdfFontNames(pdfPath);
   for (const n of rawFontNames) addName(pdfObjectNames, n);
 
-  for (const n of rawFontNames) {
+  // v3.1: resolve indirect /Font -> /FontDescriptor -> /FontFile references.
+  const objectGraph = await extractPdfObjectGraphFontNames(pdfPath);
+  for (const n of objectGraph.names || []) addName(pdfObjectNames, n);
+  for (const n of objectGraph.descriptorNames || []) addName(pdfObjectNames, n);
+
+  for (const n of [...new Set([...(rawFontNames || []), ...(objectGraph.names || []), ...(objectGraph.descriptorNames || [])])]) {
     if (!fontsHasCanonical(fonts, n)) {
       const rec = makeFontRecord(n, "pdf-dictionary-or-object-stream");
       if (rec) mergeFontRecord(fonts, rec);
@@ -564,6 +752,11 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     fontCount: fontList.length,
     rawPdfFontNames: rawFontNames,
     pdfObjectFontNames: [...pdfObjectNames],
+    pdfObjectGraph: {
+      objectCount: objectGraph.objectCount || 0,
+      descriptorFonts: objectGraph.descriptorNames || [],
+      embeddedFontFiles: objectGraph.embeddedFontFiles || [],
+    },
     textItemCount: items.length,
     pages,
     items,
@@ -720,8 +913,10 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   for (const refPath of refs) {
     try {
       const p = await extractPdfFontProfile(refPath, pdfjsLib, { maxPages });
-      if (p && p.fonts?.length) referenceProfiles.push(p);
-      else console.warn("FONT REFERENCE PROFILE EMPTY:", path.basename(refPath));
+      if (p && p.fonts?.length) {
+        referenceProfiles.push(p);
+        console.log("FONT REFERENCE PROFILE READY:", path.basename(refPath), { fonts:p.fonts.map(x => x.fontName), graph:p.pdfObjectGraph || null });
+      } else console.warn("FONT REFERENCE PROFILE EMPTY:", path.basename(refPath));
     } catch (error) {
       console.warn("FONT REFERENCE EXTRACTION HATASI:", path.basename(refPath), error?.message || error);
     }
@@ -730,7 +925,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   if (!referenceProfiles.length) {
     return {
       available: true,
-      engine: "verifydoc-pdf-font-forensics-v3",
+      engine: "verifydoc-pdf-font-forensics-v3.1",
       status: "reference-font-profile-unavailable",
       targetFile: targetProfile.fileName,
       targetFonts: targetProfile.fonts,
@@ -754,7 +949,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v3",
+    engine: "verifydoc-pdf-font-forensics-v3.1",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
