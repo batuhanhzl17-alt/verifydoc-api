@@ -12587,10 +12587,58 @@ JSON.stringify(amountForensics)
 // ReferenceError: Cannot access 'reference' before initialization
 // hatası oluşur.
 let reference = null;
+let visualReference = null;
 
 if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR);
+
+  // Görsel hedeflerde (JPG/PNG/fotoğraf) yapısal referans ile görsel referansı
+  // birbirinden ayır. PDF; font/PDF metadata ve semantik referans motorlarında
+  // korunur. Aynı varyanttaki JPG ise gerçek piksel/görsel karşılaştırmalarda
+  // kullanılır. Böylece JPG hedef, PDF rasterına karşı yanlışlıkla ölçülmez.
+  if (reference?.path) {
+    try {
+      const candidates = Array.isArray(reference.referenceCandidates)
+        ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
+        : [];
+      const imageCandidates = candidates.filter((candidate) =>
+        /\.(?:jpe?g|png|webp)$/i.test(String(candidate))
+      );
+      let visualPath = null;
+
+      if (imageCandidates.length) {
+        const variants = await Promise.all(imageCandidates.map(async (candidate) => ({
+          path: candidate,
+          variant: await readReferenceVariant(candidate)
+        })));
+        visualPath = variants.find((x) => x.variant === reference.variant)?.path || null;
+        if (!visualPath) visualPath = imageCandidates[0];
+      }
+
+      if (visualPath) {
+        const visualBuffer = await fs.readFile(visualPath);
+        visualReference = {
+          ...reference,
+          path: visualPath,
+          fileName: path.basename(visualPath),
+          base64: visualBuffer.toString("base64"),
+          visualSource: true,
+          structuralReferencePath: reference.path,
+        };
+        console.log("REFERENCE VISUAL IMAGE SELECTED:", JSON.stringify({
+          visualReference: visualReference.fileName,
+          structuralReference: path.basename(reference.path),
+          variant: reference.variant || null
+        }));
+      }
+    } catch (error) {
+      console.warn("REFERENCE VISUAL IMAGE SELECTION HATASI:", error?.message || error);
+    }
+  }
 }
+
+// Görsel referans bulunamazsa güvenli fallback: mevcut seçili referansı kullan.
+visualReference = visualReference || reference;
 
 // =====================================================
 // PDF FONT FORENSICS + DETERMINISTIC REFERENCE FORENSICS
@@ -12634,7 +12682,8 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
 
 const prepStartTime = Date.now();
 console.log("BANK:", bank || "YOK");
-console.log("REFERENCE:", reference?.fileName || "YOK");
+console.log("REFERENCE STRUCTURAL:", reference?.fileName || "YOK");
+console.log("REFERENCE VISUAL:", visualReference?.fileName || "YOK");
 console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidates || []));
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
 
@@ -13223,7 +13272,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      reference.path
+      visualReference?.path || reference.path
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
@@ -13250,14 +13299,15 @@ const shouldRunTerra = terraGateReasons.length > 0;
 console.log("TERRA CONDITIONAL GATE:", JSON.stringify({
   shouldRunTerra,
   reasons: terraGateReasons,
-  referenceFile: reference?.fileName || null,
+  referenceFile: visualReference?.fileName || reference?.fileName || null,
+  structuralReferenceFile: reference?.fileName || null,
   variant: reference?.variant || null
 }));
 
 referenceVisualAdjudication = null;
 if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra) {
   try {
-    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference,targetOCR:paddleImageOCR,bank});
+    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:visualReference,targetOCR:paddleImageOCR,bank});
     console.log('REFERENCE VISUAL ADJUDICATOR V39:',JSON.stringify(referenceVisualAdjudication));
   } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V39 HATASI:',e?.message||e); }
 } else if ((type === 'image' || type === 'pdf') && bank && reference) {
@@ -13265,7 +13315,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra)
     available:true,
     skipped:true,
     engine:"gpt-5.6-terra-focused-zones-v43",
-    referenceFile:path.basename(reference.path),
+    referenceFile:path.basename(visualReference?.path || reference.path),
     findingCount:0,
     findings:[],
     zonesChecked:[],
@@ -13281,7 +13331,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra)
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
-    const trustedReferencePaths = reference?.path ? [reference.path] : [];
+    const trustedReferencePaths = visualReference?.path ? [visualReference.path] : [];
     pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
