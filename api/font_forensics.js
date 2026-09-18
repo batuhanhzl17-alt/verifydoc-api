@@ -785,7 +785,7 @@ function mergeFontRecord(map, rec) {
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v31-targetfix-activefonts-refactive`;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v32-active-font-usage`;
   if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
 
   const buffer = await fs.readFile(pdfPath);
@@ -882,13 +882,19 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   // from a font that is actually attached to meaningful text on the page.
   const activeFontUsagesMap = new Map();
   for (const item of items) {
-    const fontName = item?.font?.fontName || null;
-    if (!fontName) continue;
-    const key = normalizeFontName(fontName) || fontName;
+    // Keep the PDF.js internal resource name even when it cannot yet be
+    // resolved to a canonical font. This is essential: an unresolved
+    // g_d6_f3-style name still tells us which visible text items share the
+    // same actual PDF.js font resource.
+    const canonicalFontName = item?.font?.fontName || null;
+    const rawFontName = item?.font?.rawFontName || null;
+    const key = normalizeFontName(canonicalFontName || rawFontName) || canonicalFontName || rawFontName;
+    if (!key) continue;
     const rec = activeFontUsagesMap.get(key) || {
-      fontName,
-      family: item.font.family || fontFamily(fontName) || fontName,
-      style: item.font.style || fontStyle(fontName),
+      fontName: canonicalFontName || null,
+      rawFontName: rawFontName || null,
+      family: item?.font?.family || (canonicalFontName ? fontFamily(canonicalFontName) : null),
+      style: item?.font?.style || (canonicalFontName ? fontStyle(canonicalFontName) : 'unknown'),
       pages: new Set(),
       textSnippets: [],
       boxes: [],
@@ -912,7 +918,13 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     activeFontUsagesMap.set(key, rec);
   }
   const activeFontUsages = [...activeFontUsagesMap.values()]
-    .map(x => ({ ...x, pages: [...x.pages].sort((a,b) => a-b) }))
+    .map(x => ({
+      ...x,
+      // A usage with no canonical name is still useful evidence; downstream
+      // code can decide whether the raw resource is resolvable.
+      fontName: x.fontName || x.rawFontName || null,
+      pages: [...x.pages].sort((a,b) => a-b),
+    }))
     .sort((a,b) => b.charCount - a.charCount);
 
   const result = {
