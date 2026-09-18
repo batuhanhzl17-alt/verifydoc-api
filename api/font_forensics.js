@@ -877,6 +877,44 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     sources: [...x.sources],
   })).filter(x => isUsefulFontName(x.fontName)).sort((a,b) => b.charCount - a.charCount);
 
+  // Map each PDF.js font to the actual visible text items that use it.
+  // This lets downstream logic distinguish a font that is merely declared
+  // from a font that is actually attached to meaningful text on the page.
+  const activeFontUsagesMap = new Map();
+  for (const item of items) {
+    const fontName = item?.font?.fontName || null;
+    if (!fontName) continue;
+    const key = normalizeFontName(fontName) || fontName;
+    const rec = activeFontUsagesMap.get(key) || {
+      fontName,
+      family: item.font.family || fontFamily(fontName) || fontName,
+      style: item.font.style || fontStyle(fontName),
+      pages: new Set(),
+      textSnippets: [],
+      boxes: [],
+      charCount: 0,
+      itemCount: 0,
+    };
+    rec.pages.add(Number(item.pageNumber) || 0);
+    rec.itemCount += 1;
+    rec.charCount += String(item.text || '').length;
+    if (rec.textSnippets.length < 30 && item.text) rec.textSnippets.push(String(item.text).slice(0, 160));
+    if (rec.boxes.length < 30) {
+      rec.boxes.push({
+        pageNumber: Number(item.pageNumber) || 0,
+        x: Number(item.x) || 0,
+        y: Number(item.y) || 0,
+        width: Number(item.width) || 0,
+        height: Number(item.height) || 0,
+        text: String(item.text || '').slice(0, 120),
+      });
+    }
+    activeFontUsagesMap.set(key, rec);
+  }
+  const activeFontUsages = [...activeFontUsagesMap.values()]
+    .map(x => ({ ...x, pages: [...x.pages].sort((a,b) => a-b) }))
+    .sort((a,b) => b.charCount - a.charCount);
+
   const result = {
     available: true,
     fileName: path.basename(pdfPath),
@@ -895,6 +933,8 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
       activeFontRefs: usedFontGraph.usedFontRefs || [],
       activeFontPages: usedFontGraph.pages || [],
     },
+    // Actual PDF.js text usage, grouped by canonical font.
+    activeFontUsages,
     textItemCount: items.length,
     pages,
     items,
@@ -1070,6 +1110,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
       targetFontCount: targetProfile.fontCount,
       referenceFiles: refs.map(x => path.basename(x)),
       referenceFontProfiles: [],
+      targetActiveFontUsages: targetProfile.activeFontUsages || [],
       score: 0,
       severity: "unknown",
       familySimilarity: null,
@@ -1093,7 +1134,8 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
     targetFonts: targetProfile.fonts,
     targetFontCount: targetProfile.fontCount,
     referenceFiles: referenceProfiles.map(x => x.fileName),
-    referenceFontProfiles: referenceProfiles.map(x => ({ fileName: x.fileName, fonts: x.fonts, fontCount: x.fontCount, rawPdfFontNames: x.rawPdfFontNames })),
+    referenceFontProfiles: referenceProfiles.map(x => ({ fileName: x.fileName, fonts: x.fonts, fontCount: x.fontCount, rawPdfFontNames: x.rawPdfFontNames, activeFontUsages: x.activeFontUsages || [] })),
+    targetActiveFontUsages: targetProfile.activeFontUsages || [],
     targetOnlyFamiliesAcrossReferences: ensembleTargetOnlyFamilies,
     bestReference: best?.referenceFile || null,
     score: best?.comparison?.score || 0,
