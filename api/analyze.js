@@ -13236,6 +13236,16 @@ console.log("V63 LOCAL CROP SURE:", ((Date.now() - localCropStartTime) / 1000).t
 // deterministic/reference layer has already found a concrete localized signal.
 // This keeps Terra available for genuinely interesting cases while making
 // normal clean receipts fast.
+// V39: compute the PDF active-font consistency flag before the Terra gate
+// references it. This avoids a temporal-dead-zone ReferenceError on PDF requests.
+const pdfActiveFontsConsistent =
+  type === 'pdf' &&
+  fontForensics?.available === true &&
+  Number(fontForensics?.familySimilarity) >= 100 &&
+  Number(fontForensics?.score || 0) === 0 &&
+  Array.isArray(fontForensics?.targetOnlyFamiliesAcrossReferences) &&
+  fontForensics.targetOnlyFamiliesAcrossReferences.length === 0;
+
 const terraGateReasons = [];
 if ((azureReferenceGeometry?.strongAnomalies || []).length > 0) terraGateReasons.push("azure-strong-anomaly");
 // V39: template geometry is not independent evidence for a PDF→PDF font/raster
@@ -13250,14 +13260,6 @@ if (!pdfActiveFontsConsistent && (referenceLocalCrop?.findings || []).length > 0
 // extra wait on normal Enpara PDFs and for promoting rasterization noise into
 // user-facing findings. Keep Terra available when font metadata is unavailable
 // or when an independent non-font signal exists.
-const pdfActiveFontsConsistent =
-  type === 'pdf' &&
-  fontForensics?.available === true &&
-  Number(fontForensics?.familySimilarity) >= 100 &&
-  Number(fontForensics?.score || 0) === 0 &&
-  Array.isArray(fontForensics?.targetOnlyFamiliesAcrossReferences) &&
-  fontForensics.targetOnlyFamiliesAcrossReferences.length === 0;
-
 if (referenceForensics?.available === true && !pdfActiveFontsConsistent && (
   String(referenceForensics.severity || "").toLowerCase() === "strong" ||
   Number(referenceForensics.maxSpacingScore || 0) >= 85 ||
