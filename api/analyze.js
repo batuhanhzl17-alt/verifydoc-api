@@ -9640,10 +9640,48 @@ segStart = null;
 
 // Çok dar noktaları temizle; fakat virgül/nokta gibi işaretlerin
 // tamamen kaybolmasına izin verme.
-const filteredSegments = segments.filter((segment) => {
+let filteredSegments = segments.filter((segment) => {
 const sw = segment.end - segment.start;
 return sw >= 2 && sw <= Math.max(4, Math.floor(w * 0.35));
 });
+
+// v3.5 Amount Forensics: düşük çözünürlüklü PDF rasterlarında birkaç rakam
+// tek connected component/ink bandı halinde birleşebilir. Bu durumda eski
+// <4 segment kapısı characterCount=0/unknown üretip analizi tamamen kesiyordu.
+// OCR'nin seçtiği tutarın beklenen sayısal karakter sayısını yalnızca bir
+// GEOMETRİK SLOT sayısı olarak kullanıyoruz. Slotlar gerçek OCR karakteri
+// değildir; bu nedenle sonuçta estimated=true olarak raporlanır ve bu fallback
+// tek başına yüksek risk üretmez.
+let estimatedCharacterSlots = false;
+const expectedCharacterCount = [...cleanAmountText(candidate.text)]
+  .filter((char) => /[0-9.,]/.test(char)).length;
+
+if (filteredSegments.length < Math.max(4, expectedCharacterCount) && expectedCharacterCount >= 4) {
+  const slotCount = Math.min(32, expectedCharacterCount);
+  const slotSegments = [];
+  for (let i = 0; i < slotCount; i++) {
+    const start = Math.floor((i * w) / slotCount);
+    const end = Math.max(start + 1, Math.floor(((i + 1) * w) / slotCount));
+    slotSegments.push({ start, end, estimated: true });
+  }
+  // Yalnızca slotların içinde yeterli ink varsa kullan. Böylece geniş beyaz
+  // padding veya yanlış ROI characterCount'i yapay biçimde doldurmaz.
+  const usable = slotSegments.filter((segment) => {
+    let ink = 0;
+    let pixels = 0;
+    for (let x = segment.start; x < segment.end; x++) {
+      for (let y = yStart; y < yEnd; y++) {
+        pixels++;
+        if (data[y * w + x] < 220) ink++;
+      }
+    }
+    return pixels > 0 && ink / pixels >= 0.01;
+  });
+  if (usable.length >= Math.max(4, Math.ceil(expectedCharacterCount * 0.6))) {
+    filteredSegments = usable;
+    estimatedCharacterSlots = true;
+  }
+}
 
 if (filteredSegments.length < 4) {
 return {
@@ -10055,7 +10093,7 @@ evidence =
 `Tutar alanında ${features.length} karakter bölgesi karşılaştırıldı. ${maxScore} ayrı mikro-görsel özellik aynı karakter bölgesinde diğer karakterlerden ayrıştı.${repeatedText} En belirgin fark; ink/stroke yoğunluğu, kenar yapısı veya karakter geometrisinde lokalize bir tutarsızlık olarak ölçüldü. Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
 } else {
 evidence =
-`Tutar alanında ${features.length} karakter bölgesi mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
+`Tutar alanında ${features.length} karakter bölgesi ${estimatedCharacterSlots ? "geometrik slotlar üzerinden yaklaşık olarak " : ""}mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
 }
 
 console.log(
@@ -10067,6 +10105,7 @@ templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
 templatePositionScore: candidate.templateScore || 0,
 characterCount: features.length,
+estimatedCharacterSlots,
 maxScore,
 maxInkDifference,
 maxStrokeProxyDifference,
@@ -10090,6 +10129,7 @@ region: {
 pageIndex: candidate.pageIndex,
 },
 characterCount: features.length,
+estimatedCharacterSlots,
 metrics: {
 medianInkRatio: Number(medInk.toFixed(4)),
 medianInkRatio200: Number(medInk200.toFixed(4)),
