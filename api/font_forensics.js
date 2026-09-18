@@ -450,6 +450,118 @@ function extractPdfObjectGraphFontNamesFromBuffer(buffer) {
   };
 }
 
+
+function pdfDictRefsForKey(dictionary, key) {
+  const out = [];
+  const src = String(dictionary || '');
+  const re = new RegExp(`\\/${key}\\s+(\\[[\\s\\S]*?\\]|\\d+\\s+\\d+\\s+R)`, 'i');
+  const m = src.match(re);
+  if (!m) return out;
+  const value = m[1];
+  const refRe = /(\d+)\s+(\d+)\s+R/g;
+  let x;
+  while ((x = refRe.exec(value))) out.push(`${x[1]} ${x[2]}`);
+  return out;
+}
+
+function extractPdfUsedFontNamesFromBuffer(buffer) {
+  const objects = parsePdfObjectStreams(parsePdfIndirectObjects(buffer));
+  const usedResourceNames = new Set();
+  const usedFontRefs = new Set();
+  const usedFontNames = new Set();
+  const resourceFontMaps = [];
+
+  const getObject = (ref) => ref ? objects.get(ref) : null;
+  const decodeObjectStream = (obj) => {
+    if (!obj?.stream) return null;
+    const filters = parsePdfFilterNames(obj.dictionary);
+    return filters.length ? decodePdfStream(obj.stream, filters) : obj.stream;
+  };
+
+  const inspectFontObject = (ref, depth = 0, visited = new Set()) => {
+    if (!ref || depth > 8 || visited.has(ref)) return;
+    visited.add(ref);
+    const obj = getObject(ref);
+    if (!obj) return;
+    addName(usedFontNames, pdfDictName(obj.dictionary, 'BaseFont'));
+    const descRef = pdfDictRef(obj.dictionary, 'FontDescriptor');
+    if (descRef) {
+      const desc = getObject(descRef);
+      if (desc) addName(usedFontNames, pdfDictName(desc.dictionary, 'FontName'));
+    }
+    const descendantsRef = pdfDictRef(obj.dictionary, 'DescendantFonts');
+    if (descendantsRef) {
+      const arr = getObject(descendantsRef);
+      if (arr) {
+        for (const m of String(arr.dictionary || '').matchAll(/(\d+)\s+(\d+)\s+R/g)) {
+          inspectFontObject(`${m[1]} ${m[2]}`, depth + 1, visited);
+        }
+      }
+    }
+  };
+
+  // Build a global resource-name -> font-object map. This intentionally does
+  // not require the page dictionary itself to be directly visible: some PDFs
+  // keep page/xref structures compressed, while the resource and font objects
+  // remain discoverable in the parsed object/object-stream layer.
+  for (const obj of objects.values()) {
+    const maps = [];
+    const fontRef = pdfDictRef(obj.dictionary, 'Font');
+    if (fontRef) {
+      const fontDict = getObject(fontRef);
+      if (fontDict) maps.push(...pdfDictRefsInMap(fontDict.dictionary));
+    }
+    const direct = obj.dictionary.match(/\/Font\s*<<([\s\S]*?)>>/i);
+    if (direct) {
+      for (const m of direct[1].matchAll(/\/(F\w+)\s+(\d+)\s+(\d+)\s+R/g)) maps.push([m[1], `${m[2]} ${m[3]}`]);
+    }
+    if (maps.length) resourceFontMaps.push({ object: obj.key, maps: new Map(maps) });
+  }
+
+  // Scan all decoded streams for actual PDF text-state font selection. A font
+  // is considered active only when its resource name is actually selected by
+  // `/F1 ... Tf` (or equivalent) in a content stream.
+  const diagnostics = [];
+  for (const stream of findPdfStreams(buffer)) {
+    const raw = buffer.subarray(stream.dataStart, stream.dataEnd);
+    const decoded = stream.filters?.length ? decodePdfStream(raw, stream.filters) : raw;
+    if (!decoded) continue;
+    const text = decoded.toString('latin1');
+    const selected = [...text.matchAll(/\/([A-Za-z0-9._-]+)\s+[-+]?\d*\.?\d+\s+Tf\b/g)].map(m => m[1]);
+    if (!selected.length) continue;
+    for (const resourceName of selected) {
+      usedResourceNames.add(resourceName);
+      let matchedRef = null;
+      for (const entry of resourceFontMaps) {
+        const ref = entry.maps.get(resourceName);
+        if (!ref) continue;
+        matchedRef = ref;
+        usedFontRefs.add(ref);
+        inspectFontObject(ref);
+      }
+      diagnostics.push({ resourceName, fontRef: matchedRef });
+    }
+  }
+
+  return {
+    names: [...usedFontNames],
+    usedResourceNames: [...usedResourceNames],
+    usedFontRefs: [...usedFontRefs],
+    pages: [{ resourceFontMaps: resourceFontMaps.map(x => ({ object:x.object, resources:[...x.maps.keys()] })), selections:diagnostics }],
+    objectCount: objects.size,
+  };
+}
+
+async function extractPdfUsedFontNames(pdfPath) {
+  try {
+    const buffer = await fs.readFile(pdfPath);
+    return extractPdfUsedFontNamesFromBuffer(buffer);
+  } catch (error) {
+    console.warn('PDF USED FONT EXTRACTION HATASI:', path.basename(pdfPath), error?.message || error);
+    return { names:[], usedResourceNames:[], usedFontRefs:[], pages:[], objectCount:0 };
+  }
+}
+
 async function extractPdfObjectGraphFontNames(pdfPath) {
   try {
     const buffer = await fs.readFile(pdfPath);
@@ -666,7 +778,7 @@ function mergeFontRecord(map, rec) {
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v31`;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v31-targetfix-activefonts`;
   if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
 
   const buffer = await fs.readFile(pdfPath);
@@ -727,7 +839,17 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   for (const n of objectGraph.names || []) addName(pdfObjectNames, n);
   for (const n of objectGraph.descriptorNames || []) addName(pdfObjectNames, n);
 
-  for (const n of [...new Set([...(rawFontNames || []), ...(objectGraph.names || []), ...(objectGraph.descriptorNames || [])])]) {
+  // Only fonts selected by a real PDF content-stream `Tf` operator are treated
+  // as actively used. This prevents incidental resource fonts such as
+  // Helvetica/ZapfDingbats from becoming target-only mismatches merely because
+  // they are present in the PDF resource graph.
+  const usedFontGraph = await extractPdfUsedFontNames(pdfPath);
+  const activeNames = new Set((usedFontGraph.names || []).map(normalizeFontName).filter(Boolean));
+  for (const n of activeNames) addName(pdfObjectNames, n);
+
+  const candidateNames = [...new Set([...(rawFontNames || []), ...(objectGraph.names || []), ...(objectGraph.descriptorNames || [])])];
+  for (const n of candidateNames) {
+    if (activeNames.size && !activeNames.has(normalizeFontName(n))) continue;
     if (!fontsHasCanonical(fonts, n)) {
       const rec = makeFontRecord(n, "pdf-dictionary-or-object-stream");
       if (rec) mergeFontRecord(fonts, rec);
@@ -761,6 +883,10 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
       objectCount: objectGraph.objectCount || 0,
       descriptorFonts: objectGraph.descriptorNames || [],
       embeddedFontFiles: objectGraph.embeddedFontFiles || [],
+      activeFontNames: usedFontGraph.names || [],
+      activeFontResources: usedFontGraph.usedResourceNames || [],
+      activeFontRefs: usedFontGraph.usedFontRefs || [],
+      activeFontPages: usedFontGraph.pages || [],
     },
     textItemCount: items.length,
     pages,
@@ -930,7 +1056,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   if (!referenceProfiles.length) {
     return {
       available: true,
-      engine: "verifydoc-pdf-font-forensics-v3.1-targetfix",
+      engine: "verifydoc-pdf-font-forensics-v3.1-targetfix-activefonts",
       status: "reference-font-profile-unavailable",
       targetFile: targetProfile.fileName,
       targetFonts: targetProfile.fonts,
@@ -954,7 +1080,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v3.1-targetfix",
+    engine: "verifydoc-pdf-font-forensics-v3.1-targetfix-activefonts",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
@@ -971,5 +1097,5 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   };
 }
 
-export { extractPdfFontProfile, compareFontProfiles, normalizeFontName, fontFamily, fontStyle };
+export { extractPdfFontProfile, compareFontProfiles, normalizeFontName, fontFamily, fontStyle, extractPdfUsedFontNames };
 export default analyzeFontForensics;
