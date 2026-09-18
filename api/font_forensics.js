@@ -1035,8 +1035,28 @@ function sameRow(a, b) {
   return Math.abs(ay - by) <= Math.max(8, ah * 1.5);
 }
 
+function activeFontFamilyMap(profile) {
+  const map = new Map();
+  for (const usage of profile?.activeFontUsages || []) {
+    const raw = clean(usage?.rawFontName || usage?.fontName);
+    const family = clean(usage?.resolvedFamily || usage?.family);
+    if (raw && family) map.set(raw, family);
+  }
+  return map;
+}
+
+function activeFontFamilies(profile) {
+  const out = new Set();
+  for (const usage of profile?.activeFontUsages || []) {
+    const family = clean(usage?.resolvedFamily || usage?.family);
+    if (family) out.add(family);
+  }
+  return out;
+}
+
 function fieldValueFontProfiles(profile) {
   const labels = profile.items.filter(x => isLikelyLabel(x.text));
+  const activeMap = activeFontFamilyMap(profile);
   const rows = [];
   for (const label of labels) {
     const candidates = profile.items
@@ -1045,7 +1065,10 @@ function fieldValueFontProfiles(profile) {
     if (!candidates.length) continue;
     const values = candidates.slice(0, 12).filter(x => !isLikelyLabel(x.text));
     if (!values.length) continue;
-    const fontKeys = [...new Set(values.map(x => x.font.family || x.font.fontName).filter(Boolean))];
+    const fontKeys = [...new Set(values.map(x => {
+      const raw = clean(x?.font?.rawFontName || x?.font?.fontName);
+      return activeMap.get(raw) || x?.font?.family || x?.font?.fontName || null;
+    }).filter(Boolean))];
     if (!fontKeys.length) continue;
     rows.push({
       pageNumber: label.pageNumber,
@@ -1062,10 +1085,22 @@ function fieldValueFontProfiles(profile) {
 function compareFontProfiles(reference, target) {
   const refFonts = Array.isArray(reference?.fonts) ? reference.fonts : [];
   const tarFonts = Array.isArray(target?.fonts) ? target.fonts : [];
-  const refFamilies = new Set(refFonts.map(x => x.family || x.fontName).filter(Boolean));
-  const tarFamilies = new Set(tarFonts.map(x => x.family || x.fontName).filter(Boolean));
-  const refStyles = new Set(refFonts.map(x => x.style).filter(x => x && x !== "unknown"));
-  const tarStyles = new Set(tarFonts.map(x => x.style).filter(x => x && x !== "unknown"));
+  // Compare families actually attached to visible PDF.js text items when the
+  // active resource bridge resolved them. Fall back to discovered font
+  // dictionaries only when active usage data is unavailable. This prevents a
+  // declared-but-unused Helvetica resource from becoming a false mismatch.
+  const refActiveFamilies = activeFontFamilies(reference);
+  const tarActiveFamilies = activeFontFamilies(target);
+  const refFamilies = refActiveFamilies.size
+    ? refActiveFamilies
+    : new Set(refFonts.map(x => x.family || x.fontName).filter(Boolean));
+  const tarFamilies = tarActiveFamilies.size
+    ? tarActiveFamilies
+    : new Set(tarFonts.map(x => x.family || x.fontName).filter(Boolean));
+  const refStyles = new Set((reference?.activeFontUsages || []).map(x => x.resolvedStyle || x.style).filter(x => x && x !== "unknown"));
+  const tarStyles = new Set((target?.activeFontUsages || []).map(x => x.resolvedStyle || x.style).filter(x => x && x !== "unknown"));
+  if (!refStyles.size) for (const x of refFonts) if (x.style && x.style !== "unknown") refStyles.add(x.style);
+  if (!tarStyles.size) for (const x of tarFonts) if (x.style && x.style !== "unknown") tarStyles.add(x.style);
   const familyOnlyTarget = [...tarFamilies].filter(x => !refFamilies.has(x));
   const familyOnlyReference = [...refFamilies].filter(x => !tarFamilies.has(x));
   const sharedFamilies = [...tarFamilies].filter(x => refFamilies.has(x));
@@ -1176,7 +1211,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   if (!referenceProfiles.length) {
     return {
       available: true,
-      engine: "verifydoc-pdf-font-forensics-v3.3-active-font-resource-bridge",
+      engine: "verifydoc-pdf-font-forensics-v3.4-active-family-comparison",
       status: "reference-font-profile-unavailable",
       targetFile: targetProfile.fileName,
       targetFonts: targetProfile.fonts,
@@ -1195,13 +1230,19 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   const comparisons = referenceProfiles.map(ref => ({ referenceFile: ref.fileName, comparison: compareFontProfiles(ref, targetProfile) }));
   comparisons.sort((a,b) => Number(a.comparison.score) - Number(b.comparison.score));
   const best = comparisons[0];
-  const allReferenceFamilies = new Set(referenceProfiles.flatMap(p => p.fonts.map(x => x.family || x.fontName).filter(Boolean)));
-  const allTargetFamilies = new Set(targetProfile.fonts.map(x => x.family || x.fontName).filter(Boolean));
+  const allReferenceFamilies = new Set(referenceProfiles.flatMap(p => {
+    const active = activeFontFamilies(p);
+    return [...(active.size ? active : new Set(p.fonts.map(x => x.family || x.fontName).filter(Boolean)))];
+  }));
+  const targetActiveFamilies = activeFontFamilies(targetProfile);
+  const allTargetFamilies = targetActiveFamilies.size
+    ? targetActiveFamilies
+    : new Set(targetProfile.fonts.map(x => x.family || x.fontName).filter(Boolean));
   const ensembleTargetOnlyFamilies = [...allTargetFamilies].filter(x => !allReferenceFamilies.has(x));
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v3.3-active-font-resource-bridge",
+    engine: "verifydoc-pdf-font-forensics-v3.4-active-family-comparison",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
