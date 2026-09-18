@@ -528,6 +528,7 @@ function extractPdfUsedFontNamesFromBuffer(buffer) {
   // data with misleading `stream`/`endstream` byte sequences, and the previous
   // scanner could miss otherwise valid content streams.
   const diagnostics = [];
+  const resourceFontDetails = [];
   for (const obj of objects.values()) {
     if (!obj?.stream) continue;
     const filters = parsePdfFilterNames(obj.dictionary);
@@ -545,6 +546,23 @@ function extractPdfUsedFontNamesFromBuffer(buffer) {
         matchedRef = ref;
         usedFontRefs.add(ref);
         inspectFontObject(ref);
+        const fontObj = getObject(ref);
+        const canonicalNames = [];
+        if (fontObj) {
+          const base = pdfDictName(fontObj.dictionary, 'BaseFont');
+          if (base) canonicalNames.push(normalizeFontName(base));
+          const descRef = pdfDictRef(fontObj.dictionary, 'FontDescriptor');
+          const desc = descRef ? getObject(descRef) : null;
+          const descName = desc ? pdfDictName(desc.dictionary, 'FontName') : null;
+          if (descName) canonicalNames.push(normalizeFontName(descName));
+        }
+        const detail = {
+          object: obj.key,
+          resourceName,
+          fontRef: matchedRef,
+          fontNames: [...new Set(canonicalNames.filter(Boolean))],
+        };
+        resourceFontDetails.push(detail);
       }
       diagnostics.push({ object: obj.key, resourceName, fontRef: matchedRef });
     }
@@ -554,7 +572,12 @@ function extractPdfUsedFontNamesFromBuffer(buffer) {
     names: [...usedFontNames],
     usedResourceNames: [...usedResourceNames],
     usedFontRefs: [...usedFontRefs],
-    pages: [{ resourceFontMaps: resourceFontMaps.map(x => ({ object:x.object, resources:[...x.maps.keys()] })), selections:diagnostics }],
+    pages: [{
+      resourceFontMaps: resourceFontMaps.map(x => ({ object:x.object, resources:[...x.maps.keys()] })),
+      selections: diagnostics,
+      resourceFontDetails,
+    }],
+    resourceFontDetails,
     objectCount: objects.size,
   };
 }
@@ -785,7 +808,7 @@ function mergeFontRecord(map, rec) {
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v32-active-font-usage`;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v33-active-font-resource-bridge`;
   if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
 
   const buffer = await fs.readFile(pdfPath);
@@ -927,6 +950,43 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     }))
     .sort((a,b) => b.charCount - a.charCount);
 
+  // Bridge PDF.js internal names such as g_d3_f3 to the actual PDF resource
+  // selected by Tf (F3) when the document exposes that resource mapping.
+  // The suffix is intentionally used only as a conservative bridge: it must
+  // match an actually selected F<number> resource, otherwise no inference is
+  // made. This turns the raw usage into a canonical family without changing
+  // the forensic score.
+  const resourceDetails = Array.isArray(usedFontGraph.resourceFontDetails)
+    ? usedFontGraph.resourceFontDetails
+    : [];
+  const selectedResourceMap = new Map();
+  for (const d of resourceDetails) {
+    const rn = clean(d?.resourceName);
+    if (!rn || !/^F\d+$/i.test(rn)) continue;
+    const names = [...new Set((d?.fontNames || []).map(normalizeFontName).filter(Boolean))];
+    if (!names.length) continue;
+    selectedResourceMap.set(rn.toUpperCase(), {
+      resourceName: rn,
+      fontRef: d?.fontRef || null,
+      fontNames: names,
+      family: fontFamily(names[0]),
+      style: fontStyle(names[0]),
+    });
+  }
+
+  for (const usage of activeFontUsages) {
+    const raw = clean(usage.rawFontName || usage.fontName);
+    const m = raw.match(/_f(\d+)$/i);
+    if (!m) continue;
+    const resource = selectedResourceMap.get(`F${m[1]}`);
+    if (!resource) continue;
+    usage.pdfResourceName = resource.resourceName;
+    usage.pdfFontRef = resource.fontRef;
+    usage.resolvedFontNames = resource.fontNames;
+    usage.resolvedFamily = resource.family || null;
+    usage.resolvedStyle = resource.style || 'unknown';
+  }
+
   const result = {
     available: true,
     fileName: path.basename(pdfPath),
@@ -944,6 +1004,7 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
       activeFontResources: usedFontGraph.usedResourceNames || [],
       activeFontRefs: usedFontGraph.usedFontRefs || [],
       activeFontPages: usedFontGraph.pages || [],
+      activeFontResourceDetails: usedFontGraph.resourceFontDetails || [],
     },
     // Actual PDF.js text usage, grouped by canonical font.
     activeFontUsages,
@@ -1115,7 +1176,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   if (!referenceProfiles.length) {
     return {
       available: true,
-      engine: "verifydoc-pdf-font-forensics-v3.1-targetfix-activefonts-refactive",
+      engine: "verifydoc-pdf-font-forensics-v3.3-active-font-resource-bridge",
       status: "reference-font-profile-unavailable",
       targetFile: targetProfile.fileName,
       targetFonts: targetProfile.fonts,
@@ -1140,7 +1201,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v3.1-targetfix-activefonts-refactive",
+    engine: "verifydoc-pdf-font-forensics-v3.3-active-font-resource-bridge",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
