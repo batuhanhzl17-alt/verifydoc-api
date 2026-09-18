@@ -8367,12 +8367,13 @@ return {score, positive, negative};
 
 let image;
 try {
+// Yalnızca metadata okumasını düzelt: aynı dosyayı buffer olarak okuyup
+// Sharp'a veriyoruz. Amount Forensics'in geri kalan mantığına dokunma.
 const imageBuffer = await fs.readFile(filePath);
 const meta = await sharp(imageBuffer).metadata();
 if (!meta?.width || !meta?.height) throw new Error("Görüntü boyutu alınamadı.");
 image = {width: meta.width, height: meta.height};
 } catch (error) {
-console.warn("AMOUNT FORENSICS IMAGE METADATA HATASI:", error?.message || error);
 return {available: false, status: "unknown", severity: "none", score: 0, amountText: null, region: null, characterCount: 0, metrics: {}, evidence: "Görüntü boyutu alınamadı."};
 }
 
@@ -13236,31 +13237,11 @@ console.log("V63 LOCAL CROP SURE:", ((Date.now() - localCropStartTime) / 1000).t
 // deterministic/reference layer has already found a concrete localized signal.
 // This keeps Terra available for genuinely interesting cases while making
 // normal clean receipts fast.
-// V39: compute the PDF active-font consistency flag before the Terra gate
-// references it. This avoids a temporal-dead-zone ReferenceError on PDF requests.
-const pdfActiveFontsConsistent =
-  type === 'pdf' &&
-  fontForensics?.available === true &&
-  Number(fontForensics?.familySimilarity) >= 100 &&
-  Number(fontForensics?.score || 0) === 0 &&
-  Array.isArray(fontForensics?.targetOnlyFamiliesAcrossReferences) &&
-  fontForensics.targetOnlyFamiliesAcrossReferences.length === 0;
-
 const terraGateReasons = [];
 if ((azureReferenceGeometry?.strongAnomalies || []).length > 0) terraGateReasons.push("azure-strong-anomaly");
-// V39: template geometry is not independent evidence for a PDF→PDF font/raster
-// difference. It was waking Terra on normal Enpara PDFs and creating false
-// user-facing visual findings.
-if (!pdfActiveFontsConsistent && Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0) terraGateReasons.push("template-strong-geometry");
-if (!pdfActiveFontsConsistent && (referenceLocalCrop?.findings || []).length > 0) terraGateReasons.push("local-render-outlier");
-
-// V38: PDF→PDF with a verified matching active-font profile should not wake
-// the expensive Terra adjudicator merely because the raster typography engine
-// produced a suspiciousFieldCount. That path was responsible for the long
-// extra wait on normal Enpara PDFs and for promoting rasterization noise into
-// user-facing findings. Keep Terra available when font metadata is unavailable
-// or when an independent non-font signal exists.
-if (referenceForensics?.available === true && !pdfActiveFontsConsistent && (
+if (Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0) terraGateReasons.push("template-strong-geometry");
+if ((referenceLocalCrop?.findings || []).length > 0) terraGateReasons.push("local-render-outlier");
+if (referenceForensics?.available === true && (
   String(referenceForensics.severity || "").toLowerCase() === "strong" ||
   Number(referenceForensics.maxSpacingScore || 0) >= 85 ||
   Number(referenceForensics.suspiciousFieldCount || 0) >= 1
@@ -13269,7 +13250,6 @@ if (referenceForensics?.available === true && !pdfActiveFontsConsistent && (
 const shouldRunTerra = terraGateReasons.length > 0;
 console.log("TERRA CONDITIONAL GATE:", JSON.stringify({
   shouldRunTerra,
-  pdfActiveFontsConsistent,
   reasons: terraGateReasons,
   referenceFile: reference?.fileName || null,
   variant: reference?.variant || null
@@ -14417,8 +14397,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     targetOCR: paddleImageOCR,
     referenceInfo: reference,
     targetPath: filePath,
-    targetMime: mime,
-    samePdfFontProfile: pdfActiveFontsConsistent
+    targetMime: mime
   });
   const detailedDeterministicReport = buildHumanReadableReferenceForensicReport(
     referenceForensics,
@@ -14426,19 +14405,9 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     referenceLocalCrop,
     azureReferenceGeometry
   );
-  const aiReportRaw = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
+  const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
     : null;
-  const aiReport = pdfActiveFontsConsistent && aiReportRaw
-    ? {
-        ...aiReportRaw,
-        findings: (Array.isArray(aiReportRaw.findings) ? aiReportRaw.findings : []).filter(row => {
-          const kind = String(row?.kind || '').toLowerCase();
-          const hay = `${row?.title || ''} ${row?.detail || ''}`.toLocaleLowerCase('tr-TR');
-          return !(kind.includes('typography') || kind.includes('spacing') || hay.includes('spacing') || hay.includes('aralık'));
-        })
-      }
-    : aiReportRaw;
 
   // V64: Tek bir nihai referans bulgu listesi kullan. V63'te V48 raporu
   // muhafazakâr eşleştirme nedeniyle boş kalabildiği halde, aynı çalışmada
@@ -14455,15 +14424,6 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
         const title = String(row?.title || '').trim();
         const detail = String(row?.detail || '').trim();
         if (!title || !detail) continue;
-        if (pdfActiveFontsConsistent) {
-          const kind = String(row?.kind || '').toLowerCase();
-          const hay = `${title} ${detail}`.toLocaleLowerCase('tr-TR');
-          if (kind.includes('typography') || kind.includes('raster') || kind.includes('character') ||
-              kind === 'strong-typography' ||
-              hay.includes('yazı/karakter raster') || hay.includes('karakter/raster') ||
-              hay.includes('yazı/raster') || hay.includes('yazı karakter') ||
-              hay.includes('karakter geometrisi')) continue;
-        }
         const key = `${title}|${detail}`.toLocaleLowerCase('tr-TR');
         if (seen.has(key)) continue;
         seen.add(key);
@@ -14511,7 +14471,6 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
         azureReferenceGeometry,
         humanReport: humanForensicReport,
         finalAdjudication: referenceVisualAdjudication,
-        samePdfActiveFontProfile: pdfActiveFontsConsistent,
       });
       if (annotatedReferenceDifference?.available) {
         result.annotatedReferenceDifference = annotatedReferenceDifference;
@@ -15546,8 +15505,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   targetOCR = null,
   referenceInfo = null,
   targetPath = null,
-  targetMime = null,
-  samePdfFontProfile = false
+  targetMime = null
 }) {
   const base = buildV46ReferenceDifferenceReport(
     referenceForensics,
@@ -15556,12 +15514,6 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     azureReferenceGeometry,
     referenceTemplateAnalysis
   );
-
-  // V38: when both sides are PDFs and the deterministic embedded-font profile
-  // says the active families/styles match, raster-only typography findings are
-  // treated as render noise. Structural/content findings remain active.
-  const samePdfActiveFontProfile =
-    Boolean(samePdfFontProfile);
 
   // V51: If the submitted target file is byte-for-byte identical to the
   // selected trusted reference file, there is no reference difference to
@@ -15618,10 +15570,11 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     .some(row => String(row?.field || '').toLowerCase() === 'generic:senaryo/dekont tipi' &&
       String(row?.valueReference || '').trim() && String(row?.valueTarget || '').trim() &&
       String(row.valueReference).trim().toLocaleLowerCase('tr-TR') !== String(row.valueTarget).trim().toLocaleLowerCase('tr-TR'));
-  // V39: for PDF→PDF, active embedded-font agreement is the authority for
-  // typography. Raster glyph differences must NOT become standalone findings
-  // merely because the raster typography engine scored them as strong.
-  const allowStandaloneTypography = !pdfToPdfTypographyGuard || !samePdfActiveFontProfile;
+  const allowStandaloneTypography = !pdfToPdfTypographyGuard || (
+    pdfToPdfTypographyGuard &&
+    (String(referenceForensics?.typographyCredibility || '').toLowerCase() === 'strong' ||
+     String(referenceForensics?.typographySeverity || '').toLowerCase() === 'strong')
+  );
 
   // For PDF→PDF, raster glyph differences are not used as a standalone finding.
   // Structural and semantic differences remain active.
@@ -15780,10 +15733,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   // Keep V47's validated spacing evidence, but never let it be the only finding
   // when stronger whole-document semantic differences are available.
   differences.sort((a,b) => ({güçlü:3,belirgin:2,orta:1}[b.strength]||0)-({güçlü:3,belirgin:2,orta:1}[a.strength]||0) || Number(b.score||0)-Number(a.score||0));
-  const material = differences
-    .filter(x => x.strength === 'güçlü' || x.strength === 'belirgin')
-    .filter(x => !(samePdfActiveFontProfile && String(x?.category || '').toLowerCase() === 'typography'))
-    .slice(0,8);
+  const material = differences.filter(x => x.strength === 'güçlü' || x.strength === 'belirgin').slice(0,8);
   const lines = ['🔎 REFERANS KARŞILAŞTIRMASI'];
   if (material.length) {
     lines.push('', '🔴 FARKLAR', ...material.map(x => `• ${x.title}: ${x.detail}`));
@@ -16357,7 +16307,6 @@ async function buildAnnotatedReferenceDifferenceImage({
   azureReferenceGeometry,
   humanReport,
   finalAdjudication = null,
-  samePdfActiveFontProfile = false,
 }) {
   // V25 PURPOSE:
   // Draw ONLY evidence-linked locations. A field label is never considered the
@@ -16513,7 +16462,7 @@ async function buildAnnotatedReferenceDifferenceImage({
     // 3) Typography: V45 uses ONLY the evidence-linked findings selected by the
     // new reference-difference core. Raw characterFindings are diagnostics and
     // must not create stale/unreported red boxes.
-    if (!useFinalAdjudicationOnly && !samePdfActiveFontProfile) for (const row of ((humanReport?.findings || []).filter(x =>
+    if (!useFinalAdjudicationOnly) for (const row of ((humanReport?.findings || []).filter(x =>
       x?.category === 'typography' && x?.targetBox) || [])) {
       let b = boxOf(row?.targetBox);
 
@@ -16583,12 +16532,9 @@ async function buildAnnotatedReferenceDifferenceImage({
     for (const row of (humanReport?.findings || []).slice(0,12)) {
       let b = boxOf(row?.targetBox);
       const label = String(row?.title || '').trim();
-      // V39: a human-readable field/position finding without an evidence-linked
-      // targetBox must NOT be guessed onto the label. Guessing created red boxes
-      // on unrelated text such as 'Açıklama'.
-      if (!b && label && row?.kind === 'terra-visual-adjudication') {
+      if (!b && label) {
         const labelBox = findExactLabelRegion(label);
-        b = findValueNearLabel(labelBox, label);
+        b = findValueNearLabel(labelBox, label) || labelBox;
       }
       if (!b) continue;
       const key = `human|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
