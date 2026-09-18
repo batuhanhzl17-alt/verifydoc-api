@@ -13779,8 +13779,20 @@ else if (
 type === "pdf"
 ) {
 
-const pdfDataUrl =
-`data:application/pdf;base64,${base64}`;
+// PDF'nin tamamını input_file olarak Terra'ya göndermek yerine,
+  // zaten forensic hattında hazırlanmış ilk sayfa rasterını görüntü olarak kullan.
+  // Deterministik OCR/forensic katmanları değişmez; amaç yalnızca ana Terra
+  // çağrısındaki PDF parse/render maliyetini azaltmaktır.
+  let pdfImageDataUrl = null;
+  try {
+    if (forensicTargetPath && forensicTargetMime?.startsWith("image/")) {
+      const pdfImageBuffer = await fs.readFile(forensicTargetPath);
+      pdfImageDataUrl =
+        `data:${forensicTargetMime};base64,${pdfImageBuffer.toString("base64")}`;
+    }
+  } catch (error) {
+    console.warn("PDF ANA GORSEL HAZIRLAMA HATASI:", error?.message || error);
+  }
 
 
 content = [
@@ -13819,9 +13831,9 @@ ${fileName}
 `
 },
 {
-type: "input_file",
-filename: fileName,
-file_data: pdfDataUrl,
+type: "input_image",
+image_url: pdfImageDataUrl || `data:application/pdf;base64,${base64}`,
+detail: "high",
 },
 
 // =================================================
