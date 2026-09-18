@@ -8,6 +8,7 @@ import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
+import { analyzeFontForensics } from "./font_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -12499,6 +12500,7 @@ let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
 let pixelForensics = null;
 let openSourceForensics = null;
+let fontForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -12588,6 +12590,46 @@ let reference = null;
 
 if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR);
+}
+
+// =====================================================
+// PDF FONT FORENSICS + DETERMINISTIC REFERENCE FORENSICS
+// =====================================================
+// Font metadata is independent from raster/reference adjudication. Keep it
+// active for PDF targets so real embedded-font substitutions are not lost.
+if (type === "pdf" && reference?.path) {
+  try {
+    const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
+      ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
+      : [];
+    fontForensics = await analyzeFontForensics({
+      targetPath: filePath,
+      referencePath: reference.path,
+      referencePaths: candidateReferencePaths,
+      pdfjsLib,
+      maxPages: 5,
+    });
+    console.log("FONT FORENSICS V35:", JSON.stringify(fontForensics));
+  } catch (error) {
+    console.warn("FONT FORENSICS V35 HATASI:", error?.message || error);
+    fontForensics = { available: false, status: "error", error: error?.message || String(error) };
+  }
+}
+
+if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+  try {
+    referenceForensics = await runReferenceForensicEngine(
+      forensicTargetPath,
+      bank,
+      paddleImageOCR,
+      reference.path
+    );
+    referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
+    console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
+  } catch (error) {
+    console.warn("REFERENCE FORENSIC ENGINE V26 HATASI:", error?.message || error);
+    referenceForensics = null;
+  }
 }
 
 const prepStartTime = Date.now();
@@ -14293,6 +14335,18 @@ if (visualForensics) {
 if (layoutForensics) {
   result.layoutForensics = layoutForensics;
 }
+if (fontForensics) {
+  result.fontForensics = fontForensics;
+  console.log("FONT FORENSICS RESULT ATTACHED:", JSON.stringify({
+    available: fontForensics.available,
+    status: fontForensics.status,
+    engine: fontForensics.engine,
+    score: fontForensics.score,
+    severity: fontForensics.severity,
+    bestReference: fontForensics.bestReference,
+    targetActiveFontUsages: fontForensics.targetActiveFontUsages || []
+  }));
+}
 if (referenceForensics) {
   result.referenceForensics = referenceForensics;
 
@@ -15513,7 +15567,11 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     .some(row => String(row?.field || '').toLowerCase() === 'generic:senaryo/dekont tipi' &&
       String(row?.valueReference || '').trim() && String(row?.valueTarget || '').trim() &&
       String(row.valueReference).trim().toLocaleLowerCase('tr-TR') !== String(row.valueTarget).trim().toLocaleLowerCase('tr-TR'));
-  const allowStandaloneTypography = !pdfToPdfTypographyGuard;
+  const allowStandaloneTypography = !pdfToPdfTypographyGuard || (
+    pdfToPdfTypographyGuard &&
+    (String(referenceForensics?.typographyCredibility || '').toLowerCase() === 'strong' ||
+     String(referenceForensics?.typographySeverity || '').toLowerCase() === 'strong')
+  );
 
   // For PDF→PDF, raster glyph differences are not used as a standalone finding.
   // Structural and semantic differences remain active.
@@ -15685,7 +15743,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
 
   return {
     available:true,
-    engine:'reference-difference-core-v56-camera-raster-amount-guard',
+    engine:'reference-difference-core-v57-deterministic-reference-forensics',
     referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
