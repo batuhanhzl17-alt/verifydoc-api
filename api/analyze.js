@@ -1824,6 +1824,27 @@ fileName
 // =====================================================
 // REFERANS PDF OKUMA
 // =====================================================
+function findReferenceVisualPath(selectedPath, candidatePaths = []) {
+  if (!selectedPath) return null;
+
+  const ext = path.extname(selectedPath).toLowerCase();
+  if (['.jpg', '.jpeg', '.png', '.webp'].includes(ext)) return selectedPath;
+
+  const stem = path.basename(selectedPath, ext).toLocaleLowerCase('tr-TR');
+  const visualCandidates = candidatePaths.filter((p) =>
+    /\\.(jpg|jpeg|png|webp)$/i.test(String(p))
+  );
+
+  const exact = visualCandidates.find((p) =>
+    path.basename(p, path.extname(p)).toLocaleLowerCase('tr-TR') === stem
+  );
+  if (exact) return exact;
+
+  return visualCandidates.find((p) =>
+    path.basename(p, path.extname(p)).toLocaleLowerCase('tr-TR').startsWith(stem)
+  ) || null;
+}
+
 async function loadReferenceFile(bank, targetOCR = null) {
 // V63 ZIRAAT/VARIANT FIX: Her analiz isteği kendi referans varyantını baştan seçsin.
 // Önceki isteğin activeReferenceVariant değeri yeni isteğin adaylarını filtrelemesin.
@@ -1862,6 +1883,17 @@ if (!selectedPath) {
 const selectedVariant = await readReferenceVariant(selectedPath);
 activeReferenceVariant = selectedVariant || detectedVariant || null;
 
+// V64 DUAL REFERENCE: PDF yapısal/font referansı olarak korunur;
+// eş isimli JPEG/PNG görsel karşılaştırmalar için ayrıca tutulur.
+const visualPath = findReferenceVisualPath(selectedPath, candidatePaths);
+const structuralPath = /\\.pdf$/i.test(String(selectedPath))
+  ? selectedPath
+  : (candidatePaths.find((p) =>
+      path.basename(p, path.extname(p)).toLocaleLowerCase('tr-TR') ===
+      path.basename(selectedPath, path.extname(selectedPath)).toLocaleLowerCase('tr-TR') &&
+      /\\.pdf$/i.test(String(p))
+    ) || candidatePaths.find((p) => /\\.pdf$/i.test(String(p))) || selectedPath);
+
 console.log("REFERENCE VARIANT SELECTION:", JSON.stringify({
   bank: normalizedBank,
   detectedTargetVariant: detectedVariant,
@@ -1881,7 +1913,9 @@ try {
   return {
     bank: normalizedBank,
     fileName: path.basename(selectedPath),
-    path: selectedPath,
+    path: structuralPath,
+    visualPath: visualPath || null,
+    structuralPath,
     base64: buffer.toString("base64"),
     variant: activeReferenceVariant || null,
     referenceCandidates: candidatePaths.map(p => path.basename(p)),
@@ -6977,67 +7011,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           }
         }
 
-        // =============================================================
-        // JPG GLYPH FINGERPRINT V1 — DIAGNOSTIC ONLY
-        // =============================================================
-        // JPG'nin içinde gerçek font metadata'sı bulunmadığı için burada
-        // mevcut raster/glyph ölçümlerini ayrı bir profil halinde topluyoruz.
-        // ÖNEMLİ: Bu ilk sürüm risk skorunu veya anotasyonu değiştirmez.
-        // Amaç önce gerçek dekontlarda sinyalin stabilitesini ölçmektir.
-        const targetIsJpg = /\.(?:jpe?g)$/i.test(String(targetPath || ''));
-        const jpgGlyphFingerprint = targetIsJpg ? (() => {
-          const rows = typographyFieldProfiles
-            .map(p => ({
-              field: p.field,
-              label: p.labelTarget || p.labelReference || null,
-              value: p.valueTarget || null,
-              sharedCharacterCount: Number(p.valueSharedCharacterCount || 0),
-              sharedCharacters: Array.isArray(p.valueSharedCharacters) ? p.valueSharedCharacters.slice(0,20) : [],
-              highDistanceCount: Number(p.valueRepeatedHighDistanceGlyphCount || 0),
-              strongDistanceCount: Number(p.valueRepeatedStrongDistanceGlyphCount || 0),
-              characterDistance: Number.isFinite(Number(p.valueCharacterDistance)) ? Number(p.valueCharacterDistance) : null,
-            }))
-            .filter(r => r.sharedCharacterCount >= 3 && Number.isFinite(r.characterDistance));
-
-          const comparable = rows.length;
-          const candidateRows = rows.filter(r =>
-            r.sharedCharacterCount >= 4 &&
-            r.highDistanceCount >= Math.max(3, Math.ceil(r.sharedCharacterCount * .55)) &&
-            r.characterDistance >= .50
-          );
-          const strongRows = candidateRows.filter(r =>
-            r.strongDistanceCount >= Math.max(3, Math.ceil(r.sharedCharacterCount * .45)) &&
-            r.characterDistance >= .60
-          );
-          const medianDistance = comparable
-            ? rfMedianSigned(rows.map(r => r.characterDistance).filter(Number.isFinite))
-            : null;
-          const status = strongRows.length >= 2
-            ? 'multi-field-candidate'
-            : candidateRows.length >= 1
-              ? 'single-field-candidate'
-              : comparable >= 2
-                ? 'consistent-or-weak'
-                : 'insufficient-data';
-
-          return {
-            available: true,
-            engine: 'jpg-glyph-fingerprint-v1-diagnostic-only',
-            targetType: 'jpg',
-            comparableFieldCount: comparable,
-            candidateFieldCount: candidateRows.length,
-            strongCandidateFieldCount: strongRows.length,
-            medianCharacterDistance: Number.isFinite(medianDistance) ? Number(medianDistance.toFixed(4)) : null,
-            status,
-            fields: rows.slice(0, 30),
-            note: 'Bu sürüm yalnızca ölçüm/diagnostic üretir; risk skoru, suspicious kararı ve kırmızı anotasyon üretmez.'
-          };
-        })() : null;
-
-        if (jpgGlyphFingerprint?.available) {
-          console.log('JPG GLYPH FINGERPRINT V1:', JSON.stringify(jpgGlyphFingerprint));
-        }
-
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
         const typographyMedium=typographyFindings.filter(x=>x.severity==='medium');
         const typographyComparableCount=typographyFieldProfiles.length;
@@ -7067,7 +7040,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           characterFindingCount:typographyFindings.length,
           characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
-          jpgGlyphFingerprint,
           fields:fieldResults,referenceQuality,
         });
       }catch(error){
@@ -7143,7 +7115,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       typographySeverity:referenceResults.some(x=>x.typographySeverity==='strong')?'strong':referenceResults.some(x=>x.typographySeverity==='medium')?'medium':(referenceResults.some(x=>x.typographySeverity==='low')?'low':'insufficient-data'),
       typographyStatus:referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).length?'comparable-data':'insufficient-data',
       typographyFieldProfiles:referenceResults.flatMap(x=>x.typographyFieldProfiles||[]).slice(0,60),
-      jpgGlyphFingerprint:referenceResults.find(x=>x.jpgGlyphFingerprint?.available)?.jpgGlyphFingerprint || null,
       localStructuralEdit:strongSpacing.length>=1,
       maxSpacingScore:Number(maxSpacingScore.toFixed(1)),
       score,severity,
@@ -12663,11 +12634,13 @@ if (type !== "video" && type !== "statement") {
 if (type === "pdf" && reference?.path) {
   try {
     const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
-      ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
+      ? reference.referenceCandidates
+          .map((name) => path.join(REFERENCE_DIR, String(name)))
+          .filter((p) => /\\.pdf$/i.test(String(p)))
       : [];
     fontForensics = await analyzeFontForensics({
       targetPath: filePath,
-      referencePath: reference.path,
+      referencePath: reference.structuralPath || reference.path,
       referencePaths: candidateReferencePaths,
       pdfjsLib,
       maxPages: 5,
@@ -12685,7 +12658,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      reference.path
+      reference.visualPath || reference.path
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
@@ -12698,6 +12671,8 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
 const prepStartTime = Date.now();
 console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
+console.log("REFERENCE STRUCTURAL:", path.basename(reference?.structuralPath || reference?.path || "") || "YOK");
+console.log("REFERENCE VISUAL:", path.basename(reference?.visualPath || "") || "YOK");
 console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidates || []));
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
 
@@ -12744,7 +12719,9 @@ prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
-      const arg = await runAzureReferenceGeometryComparison(al, bank, reference.path);
+      const arg = await runAzureReferenceGeometryComparison(
+        al, bank, reference.visualPath || reference.path
+      );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
     }
@@ -12759,7 +12736,11 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
   prepTasks.push((async () => {
     try {
       const ta = await analyzeReferenceTemplateAgainstDocument(
-        forensicTargetPath, forensicTargetMime, bank, paddleImageOCR, reference.path
+        forensicTargetPath,
+        forensicTargetMime,
+        bank,
+        paddleImageOCR,
+        reference.structuralPath || reference.path
       );
       console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(ta));
       return { kind:"template", referenceTemplateAnalysis:ta };
@@ -13286,7 +13267,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      reference.path
+      reference.visualPath || reference.path
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
@@ -13344,7 +13325,10 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra)
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
-    const trustedReferencePaths = reference?.path ? [reference.path] : [];
+    const trustedReferencePaths =
+      (reference?.visualPath || reference?.path)
+        ? [reference.visualPath || reference.path]
+        : [];
     pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
