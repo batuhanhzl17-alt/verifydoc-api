@@ -9641,48 +9641,10 @@ segStart = null;
 
 // Çok dar noktaları temizle; fakat virgül/nokta gibi işaretlerin
 // tamamen kaybolmasına izin verme.
-let filteredSegments = segments.filter((segment) => {
+const filteredSegments = segments.filter((segment) => {
 const sw = segment.end - segment.start;
 return sw >= 2 && sw <= Math.max(4, Math.floor(w * 0.35));
 });
-
-// v3.5 Amount Forensics: düşük çözünürlüklü PDF rasterlarında birkaç rakam
-// tek connected component/ink bandı halinde birleşebilir. Bu durumda eski
-// <4 segment kapısı characterCount=0/unknown üretip analizi tamamen kesiyordu.
-// OCR'nin seçtiği tutarın beklenen sayısal karakter sayısını yalnızca bir
-// GEOMETRİK SLOT sayısı olarak kullanıyoruz. Slotlar gerçek OCR karakteri
-// değildir; bu nedenle sonuçta estimated=true olarak raporlanır ve bu fallback
-// tek başına yüksek risk üretmez.
-let estimatedCharacterSlots = false;
-const expectedCharacterCount = [...cleanAmountText(candidate.text)]
-  .filter((char) => /[0-9.,]/.test(char)).length;
-
-if (filteredSegments.length < Math.max(4, expectedCharacterCount) && expectedCharacterCount >= 4) {
-  const slotCount = Math.min(32, expectedCharacterCount);
-  const slotSegments = [];
-  for (let i = 0; i < slotCount; i++) {
-    const start = Math.floor((i * w) / slotCount);
-    const end = Math.max(start + 1, Math.floor(((i + 1) * w) / slotCount));
-    slotSegments.push({ start, end, estimated: true });
-  }
-  // Yalnızca slotların içinde yeterli ink varsa kullan. Böylece geniş beyaz
-  // padding veya yanlış ROI characterCount'i yapay biçimde doldurmaz.
-  const usable = slotSegments.filter((segment) => {
-    let ink = 0;
-    let pixels = 0;
-    for (let x = segment.start; x < segment.end; x++) {
-      for (let y = yStart; y < yEnd; y++) {
-        pixels++;
-        if (data[y * w + x] < 220) ink++;
-      }
-    }
-    return pixels > 0 && ink / pixels >= 0.01;
-  });
-  if (usable.length >= Math.max(4, Math.ceil(expectedCharacterCount * 0.6))) {
-    filteredSegments = usable;
-    estimatedCharacterSlots = true;
-  }
-}
 
 if (filteredSegments.length < 4) {
 return {
@@ -10094,7 +10056,7 @@ evidence =
 `Tutar alanında ${features.length} karakter bölgesi karşılaştırıldı. ${maxScore} ayrı mikro-görsel özellik aynı karakter bölgesinde diğer karakterlerden ayrıştı.${repeatedText} En belirgin fark; ink/stroke yoğunluğu, kenar yapısı veya karakter geometrisinde lokalize bir tutarsızlık olarak ölçüldü. Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
 } else {
 evidence =
-`Tutar alanında ${features.length} karakter bölgesi ${estimatedCharacterSlots ? "geometrik slotlar üzerinden yaklaşık olarak " : ""}mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
+`Tutar alanında ${features.length} karakter bölgesi mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
 }
 
 console.log(
@@ -10106,7 +10068,6 @@ templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
 templatePositionScore: candidate.templateScore || 0,
 characterCount: features.length,
-estimatedCharacterSlots,
 maxScore,
 maxInkDifference,
 maxStrokeProxyDifference,
@@ -10130,7 +10091,6 @@ region: {
 pageIndex: candidate.pageIndex,
 },
 characterCount: features.length,
-estimatedCharacterSlots,
 metrics: {
 medianInkRatio: Number(medInk.toFixed(4)),
 medianInkRatio200: Number(medInk200.toFixed(4)),
@@ -12499,8 +12459,8 @@ let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
 let pixelForensics = null;
-let openSourceForensics = null;
 let fontForensics = null;
+let openSourceForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -12510,12 +12470,10 @@ let azureReferenceGeometry = null;
 let forensicTargetPath = filePath;
 let forensicTargetMime = mime;
 let forensicTargetIsTemporary = false;
-let forensicPdfPageCount = null;
 
 if (type === "pdf") {
   try {
     const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
-    forensicPdfPageCount = Number(pdf?.numPages || 0);
     const rendered = await renderPdfPagePng(pdf, 1, 1.6);
     if (rendered?.buffer) {
       forensicTargetPath = `/tmp/verifydoc-forensic-${fileFingerprint}.png`;
@@ -12566,7 +12524,7 @@ paddleImageOCR.confidence
 
 amountForensics =
 await analyzeAmountForensics(
-forensicTargetPath,
+filePath,
 paddleImageOCR,
 fileFingerprint,
 bank
@@ -12595,10 +12553,11 @@ if (type !== "video" && type !== "statement") {
 }
 
 // =====================================================
-// PDF FONT FORENSICS + DETERMINISTIC REFERENCE FORENSICS
+// PDF FONT FORENSICS
 // =====================================================
-// Font metadata is independent from raster/reference adjudication. Keep it
-// active for PDF targets so real embedded-font substitutions are not lost.
+// Gerçek PDF text/font metadata'sını referans dekontla karşılaştırır.
+// Bu motor bağımsız bir adli sinyaldir; tek başına sahtecilik kararı vermez
+// ve ilk entegrasyonda ana risk skorunu değiştirmez.
 if (type === "pdf" && reference?.path) {
   try {
     const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
@@ -12611,26 +12570,10 @@ if (type === "pdf" && reference?.path) {
       pdfjsLib,
       maxPages: 5,
     });
-    console.log("FONT FORENSICS V35:", JSON.stringify(fontForensics));
+    console.log("FONT FORENSICS:", JSON.stringify(fontForensics));
   } catch (error) {
-    console.warn("FONT FORENSICS V35 HATASI:", error?.message || error);
+    console.warn("FONT FORENSICS HATASI:", error?.message || error);
     fontForensics = { available: false, status: "error", error: error?.message || String(error) };
-  }
-}
-
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
-  try {
-    referenceForensics = await runReferenceForensicEngine(
-      forensicTargetPath,
-      bank,
-      paddleImageOCR,
-      reference.path
-    );
-    referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
-    console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
-  } catch (error) {
-    console.warn("REFERENCE FORENSIC ENGINE V26 HATASI:", error?.message || error);
-    referenceForensics = null;
   }
 }
 
@@ -12933,7 +12876,6 @@ Koordinatlar bu zone görüntüsüne göre 0..1 arasındadır.`
 
         const response = await openai.responses.create({
           model:"gpt-5.6-terra",
-          reasoning:{ effort:"low" },
           input:[{role:"user",content}],
           text:{
             format:{
@@ -13144,7 +13086,6 @@ Sonuçları aday numarasıyla döndür.`
       try {
         const vr=await openai.responses.create({
           model:"gpt-5.6-terra",
-          reasoning:{ effort:"low" },
           input:[{role:"user",content}],
           text:{
             format:{
@@ -13820,34 +13761,11 @@ Dosya adı:
 ${fileName}
 `
 },
-
-];
-
-// Tek sayfalı PDF'lerde forensic hattında zaten render edilmiş PNG'yi kullan.
-// Çok sayfalı PDF'lerde orijinal PDF gönderimi korunur.
-if (forensicPdfPageCount === 1 && forensicTargetPath && forensicTargetMime === "image/png") {
-  try {
-    const mainPdfImageBuffer = await fs.readFile(forensicTargetPath);
-    content.push({
-      type: "input_image",
-      image_url: `data:image/png;base64,${mainPdfImageBuffer.toString("base64")}`,
-      detail: "high",
-    });
-  } catch (error) {
-    console.warn("PDF ANA GORSEL HAZIRLAMA HATASI:", error?.message || error);
-    content.push({
-      type: "input_file",
-      filename: fileName,
-      file_data: pdfDataUrl,
-    });
-  }
-} else {
-  content.push({
-    type: "input_file",
-    filename: fileName,
-    file_data: pdfDataUrl,
-  });
-}
+{
+type: "input_file",
+filename: fileName,
+file_data: pdfDataUrl,
+},
 
 // =================================================
 // REFERANS BANKA ŞABLONU — HAM PDF MODELE GONDERILMEZ
@@ -13856,6 +13774,8 @@ if (forensicPdfPageCount === 1 && forensicTargetPath && forensicTargetMime === "
 // yalnızca türetilmiş, değer-izole edilmiş şablon bilgisi
 // daha sonraki context katmanından kullanılabilir.
 
+
+];
 }
 
 // =================================================
@@ -13991,7 +13911,7 @@ paddleOcrAttempted = true;
 if (!amountForensics) {
 amountForensics =
 await analyzeAmountForensics(
-forensicTargetPath || filePath,
+filePath,
 paddleResult,
 fileFingerprint,
 bank
@@ -14357,20 +14277,11 @@ if (negativeSampleForensics) {
 if (visualForensics) {
   result.visualForensics = visualForensics;
 }
-if (layoutForensics) {
-  result.layoutForensics = layoutForensics;
-}
 if (fontForensics) {
   result.fontForensics = fontForensics;
-  console.log("FONT FORENSICS RESULT ATTACHED:", JSON.stringify({
-    available: fontForensics.available,
-    status: fontForensics.status,
-    engine: fontForensics.engine,
-    score: fontForensics.score,
-    severity: fontForensics.severity,
-    bestReference: fontForensics.bestReference,
-    targetActiveFontUsages: fontForensics.targetActiveFontUsages || []
-  }));
+}
+if (layoutForensics) {
+  result.layoutForensics = layoutForensics;
 }
 if (referenceForensics) {
   result.referenceForensics = referenceForensics;
@@ -15592,11 +15503,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     .some(row => String(row?.field || '').toLowerCase() === 'generic:senaryo/dekont tipi' &&
       String(row?.valueReference || '').trim() && String(row?.valueTarget || '').trim() &&
       String(row.valueReference).trim().toLocaleLowerCase('tr-TR') !== String(row.valueTarget).trim().toLocaleLowerCase('tr-TR'));
-  const allowStandaloneTypography = !pdfToPdfTypographyGuard || (
-    pdfToPdfTypographyGuard &&
-    (String(referenceForensics?.typographyCredibility || '').toLowerCase() === 'strong' ||
-     String(referenceForensics?.typographySeverity || '').toLowerCase() === 'strong')
-  );
+  const allowStandaloneTypography = !pdfToPdfTypographyGuard;
 
   // For PDF→PDF, raster glyph differences are not used as a standalone finding.
   // Structural and semantic differences remain active.
@@ -15768,7 +15675,7 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
 
   return {
     available:true,
-    engine:'reference-difference-core-v57-deterministic-reference-forensics',
+    engine:'reference-difference-core-v56-camera-raster-amount-guard',
     referenceCount:Number(referenceForensics?.referenceCount||referenceTemplateAnalysis?.referenceCount||0),
     differenceCount:material.length,
     strongDifferenceCount:material.filter(x=>x.strength==='güçlü').length,
@@ -16481,19 +16388,33 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 3) Typography: DO NOT draw automatic red boxes from generic
-    // value-vs-label/raster typography findings. The forensic typography
-    // engine continues to analyze and report these findings, but its OCR
-    // field-to-value mapping can legitimately be uncertain (especially when
-    // reference and target contain different dynamic values). Showing those
-    // approximate ROIs to the user creates noisy/incorrect markings.
-    //
-    // Visual annotations are intentionally restricted to:
-    //   - exact local-crop evidence boxes,
-    //   - confirmed Terra field boxes,
-    //   - Azure abnormal-gap markers.
-    // This changes ONLY the presentation layer; it does not disable or lower
-    // typography detection/risk calculations.
+    // 3) Typography: V45 uses ONLY the evidence-linked findings selected by the
+    // new reference-difference core. Raw characterFindings are diagnostics and
+    // must not create stale/unreported red boxes.
+    if (!useFinalAdjudicationOnly) for (const row of ((humanReport?.findings || []).filter(x =>
+      x?.category === 'typography' && x?.targetBox) || [])) {
+      let b = boxOf(row?.targetBox);
+
+      if (!b) {
+        const labelText = row?.targetLabelText || row?.labelText || '';
+        const labelBox = findExactLabelRegion(labelText);
+        b = findValueNearLabel(labelBox,labelText);
+      }
+
+      // V25: NEVER fall back to the label itself. If the value ROI cannot be
+      // located, omit the annotation rather than pointing at the wrong place.
+      if (!b) continue;
+
+      const field = String(row?.field || '').replace(/:value$/i,'');
+      const key = `tp-value-v45|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({
+        box:b,
+        label:row?.labelText || row?.targetLabelText || field || 'tipografi farkı',
+        source:'typography-value'
+      });
+    }
 
     // 4) V29 confirmed findings: use the exact evidence-linked targetBox returned
     // by the field-level Terra inspection. This is the only AI annotation source.
@@ -16533,11 +16454,23 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 6) IMPORTANT: Do not convert the generic human-readable finding list
-    // back into approximate red boxes. That list is for text reporting.
-    // Re-resolving a title against OCR here was the source of several
-    // misleading boxes in real tests (e.g. a label being boxed as its value).
-    // Exact visual evidence is already handled by local-crop and V29 above.
+    // 6) V44 human-report findings. If a deterministic finding has an exact
+    // targetBox use it; otherwise resolve the semantic title against OCR.
+    // This is the fallback that V43 deliberately disabled and is what allows
+    // proven forensic differences to be shown even when Terra returns zero.
+    for (const row of (humanReport?.findings || []).slice(0,12)) {
+      let b = boxOf(row?.targetBox);
+      const label = String(row?.title || '').trim();
+      if (!b && label) {
+        const labelBox = findExactLabelRegion(label);
+        b = findValueNearLabel(labelBox, label) || labelBox;
+      }
+      if (!b) continue;
+      const key = `human|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({box:b,label:label || 'referans farkı',source:'deterministic-reference'});
+    }
 
     if (!boxes.length && !gapMarkers.length) return null;
 
