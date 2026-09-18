@@ -13238,8 +13238,11 @@ console.log("V63 LOCAL CROP SURE:", ((Date.now() - localCropStartTime) / 1000).t
 // normal clean receipts fast.
 const terraGateReasons = [];
 if ((azureReferenceGeometry?.strongAnomalies || []).length > 0) terraGateReasons.push("azure-strong-anomaly");
-if (Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0) terraGateReasons.push("template-strong-geometry");
-if ((referenceLocalCrop?.findings || []).length > 0) terraGateReasons.push("local-render-outlier");
+// V39: template geometry is not independent evidence for a PDF→PDF font/raster
+// difference. It was waking Terra on normal Enpara PDFs and creating false
+// user-facing visual findings.
+if (!pdfActiveFontsConsistent && Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0) terraGateReasons.push("template-strong-geometry");
+if (!pdfActiveFontsConsistent && (referenceLocalCrop?.findings || []).length > 0) terraGateReasons.push("local-render-outlier");
 
 // V38: PDF→PDF with a verified matching active-font profile should not wake
 // the expensive Terra adjudicator merely because the raster typography engine
@@ -13255,10 +13258,10 @@ const pdfActiveFontsConsistent =
   Array.isArray(fontForensics?.targetOnlyFamiliesAcrossReferences) &&
   fontForensics.targetOnlyFamiliesAcrossReferences.length === 0;
 
-if (referenceForensics?.available === true && (
-  (String(referenceForensics.severity || "").toLowerCase() === "strong" && !pdfActiveFontsConsistent) ||
+if (referenceForensics?.available === true && !pdfActiveFontsConsistent && (
+  String(referenceForensics.severity || "").toLowerCase() === "strong" ||
   Number(referenceForensics.maxSpacingScore || 0) >= 85 ||
-  (Number(referenceForensics.suspiciousFieldCount || 0) >= 1 && !pdfActiveFontsConsistent)
+  Number(referenceForensics.suspiciousFieldCount || 0) >= 1
 )) terraGateReasons.push("forensic-strong-signal");
 
 const shouldRunTerra = terraGateReasons.length > 0;
@@ -14454,8 +14457,10 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
           const kind = String(row?.kind || '').toLowerCase();
           const hay = `${title} ${detail}`.toLocaleLowerCase('tr-TR');
           if (kind.includes('typography') || kind.includes('raster') || kind.includes('character') ||
+              kind === 'strong-typography' ||
               hay.includes('yazı/karakter raster') || hay.includes('karakter/raster') ||
-              hay.includes('yazı/raster')) continue;
+              hay.includes('yazı/raster') || hay.includes('yazı karakter') ||
+              hay.includes('karakter geometrisi')) continue;
         }
         const key = `${title}|${detail}`.toLocaleLowerCase('tr-TR');
         if (seen.has(key)) continue;
@@ -14504,6 +14509,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
         azureReferenceGeometry,
         humanReport: humanForensicReport,
         finalAdjudication: referenceVisualAdjudication,
+        samePdfActiveFontProfile: pdfActiveFontsConsistent,
       });
       if (annotatedReferenceDifference?.available) {
         result.annotatedReferenceDifference = annotatedReferenceDifference;
@@ -15610,11 +15616,10 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     .some(row => String(row?.field || '').toLowerCase() === 'generic:senaryo/dekont tipi' &&
       String(row?.valueReference || '').trim() && String(row?.valueTarget || '').trim() &&
       String(row.valueReference).trim().toLocaleLowerCase('tr-TR') !== String(row.valueTarget).trim().toLocaleLowerCase('tr-TR'));
-  const allowStandaloneTypography = !pdfToPdfTypographyGuard || (
-    pdfToPdfTypographyGuard &&
-    (String(referenceForensics?.typographyCredibility || '').toLowerCase() === 'strong' ||
-     String(referenceForensics?.typographySeverity || '').toLowerCase() === 'strong')
-  );
+  // V39: for PDF→PDF, active embedded-font agreement is the authority for
+  // typography. Raster glyph differences must NOT become standalone findings
+  // merely because the raster typography engine scored them as strong.
+  const allowStandaloneTypography = !pdfToPdfTypographyGuard || !samePdfActiveFontProfile;
 
   // For PDF→PDF, raster glyph differences are not used as a standalone finding.
   // Structural and semantic differences remain active.
@@ -16350,6 +16355,7 @@ async function buildAnnotatedReferenceDifferenceImage({
   azureReferenceGeometry,
   humanReport,
   finalAdjudication = null,
+  samePdfActiveFontProfile = false,
 }) {
   // V25 PURPOSE:
   // Draw ONLY evidence-linked locations. A field label is never considered the
@@ -16505,7 +16511,7 @@ async function buildAnnotatedReferenceDifferenceImage({
     // 3) Typography: V45 uses ONLY the evidence-linked findings selected by the
     // new reference-difference core. Raw characterFindings are diagnostics and
     // must not create stale/unreported red boxes.
-    if (!useFinalAdjudicationOnly) for (const row of ((humanReport?.findings || []).filter(x =>
+    if (!useFinalAdjudicationOnly && !samePdfActiveFontProfile) for (const row of ((humanReport?.findings || []).filter(x =>
       x?.category === 'typography' && x?.targetBox) || [])) {
       let b = boxOf(row?.targetBox);
 
@@ -16575,9 +16581,12 @@ async function buildAnnotatedReferenceDifferenceImage({
     for (const row of (humanReport?.findings || []).slice(0,12)) {
       let b = boxOf(row?.targetBox);
       const label = String(row?.title || '').trim();
-      if (!b && label) {
+      // V39: a human-readable field/position finding without an evidence-linked
+      // targetBox must NOT be guessed onto the label. Guessing created red boxes
+      // on unrelated text such as 'Açıklama'.
+      if (!b && label && row?.kind === 'terra-visual-adjudication') {
         const labelBox = findExactLabelRegion(label);
-        b = findValueNearLabel(labelBox, label) || labelBox;
+        b = findValueNearLabel(labelBox, label);
       }
       if (!b) continue;
       const key = `human|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
