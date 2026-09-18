@@ -12510,10 +12510,12 @@ let azureReferenceGeometry = null;
 let forensicTargetPath = filePath;
 let forensicTargetMime = mime;
 let forensicTargetIsTemporary = false;
+let forensicPdfPageCount = null;
 
 if (type === "pdf") {
   try {
     const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    forensicPdfPageCount = Number(pdf?.numPages || 0);
     const rendered = await renderPdfPagePng(pdf, 1, 1.6);
     if (rendered?.buffer) {
       forensicTargetPath = `/tmp/verifydoc-forensic-${fileFingerprint}.png`;
@@ -13779,20 +13781,8 @@ else if (
 type === "pdf"
 ) {
 
-// PDF'nin tamamını input_file olarak Terra'ya göndermek yerine,
-  // zaten forensic hattında hazırlanmış ilk sayfa rasterını görüntü olarak kullan.
-  // Deterministik OCR/forensic katmanları değişmez; amaç yalnızca ana Terra
-  // çağrısındaki PDF parse/render maliyetini azaltmaktır.
-  let pdfImageDataUrl = null;
-  try {
-    if (forensicTargetPath && forensicTargetMime?.startsWith("image/")) {
-      const pdfImageBuffer = await fs.readFile(forensicTargetPath);
-      pdfImageDataUrl =
-        `data:${forensicTargetMime};base64,${pdfImageBuffer.toString("base64")}`;
-    }
-  } catch (error) {
-    console.warn("PDF ANA GORSEL HAZIRLAMA HATASI:", error?.message || error);
-  }
+const pdfDataUrl =
+`data:application/pdf;base64,${base64}`;
 
 
 content = [
@@ -13830,11 +13820,31 @@ Dosya adı:
 ${fileName}
 `
 },
-{
-type: "input_image",
-image_url: pdfImageDataUrl || `data:application/pdf;base64,${base64}`,
-detail: "high",
-},
+// Tek sayfalı PDF'lerde forensic hattında zaten render edilmiş PNG'yi kullan.
+// Çok sayfalı PDF'lerde orijinal PDF gönderimi korunur.
+if (forensicPdfPageCount === 1 && forensicTargetPath && forensicTargetMime === "image/png") {
+  try {
+    const mainPdfImageBuffer = await fs.readFile(forensicTargetPath);
+    content.push({
+      type: "input_image",
+      image_url: `data:image/png;base64,${mainPdfImageBuffer.toString("base64")}`,
+      detail: "high",
+    });
+  } catch (error) {
+    console.warn("PDF ANA GORSEL HAZIRLAMA HATASI:", error?.message || error);
+    content.push({
+      type: "input_file",
+      filename: fileName,
+      file_data: pdfDataUrl,
+    });
+  }
+} else {
+  content.push({
+    type: "input_file",
+    filename: fileName,
+    file_data: pdfDataUrl,
+  });
+}
 
 // =================================================
 // REFERANS BANKA ŞABLONU — HAM PDF MODELE GONDERILMEZ
@@ -16470,33 +16480,19 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 3) Typography: V45 uses ONLY the evidence-linked findings selected by the
-    // new reference-difference core. Raw characterFindings are diagnostics and
-    // must not create stale/unreported red boxes.
-    if (!useFinalAdjudicationOnly) for (const row of ((humanReport?.findings || []).filter(x =>
-      x?.category === 'typography' && x?.targetBox) || [])) {
-      let b = boxOf(row?.targetBox);
-
-      if (!b) {
-        const labelText = row?.targetLabelText || row?.labelText || '';
-        const labelBox = findExactLabelRegion(labelText);
-        b = findValueNearLabel(labelBox,labelText);
-      }
-
-      // V25: NEVER fall back to the label itself. If the value ROI cannot be
-      // located, omit the annotation rather than pointing at the wrong place.
-      if (!b) continue;
-
-      const field = String(row?.field || '').replace(/:value$/i,'');
-      const key = `tp-value-v45|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
-      if (seenBox.has(key)) continue;
-      seenBox.add(key);
-      boxes.push({
-        box:b,
-        label:row?.labelText || row?.targetLabelText || field || 'tipografi farkı',
-        source:'typography-value'
-      });
-    }
+    // 3) Typography: DO NOT draw automatic red boxes from generic
+    // value-vs-label/raster typography findings. The forensic typography
+    // engine continues to analyze and report these findings, but its OCR
+    // field-to-value mapping can legitimately be uncertain (especially when
+    // reference and target contain different dynamic values). Showing those
+    // approximate ROIs to the user creates noisy/incorrect markings.
+    //
+    // Visual annotations are intentionally restricted to:
+    //   - exact local-crop evidence boxes,
+    //   - confirmed Terra field boxes,
+    //   - Azure abnormal-gap markers.
+    // This changes ONLY the presentation layer; it does not disable or lower
+    // typography detection/risk calculations.
 
     // 4) V29 confirmed findings: use the exact evidence-linked targetBox returned
     // by the field-level Terra inspection. This is the only AI annotation source.
@@ -16536,23 +16532,11 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 6) V44 human-report findings. If a deterministic finding has an exact
-    // targetBox use it; otherwise resolve the semantic title against OCR.
-    // This is the fallback that V43 deliberately disabled and is what allows
-    // proven forensic differences to be shown even when Terra returns zero.
-    for (const row of (humanReport?.findings || []).slice(0,12)) {
-      let b = boxOf(row?.targetBox);
-      const label = String(row?.title || '').trim();
-      if (!b && label) {
-        const labelBox = findExactLabelRegion(label);
-        b = findValueNearLabel(labelBox, label) || labelBox;
-      }
-      if (!b) continue;
-      const key = `human|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
-      if (seenBox.has(key)) continue;
-      seenBox.add(key);
-      boxes.push({box:b,label:label || 'referans farkı',source:'deterministic-reference'});
-    }
+    // 6) IMPORTANT: Do not convert the generic human-readable finding list
+    // back into approximate red boxes. That list is for text reporting.
+    // Re-resolving a title against OCR here was the source of several
+    // misleading boxes in real tests (e.g. a label being boxed as its value).
+    // Exact visual evidence is already handled by local-crop and V29 above.
 
     if (!boxes.length && !gapMarkers.length) return null;
 
