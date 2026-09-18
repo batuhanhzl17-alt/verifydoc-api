@@ -13820,6 +13820,9 @@ Dosya adı:
 ${fileName}
 `
 },
+
+];
+
 // Tek sayfalı PDF'lerde forensic hattında zaten render edilmiş PNG'yi kullan.
 // Çok sayfalı PDF'lerde orijinal PDF gönderimi korunur.
 if (forensicPdfPageCount === 1 && forensicTargetPath && forensicTargetMime === "image/png") {
@@ -13853,8 +13856,6 @@ if (forensicPdfPageCount === 1 && forensicTargetPath && forensicTargetMime === "
 // yalnızca türetilmiş, değer-izole edilmiş şablon bilgisi
 // daha sonraki context katmanından kullanılabilir.
 
-
-];
 }
 
 // =================================================
