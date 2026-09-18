@@ -1054,27 +1054,6 @@ function activeFontFamilies(profile) {
   return out;
 }
 
-// v3.5: Family is useful for broad compatibility, but it must never erase
-// weight/style information. Tahoma and Tahoma-Bold share the same family but
-// are distinct active font signatures.
-function activeFontSignatures(profile) {
-  const out = new Set();
-  for (const usage of profile?.activeFontUsages || []) {
-    const family = clean(usage?.resolvedFamily || usage?.family);
-    const style = clean(usage?.resolvedStyle || usage?.style);
-    if (!family) continue;
-    out.add(`${family}|${style || 'unknown'}`);
-  }
-  if (!out.size) {
-    for (const x of profile?.fonts || []) {
-      const family = clean(x?.family || x?.fontName);
-      const style = clean(x?.style);
-      if (family) out.add(`${family}|${style || 'unknown'}`);
-    }
-  }
-  return out;
-}
-
 function fieldValueFontProfiles(profile) {
   const labels = profile.items.filter(x => isLikelyLabel(x.text));
   const activeMap = activeFontFamilyMap(profile);
@@ -1106,10 +1085,10 @@ function fieldValueFontProfiles(profile) {
 function compareFontProfiles(reference, target) {
   const refFonts = Array.isArray(reference?.fonts) ? reference.fonts : [];
   const tarFonts = Array.isArray(target?.fonts) ? target.fonts : [];
-
-  // Compare only fonts actually attached to visible text when active usage
-  // data is available. This preserves the v3.4 fix for unused resources such
-  // as Helvetica while retaining family + style/weight distinctions.
+  // Compare families actually attached to visible PDF.js text items when the
+  // active resource bridge resolved them. Fall back to discovered font
+  // dictionaries only when active usage data is unavailable. This prevents a
+  // declared-but-unused Helvetica resource from becoming a false mismatch.
   const refActiveFamilies = activeFontFamilies(reference);
   const tarActiveFamilies = activeFontFamilies(target);
   const refFamilies = refActiveFamilies.size
@@ -1118,16 +1097,14 @@ function compareFontProfiles(reference, target) {
   const tarFamilies = tarActiveFamilies.size
     ? tarActiveFamilies
     : new Set(tarFonts.map(x => x.family || x.fontName).filter(Boolean));
-
-  const refSignatures = activeFontSignatures(reference);
-  const tarSignatures = activeFontSignatures(target);
-  const sharedSignatures = [...tarSignatures].filter(x => refSignatures.has(x));
-  const styleOnlyTarget = [...tarSignatures].filter(x => !refSignatures.has(x));
-  const styleOnlyReference = [...refSignatures].filter(x => !tarSignatures.has(x));
-
+  const refStyles = new Set((reference?.activeFontUsages || []).map(x => x.resolvedStyle || x.style).filter(x => x && x !== "unknown"));
+  const tarStyles = new Set((target?.activeFontUsages || []).map(x => x.resolvedStyle || x.style).filter(x => x && x !== "unknown"));
+  if (!refStyles.size) for (const x of refFonts) if (x.style && x.style !== "unknown") refStyles.add(x.style);
+  if (!tarStyles.size) for (const x of tarFonts) if (x.style && x.style !== "unknown") tarStyles.add(x.style);
   const familyOnlyTarget = [...tarFamilies].filter(x => !refFamilies.has(x));
   const familyOnlyReference = [...refFamilies].filter(x => !tarFamilies.has(x));
   const sharedFamilies = [...tarFamilies].filter(x => refFamilies.has(x));
+  const styleOnlyTarget = [...tarStyles].filter(x => !refStyles.has(x));
   const familyDenom = Math.max(1, new Set([...refFamilies, ...tarFamilies]).size);
   const familySimilarity = Math.round((sharedFamilies.length / familyDenom) * 100);
 
@@ -1141,8 +1118,7 @@ function compareFontProfiles(reference, target) {
     const rf = new Set(r.valueFonts);
     const tf = new Set(t.valueFonts);
     const mismatch = [...tf].filter(x => !rf.has(x));
-    const styleMismatch = [...new Set(t.valueStyles || [])].filter(x => !(r.valueStyles || []).includes(x));
-    if (mismatch.length || styleMismatch.length) fieldMismatches.push({
+    if (mismatch.length) fieldMismatches.push({
       field: r.field,
       labelText: r.labelText,
       referenceFonts: [...rf],
@@ -1150,56 +1126,58 @@ function compareFontProfiles(reference, target) {
       targetOnlyFonts: mismatch,
       referenceStyles: r.valueStyles,
       targetStyles: t.valueStyles,
-      targetOnlyStyles: styleMismatch,
     });
-  }
-
-  if (!refFonts.length) {
-    return {
-      available: false, score: 0, severity: 'unknown',
-      referenceFamilies: [], targetFamilies: [...tarFamilies], sharedFamilies: [],
-      targetOnlyFamilies: [], referenceOnlyFamilies: [...refFamilies],
-      referenceSignatures: [...refSignatures], targetSignatures: [...tarSignatures],
-      sharedSignatures, targetOnlySignatures: styleOnlyTarget,
-      referenceOnlySignatures: styleOnlyReference,
-      referenceStyles: [...new Set([...refSignatures].map(x => x.split('|')[1]))],
-      targetStyles: [...new Set([...tarSignatures].map(x => x.split('|')[1]))],
-      targetOnlyStyles: styleOnlyTarget.map(x => x.split('|')[1]),
-      familySimilarity: null, fieldMismatches: [],
-      evidence: ["Referans PDF'den güvenilir font profili çıkarılamadı; font farkı skoru üretilmedi."],
-    };
   }
 
   let score = 0;
   const evidence = [];
+  if (!refFonts.length) {
+    return {
+      available: false,
+      score: 0,
+      severity: "unknown",
+      referenceFamilies: [],
+      targetFamilies: [...tarFamilies],
+      sharedFamilies: [],
+      targetOnlyFamilies: [],
+      referenceOnlyFamilies: [],
+      referenceStyles: [],
+      targetStyles: [...tarStyles],
+      targetOnlyStyles: [],
+      familySimilarity: null,
+      fieldMismatches: [],
+      evidence: ["Referans PDF'den güvenilir font profili çıkarılamadı; font farkı skoru üretilmedi."],
+    };
+  }
+
   if (familyOnlyTarget.length) {
     score += Math.min(45, familyOnlyTarget.length * 15);
-    evidence.push(`Referansta bulunmayan ${familyOnlyTarget.length} aktif font ailesi hedef PDF'de görüldü.`);
+    evidence.push(`Referansta bulunmayan ${familyOnlyTarget.length} font ailesi hedef PDF'de görüldü.`);
   }
-  // Same family but different active style/weight remains a real typography
-  // difference. Do not count an unknown style as a mismatch by itself.
-  const meaningfulStyleOnlyTarget = styleOnlyTarget.filter(x => !x.endsWith('|unknown'));
-  if (meaningfulStyleOnlyTarget.length) {
-    score += Math.min(30, meaningfulStyleOnlyTarget.length * 10);
-    evidence.push(`Hedef PDF'de referansta olmayan ${meaningfulStyleOnlyTarget.length} aktif font ailesi+stil imzası görüldü.`);
+  if (styleOnlyTarget.length) {
+    score += Math.min(20, styleOnlyTarget.length * 7);
+    evidence.push(`Hedef PDF'de referansta olmayan ${styleOnlyTarget.length} font stili görüldü.`);
   }
   if (fieldMismatches.length) {
     score += Math.min(45, fieldMismatches.length * 15);
-    evidence.push(`${fieldMismatches.length} semantic alanda referans-hedef font/stil farkı bulundu.`);
+    evidence.push(`${fieldMismatches.length} semantic alanda referans-hedef font farkı bulundu.`);
   }
   score = Math.min(100, score);
   return {
-    available: true, score,
-    severity: score >= 70 ? 'strong' : score >= 40 ? 'medium' : score >= 18 ? 'low' : 'none',
-    referenceFamilies: [...refFamilies], targetFamilies: [...tarFamilies], sharedFamilies,
-    targetOnlyFamilies: familyOnlyTarget, referenceOnlyFamilies: familyOnlyReference,
-    referenceSignatures: [...refSignatures], targetSignatures: [...tarSignatures],
-    sharedSignatures, targetOnlySignatures: meaningfulStyleOnlyTarget,
-    referenceOnlySignatures: styleOnlyReference,
-    referenceStyles: [...new Set([...refSignatures].map(x => x.split('|')[1]))],
-    targetStyles: [...new Set([...tarSignatures].map(x => x.split('|')[1]))],
-    targetOnlyStyles: meaningfulStyleOnlyTarget.map(x => x.split('|')[1]),
-    familySimilarity, fieldMismatches: fieldMismatches.slice(0, 30), evidence,
+    available: true,
+    score,
+    severity: score >= 70 ? "strong" : score >= 40 ? "medium" : score >= 18 ? "low" : "none",
+    referenceFamilies: [...refFamilies],
+    targetFamilies: [...tarFamilies],
+    sharedFamilies,
+    targetOnlyFamilies: familyOnlyTarget,
+    referenceOnlyFamilies: familyOnlyReference,
+    referenceStyles: [...refStyles],
+    targetStyles: [...tarStyles],
+    targetOnlyStyles: styleOnlyTarget,
+    familySimilarity,
+    fieldMismatches: fieldMismatches.slice(0, 30),
+    evidence,
   };
 }
 
@@ -1233,7 +1211,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   if (!referenceProfiles.length) {
     return {
       available: true,
-      engine: "verifydoc-pdf-font-forensics-v3.5-active-family-style-comparison",
+      engine: "verifydoc-pdf-font-forensics-v3.4-active-family-comparison",
       status: "reference-font-profile-unavailable",
       targetFile: targetProfile.fileName,
       targetFonts: targetProfile.fonts,
@@ -1264,7 +1242,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v3.5-active-family-style-comparison",
+    engine: "verifydoc-pdf-font-forensics-v3.4-active-family-comparison",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
@@ -1273,7 +1251,6 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
     referenceFontProfiles: referenceProfiles.map(x => ({ fileName: x.fileName, fonts: x.fonts, fontCount: x.fontCount, rawPdfFontNames: x.rawPdfFontNames, activeFontUsages: x.activeFontUsages || [] })),
     targetActiveFontUsages: targetProfile.activeFontUsages || [],
     targetOnlyFamiliesAcrossReferences: ensembleTargetOnlyFamilies,
-    targetActiveFontSignatures: activeFontSignatures(targetProfile).size ? [...activeFontSignatures(targetProfile)] : [],
     bestReference: best?.referenceFile || null,
     score: best?.comparison?.score || 0,
     severity: best?.comparison?.severity || "none",
