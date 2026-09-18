@@ -128,10 +128,14 @@ function scanFontTokens(text, names) {
 }
 
 function parsePdfFilterNames(dictionary) {
-  const m = String(dictionary || '').match(/\/Filter\s+(\[[^\]]+\]|\/[^\s<>\[\]]+)/i);
+  const m = String(dictionary || '').match(/\/Filter\s*(\[[^\]]+\]|\/[A-Za-z0-9]+)/i);
   if (!m) return [];
   const raw = m[1];
   const names = [];
+  // A single PDF filter is captured without its leading slash by the regex
+  // above (e.g. `FlateDecode`), while an array retains slash-prefixed names.
+  // Normalize both forms so compressed content streams can be decoded equally.
+  if (/^[A-Za-z0-9]+$/.test(raw)) return [raw];
   const re = /\/([A-Za-z0-9]+)/g;
   let x;
   while ((x = re.exec(raw))) names.push(x[1]);
@@ -333,7 +337,7 @@ function pdfDictRef(dictionary, key) {
 }
 
 function pdfDictName(dictionary, key) {
-  const re = new RegExp(`\\/${key}\\s+\\/([A-Za-z0-9._+#-]+)`, 'i');
+  const re = new RegExp(`\\/${key}\\s*\\/([A-Za-z0-9._+#-]+)`, 'i');
   const m = String(dictionary || '').match(re);
   return m ? m[1] : null;
 }
@@ -518,13 +522,16 @@ function extractPdfUsedFontNamesFromBuffer(buffer) {
     if (maps.length) resourceFontMaps.push({ object: obj.key, maps: new Map(maps) });
   }
 
-  // Scan all decoded streams for actual PDF text-state font selection. A font
-  // is considered active only when its resource name is actually selected by
-  // `/F1 ... Tf` (or equivalent) in a content stream.
+  // Scan the already-parsed PDF indirect objects for actual PDF text-state
+  // font selection. This is deliberately object-based rather than relying on
+  // a global `stream` keyword scan: bank PDFs may contain binary/embedded font
+  // data with misleading `stream`/`endstream` byte sequences, and the previous
+  // scanner could miss otherwise valid content streams.
   const diagnostics = [];
-  for (const stream of findPdfStreams(buffer)) {
-    const raw = buffer.subarray(stream.dataStart, stream.dataEnd);
-    const decoded = stream.filters?.length ? decodePdfStream(raw, stream.filters) : raw;
+  for (const obj of objects.values()) {
+    if (!obj?.stream) continue;
+    const filters = parsePdfFilterNames(obj.dictionary);
+    const decoded = filters.length ? decodePdfStream(obj.stream, filters) : obj.stream;
     if (!decoded) continue;
     const text = decoded.toString('latin1');
     const selected = [...text.matchAll(/\/([A-Za-z0-9._-]+)\s+[-+]?\d*\.?\d+\s+Tf\b/g)].map(m => m[1]);
@@ -539,7 +546,7 @@ function extractPdfUsedFontNamesFromBuffer(buffer) {
         usedFontRefs.add(ref);
         inspectFontObject(ref);
       }
-      diagnostics.push({ resourceName, fontRef: matchedRef });
+      diagnostics.push({ object: obj.key, resourceName, fontRef: matchedRef });
     }
   }
 
@@ -778,7 +785,7 @@ function mergeFontRecord(map, rec) {
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v31-targetfix-activefonts`;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v31-targetfix-activefonts-refactive`;
   if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
 
   const buffer = await fs.readFile(pdfPath);
@@ -1056,7 +1063,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   if (!referenceProfiles.length) {
     return {
       available: true,
-      engine: "verifydoc-pdf-font-forensics-v3.1-targetfix-activefonts",
+      engine: "verifydoc-pdf-font-forensics-v3.1-targetfix-activefonts-refactive",
       status: "reference-font-profile-unavailable",
       targetFile: targetProfile.fileName,
       targetFonts: targetProfile.fonts,
@@ -1080,7 +1087,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v3.1-targetfix-activefonts",
+    engine: "verifydoc-pdf-font-forensics-v3.1-targetfix-activefonts-refactive",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
