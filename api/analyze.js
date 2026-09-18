@@ -8,7 +8,6 @@ import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
-import { analyzeFontForensics } from "./font_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -8367,11 +8366,17 @@ return {score, positive, negative};
 
 let image;
 try {
-const meta = await sharp(filePath).metadata();
-if (!meta?.width || !meta?.height) throw new Error("Görüntü boyutu alınamadı.");
-image = {width: meta.width, height: meta.height};
+  // PDF analizinde Amount Forensics'e gönderilen dosya /tmp altında
+  // render edilmiş PNG'dir. Aynı PNG'yi doğrudan buffer olarak okuyalım;
+  // Sharp'ın geçici dosya yolu/stream çözümleme sorunları metadata kontrolünü
+  // gereksiz yere null'a düşürmesin.
+  const imageBuffer = await fs.readFile(filePath);
+  const meta = await sharp(imageBuffer).metadata();
+  if (!meta?.width || !meta?.height) throw new Error("Görüntü boyutu alınamadı.");
+  image = {width: meta.width, height: meta.height};
 } catch (error) {
-return {available: false, status: "unknown", severity: "none", score: 0, amountText: null, region: null, characterCount: 0, metrics: {}, evidence: "Görüntü boyutu alınamadı."};
+  console.warn("AMOUNT FORENSICS IMAGE METADATA HATASI:", error?.message || error);
+  return {available: false, status: "unknown", severity: "none", score: 0, amountText: null, region: null, characterCount: 0, metrics: {}, evidence: "Görüntü boyutu alınamadı."};
 }
 
 // Referans profil değişkenleri LOG'dan önce hazırlanmalı.
@@ -12459,7 +12464,6 @@ let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
 let pixelForensics = null;
-let fontForensics = null;
 let openSourceForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
@@ -12524,7 +12528,7 @@ paddleImageOCR.confidence
 
 amountForensics =
 await analyzeAmountForensics(
-filePath,
+forensicTargetPath,
 paddleImageOCR,
 fileFingerprint,
 bank
@@ -12550,31 +12554,6 @@ let reference = null;
 
 if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR);
-}
-
-// =====================================================
-// PDF FONT FORENSICS
-// =====================================================
-// Gerçek PDF text/font metadata'sını referans dekontla karşılaştırır.
-// Bu motor bağımsız bir adli sinyaldir; tek başına sahtecilik kararı vermez
-// ve ilk entegrasyonda ana risk skorunu değiştirmez.
-if (type === "pdf" && reference?.path) {
-  try {
-    const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
-      ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
-      : [];
-    fontForensics = await analyzeFontForensics({
-      targetPath: filePath,
-      referencePath: reference.path,
-      referencePaths: candidateReferencePaths,
-      pdfjsLib,
-      maxPages: 5,
-    });
-    console.log("FONT FORENSICS:", JSON.stringify(fontForensics));
-  } catch (error) {
-    console.warn("FONT FORENSICS HATASI:", error?.message || error);
-    fontForensics = { available: false, status: "error", error: error?.message || String(error) };
-  }
 }
 
 const prepStartTime = Date.now();
@@ -13911,7 +13890,7 @@ paddleOcrAttempted = true;
 if (!amountForensics) {
 amountForensics =
 await analyzeAmountForensics(
-filePath,
+forensicTargetPath || filePath,
 paddleResult,
 fileFingerprint,
 bank
@@ -14276,9 +14255,6 @@ if (negativeSampleForensics) {
 }
 if (visualForensics) {
   result.visualForensics = visualForensics;
-}
-if (fontForensics) {
-  result.fontForensics = fontForensics;
 }
 if (layoutForensics) {
   result.layoutForensics = layoutForensics;
