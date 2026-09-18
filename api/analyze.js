@@ -1824,27 +1824,6 @@ fileName
 // =====================================================
 // REFERANS PDF OKUMA
 // =====================================================
-function findReferenceVisualPath(selectedPath, candidatePaths = []) {
-  if (!selectedPath) return null;
-
-  const ext = path.extname(selectedPath).toLowerCase();
-  if (['.jpg', '.jpeg', '.png', '.webp'].includes(ext)) return selectedPath;
-
-  const stem = path.basename(selectedPath, ext).toLocaleLowerCase('tr-TR');
-  const visualCandidates = candidatePaths.filter((p) =>
-    /\\.(jpg|jpeg|png|webp)$/i.test(String(p))
-  );
-
-  const exact = visualCandidates.find((p) =>
-    path.basename(p, path.extname(p)).toLocaleLowerCase('tr-TR') === stem
-  );
-  if (exact) return exact;
-
-  return visualCandidates.find((p) =>
-    path.basename(p, path.extname(p)).toLocaleLowerCase('tr-TR').startsWith(stem)
-  ) || null;
-}
-
 async function loadReferenceFile(bank, targetOCR = null) {
 // V63 ZIRAAT/VARIANT FIX: Her analiz isteği kendi referans varyantını baştan seçsin.
 // Önceki isteğin activeReferenceVariant değeri yeni isteğin adaylarını filtrelemesin.
@@ -1883,16 +1862,15 @@ if (!selectedPath) {
 const selectedVariant = await readReferenceVariant(selectedPath);
 activeReferenceVariant = selectedVariant || detectedVariant || null;
 
-// V64 DUAL REFERENCE: PDF yapısal/font referansı olarak korunur;
-// eş isimli JPEG/PNG görsel karşılaştırmalar için ayrıca tutulur.
-const visualPath = findReferenceVisualPath(selectedPath, candidatePaths);
-const structuralPath = /\\.pdf$/i.test(String(selectedPath))
-  ? selectedPath
-  : (candidatePaths.find((p) =>
-      path.basename(p, path.extname(p)).toLocaleLowerCase('tr-TR') ===
-      path.basename(selectedPath, path.extname(selectedPath)).toLocaleLowerCase('tr-TR') &&
-      /\\.pdf$/i.test(String(p))
-    ) || candidatePaths.find((p) => /\\.pdf$/i.test(String(p))) || selectedPath);
+// Paired-reference model:
+// - PDF stays the structural/font reference.
+// - Same-bank raster (JPG/JPEG/PNG/WEBP) becomes the visual reference.
+// This prevents visual engines from repeatedly rasterizing the PDF.
+const visualReferencePath =
+  candidatePaths.find(p => {
+    const ext = path.extname(p).toLowerCase();
+    return ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+  }) || null;
 
 console.log("REFERENCE VARIANT SELECTION:", JSON.stringify({
   bank: normalizedBank,
@@ -1910,15 +1888,19 @@ try {
     return null;
   }
   console.log("REFERENCE LOADED:", selectedPath);
+  console.log("REFERENCE STRUCTURAL PDF:", path.basename(selectedPath));
+  console.log("REFERENCE VISUAL IMAGE:", visualReferencePath ? path.basename(visualReferencePath) : "YOK");
   return {
     bank: normalizedBank,
     fileName: path.basename(selectedPath),
-    path: structuralPath,
-    visualPath: visualPath || null,
-    structuralPath,
+    path: selectedPath,
     base64: buffer.toString("base64"),
     variant: activeReferenceVariant || null,
     referenceCandidates: candidatePaths.map(p => path.basename(p)),
+    visualReferencePath,
+    visualReferenceFileName: visualReferencePath
+      ? path.basename(visualReferencePath)
+      : null,
   };
 } catch (error) {
   console.error("REFERENCE LOAD ERROR:", error);
@@ -12627,6 +12609,13 @@ if (type !== "video" && type !== "statement") {
 }
 
 // =====================================================
+// PAIRED VISUAL REFERENCE HELPER
+// =====================================================
+function getVisualReferencePath(reference) {
+  return reference?.visualReferencePath || reference?.path || null;
+}
+
+// =====================================================
 // PDF FONT FORENSICS + DETERMINISTIC REFERENCE FORENSICS
 // =====================================================
 // Font metadata is independent from raster/reference adjudication. Keep it
@@ -12634,13 +12623,11 @@ if (type !== "video" && type !== "statement") {
 if (type === "pdf" && reference?.path) {
   try {
     const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
-      ? reference.referenceCandidates
-          .map((name) => path.join(REFERENCE_DIR, String(name)))
-          .filter((p) => /\\.pdf$/i.test(String(p)))
+      ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
       : [];
     fontForensics = await analyzeFontForensics({
       targetPath: filePath,
-      referencePath: reference.structuralPath || reference.path,
+      referencePath: reference.path,
       referencePaths: candidateReferencePaths,
       pdfjsLib,
       maxPages: 5,
@@ -12658,7 +12645,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      reference.visualPath || reference.path
+      getVisualReferencePath(reference)
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
@@ -12671,10 +12658,10 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
 const prepStartTime = Date.now();
 console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
-console.log("REFERENCE STRUCTURAL:", path.basename(reference?.structuralPath || reference?.path || "") || "YOK");
-console.log("REFERENCE VISUAL:", path.basename(reference?.visualPath || "") || "YOK");
 console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidates || []));
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
+console.log("REFERENCE STRUCTURAL PDF:", reference?.path ? path.basename(reference.path) : "YOK");
+console.log("REFERENCE VISUAL IMAGE:", reference?.visualReferencePath ? path.basename(reference.visualReferencePath) : "YOK");
 
 // Known-negative sample comparison is advisory. It never replaces the
 // trusted reference engine and does not by itself declare a document fake.
@@ -12720,7 +12707,9 @@ prepTasks.push((async () => {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
       const arg = await runAzureReferenceGeometryComparison(
-        al, bank, reference.visualPath || reference.path
+        al,
+        bank,
+        getVisualReferencePath(reference)
       );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
@@ -12736,11 +12725,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
   prepTasks.push((async () => {
     try {
       const ta = await analyzeReferenceTemplateAgainstDocument(
-        forensicTargetPath,
-        forensicTargetMime,
-        bank,
-        paddleImageOCR,
-        reference.structuralPath || reference.path
+        forensicTargetPath, forensicTargetMime, bank, paddleImageOCR, reference.path
       );
       console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(ta));
       return { kind:"template", referenceTemplateAnalysis:ta };
@@ -13267,7 +13252,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      reference.visualPath || reference.path
+      getVisualReferencePath(reference)
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
@@ -13301,7 +13286,21 @@ console.log("TERRA CONDITIONAL GATE:", JSON.stringify({
 referenceVisualAdjudication = null;
 if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra) {
   try {
-    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference,targetOCR:paddleImageOCR,bank});
+    const visualReference = getVisualReferencePath(reference);
+    const visualReferenceInfo = visualReference
+      ? {
+          ...reference,
+          path: visualReference,
+          fileName: path.basename(visualReference),
+          base64: null,
+        }
+      : reference;
+    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({
+      targetPath: forensicTargetPath,
+      referenceInfo: visualReferenceInfo,
+      targetOCR: paddleImageOCR,
+      bank
+    });
     console.log('REFERENCE VISUAL ADJUDICATOR V39:',JSON.stringify(referenceVisualAdjudication));
   } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V39 HATASI:',e?.message||e); }
 } else if ((type === 'image' || type === 'pdf') && bank && reference) {
@@ -13309,7 +13308,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra)
     available:true,
     skipped:true,
     engine:"gpt-5.6-terra-focused-zones-v43",
-    referenceFile:path.basename(reference.path),
+    referenceFile:path.basename(getVisualReferencePath(reference)),
     findingCount:0,
     findings:[],
     zonesChecked:[],
@@ -13325,10 +13324,8 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra)
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
-    const trustedReferencePaths =
-      (reference?.visualPath || reference?.path)
-        ? [reference.visualPath || reference.path]
-        : [];
+    const visualReferencePath = getVisualReferencePath(reference);
+    const trustedReferencePaths = visualReferencePath ? [visualReferencePath] : [];
     pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
