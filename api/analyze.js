@@ -13240,15 +13240,31 @@ const terraGateReasons = [];
 if ((azureReferenceGeometry?.strongAnomalies || []).length > 0) terraGateReasons.push("azure-strong-anomaly");
 if (Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0) terraGateReasons.push("template-strong-geometry");
 if ((referenceLocalCrop?.findings || []).length > 0) terraGateReasons.push("local-render-outlier");
+
+// V38: PDF→PDF with a verified matching active-font profile should not wake
+// the expensive Terra adjudicator merely because the raster typography engine
+// produced a suspiciousFieldCount. That path was responsible for the long
+// extra wait on normal Enpara PDFs and for promoting rasterization noise into
+// user-facing findings. Keep Terra available when font metadata is unavailable
+// or when an independent non-font signal exists.
+const pdfActiveFontsConsistent =
+  type === 'pdf' &&
+  fontForensics?.available === true &&
+  Number(fontForensics?.familySimilarity) >= 100 &&
+  Number(fontForensics?.score || 0) === 0 &&
+  Array.isArray(fontForensics?.targetOnlyFamiliesAcrossReferences) &&
+  fontForensics.targetOnlyFamiliesAcrossReferences.length === 0;
+
 if (referenceForensics?.available === true && (
-  String(referenceForensics.severity || "").toLowerCase() === "strong" ||
+  (String(referenceForensics.severity || "").toLowerCase() === "strong" && !pdfActiveFontsConsistent) ||
   Number(referenceForensics.maxSpacingScore || 0) >= 85 ||
-  Number(referenceForensics.suspiciousFieldCount || 0) >= 1
+  (Number(referenceForensics.suspiciousFieldCount || 0) >= 1 && !pdfActiveFontsConsistent)
 )) terraGateReasons.push("forensic-strong-signal");
 
 const shouldRunTerra = terraGateReasons.length > 0;
 console.log("TERRA CONDITIONAL GATE:", JSON.stringify({
   shouldRunTerra,
+  pdfActiveFontsConsistent,
   reasons: terraGateReasons,
   referenceFile: reference?.fileName || null,
   variant: reference?.variant || null
@@ -14396,7 +14412,8 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     targetOCR: paddleImageOCR,
     referenceInfo: reference,
     targetPath: filePath,
-    targetMime: mime
+    targetMime: mime,
+    samePdfFontProfile: pdfActiveFontsConsistent
   });
   const detailedDeterministicReport = buildHumanReadableReferenceForensicReport(
     referenceForensics,
@@ -14404,9 +14421,19 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     referenceLocalCrop,
     azureReferenceGeometry
   );
-  const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
+  const aiReportRaw = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
     : null;
+  const aiReport = pdfActiveFontsConsistent && aiReportRaw
+    ? {
+        ...aiReportRaw,
+        findings: (Array.isArray(aiReportRaw.findings) ? aiReportRaw.findings : []).filter(row => {
+          const kind = String(row?.kind || '').toLowerCase();
+          const hay = `${row?.title || ''} ${row?.detail || ''}`.toLocaleLowerCase('tr-TR');
+          return !(kind.includes('typography') || kind.includes('spacing') || hay.includes('spacing') || hay.includes('aralık'));
+        })
+      }
+    : aiReportRaw;
 
   // V64: Tek bir nihai referans bulgu listesi kullan. V63'te V48 raporu
   // muhafazakâr eşleştirme nedeniyle boş kalabildiği halde, aynı çalışmada
@@ -14423,6 +14450,13 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
         const title = String(row?.title || '').trim();
         const detail = String(row?.detail || '').trim();
         if (!title || !detail) continue;
+        if (pdfActiveFontsConsistent) {
+          const kind = String(row?.kind || '').toLowerCase();
+          const hay = `${title} ${detail}`.toLocaleLowerCase('tr-TR');
+          if (kind.includes('typography') || kind.includes('raster') || kind.includes('character') ||
+              hay.includes('yazı/karakter raster') || hay.includes('karakter/raster') ||
+              hay.includes('yazı/raster')) continue;
+        }
         const key = `${title}|${detail}`.toLocaleLowerCase('tr-TR');
         if (seen.has(key)) continue;
         seen.add(key);
@@ -15504,7 +15538,8 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   targetOCR = null,
   referenceInfo = null,
   targetPath = null,
-  targetMime = null
+  targetMime = null,
+  samePdfFontProfile = false
 }) {
   const base = buildV46ReferenceDifferenceReport(
     referenceForensics,
@@ -15513,6 +15548,12 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
     azureReferenceGeometry,
     referenceTemplateAnalysis
   );
+
+  // V38: when both sides are PDFs and the deterministic embedded-font profile
+  // says the active families/styles match, raster-only typography findings are
+  // treated as render noise. Structural/content findings remain active.
+  const samePdfActiveFontProfile =
+    Boolean(samePdfFontProfile);
 
   // V51: If the submitted target file is byte-for-byte identical to the
   // selected trusted reference file, there is no reference difference to
@@ -15732,7 +15773,10 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   // Keep V47's validated spacing evidence, but never let it be the only finding
   // when stronger whole-document semantic differences are available.
   differences.sort((a,b) => ({güçlü:3,belirgin:2,orta:1}[b.strength]||0)-({güçlü:3,belirgin:2,orta:1}[a.strength]||0) || Number(b.score||0)-Number(a.score||0));
-  const material = differences.filter(x => x.strength === 'güçlü' || x.strength === 'belirgin').slice(0,8);
+  const material = differences
+    .filter(x => x.strength === 'güçlü' || x.strength === 'belirgin')
+    .filter(x => !(samePdfActiveFontProfile && String(x?.category || '').toLowerCase() === 'typography'))
+    .slice(0,8);
   const lines = ['🔎 REFERANS KARŞILAŞTIRMASI'];
   if (material.length) {
     lines.push('', '🔴 FARKLAR', ...material.map(x => `• ${x.title}: ${x.detail}`));
