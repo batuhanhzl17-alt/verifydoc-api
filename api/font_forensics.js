@@ -274,7 +274,7 @@ async function extractRawPdfFontNames(pdfPath) {
 
 
 // -----------------------------------------------------
-// PDF indirect-object graph font extraction (v3.1)
+// PDF indirect-object graph font extraction (v3.1 target stream-length fix)
 // -----------------------------------------------------
 // v3.1 keeps v3's approach intact and adds one narrow layer for PDFs where
 // /Font -> /FontDescriptor -> /FontFile references are indirect objects.
@@ -303,11 +303,16 @@ function parsePdfIndirectObjects(buffer) {
       let dataStart = bodyStart + streamPos + 6;
       if (text.startsWith('\r\n', dataStart)) dataStart += 2;
       else if (text.startsWith('\n', dataStart)) dataStart += 1;
-      const lenMatch = dictionary.match(/\/Length\s+(\d+)\s+\d+\s+R/i) || dictionary.match(/\/Length\s+(\d+)/i);
+      // /Length may itself be an indirect PDF object (e.g. /Length 65 0 R).
+      // Never mistake the referenced object number for the byte length.
+      const indirectLengthMatch = dictionary.match(/\/Length\s+(\d+)\s+(\d+)\s+R\b/i);
+      const directLengthMatch = dictionary.match(/\/Length\s+(\d+)(?!\s+\d+\s+R\b)/i);
       let dataEnd = -1;
-      if (lenMatch && /^\d+$/.test(lenMatch[1])) {
-        const n = Number(lenMatch[1]);
-        if (Number.isSafeInteger(n) && dataStart + n <= buffer.length) dataEnd = dataStart + n;
+      if (!indirectLengthMatch && directLengthMatch) {
+        const n = Number(directLengthMatch[1]);
+        if (Number.isSafeInteger(n) && n >= 0 && dataStart + n <= buffer.length) {
+          dataEnd = dataStart + n;
+        }
       }
       if (dataEnd < 0) {
         const localEnd = body.indexOf('endstream', streamPos + 6);
@@ -925,7 +930,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
   if (!referenceProfiles.length) {
     return {
       available: true,
-      engine: "verifydoc-pdf-font-forensics-v3.1",
+      engine: "verifydoc-pdf-font-forensics-v3.1-targetfix",
       status: "reference-font-profile-unavailable",
       targetFile: targetProfile.fileName,
       targetFonts: targetProfile.fonts,
@@ -949,7 +954,7 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
 
   return {
     available: true,
-    engine: "verifydoc-pdf-font-forensics-v3.1",
+    engine: "verifydoc-pdf-font-forensics-v3.1-targetfix",
     status: "ok",
     targetFile: targetProfile.fileName,
     targetFonts: targetProfile.fonts,
