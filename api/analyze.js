@@ -9659,22 +9659,88 @@ const normalizedAmount = cleanAmountText(candidate.text)
 const expectedCharacters = [...normalizedAmount].filter((char) => /[0-9.,]/.test(char));
 
 if (expectedCharacters.length >= 4 && w >= expectedCharacters.length * 2) {
+// Eşit slotları doğrudan tüm crop genişliğine uygulamak güvenilir değildir:
+// OCR kutusunda sağ/sol padding bulunabildiği için son slotlar tamamen boş kalabilir.
+// Önce gerçek mürekkep/piksel sınırını bul, sonra yalnızca bu aktif alanı slotlara böl.
+let activeMinX = w;
+let activeMaxX = -1;
+let activePixelCount = 0;
+
+for (let x = 0; x < w; x++) {
+let columnActive = false;
+for (let y = yStart; y < yEnd; y++) {
+const value = data[y * w + x];
+if (value < 220) {
+columnActive = true;
+break;
+}
+}
+if (columnActive) {
+activePixelCount++;
+activeMinX = Math.min(activeMinX, x);
+activeMaxX = Math.max(activeMaxX, x);
+}
+}
+
+const activeWidth = activeMaxX >= activeMinX
+? activeMaxX - activeMinX + 1
+: 0;
+
+if (activePixelCount > 0 && activeWidth >= expectedCharacters.length * 2) {
 const slotSegments = [];
-const slotWidth = w / expectedCharacters.length;
+const slotWidth = activeWidth / expectedCharacters.length;
+
 for (let i = 0; i < expectedCharacters.length; i++) {
-const start = Math.max(0, Math.floor(i * slotWidth));
-const end = Math.min(w, Math.max(start + 2, Math.floor((i + 1) * slotWidth)));
+const start = Math.max(0, Math.floor(activeMinX + i * slotWidth));
+const end = Math.min(w, Math.max(start + 2, Math.floor(activeMinX + (i + 1) * slotWidth)));
 if (end - start >= 2) slotSegments.push({start, end, slotFallback: true});
 }
+
 if (slotSegments.length === expectedCharacters.length) {
+// Boş slotları kabul etme. Bir karakter slotunda hiç mürekkep yoksa
+// karakter sayısını yapay olarak tamamlayıp anomaly üretmek yerine
+// bu fallback'i güvenilmez sayıyoruz.
+const slotHasInk = slotSegments.map((segment) => {
+let count = 0;
+for (let x = segment.start; x < segment.end; x++) {
+for (let y = yStart; y < yEnd; y++) {
+if (data[y * w + x] < 220) {
+count++;
+break;
+}
+}
+if (count) break;
+}
+return count > 0;
+});
+
+const validSlotCount = slotHasInk.filter(Boolean).length;
+
+if (validSlotCount === expectedCharacters.length) {
 filteredSegments = slotSegments;
 console.log("AMOUNT CHARACTER SLOT FALLBACK:", JSON.stringify({
 amountText: candidate.text,
 expectedCharacterCount: expectedCharacters.length,
 slotCount: filteredSegments.length,
+activeMinX,
+activeMaxX,
+activeWidth,
 width: w,
 height: h,
 }));
+} else {
+console.log("AMOUNT CHARACTER SLOT FALLBACK SKIPPED:", JSON.stringify({
+amountText: candidate.text,
+expectedCharacterCount: expectedCharacters.length,
+validSlotCount,
+activeMinX,
+activeMaxX,
+activeWidth,
+width: w,
+height: h,
+reason: "Boş karakter slotu bulundu.",
+}));
+}
 }
 }
 }
