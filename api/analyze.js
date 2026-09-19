@@ -12510,12 +12510,10 @@ let azureReferenceGeometry = null;
 let forensicTargetPath = filePath;
 let forensicTargetMime = mime;
 let forensicTargetIsTemporary = false;
-let forensicPdfPageCount = null;
 
 if (type === "pdf") {
   try {
     const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
-    forensicPdfPageCount = Number(pdf?.numPages || 0);
     const rendered = await renderPdfPagePng(pdf, 1, 1.6);
     if (rendered?.buffer) {
       forensicTargetPath = `/tmp/verifydoc-forensic-${fileFingerprint}.png`;
@@ -13820,34 +13818,11 @@ Dosya adı:
 ${fileName}
 `
 },
-
-];
-
-// Tek sayfalı PDF'lerde forensic hattında zaten render edilmiş PNG'yi kullan.
-// Çok sayfalı PDF'lerde orijinal PDF gönderimi korunur.
-if (forensicPdfPageCount === 1 && forensicTargetPath && forensicTargetMime === "image/png") {
-  try {
-    const mainPdfImageBuffer = await fs.readFile(forensicTargetPath);
-    content.push({
-      type: "input_image",
-      image_url: `data:image/png;base64,${mainPdfImageBuffer.toString("base64")}`,
-      detail: "high",
-    });
-  } catch (error) {
-    console.warn("PDF ANA GORSEL HAZIRLAMA HATASI:", error?.message || error);
-    content.push({
-      type: "input_file",
-      filename: fileName,
-      file_data: pdfDataUrl,
-    });
-  }
-} else {
-  content.push({
-    type: "input_file",
-    filename: fileName,
-    file_data: pdfDataUrl,
-  });
-}
+{
+type: "input_file",
+filename: fileName,
+file_data: pdfDataUrl,
+},
 
 // =================================================
 // REFERANS BANKA ŞABLONU — HAM PDF MODELE GONDERILMEZ
@@ -13856,6 +13831,8 @@ if (forensicPdfPageCount === 1 && forensicTargetPath && forensicTargetMime === "
 // yalnızca türetilmiş, değer-izole edilmiş şablon bilgisi
 // daha sonraki context katmanından kullanılabilir.
 
+
+];
 }
 
 // =================================================
