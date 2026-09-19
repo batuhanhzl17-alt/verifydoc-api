@@ -12524,7 +12524,7 @@ paddleImageOCR.confidence
 
 amountForensics =
 await analyzeAmountForensics(
-filePath,
+forensicTargetPath,
 paddleImageOCR,
 fileFingerprint,
 bank
