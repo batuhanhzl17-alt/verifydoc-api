@@ -1862,6 +1862,16 @@ if (!selectedPath) {
 const selectedVariant = await readReferenceVariant(selectedPath);
 activeReferenceVariant = selectedVariant || detectedVariant || null;
 
+// Paired-reference model:
+// - PDF stays the structural/font reference.
+// - Same-bank raster (JPG/JPEG/PNG/WEBP) becomes the visual reference.
+// This prevents visual engines from repeatedly rasterizing the PDF.
+const visualReferencePath =
+  candidatePaths.find(p => {
+    const ext = path.extname(p).toLowerCase();
+    return ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+  }) || null;
+
 console.log("REFERENCE VARIANT SELECTION:", JSON.stringify({
   bank: normalizedBank,
   detectedTargetVariant: detectedVariant,
@@ -1878,6 +1888,8 @@ try {
     return null;
   }
   console.log("REFERENCE LOADED:", selectedPath);
+  console.log("REFERENCE STRUCTURAL PDF:", path.basename(selectedPath));
+  console.log("REFERENCE VISUAL IMAGE:", visualReferencePath ? path.basename(visualReferencePath) : "YOK");
   return {
     bank: normalizedBank,
     fileName: path.basename(selectedPath),
@@ -1885,6 +1897,10 @@ try {
     base64: buffer.toString("base64"),
     variant: activeReferenceVariant || null,
     referenceCandidates: candidatePaths.map(p => path.basename(p)),
+    visualReferencePath,
+    visualReferenceFileName: visualReferencePath
+      ? path.basename(visualReferencePath)
+      : null,
   };
 } catch (error) {
   console.error("REFERENCE LOAD ERROR:", error);
@@ -9646,41 +9662,85 @@ const sw = segment.end - segment.start;
 return sw >= 2 && sw <= Math.max(4, Math.floor(w * 0.35));
 });
 
-// v3.5 Amount Forensics: düşük çözünürlüklü PDF rasterlarında birkaç rakam
-// tek connected component/ink bandı halinde birleşebilir. Bu durumda eski
-// <4 segment kapısı characterCount=0/unknown üretip analizi tamamen kesiyordu.
-// OCR'nin seçtiği tutarın beklenen sayısal karakter sayısını yalnızca bir
-// GEOMETRİK SLOT sayısı olarak kullanıyoruz. Slotlar gerçek OCR karakteri
-// değildir; bu nedenle sonuçta estimated=true olarak raporlanır ve bu fallback
-// tek başına yüksek risk üretmez.
+// v3.6 Amount Forensics: OCR kutusunda sağ/sol padding bulunduğunda
+// tüm crop genişliğini eşit slotlara bölmek son slotları boş bırakabiliyor.
+// Önce gerçek ink alanını buluyoruz; ardından yalnızca bu aktif alanı OCR'nin
+// beklenen karakter sayısına göre slotluyoruz. Bir slot tamamen boşsa fallback
+// güvenilmez kabul edilir ve yapay characterCount/anomaly üretilmez.
 let estimatedCharacterSlots = false;
 const expectedCharacterCount = [...cleanAmountText(candidate.text)]
   .filter((char) => /[0-9.,]/.test(char)).length;
 
 if (filteredSegments.length < Math.max(4, expectedCharacterCount) && expectedCharacterCount >= 4) {
-  const slotCount = Math.min(32, expectedCharacterCount);
-  const slotSegments = [];
-  for (let i = 0; i < slotCount; i++) {
-    const start = Math.floor((i * w) / slotCount);
-    const end = Math.max(start + 1, Math.floor(((i + 1) * w) / slotCount));
-    slotSegments.push({ start, end, estimated: true });
-  }
-  // Yalnızca slotların içinde yeterli ink varsa kullan. Böylece geniş beyaz
-  // padding veya yanlış ROI characterCount'i yapay biçimde doldurmaz.
-  const usable = slotSegments.filter((segment) => {
-    let ink = 0;
-    let pixels = 0;
-    for (let x = segment.start; x < segment.end; x++) {
-      for (let y = yStart; y < yEnd; y++) {
-        pixels++;
-        if (data[y * w + x] < 220) ink++;
+  let activeMinX = w;
+  let activeMaxX = -1;
+
+  for (let x = 0; x < w; x++) {
+    let columnHasInk = false;
+    for (let y = yStart; y < yEnd; y++) {
+      if (data[y * w + x] < 220) {
+        columnHasInk = true;
+        break;
       }
     }
-    return pixels > 0 && ink / pixels >= 0.01;
-  });
-  if (usable.length >= Math.max(4, Math.ceil(expectedCharacterCount * 0.6))) {
-    filteredSegments = usable;
-    estimatedCharacterSlots = true;
+    if (columnHasInk) {
+      activeMinX = Math.min(activeMinX, x);
+      activeMaxX = Math.max(activeMaxX, x);
+    }
+  }
+
+  const activeWidth = activeMaxX >= activeMinX
+    ? activeMaxX - activeMinX + 1
+    : 0;
+
+  if (activeWidth >= expectedCharacterCount * 2) {
+    const slotWidth = activeWidth / expectedCharacterCount;
+    const slotSegments = [];
+
+    for (let i = 0; i < expectedCharacterCount; i++) {
+      const start = Math.max(0, Math.floor(activeMinX + i * slotWidth));
+      const end = Math.min(
+        w,
+        Math.max(start + 2, Math.floor(activeMinX + (i + 1) * slotWidth))
+      );
+      if (end - start >= 2) {
+        slotSegments.push({ start, end, estimated: true });
+      }
+    }
+
+    if (slotSegments.length === expectedCharacterCount) {
+      const slotHasInk = slotSegments.map((segment) => {
+        for (let x = segment.start; x < segment.end; x++) {
+          for (let y = yStart; y < yEnd; y++) {
+            if (data[y * w + x] < 220) return true;
+          }
+        }
+        return false;
+      });
+
+      if (slotHasInk.every(Boolean)) {
+        filteredSegments = slotSegments;
+        estimatedCharacterSlots = true;
+        console.log("AMOUNT CHARACTER SLOT FALLBACK:", JSON.stringify({
+          amountText: candidate.text,
+          expectedCharacterCount,
+          slotCount: slotSegments.length,
+          activeMinX,
+          activeMaxX,
+          activeWidth,
+        }));
+      } else {
+        console.log("AMOUNT CHARACTER SLOT FALLBACK SKIPPED:", JSON.stringify({
+          amountText: candidate.text,
+          expectedCharacterCount,
+          validSlotCount: slotHasInk.filter(Boolean).length,
+          activeMinX,
+          activeMaxX,
+          activeWidth,
+          reason: "Boş karakter slotu bulundu.",
+        }));
+      }
+    }
   }
 }
 
@@ -12593,6 +12653,13 @@ if (type !== "video" && type !== "statement") {
 }
 
 // =====================================================
+// PAIRED VISUAL REFERENCE HELPER
+// =====================================================
+function getVisualReferencePath(reference) {
+  return reference?.visualReferencePath || reference?.path || null;
+}
+
+// =====================================================
 // PDF FONT FORENSICS + DETERMINISTIC REFERENCE FORENSICS
 // =====================================================
 // Font metadata is independent from raster/reference adjudication. Keep it
@@ -12622,7 +12689,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      reference.path
+      getVisualReferencePath(reference)
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
@@ -12637,6 +12704,8 @@ console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
 console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidates || []));
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
+console.log("REFERENCE STRUCTURAL PDF:", reference?.path ? path.basename(reference.path) : "YOK");
+console.log("REFERENCE VISUAL IMAGE:", reference?.visualReferencePath ? path.basename(reference.visualReferencePath) : "YOK");
 
 // Known-negative sample comparison is advisory. It never replaces the
 // trusted reference engine and does not by itself declare a document fake.
@@ -12681,7 +12750,11 @@ prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
-      const arg = await runAzureReferenceGeometryComparison(al, bank, reference.path);
+      const arg = await runAzureReferenceGeometryComparison(
+        al,
+        bank,
+        getVisualReferencePath(reference)
+      );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
     }
@@ -13223,7 +13296,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      reference.path
+      getVisualReferencePath(reference)
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
@@ -13257,7 +13330,21 @@ console.log("TERRA CONDITIONAL GATE:", JSON.stringify({
 referenceVisualAdjudication = null;
 if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra) {
   try {
-    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({targetPath:forensicTargetPath,referenceInfo:reference,targetOCR:paddleImageOCR,bank});
+    const visualReference = getVisualReferencePath(reference);
+    const visualReferenceInfo = visualReference
+      ? {
+          ...reference,
+          path: visualReference,
+          fileName: path.basename(visualReference),
+          base64: null,
+        }
+      : reference;
+    referenceVisualAdjudication = await runDirectReferenceDifferenceEngine({
+      targetPath: forensicTargetPath,
+      referenceInfo: visualReferenceInfo,
+      targetOCR: paddleImageOCR,
+      bank
+    });
     console.log('REFERENCE VISUAL ADJUDICATOR V39:',JSON.stringify(referenceVisualAdjudication));
   } catch(e){ console.warn('REFERENCE VISUAL ADJUDICATOR V39 HATASI:',e?.message||e); }
 } else if ((type === 'image' || type === 'pdf') && bank && reference) {
@@ -13265,7 +13352,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra)
     available:true,
     skipped:true,
     engine:"gpt-5.6-terra-focused-zones-v43",
-    referenceFile:path.basename(reference.path),
+    referenceFile:path.basename(getVisualReferencePath(reference)),
     findingCount:0,
     findings:[],
     zonesChecked:[],
@@ -13281,7 +13368,8 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra)
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
-    const trustedReferencePaths = reference?.path ? [reference.path] : [];
+    const visualReferencePath = getVisualReferencePath(reference);
+    const trustedReferencePaths = visualReferencePath ? [visualReferencePath] : [];
     pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
@@ -16458,19 +16546,33 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 3) Typography: DO NOT draw automatic red boxes from generic
-    // value-vs-label/raster typography findings. The forensic typography
-    // engine continues to analyze and report these findings, but its OCR
-    // field-to-value mapping can legitimately be uncertain (especially when
-    // reference and target contain different dynamic values). Showing those
-    // approximate ROIs to the user creates noisy/incorrect markings.
-    //
-    // Visual annotations are intentionally restricted to:
-    //   - exact local-crop evidence boxes,
-    //   - confirmed Terra field boxes,
-    //   - Azure abnormal-gap markers.
-    // This changes ONLY the presentation layer; it does not disable or lower
-    // typography detection/risk calculations.
+    // 3) Typography: V45 uses ONLY the evidence-linked findings selected by the
+    // new reference-difference core. Raw characterFindings are diagnostics and
+    // must not create stale/unreported red boxes.
+    if (!useFinalAdjudicationOnly) for (const row of ((humanReport?.findings || []).filter(x =>
+      x?.category === 'typography' && x?.targetBox) || [])) {
+      let b = boxOf(row?.targetBox);
+
+      if (!b) {
+        const labelText = row?.targetLabelText || row?.labelText || '';
+        const labelBox = findExactLabelRegion(labelText);
+        b = findValueNearLabel(labelBox,labelText);
+      }
+
+      // V25: NEVER fall back to the label itself. If the value ROI cannot be
+      // located, omit the annotation rather than pointing at the wrong place.
+      if (!b) continue;
+
+      const field = String(row?.field || '').replace(/:value$/i,'');
+      const key = `tp-value-v45|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({
+        box:b,
+        label:row?.labelText || row?.targetLabelText || field || 'tipografi farkı',
+        source:'typography-value'
+      });
+    }
 
     // 4) V29 confirmed findings: use the exact evidence-linked targetBox returned
     // by the field-level Terra inspection. This is the only AI annotation source.
@@ -16510,11 +16612,23 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 6) IMPORTANT: Do not convert the generic human-readable finding list
-    // back into approximate red boxes. That list is for text reporting.
-    // Re-resolving a title against OCR here was the source of several
-    // misleading boxes in real tests (e.g. a label being boxed as its value).
-    // Exact visual evidence is already handled by local-crop and V29 above.
+    // 6) V44 human-report findings. If a deterministic finding has an exact
+    // targetBox use it; otherwise resolve the semantic title against OCR.
+    // This is the fallback that V43 deliberately disabled and is what allows
+    // proven forensic differences to be shown even when Terra returns zero.
+    for (const row of (humanReport?.findings || []).slice(0,12)) {
+      let b = boxOf(row?.targetBox);
+      const label = String(row?.title || '').trim();
+      if (!b && label) {
+        const labelBox = findExactLabelRegion(label);
+        b = findValueNearLabel(labelBox, label) || labelBox;
+      }
+      if (!b) continue;
+      const key = `human|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({box:b,label:label || 'referans farkı',source:'deterministic-reference'});
+    }
 
     if (!boxes.length && !gapMarkers.length) return null;
 
