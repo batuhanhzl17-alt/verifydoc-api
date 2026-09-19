@@ -7454,6 +7454,19 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         }
       }
 
+      // V67 SPEED: Reference Template Ensemble ve Reference Forensic Engine
+      // aynı PDF'in raster OCR'unu ayrı cache anahtarlarıyla çağırıyordu.
+      // Cached veya yeni üretilmiş sonucu ortak forensic cache'e de yaz;
+      // aynı referans için ikinci PaddleOCR isteği yapılmasın.
+      try {
+        const refId = createHash('sha256')
+          .update(buffer)
+          .digest('hex')
+          .slice(0, 16);
+        const forensicCacheKey = `rfocr39:${normalizedBank}:${refId}`;
+        if (ocr?.success) paddleOCRCache.set(forensicCacheKey, ocr);
+      } catch {}
+
       if (ocr?.success && Array.isArray(ocr.regions)) {
         const regions = ocr.regions
           .filter(x => x?.region && String(x.text || '').trim())
@@ -12494,6 +12507,7 @@ error
 // =====================================================
 
 if (
+(type === "pdf" || mime === "application/pdf") &&
 extractedPdfText.trim().length < 100
 ) {
 
@@ -13347,7 +13361,24 @@ console.log("TERRA CONDITIONAL GATE V64:", JSON.stringify({
 }));
 
 referenceVisualAdjudication = null;
-if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra) {
+// V67 SPEED: When a hard deterministic signal already triggered the main Terra
+// analysis, do not launch a second, expensive reference-visual Terra pipeline.
+// The main Terra call already receives the deterministic/reference context.
+// Keep the dedicated visual adjudicator only for the softer two-signal path,
+// where it adds a genuinely independent visual arbitration layer.
+const shouldRunReferenceVisualAdjudicator =
+  shouldRunTerra && hardTerraReasons.length === 0 && terraGateReasons.length >= 2;
+
+console.log("REFERENCE VISUAL GATE V67:", JSON.stringify({
+  shouldRun: shouldRunReferenceVisualAdjudicator,
+  reasons: terraGateReasons,
+  hardReasons: hardTerraReasons,
+  rule: hardTerraReasons.length > 0
+    ? "hard-signal-main-terra-already-running"
+    : (terraGateReasons.length >= 2 ? "soft-corroboration" : "skip")
+}));
+
+if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunReferenceVisualAdjudicator) {
   try {
     const visualReference = getVisualReferencePath(reference);
     const visualReferenceInfo = visualReference
@@ -13377,7 +13408,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunTerra)
     zonesChecked:[],
     candidateCount:0,
     verifiedCount:0,
-    skipReason:"No concrete pre-Terra localized signal; expensive visual adjudication skipped."
+    skipReason:"V67 speed gate: main Terra already receives sufficient deterministic evidence; duplicate reference-visual Terra skipped."
   };
   console.log('REFERENCE VISUAL ADJUDICATOR V39 SKIPPED:', JSON.stringify(referenceVisualAdjudication));
 }
