@@ -9641,10 +9641,43 @@ segStart = null;
 
 // Çok dar noktaları temizle; fakat virgül/nokta gibi işaretlerin
 // tamamen kaybolmasına izin verme.
-const filteredSegments = segments.filter((segment) => {
+let filteredSegments = segments.filter((segment) => {
 const sw = segment.end - segment.start;
 return sw >= 2 && sw <= Math.max(4, Math.floor(w * 0.35));
 });
+
+// PaddleOCR çoğu zaman tutarın tamamını tek bir region olarak döndürür.
+// Bu durumda gerçek glyph sınırları çıkmayabilir; fakat OCR metnindeki
+// sayısal karakter sayısını bildiğimiz için crop'u karakter-slotlarına
+// bölerek mikro-görsel karşılaştırmayı yine de çalıştırabiliriz.
+// Bu fallback yalnızca segment sayısı yetersiz olduğunda devreye girer;
+// normal connected-component sonucu varsa mevcut analiz aynen korunur.
+if (filteredSegments.length < 4) {
+const normalizedAmount = cleanAmountText(candidate.text)
+.replace(/(?:TL|TRY|EUR|USD|GBP|₺|€|\$|£)/gi, "")
+.replace(/\s+/g, "");
+const expectedCharacters = [...normalizedAmount].filter((char) => /[0-9.,]/.test(char));
+
+if (expectedCharacters.length >= 4 && w >= expectedCharacters.length * 2) {
+const slotSegments = [];
+const slotWidth = w / expectedCharacters.length;
+for (let i = 0; i < expectedCharacters.length; i++) {
+const start = Math.max(0, Math.floor(i * slotWidth));
+const end = Math.min(w, Math.max(start + 2, Math.floor((i + 1) * slotWidth)));
+if (end - start >= 2) slotSegments.push({start, end, slotFallback: true});
+}
+if (slotSegments.length === expectedCharacters.length) {
+filteredSegments = slotSegments;
+console.log("AMOUNT CHARACTER SLOT FALLBACK:", JSON.stringify({
+amountText: candidate.text,
+expectedCharacterCount: expectedCharacters.length,
+slotCount: filteredSegments.length,
+width: w,
+height: h,
+}));
+}
+}
+}
 
 if (filteredSegments.length < 4) {
 return {
