@@ -16279,19 +16279,71 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 4) Strong typography evidence can stand on its own when it is a repeated
-  // value-level render mismatch. V43 lost these findings because generic:*
-  // fields were filtered out and the AI visual gate returned zero findings.
-  // These are already localized by the forensic engine to targetValueBox.
+  // 4) Strong typography evidence is user-facing only when the semantic field
+  // is actually present on the trusted reference and the compared content is
+  // the same, OR when a transaction-value field has exceptionally strong
+  // repeated-glyph evidence. A raster mismatch on an OCR-assigned field whose
+  // reference counterpart/value is missing is not a valid finding.
+  const referenceTypographyProfiles = Array.isArray(forensic?.typographyFieldProfiles)
+    ? forensic.typographyFieldProfiles
+    : [];
+  const profileForField = (field) => {
+    const wanted = String(field || '').replace(/:value$/i, '').trim().toLocaleLowerCase('tr-TR');
+    return referenceTypographyProfiles.find(p =>
+      String(p?.field || '').replace(/:value$/i, '').trim().toLocaleLowerCase('tr-TR') === wanted
+    ) || null;
+  };
+  const normComparable = (value) => String(value ?? '')
+    .trim()
+    .toLocaleLowerCase('tr-TR')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/ı/g, 'i')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const transactionValueFields = new Set(['amount','accountNo','transactionNo','iban']);
+
   for (const f of (Array.isArray(forensic?.characterFindings) ? forensic.characterFindings : [])) {
     if (String(f?.scope || '') !== 'value') continue;
+    if (String(f?.severity || '').toLowerCase() !== 'strong') continue;
+
+    const field = String(f?.field || '').replace(/:value$/i, '').trim();
+    if (!field) continue;
+
+    const profile = profileForField(field);
+    if (!profile) continue;
+
+    const targetValue = String(f?.valueTarget || f?.targetValue || profile?.valueTarget || '').trim();
+    const referenceValue = String(f?.valueReference || profile?.valueReference || '').trim();
+    if (!targetValue || !referenceValue) continue;
+
+    const sameContent = normComparable(targetValue) === normComparable(referenceValue);
     const d = Number(f?.characterDistance);
     const repeated = Number(f?.repeatedHighDistanceGlyphCount || 0);
+    const strongRepeated = Number(f?.repeatedStrongDistanceGlyphCount || 0);
     const internal = f?.type === 'internal-value-style-substitution-v23' || !!f?.corroboration;
-    if (String(f?.severity || '').toLowerCase() !== 'strong') continue;
-    if (!internal && (!Number.isFinite(d) || (d < 0.75 && repeated < 5))) continue;
-    const field = String(f?.field || '').replace(/:value$/i,'');
-    if (!field) continue;
+
+    // Static/administrative fields (bank, address, company centre, metadata,
+    // etc.) are only comparable when the actual reference value is identical.
+    // Otherwise different legitimate text naturally produces different glyphs.
+    const isGenericField = /^generic:/i.test(field);
+    const staticOrAdministrative = isGenericField || [
+      'senderAddress','recipientAddress','address','description','senderName','recipientName',
+      'branch','taxNo','date','time'
+    ].includes(field);
+    if (staticOrAdministrative && !sameContent) continue;
+
+    // Transaction values may legitimately differ. For those fields, literal
+    // equality is not required, but the raster evidence must be exceptionally
+    // strong and repeated before it can become user-facing.
+    if (!sameContent) {
+      if (!transactionValueFields.has(field)) continue;
+      if (!internal && (!Number.isFinite(d) || d < 0.85 || repeated < 5 || strongRepeated < 2)) continue;
+    } else if (!internal && (!Number.isFinite(d) || (d < 0.75 && repeated < 5))) {
+      continue;
+    }
+
     const key = `strong-typography|${field}`;
     if (seen.has(key)) continue;
     seen.add(key);
