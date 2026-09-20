@@ -5228,10 +5228,26 @@ function rfLooksLikeValue(text) {
 // The previous geometry-only resolver could pair `VAKIFBANK` with `İŞLEM
 // TARİHİ`, or `İŞLEM TÜRÜ` with `ALICI BANKA`. Value selection is now typed
 // first, geometry second.
-function rfValueTypeForField(field, text) {
+function rfInferSemanticFieldKey(field, labelText = '') {
+  const rawField = String(field || '');
+  if (!rawField.startsWith('generic:')) return rawField;
+  const n = normalizeFieldTextForMatch(labelText || rawField.slice(8)).replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
+  if (/alici\s+hesap\s+no.*iban|iban/.test(n)) return 'iban';
+  if (/alici\s+ad\s+soyad|alici\s+ad\s+soyad.*unvan/.test(n)) return 'recipientName';
+  if (/gonderen\s+ad\s+soyad|gonderici\s+ad\s+soyad/.test(n)) return 'senderName';
+  if (/islem\s+tutari|masraf\s+tutari|tutar/.test(n)) return 'amount';
+  if (/islem\s+tarihi|tarih/.test(n)) return 'date';
+  if (/sorgu\s+no|islem\s+no|fis\s+no|referans\s+no|numarasi|no$/.test(n)) return 'transactionNo';
+  if (/ticaret\s+merkezi\s+adresi|internet\s+sitesi\s+adresi|adres/.test(n)) return 'address';
+  if (/sicil\s+numarasi|vergi\s+no|tckn/.test(n)) return 'taxNo';
+  if (/islem\s+turu|alici\s+banka|ticaret\s+unvani|unvan|subesiz\s+bankacilik|banka/.test(n)) return 'text';
+  return 'generic-text';
+}
+
+function rfValueTypeForField(field, text, labelText = '') {
   const s = String(text || '').trim();
   const n = normalizeFieldTextForMatch(s);
-  const key = String(field || '');
+  const key = rfInferSemanticFieldKey(field, labelText);
   if (!s) return 'empty';
   if (key === 'amount' || /amount/i.test(key)) {
     return /(?:^|\s)(?:\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:TL|TRY|EUR|USD|GBP|₺)?(?:\s|$)/i.test(s) ? 'amount' : 'other';
@@ -5245,7 +5261,7 @@ function rfValueTypeForField(field, text) {
   if (key === 'transactionNo' || key === 'accountNo' || key === 'taxNo') {
     return /\d{6,}/.test(s.replace(/\s+/g,'')) ? 'numeric-id' : 'other';
   }
-  if (key === 'branch' || key === 'senderName' || key === 'recipientName' || key === 'senderAddress' || key === 'recipientAddress' || key === 'address' || key === 'description' || key.startsWith('generic:')) {
+  if (key === 'branch' || key === 'senderName' || key === 'recipientName' || key === 'senderAddress' || key === 'recipientAddress' || key === 'address' || key === 'description' || key === 'text' || key === 'generic-text') {
     if (/^VAKIFBANK$/i.test(n) || /^ŞUBESİZ BANKACILIK$/i.test(n) || /^FAST GİDEN ANLIK ÖDEME$/i.test(n)) return 'known-static-value';
     if (/\b(?:A\.Ş\.|A\.O\.|BANKASI|BANK)$/i.test(s) && key !== 'branch') return 'text';
     if (/^(?:TR\s*\d{2}|www\.|https?:)/i.test(s)) return 'other';
@@ -5299,7 +5315,7 @@ function rfFindValueRegion(regions, label, expectedField = null) {
   const lx = (lr.x1 + lr.x2) / 2;
   const ly = (lr.y1 + lr.y2) / 2;
   const expectedTypes = new Set();
-  if (field) expectedTypes.add(rfValueTypeForField(field, 'PLACEHOLDER') === 'other' ? 'text' : rfValueTypeForField(field, 'PLACEHOLDER'));
+  if (field) expectedTypes.add(rfValueTypeForField(field, 'PLACEHOLDER', label?.labelText || label?.text || '') === 'other' ? 'text' : rfValueTypeForField(field, 'PLACEHOLDER', label?.labelText || label?.text || ''));
 
   const candidates = regions
     .filter(x => x !== label && x?.region && String(x.text || '').trim())
@@ -5307,8 +5323,15 @@ function rfFindValueRegion(regions, label, expectedField = null) {
       const text = String(v.text || '').trim();
       // Never attach another recognized label as a value.
       if (rfLooksLikeLabelRegion(v)) return null;
-      const type = rfValueTypeForField(field, text);
+      const type = rfValueTypeForField(field, text, label?.labelText || label?.text || '');
       if (type === 'other' || type === 'empty' || type === 'known-static-value') return null;
+      const inferredKey = rfInferSemanticFieldKey(field, label?.labelText || label?.text || '');
+      if (inferredKey === 'iban' && type !== 'iban') return null;
+      if (inferredKey === 'amount' && type !== 'amount') return null;
+      if (inferredKey === 'date' && type !== 'date-time') return null;
+      if (inferredKey === 'transactionNo' && type !== 'numeric-id') return null;
+      if (inferredKey === 'taxNo' && type !== 'numeric-id') return null;
+      if (inferredKey === 'address' && !/\b(?:cad|caddesi|sok|sokak|mah|mahalle|no[: ]|istanbul|ankara|romanya|romania|www\.)\b/i.test(text) && text.length < 12) return null;
       const r = v.region;
       const vertical = Math.min(lr.y2, r.y2) - Math.max(lr.y1, r.y1);
       const rightGap = r.x1 - lr.x2;
@@ -6875,11 +6898,22 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const core=vals.slice(trim,vals.length-trim||undefined);
           return {distance:rfMedian(core),components:vals.length,componentDistances:vals};
         };
-        const tpInternalStyleFinding=(field,labelText,valueText,refValueChar,tarValueChar,refLabelChar,tarLabelChar)=>{
+        const tpInternalStyleFinding=(field,labelText,valueText,refValueText,targetValueText,refValueChar,tarValueChar,refLabelChar,tarLabelChar,sameValueGlyph)=>{
           const refRel=tpRelationMetrics(refValueChar,refLabelChar);
           const tarRel=tpRelationMetrics(tarValueChar,tarLabelChar);
           const cmp=tpRelationDistance(refRel,tarRel);
           if(!cmp||!Number.isFinite(cmp.distance)||cmp.components<3)return null;
+          // Dynamic transaction values legitimately differ between references.
+          // Never call aggregate value-vs-label drift a typography anomaly by
+          // itself. Require either the exact same value or repeated same-character
+          // glyph evidence from the actual value ROI.
+          const exactValue = tpNorm(refValueText) === tpNorm(targetValueText);
+          const sharedCount = Number(sameValueGlyph?.sharedCount || 0);
+          const sharedDistance = Number(sameValueGlyph?.distance);
+          if(!exactValue){
+            if(!Number.isFinite(sharedDistance) || sharedCount < 4) return null;
+            if(sharedDistance < 0.50) return null;
+          }
           // Require several relation dimensions to move together. One metric
           // alone is too sensitive to OCR segmentation or camera noise.
           const elevated=cmp.componentDistances.filter(v=>v>=0.26).length;
@@ -6998,7 +7032,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           // This compares value-vs-label typography relationship in target vs
           // reference, so a global camera/JPEG rendering shift largely cancels.
           const internalStyleFinding=tpInternalStyleFinding(
-            key,refLabelText,valueTarText,refValueChar,tarValueChar,refChar,tarChar
+            key,refLabelText,valueRefText,valueTarText,refValueChar,tarValueChar,refChar,tarChar,sameValueGlyph
           );
 
           const profile={
@@ -7011,6 +7045,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             labelCharacterDistance:Number.isFinite(labelCharDistance)?Number(labelCharDistance.toFixed(4)):null,
             labelDiacriticDistance:Number.isFinite(labelDiaDistance)?Number(labelDiaDistance.toFixed(4)):null,
             valueComparable,
+            valueSemanticTypeReference:rfValueTypeForField(key,valueRefText,refLabelText),
+            valueSemanticTypeTarget:rfValueTypeForField(key,valueTarText,tarLabelText),
             valueReference:valueRefText||null,
             valueTarget:valueTarText||null,
             valueCharacterDistance:Number.isFinite(valueDistance)?Number(valueDistance.toFixed(4)):null,
@@ -7122,6 +7158,36 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     }
 
     if(!referenceResults.length)return null;
+
+    // V13: a typography anomaly must repeat across the Telegram reference
+    // ensemble. One clean reference can differ because of OCR segmentation,
+    // JPEG ringing or a different dynamic value. Collapse value findings by
+    // semantic field and require support from at least two independent refs.
+    const typographySupport=new Map();
+    for(const ref of referenceResults){
+      for(const finding of ref.characterFindings||[]){
+        const field=String(finding?.field||'');
+        if(!field.endsWith(':value')) continue;
+        const base=field.replace(/:value$/i,'');
+        if(!typographySupport.has(base)) typographySupport.set(base,[]);
+        typographySupport.get(base).push({ref:ref.file,finding});
+      }
+    }
+    const supportedTypographyFields=new Set([...typographySupport.entries()]
+      .filter(([,rows])=>rows.length>=2)
+      .map(([field])=>field));
+    for(const ref of referenceResults){
+      ref.characterFindings=(ref.characterFindings||[]).filter(f=>supportedTypographyFields.has(String(f?.field||'').replace(/:value$/i,'')));
+      ref.typographyCredibleFieldCount=new Set(ref.characterFindings.map(f=>String(f.field||'').replace(/:value$/i,''))).size;
+      ref.typographyScore=ref.characterFindings.length ? rfClamp100(ref.typographyScore) : 0;
+      ref.typographySeverity=ref.characterFindings.length ? ref.typographySeverity : 'insufficient-data';
+      ref.typographyCredibility=ref.characterFindings.length ? ref.typographyCredibility : 'none';
+    }
+    console.log('TYPOGRAPHY ENSEMBLE SUPPORT V13:',JSON.stringify({
+      referenceCount:referenceResults.length,
+      fieldSupport:[...typographySupport.entries()].map(([field,rows])=>({field,referenceCount:rows.length,references:rows.map(x=>x.ref)})),
+      supportedFields:[...supportedTypographyFields]
+    }));
 
     const groups=new Map();
     for(const ref of referenceResults)for(const f of ref.fields||[]){
@@ -7449,7 +7515,22 @@ async function getReferenceFiles(bank) {
     files.push(canonical);
   }
 
-  const uniqueFiles = [...new Set(files)].filter(p => !isStatementReferencePath(p));
+  let uniqueFiles = [...new Set(files)].filter(p => !isStatementReferencePath(p));
+
+  // V13: Telegram'dan teslim alınmış aynı format referansları mevcutsa, eski
+  // yüksek çözünürlüklü/başka render zincirinden gelen JPG'leri aynı ensemble'a
+  // karıştırma. Kullanıcının gerçek hedefi Telegram üzerinden geldiği için
+  // karşılaştırmanın referans tarafı da aynı transport/render zincirinden gelmeli.
+  if (requestedFormat === 'jpg') {
+    const telegramFiles = uniqueFiles.filter(p => /telegram/i.test(path.basename(p)));
+    if (telegramFiles.length) {
+      uniqueFiles = telegramFiles;
+      console.log('REFERENCE TELEGRAM JPG PRIORITY V13:', JSON.stringify({
+        selected: uniqueFiles.map(p => path.basename(p)),
+        excludedNonTelegramJpg: files.filter(p => !telegramFiles.includes(p) && /\.(?:jpe?g)$/i.test(p)).map(p => path.basename(p))
+      }));
+    }
+  }
 
   // Hedefin işlem ailesi belirlendiyse diğer aileyi referans karşılaştırmasına
   // sokma. Böylece HVL dekontu EFT/FAST referansıyla karıştırılmaz.
