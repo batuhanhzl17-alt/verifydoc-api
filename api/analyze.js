@@ -5224,6 +5224,53 @@ function rfLooksLikeValue(text) {
   return /(?:\d|TR\d{2}|TL|TRY|EUR|USD|GBP|₺|@|\/)/i.test(s);
 }
 
+// V8 ACCURACY: value selection is semantic-first. The previous implementation
+// chose the nearest OCR box and could therefore pair fields such as ALICI BANKA
+// with an unrelated amount/IBAN elsewhere on the same row.
+function rfValueKind(text) {
+  const s = String(text || '').trim();
+  if (!s) return 'empty';
+  const compact = s.replace(/\s+/g, '');
+  if (/^TR\d{2}[A-Z0-9]{10,30}$/i.test(compact) || /^TR\d{2}/i.test(compact) && /\d/.test(compact)) return 'iban';
+  if (/^\d{1,3}(?:[. ]\d{3})*(?:,\d{2})?\s*(?:TL|TRY|₺)$/i.test(s) || /\b(?:TL|TRY|EUR|USD|GBP)\b|₺/i.test(s) && /\d/.test(s)) return 'amount';
+  if (/^\d{1,2}[.\/\-]\d{1,2}[.\/\-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?$/.test(s)) return 'date';
+  if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(s)) return 'time';
+  if (/^\d{6,20}$/.test(compact)) return 'numeric-id';
+  if (/^[\p{L}][\p{L}\s.'’\-]{2,}$/u.test(s)) return 'text';
+  return /\d/.test(s) ? 'mixed' : 'text';
+}
+
+function rfExpectedValueKind(label) {
+  const key = String(label?.rule?.key || '').toLowerCase();
+  const text = normalizeFieldTextForMatch(String(label?.labelText || label?.text || ''));
+  if (key === 'amount') return 'amount';
+  if (key === 'iban') return 'iban';
+  if (key === 'date') return 'date';
+  if (key === 'time') return 'time';
+  if (key === 'transactionno' || key === 'accountno' || key === 'taxno') return 'numeric-id';
+  if (key === 'sendername' || key === 'recipientname') return 'text';
+  if (key === 'description' || key === 'address' || key === 'senderaddress' || key === 'recipientaddress' || key === 'branch') return 'text';
+
+  // Bank-specific generic labels are common in the VakıfBank template. Infer
+  // their value family from the label itself without pretending to know the
+  // exact bank-specific schema.
+  if (/IBAN|HESAP NO/.test(text)) return 'iban';
+  if (/TUTAR|ÜCRET|UCRET|MASRAF|KOMISYON|KOMİSYON|TAHSILAT/.test(text)) return 'amount';
+  if (/TARIH|TARİH|DATE/.test(text)) return 'date';
+  if (/SAAT|TIME/.test(text)) return 'time';
+  if (/SORG[UÜ]|ISLEM NO|İŞLEM NO|FIS NO|FİŞ NO|REFERANS NO/.test(text)) return 'numeric-id';
+  if (/AD SOYAD|UNVAN|BANKA|ADRES|AÇIKLAMA|ACIKLAMA|ŞUBE|SUBE/.test(text)) return 'text';
+  return null;
+}
+
+function rfValueKindCompatible(expected, actual) {
+  if (!expected || !actual) return true;
+  if (expected === actual) return true;
+  if (expected === 'text' && actual === 'mixed') return false;
+  if (expected === 'numeric-id' && actual === 'mixed') return false;
+  return false;
+}
+
 function rfFindValueRegion(regions, label) {
   if (!label?.region) return null;
   // OCR frequently returns `LABEL : VALUE` as one region. In that case the
@@ -5234,25 +5281,36 @@ function rfFindValueRegion(regions, label) {
   const lh = Math.max(6, lr.y2 - lr.y1);
   const lx = (lr.x1 + lr.x2) / 2;
   const ly = (lr.y1 + lr.y2) / 2;
-  const candidates = regions.filter(x => x !== label && x?.region && String(x.text || '').trim()).map(v => {
-    const r = v.region;
-    const vh = Math.max(6, r.y2 - r.y1);
-    const vertical = Math.min(lr.y2, r.y2) - Math.max(lr.y1, r.y1);
-    const rightGap = r.x1 - lr.x2;
-    const sameLine = vertical >= -lh * 0.6;
-    const valueBonus = rfLooksLikeValue(v.text) ? -2.0 : 0;
-    let cost = Infinity;
-    if (sameLine && rightGap >= -lh * 0.5 && rightGap < Math.max(350, lh * 18)) {
-      cost = Math.abs(rightGap) / Math.max(1, lh) + Math.abs(((r.y1 + r.y2) / 2) - ly) / Math.max(1, lh) * 0.5 + valueBonus;
-    } else {
-      const belowGap = r.y1 - lr.y2;
-      const xGap = Math.abs(((r.x1 + r.x2) / 2) - lx);
-      if (belowGap >= -lh * 0.4 && belowGap < Math.max(220, lh * 10) && xGap < Math.max(350, lh * 18)) {
-        cost = 4 + Math.abs(belowGap) / Math.max(1, lh) + xGap / Math.max(1, lh) * 0.25 + valueBonus;
+  const expectedKind = rfExpectedValueKind(label);
+  const candidates = regions
+    .filter(x => x !== label && x?.region && String(x.text || '').trim())
+    .map(v => {
+      const actualKind = rfValueKind(v.text);
+      // A known field type must never consume a clearly incompatible value.
+      if (expectedKind && !rfValueKindCompatible(expectedKind, actualKind)) return null;
+      const r = v.region;
+      const vertical = Math.min(lr.y2, r.y2) - Math.max(lr.y1, r.y1);
+      const rightGap = r.x1 - lr.x2;
+      const sameLine = vertical >= -lh * 0.6;
+      let cost = Infinity;
+      if (sameLine && rightGap >= -lh * 0.5 && rightGap < Math.max(350, lh * 18)) {
+        cost = Math.abs(rightGap) / Math.max(1, lh) + Math.abs(((r.y1 + r.y2) / 2) - ly) / Math.max(1, lh) * 0.5;
+      } else {
+        const belowGap = r.y1 - lr.y2;
+        const xGap = Math.abs(((r.x1 + r.x2) / 2) - lx);
+        if (belowGap >= -lh * 0.4 && belowGap < Math.max(220, lh * 10) && xGap < Math.max(350, lh * 18)) {
+          cost = 4 + Math.abs(belowGap) / Math.max(1, lh) + xGap / Math.max(1, lh) * 0.25;
+        }
       }
-    }
-    return { v, cost };
-  }).filter(x => Number.isFinite(x.cost));
+      if (!Number.isFinite(cost)) return null;
+
+      // Prefer the semantic family strongly, then geometry. This keeps the
+      // geometry useful for choosing between two valid candidates of the same
+      // type without letting a nearby number beat the correct text value.
+      const semanticBonus = expectedKind === actualKind ? -1.5 : 0;
+      return { v, cost: cost + semanticBonus, actualKind };
+    })
+    .filter(Boolean);
   candidates.sort((a, b) => a.cost - b.cost);
   return candidates[0]?.v || null;
 }
@@ -5598,6 +5656,68 @@ function rfValueRenderComparable(refText, targetText) {
   const lenRatio = Math.min(a.length, b.length) / Math.max(a.length, b.length);
   // Very different text lengths are poor glyph-distribution comparisons.
   return lenRatio >= 0.45;
+}
+
+// V8 TELEGRAM QUALITY NORMALIZATION. Raster typography is only comparable when
+// target and reference went through a reasonably similar render/compression
+// pipeline. This is a confidence gate, not a blanket discount of typography.
+async function rfImageQualityProfile(buffer, meta = null) {
+  if (!buffer) return null;
+  try {
+    const m = meta || await sharp(buffer).metadata();
+    const width = Number(m?.width) || 0;
+    const height = Number(m?.height) || 0;
+    const pixels = width * height;
+    if (!width || !height || !pixels) return null;
+    const { data, info } = await sharp(buffer)
+      .resize({ width: 160, height: 160, fit: 'inside', withoutEnlargement: true })
+      .grayscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    let edge = 0, varianceSum = 0, mean = 0;
+    for (const v of data) mean += v;
+    mean /= Math.max(1, data.length);
+    for (let y = 0; y < info.height; y++) {
+      for (let x = 0; x < info.width; x++) {
+        const i = y * info.width + x;
+        const v = data[i];
+        varianceSum += (v - mean) * (v - mean);
+        if (x > 0 && Math.abs(v - data[i - 1]) > 42) edge++;
+        if (y > 0 && Math.abs(v - data[i - info.width]) > 42) edge++;
+      }
+    }
+    return {
+      width, height, pixels, bytes: buffer.length,
+      bytesPerPixel: buffer.length / pixels,
+      edgeDensity: edge / Math.max(1, data.length * 2),
+      variance: varianceSum / Math.max(1, data.length)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function rfImageQualityGap(a, b) {
+  if (!a || !b) return { score: 0, level: 'unknown', resolutionGap: null, compressionGap: null };
+  const aDim = Math.sqrt(Math.max(1, a.pixels));
+  const bDim = Math.sqrt(Math.max(1, b.pixels));
+  const resolutionGap = Math.min(2, Math.abs(Math.log(aDim / bDim)));
+  const compressionGap = Math.min(2, Math.abs(Math.log(
+    Math.max(1e-9, a.bytesPerPixel) / Math.max(1e-9, b.bytesPerPixel)
+  )));
+  const edgeGap = Math.min(1, Math.abs(Number(a.edgeDensity || 0) - Number(b.edgeDensity || 0)) * 5);
+  const score = Math.min(1, resolutionGap * 0.55 + compressionGap * 0.35 + edgeGap * 0.10);
+  const level = score < 0.18 ? 'matched' : score < 0.35 ? 'mild' : score < 0.55 ? 'moderate' : 'severe';
+  return { score, level, resolutionGap, compressionGap, edgeGap };
+}
+
+function rfTypographyQualityGate(qualityGap) {
+  const score = Number(qualityGap?.score);
+  if (!Number.isFinite(score)) return { allow: true, factor: 1, minimumSeverity: 'medium' };
+  if (score < 0.18) return { allow: true, factor: 1, minimumSeverity: 'medium' };
+  if (score < 0.35) return { allow: true, factor: 0.92, minimumSeverity: 'medium' };
+  if (score < 0.55) return { allow: true, factor: 0.72, minimumSeverity: 'strong' };
+  return { allow: true, factor: 0.45, minimumSeverity: 'strong' };
 }
 
 
@@ -6308,6 +6428,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     const targetMeta = await sharp(targetBuffer).metadata();
     const targetSize = { width:Number(targetMeta.width)||0, height:Number(targetMeta.height)||0 };
     if (!targetSize.width || !targetSize.height) return null;
+    const targetQuality = await rfImageQualityProfile(targetBuffer, targetMeta);
+    console.log('REFERENCE TYPOGRAPHY TARGET QUALITY V8:', JSON.stringify(targetQuality));
 
     const allReferencePaths = await getReferenceFiles(normalizedBank);
     const requestedReferencePaths = Array.isArray(selectedReferencePath)
@@ -6448,6 +6570,13 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const refMeta=await sharp(refBuffer).metadata();
         const refSize={width:Number(refMeta.width)||0,height:Number(refMeta.height)||0};
         if(!refSize.width||!refSize.height)continue;
+        const referenceQuality = await rfImageQualityProfile(refBuffer, refMeta);
+        const qualityGap = rfImageQualityGap(targetQuality, referenceQuality);
+        const typographyQualityGate = rfTypographyQualityGate(qualityGap);
+        console.log('REFERENCE TYPOGRAPHY QUALITY GAP V8:', JSON.stringify({
+          reference:path.basename(referencePath),
+          target:targetQuality, referenceQuality, qualityGap, typographyQualityGate
+        }));
 
         const refId=createHash('sha256').update(raw).digest('hex').slice(0,16);
         const cacheKey=`rfocr39:${normalizedBank}:${refId}`;
@@ -6914,9 +7043,29 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           // V23 primary typography evidence: internal style substitution.
           // This compares value-vs-label typography relationship in target vs
           // reference, so a global camera/JPEG rendering shift largely cancels.
-          const internalStyleFinding=tpInternalStyleFinding(
+          let internalStyleFinding=tpInternalStyleFinding(
             key,refLabelText,valueTarText,refValueChar,tarValueChar,refChar,tarChar
           );
+          if(internalStyleFinding){
+            // JPEG/render mismatch can inflate local character relations. Do not
+            // erase the signal; require stronger evidence and attenuate its
+            // contribution when the target/reference quality pipelines diverge.
+            const originalDistance=Number(internalStyleFinding.characterDistance)||0;
+            const adjustedDistance=originalDistance * Number(typographyQualityGate.factor || 1);
+            const strongEvidence=Number(internalStyleFinding.relationComponents||0)>=5 && originalDistance>=0.52;
+            if(typographyQualityGate.minimumSeverity==='strong' && !strongEvidence){
+              internalStyleFinding=null;
+            }else if(internalStyleFinding){
+              internalStyleFinding.characterDistance=Number(adjustedDistance.toFixed(4));
+              internalStyleFinding.qualityGap=Number(qualityGap.score.toFixed(4));
+              internalStyleFinding.qualityLevel=qualityGap.level;
+              internalStyleFinding.qualityNormalizationFactor=typographyQualityGate.factor;
+              if(internalStyleFinding.severity==='strong' && adjustedDistance<0.42){
+                internalStyleFinding.severity='medium';
+              }
+              internalStyleFinding.evidence += ` Görüntü kalite farkı: ${qualityGap.level}; tipografi kanıtı ${typographyQualityGate.factor.toFixed(2)} katsayısıyla normalize edildi.`;
+            }
+          }
 
           const profile={
             field:key,
@@ -7028,6 +7177,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           typographySeverity:typographyCredibility==='strong' ? 'strong' : typographyCredibility==='medium' ? 'medium' : typographyCredibility==='weak' ? 'low' : (typographyFieldProfiles.length?'insufficient-data':'insufficient-data'),
           typographyCredibility,
           typographyCredibleFieldCount:credibleFieldCount,
+          typographyQuality:{target:targetQuality,reference:referenceQuality,gap:qualityGap,gate:typographyQualityGate},
           characterFindingCount:typographyFindings.length,
           characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
@@ -12735,55 +12885,17 @@ if (type !== "video" && type !== "statement") {
 // =====================================================
 // PAIRED VISUAL REFERENCE HELPER
 // =====================================================
-function normalizeReferencePath(value) {
-  // Some older deployments may have accidentally stored the visual reference
-  // as an array. Never let that array reach Node path.* APIs.
-  if (Array.isArray(value)) {
-    const first = value.find((item) => typeof item === "string" && item.trim());
-    return first ? first.trim() : null;
-  }
-  return (typeof value === "string" && value.trim()) ? value.trim() : null;
-}
-
 function getVisualReferencePaths(reference) {
-  const multi = Array.isArray(reference?.visualReferencePaths)
-    ? reference.visualReferencePaths
-        .map(normalizeReferencePath)
-        .filter(Boolean)
-    : [];
-
-  if (multi.length) return [...new Set(multi)];
-
-  const single = normalizeReferencePath(reference?.visualReferencePath);
-  if (single) return [single];
-
-  const fallback = normalizeReferencePath(reference?.path);
-  return fallback ? [fallback] : [];
-}
-
-// Backward-compatible helper for engines that require ONE string path.
-// IMPORTANT: this function can ONLY return a string or null.
-// Multi-reference engines must use getVisualReferencePaths(reference).
-function getSingleVisualReferencePath(reference) {
-  // HARD GUARANTEE: callers of this helper receive ONLY a string or null.
-  // Never return reference.visualReferencePaths directly.
-  const raw = reference?.visualReferencePath ?? reference?.path ?? null;
-  if (typeof raw === "string" && raw.trim()) return raw.trim();
-
-  if (Array.isArray(raw)) {
-    const first = raw.find((item) => typeof item === "string" && item.trim());
-    return first ? first.trim() : null;
+  if (Array.isArray(reference?.visualReferencePaths) && reference.visualReferencePaths.length) {
+    return reference.visualReferencePaths;
   }
-
-  const multi = Array.isArray(reference?.visualReferencePaths)
-    ? reference.visualReferencePaths
-    : [];
-  const first = multi.find((item) => typeof item === "string" && item.trim());
-  return first ? first.trim() : null;
+  const single = reference?.visualReferencePath || reference?.path || null;
+  return single ? [single] : [];
 }
 
-// Deployment marker for the format/path hardening patch.
-console.log("VERIFYDOC PATH HARDENING V3: ACTIVE");
+function getVisualReferencePath(reference) {
+  return getVisualReferencePaths(reference)[0] || null;
+}
 
 // =====================================================
 // PDF FONT FORENSICS + DETERMINISTIC REFERENCE FORENSICS
@@ -12832,10 +12944,8 @@ console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidat
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
 console.log("REFERENCE FORMAT:", reference?.referenceFormat || activeReferenceFormat || "AUTO");
 console.log("REFERENCE STRUCTURAL PDF:", reference?.path && path.extname(reference.path).toLowerCase() === '.pdf' ? path.basename(reference.path) : "YOK");
-const visualReferencePathForLog = getSingleVisualReferencePath(reference);
-const visualReferencePathsForLog = getVisualReferencePaths(reference);
-console.log("REFERENCE VISUAL IMAGE:", visualReferencePathForLog ? path.basename(visualReferencePathForLog) : "YOK");
-console.log("REFERENCE VISUAL IMAGES:", JSON.stringify(visualReferencePathsForLog.map(p => path.basename(p))));
+console.log("REFERENCE VISUAL IMAGE:", reference?.visualReferencePath ? path.basename(reference.visualReferencePath) : "YOK");
+console.log("REFERENCE VISUAL IMAGES:", JSON.stringify((reference?.visualReferencePaths || []).map(p => path.basename(p))));
 
 // Known-negative sample comparison is advisory. It never replaces the
 // trusted reference engine and does not by itself declare a document fake.
@@ -12883,7 +12993,7 @@ prepTasks.push((async () => {
       const arg = await runAzureReferenceGeometryComparison(
         al,
         bank,
-        getSingleVisualReferencePath(reference)
+        getVisualReferencePath(reference)
       );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
@@ -13426,7 +13536,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getSingleVisualReferencePath(reference)
+      getVisualReferencePath(reference)
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
@@ -13496,7 +13606,7 @@ console.log("REFERENCE VISUAL GATE V67:", JSON.stringify({
 
 if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunReferenceVisualAdjudicator) {
   try {
-    const visualReference = getSingleVisualReferencePath(reference);
+    const visualReference = getVisualReferencePath(reference);
     const visualReferenceInfo = visualReference
       ? {
           ...reference,
@@ -13518,10 +13628,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunRefere
     available:true,
     skipped:true,
     engine:"gpt-5.6-terra-focused-zones-v43",
-    referenceFile:(() => {
-      const safePath = getSingleVisualReferencePath(reference);
-      return safePath ? path.basename(safePath) : null;
-    })(),
+    referenceFile:path.basename(getVisualReferencePath(reference)),
     findingCount:0,
     findings:[],
     zonesChecked:[],
