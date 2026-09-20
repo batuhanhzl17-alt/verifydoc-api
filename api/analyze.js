@@ -1824,10 +1824,11 @@ fileName
 // =====================================================
 // REFERANS PDF OKUMA
 // =====================================================
-async function loadReferenceFile(bank, targetOCR = null) {
+async function loadReferenceFile(bank, targetOCR = null, targetFormat = null) {
 // V63 ZIRAAT/VARIANT FIX: Her analiz isteği kendi referans varyantını baştan seçsin.
 // Önceki isteğin activeReferenceVariant değeri yeni isteğin adaylarını filtrelemesin.
 activeReferenceVariant = null;
+if (targetFormat) activeReferenceFormat = normalizeReferenceFormat(targetFormat);
 const normalizedBank = normalizeBank(bank);
 if (!normalizedBank) {
   console.log("REFERENCE BANK TANINMADI:", bank);
@@ -1862,15 +1863,15 @@ if (!selectedPath) {
 const selectedVariant = await readReferenceVariant(selectedPath);
 activeReferenceVariant = selectedVariant || detectedVariant || null;
 
-// Paired-reference model:
-// - PDF stays the structural/font reference.
-// - Same-bank raster (JPG/JPEG/PNG/WEBP) becomes the visual reference.
-// This prevents visual engines from repeatedly rasterizing the PDF.
-const visualReferencePath =
-  candidatePaths.find(p => {
-    const ext = path.extname(p).toLowerCase();
-    return ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
-  }) || null;
+// V8 FORMAT-MATCHED VISUAL REFERENCES:
+// Image hedeflerinde yalnızca aynı format ailesindeki raster referanslar
+// kullanılır. PDF hedeflerinde visualReferencePath boş kalır; PDF rasterizasyonu
+// mevcut V7 davranışıyla devam eder.
+const visualReferencePaths = candidatePaths.filter(p => {
+  const ext = path.extname(p).toLowerCase();
+  return ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+});
+const visualReferencePath = visualReferencePaths[0] || null;
 
 console.log("REFERENCE VARIANT SELECTION:", JSON.stringify({
   bank: normalizedBank,
@@ -1888,8 +1889,10 @@ try {
     return null;
   }
   console.log("REFERENCE LOADED:", selectedPath);
-  console.log("REFERENCE STRUCTURAL PDF:", path.basename(selectedPath));
+  console.log("REFERENCE FORMAT:", activeReferenceFormat || "AUTO");
+  console.log("REFERENCE STRUCTURAL PDF:", path.extname(selectedPath).toLowerCase() === '.pdf' ? path.basename(selectedPath) : "YOK");
   console.log("REFERENCE VISUAL IMAGE:", visualReferencePath ? path.basename(visualReferencePath) : "YOK");
+  console.log("REFERENCE VISUAL IMAGES:", JSON.stringify(visualReferencePaths.map(p => path.basename(p))));
   return {
     bank: normalizedBank,
     fileName: path.basename(selectedPath),
@@ -1897,7 +1900,10 @@ try {
     base64: buffer.toString("base64"),
     variant: activeReferenceVariant || null,
     referenceCandidates: candidatePaths.map(p => path.basename(p)),
+    referenceCandidatePaths: candidatePaths,
+    referenceFormat: activeReferenceFormat || null,
     visualReferencePath,
+    visualReferencePaths,
     visualReferenceFileName: visualReferencePath
       ? path.basename(visualReferencePath)
       : null,
@@ -6304,8 +6310,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     if (!targetSize.width || !targetSize.height) return null;
 
     const allReferencePaths = await getReferenceFiles(normalizedBank);
-    const referencePaths = selectedReferencePath && allReferencePaths.includes(selectedReferencePath)
-      ? [selectedReferencePath]
+    const requestedReferencePaths = Array.isArray(selectedReferencePath)
+      ? selectedReferencePath
+      : (selectedReferencePath ? [selectedReferencePath] : []);
+    const referencePaths = requestedReferencePaths.length
+      ? requestedReferencePaths.filter(p => allReferencePaths.includes(p))
       : allReferencePaths;
     if (!referencePaths.length) return null;
 
@@ -7215,6 +7224,38 @@ function synchronizeReferenceForensicDecision(forensic) {
 // uygun referansı seçeriz. Tutar/isim/IBAN gibi dinamik değerler seçimde kullanılmaz.
 let activeReferenceVariant = null;
 
+// V8 FORMAT-MATCHED REFERENCES:
+// Hedef dosyanın formatı ile aynı format ailesindeki referansları kullan.
+// PDF -> PDF, JPG/JPEG -> JPG, PNG -> PNG.
+// Bu değer yalnızca mevcut request'in referans seçim akışında kullanılır.
+let activeReferenceFormat = null;
+
+function normalizeReferenceFormat(value) {
+  const raw = String(value || '').toLowerCase().trim();
+  if (!raw) return null;
+  if (raw === 'pdf' || raw === '.pdf' || raw.includes('application/pdf')) return 'pdf';
+  if (raw === 'jpg' || raw === 'jpeg' || raw === '.jpg' || raw === '.jpeg' || /image\/(?:jpe?g)/i.test(raw)) return 'jpg';
+  if (raw === 'png' || raw === '.png' || raw.includes('image/png')) return 'png';
+  if (raw === 'webp' || raw === '.webp' || raw.includes('image/webp')) return 'webp';
+  return null;
+}
+
+function detectTargetReferenceFormat({ mime = '', filePath = '', type = '' } = {}) {
+  const byMime = normalizeReferenceFormat(mime);
+  if (byMime) return byMime;
+  const byExt = normalizeReferenceFormat(path.extname(String(filePath || '')));
+  if (byExt) return byExt;
+  if (String(type || '').toLowerCase() === 'pdf') return 'pdf';
+  return null;
+}
+
+function referenceFormatMatches(filePath, format) {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  if (!format) return true;
+  if (format === 'jpg') return ext === '.jpg' || ext === '.jpeg';
+  return ext === `.${format}`;
+}
+
 function detectReferenceVariantFromText(text) {
   const t = normalizeFieldTextForMatch(text || '');
   if (!t) return null;
@@ -7271,41 +7312,59 @@ async function getReferenceFiles(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return [];
 
+  const requestedFormat = normalizeReferenceFormat(activeReferenceFormat);
   const files = [];
-  try {
-    const entries = await fs.readdir(REFERENCE_DIR, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile()) continue;
-      const ext = path.extname(entry.name).toLowerCase();
-      if (!['.pdf', '.jpg', '.jpeg', '.png', '.webp'].includes(ext)) continue;
-      if (isStatementReferencePath(entry.name)) continue;
-      const normalizedName = normalizeTurkishText(path.basename(entry.name, ext)).replace(/[^a-z0-9]/g, '');
-      if (normalizedName.includes(normalizedBank)) {
-        files.push(path.join(REFERENCE_DIR, entry.name));
+
+  const collectEntries = async (dir, { requireBankName = false } = {}) => {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!['.pdf', '.jpg', '.jpeg', '.png', '.webp'].includes(ext)) continue;
+        if (isStatementReferencePath(entry.name)) continue;
+        if (requestedFormat && !referenceFormatMatches(entry.name, requestedFormat)) continue;
+
+        if (requireBankName) {
+          const normalizedName = normalizeTurkishText(path.basename(entry.name, ext)).replace(/[^a-z0-9]/g, '');
+          if (!normalizedName.includes(normalizedBank)) continue;
+        }
+
+        files.push(path.join(dir, entry.name));
       }
+    } catch (error) {
+      if (dir !== REFERENCE_DIR) return;
+      console.warn('REFERENCE KLASORU OKUNAMADI:', error?.message || error);
     }
-  } catch (error) {
-    console.warn('REFERENCE KLASORU OKUNAMADI:', error?.message || error);
+  };
+
+  // 1) Yeni format-spesifik klasörler: references/jpg, references/png, ...
+  // Aynı banka adına sahip referansların tamamını ensemble adayı yap.
+  if (requestedFormat) {
+    const formatDir = path.join(REFERENCE_DIR, requestedFormat);
+    await collectEntries(formatDir, { requireBankName: true });
   }
 
-  // Önerilen yapı: references/<bank>/*
-  const bankDir = path.join(REFERENCE_DIR, normalizedBank);
-  try {
-    const entries = await fs.readdir(bankDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile()) continue;
-      const ext = path.extname(entry.name).toLowerCase();
-      if (!['.pdf', '.jpg', '.jpeg', '.png', '.webp'].includes(ext)) continue;
-      if (isStatementReferencePath(entry.name)) continue;
-      files.push(path.join(bankDir, entry.name));
-    }
-  } catch {}
+  // 2) Eski düz references/ yapısı: geriye dönük uyumluluk.
+  // Yeni format klasöründe aday bulunduysa aynı formatın kök dosyalarını
+  // tekrar karıştırma; böylece VakıfBank JPG/PNG referansları PDF'lere dönmez.
+  const hasFormatSpecificCandidates = files.length > 0;
+  if (!hasFormatSpecificCandidates) {
+    await collectEntries(REFERENCE_DIR, { requireBankName: true });
+  }
 
-  // Canonical normal-dekont referansı varsa her zaman adaylara dahil et.
-  // Hesap özeti/hareket dosyaları canonical olarak yanlışlıkla dönse bile
-  // savunma katmanı aşağıda bunları eler.
+  // 3) Önerilen references/<bank>/* yapısı da desteklenir.
+  // Format seçilmişse yalnızca aynı format ailesini kabul et.
+  const bankDir = path.join(REFERENCE_DIR, normalizedBank);
+  const bankBefore = files.length;
+  await collectEntries(bankDir, { requireBankName: false });
+
+  // Canonical normal-dekont referansı yalnızca format eşleşiyorsa dahil edilir.
+  // Hesap özeti/hareket dosyaları hiçbir koşulda normal dekont referansı olmaz.
   const canonical = getReferenceFile(bank);
-  if (canonical && !isStatementReferencePath(canonical)) files.push(canonical);
+  if (canonical && !isStatementReferencePath(canonical) && referenceFormatMatches(canonical, requestedFormat)) {
+    files.push(canonical);
+  }
 
   const uniqueFiles = [...new Set(files)].filter(p => !isStatementReferencePath(p));
 
@@ -7314,8 +7373,10 @@ async function getReferenceFiles(bank) {
   if (activeReferenceVariant === 'hvl' || activeReferenceVariant === 'eft') {
     const variantFiles = [];
     for (const filePath of uniqueFiles) {
+      // Raster referanslarda PDF metni okunamadığı için variant tespiti yoktur;
+      // bunları format ailesi içinde tutmaya devam ediyoruz.
       const v = await readReferenceVariant(filePath);
-      if (v === activeReferenceVariant) variantFiles.push(filePath);
+      if (!v || v === activeReferenceVariant) variantFiles.push(filePath);
     }
     if (variantFiles.length) return variantFiles;
   }
@@ -12370,6 +12431,11 @@ const filePath =
 uploadedFile.filepath;
 let mime =
 uploadedFile.mimetype || ""
+
+// V8: target/reference format pairing is determined once per request.
+// PDF -> PDF, JPG/JPEG -> JPG, PNG -> PNG.
+activeReferenceFormat = detectTargetReferenceFormat({ mime, filePath, type });
+console.log("TARGET REFERENCE FORMAT:", activeReferenceFormat || "AUTO");
 if (
 !filePath
 ) {
@@ -12663,13 +12729,16 @@ JSON.stringify(amountForensics)
 let reference = null;
 
 if (type !== "video" && type !== "statement") {
-  reference = await loadReferenceFile(bank, paddleImageOCR);
+  reference = await loadReferenceFile(bank, paddleImageOCR, activeReferenceFormat);
 }
 
 // =====================================================
 // PAIRED VISUAL REFERENCE HELPER
 // =====================================================
 function getVisualReferencePath(reference) {
+  if (Array.isArray(reference?.visualReferencePaths) && reference.visualReferencePaths.length) {
+    return reference.visualReferencePaths;
+  }
   return reference?.visualReferencePath || reference?.path || null;
 }
 
@@ -12718,8 +12787,10 @@ console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
 console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidates || []));
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
-console.log("REFERENCE STRUCTURAL PDF:", reference?.path ? path.basename(reference.path) : "YOK");
+console.log("REFERENCE FORMAT:", reference?.referenceFormat || activeReferenceFormat || "AUTO");
+console.log("REFERENCE STRUCTURAL PDF:", reference?.path && path.extname(reference.path).toLowerCase() === '.pdf' ? path.basename(reference.path) : "YOK");
 console.log("REFERENCE VISUAL IMAGE:", reference?.visualReferencePath ? path.basename(reference.visualReferencePath) : "YOK");
+console.log("REFERENCE VISUAL IMAGES:", JSON.stringify((reference?.visualReferencePaths || []).map(p => path.basename(p))));
 
 // Known-negative sample comparison is advisory. It never replaces the
 // trusted reference engine and does not by itself declare a document fake.
