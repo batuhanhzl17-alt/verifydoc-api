@@ -6570,12 +6570,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const refMeta=await sharp(refBuffer).metadata();
         const refSize={width:Number(refMeta.width)||0,height:Number(refMeta.height)||0};
         if(!refSize.width||!refSize.height)continue;
-        const referenceQuality = await rfImageQualityProfile(refBuffer, refMeta);
-        const qualityGap = rfImageQualityGap(targetQuality, referenceQuality);
+        const refImageQualityV8 = await rfImageQualityProfile(refBuffer, refMeta);
+        const qualityGap = rfImageQualityGap(targetQuality, refImageQualityV8);
         const typographyQualityGate = rfTypographyQualityGate(qualityGap);
         console.log('REFERENCE TYPOGRAPHY QUALITY GAP V8:', JSON.stringify({
           reference:path.basename(referencePath),
-          target:targetQuality, referenceQuality, qualityGap, typographyQualityGate
+          target:targetQuality, referenceQuality:refImageQualityV8, qualityGap, typographyQualityGate
         }));
 
         const refId=createHash('sha256').update(raw).digest('hex').slice(0,16);
@@ -7166,7 +7166,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const typographyCredibility = credibleFieldCount>=3 ? 'strong' : credibleFieldCount>=2 ? 'medium' : credibleFieldCount===1 ? 'weak' : 'none';
         const suspiciousFields=fieldResults.filter(x=>x.suspicious);
         const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
-        const referenceQuality={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
+        const referenceQualitySummary={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
         referenceResults.push({
           file:path.basename(referencePath),fieldCount:fieldResults.length,
           styleScore:rfClamp100(rfMedian(fieldResults.map(x=>x.styleScore))),
@@ -7177,11 +7177,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           typographySeverity:typographyCredibility==='strong' ? 'strong' : typographyCredibility==='medium' ? 'medium' : typographyCredibility==='weak' ? 'low' : (typographyFieldProfiles.length?'insufficient-data':'insufficient-data'),
           typographyCredibility,
           typographyCredibleFieldCount:credibleFieldCount,
-          typographyQuality:{target:targetQuality,reference:referenceQuality,gap:qualityGap,gate:typographyQualityGate},
+          typographyQuality:{target:targetQuality,reference:refImageQualityV8,gap:qualityGap,gate:typographyQualityGate},
           characterFindingCount:typographyFindings.length,
           characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
-          fields:fieldResults,referenceQuality,
+          fields:fieldResults,referenceQuality:referenceQualitySummary,
         });
       }catch(error){
         console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:',path.basename(referencePath),error?.message||error);
