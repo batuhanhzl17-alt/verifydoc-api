@@ -5224,119 +5224,112 @@ function rfLooksLikeValue(text) {
   return /(?:\d|TR\d{2}|TL|TRY|EUR|USD|GBP|₺|@|\/)/i.test(s);
 }
 
-// V8 ACCURACY: value selection is semantic-first. The previous implementation
-// chose the nearest OCR box and could therefore pair fields such as ALICI BANKA
-// with an unrelated amount/IBAN elsewhere on the same row.
-function rfValueKind(text) {
+// V12: A nearby OCR region is NOT automatically the value of a label.
+// The previous geometry-only resolver could pair `VAKIFBANK` with `İŞLEM
+// TARİHİ`, or `İŞLEM TÜRÜ` with `ALICI BANKA`. Value selection is now typed
+// first, geometry second.
+function rfValueTypeForField(field, text) {
   const s = String(text || '').trim();
+  const n = normalizeFieldTextForMatch(s);
+  const key = String(field || '');
   if (!s) return 'empty';
-  const compact = s.replace(/\s+/g, '');
-  if (/^TR\d{2}[A-Z0-9]{10,30}$/i.test(compact) || /^TR\d{2}/i.test(compact) && /\d/.test(compact)) return 'iban';
-  if (/^\d{1,3}(?:[. ]\d{3})*(?:,\d{2})?\s*(?:TL|TRY|₺)$/i.test(s) || /\b(?:TL|TRY|EUR|USD|GBP)\b|₺/i.test(s) && /\d/.test(s)) return 'amount';
-  if (/^\d{1,2}[.\/\-]\d{1,2}[.\/\-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?$/.test(s)) return 'date';
-  if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(s)) return 'time';
-  if (/^\d{6,20}$/.test(compact)) return 'numeric-id';
-  if (/^[\p{L}][\p{L}\s.'’\-]{2,}$/u.test(s)) return 'text';
-  return /\d/.test(s) ? 'mixed' : 'text';
+  if (key === 'amount' || /amount/i.test(key)) {
+    return /(?:^|\s)(?:\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:TL|TRY|EUR|USD|GBP|₺)?(?:\s|$)/i.test(s) ? 'amount' : 'other';
+  }
+  if (key === 'iban' || /iban/i.test(key)) {
+    return /^TR\s*\d{2}(?:\s*\d{4}){4,6}(?:\s*\d{1,4})?$/i.test(s.replace(/[^A-Z0-9\s]/gi,'')) || /\bTR\d{2}(?:[A-Z0-9]{20,30})\b/i.test(s.replace(/\s+/g,'')) ? 'iban' : 'other';
+  }
+  if (key === 'date' || key === 'time') {
+    return /\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?\b/.test(s) || /\b\d{1,2}:\d{2}(?::\d{2})?\b/.test(s) ? 'date-time' : 'other';
+  }
+  if (key === 'transactionNo' || key === 'accountNo' || key === 'taxNo') {
+    return /\d{6,}/.test(s.replace(/\s+/g,'')) ? 'numeric-id' : 'other';
+  }
+  if (key === 'branch' || key === 'senderName' || key === 'recipientName' || key === 'senderAddress' || key === 'recipientAddress' || key === 'address' || key === 'description' || key.startsWith('generic:')) {
+    if (/^VAKIFBANK$/i.test(n) || /^ŞUBESİZ BANKACILIK$/i.test(n) || /^FAST GİDEN ANLIK ÖDEME$/i.test(n)) return 'known-static-value';
+    if (/\b(?:A\.Ş\.|A\.O\.|BANKASI|BANK)$/i.test(s) && key !== 'branch') return 'text';
+    if (/^(?:TR\s*\d{2}|www\.|https?:)/i.test(s)) return 'other';
+    return /[A-Za-zÇĞİÖŞÜçğıöşü]{2,}/.test(s) ? 'text' : 'other';
+  }
+  return rfLooksLikeValue(s) ? 'value' : 'text';
 }
 
-function rfExpectedValueKind(label) {
-  const key = String(label?.rule?.key || '').toLowerCase();
-  const text = normalizeFieldTextForMatch(String(label?.labelText || label?.text || ''));
-  if (key === 'amount') return 'amount';
-  if (key === 'iban') return 'iban';
-  if (key === 'date') return 'date';
-  if (key === 'time') return 'time';
-  if (key === 'transactionno' || key === 'accountno' || key === 'taxno') return 'numeric-id';
-  if (key === 'sendername' || key === 'recipientname') return 'text';
-  if (key === 'description' || key === 'address' || key === 'senderaddress' || key === 'recipientaddress' || key === 'branch') return 'text';
+function rfLooksLikeLabelRegion(region) {
+  if (!region?.text) return false;
+  const text = String(region.text || '').trim();
+  const canonical = referenceFieldRuleForText(text);
+  if (canonical) return true;
 
-  // Bank-specific generic labels are common in the VakıfBank template. Infer
-  // their value family from the label itself without pretending to know the
-  // exact bank-specific schema.
-  if (/IBAN|HESAP NO/.test(text)) return 'iban';
-  if (/TUTAR|ÜCRET|UCRET|MASRAF|KOMISYON|KOMİSYON|TAHSILAT/.test(text)) return 'amount';
-  if (/TARIH|TARİH|DATE/.test(text)) return 'date';
-  if (/SAAT|TIME/.test(text)) return 'time';
-  if (/SORG[UÜ]|ISLEM NO|İŞLEM NO|FIS NO|FİŞ NO|REFERANS NO/.test(text)) return 'numeric-id';
-  if (/AD SOYAD|UNVAN|BANKA|ADRES|AÇIKLAMA|ACIKLAMA|ŞUBE|SUBE/.test(text)) return 'text';
-  return null;
+  // Generic labels need an additional lexical signal. Treating every OCR
+  // string as a generic label would reject legitimate text values such as
+  // `OSMAN GÜNGÖR` or `Türkiye Vakıflar Bankası T.A.O` from value matching.
+  const n = normalizeFieldTextForMatch(rfLabelPart(text));
+  if (!n || n.length > 70) return false;
+  if (/^VAKIFBANK$|^ŞUBESİZ BANKACILIK$|^FAST GİDEN ANLIK ÖDEME$/i.test(n)) return false;
+  if (/\b(?:A\.Ş\.|A\.O\.|T\.A\.O\.)\b/i.test(text)) return false;
+  if (/^(?:TR\d{2}|www\.|https?:)/i.test(n.replace(/\s+/g,''))) return false;
+  const labelWords = /(?:^|\s)(?:no|numarası|numarasi|adı|adi|soyadı|soyadi|ünvan|unvan|türü|turu|tarihi|saati|tutarı|tutari|banka|hesap|iban|işlem|islem|sorgu|fiş|fis|açıklaması|aciklamasi|merkezi|adresi|sitesi|şubesi|subesi)(?:\s|$)/i;
+  const upper = (String(text).match(/[A-ZÇĞİÖŞÜ]/g)||[]).length;
+  const letters = (String(text).match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g)||[]).length;
+  const uppercaseRatio = letters ? upper / letters : 0;
+  const generic = rfGenericFieldKey(n);
+  return !!generic && (labelWords.test(n) || uppercaseRatio >= 0.78);
 }
 
-function rfValueKindCompatible(expected, actual) {
-  if (!expected || !actual) return true;
-  if (expected === actual) return true;
-  if (expected === 'text' && actual === 'mixed') return false;
-  if (expected === 'numeric-id' && actual === 'mixed') return false;
-  return false;
-}
-
-// A nearby OCR region can itself be another FIELD LABEL (e.g. MASRAF TUTARI,
-// ALICI AD SOYAD/UNVAN). Treating that label as the value of ALICI BANKA was
-// one of the main false-positive paths in the previous typography run.
-function rfLooksLikeFieldLabelText(text) {
-  const raw = String(text || '').trim();
-  if (!raw || raw.length > 70) return false;
-  const normalized = normalizeFieldTextForMatch(raw).replace(/[:：]/g, '').replace(/\s+/g, ' ').trim();
-  if (!normalized) return false;
-
-  const known = referenceFieldRuleForText(raw);
-  if (!known) return false;
-
-  // Labels in this bank template are predominantly uppercase and/or contain
-  // label punctuation. Do not reject normal title-case values such as
-  // "Türkiye Garanti Bankası A.Ş." merely because the word BANKA occurs.
-  const letters = raw.match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g) || [];
-  const upper = raw.match(/[A-ZÇĞİÖŞÜ]/g) || [];
-  const upperRatio = letters.length ? upper.length / letters.length : 0;
-  const hasSlash = /\//.test(raw);
-  const hasColon = /[:：]/.test(raw);
-  const looksLabelShape = upperRatio >= 0.72 || hasSlash || hasColon;
-  return looksLabelShape;
-}
-
-function rfFindValueRegion(regions, label) {
+function rfFindValueRegion(regions, label, expectedField = null) {
   if (!label?.region) return null;
-  // OCR frequently returns `LABEL : VALUE` as one region. In that case the
-  // safest value source is the same OCR region; searching nearby can attach a
-  // completely unrelated number (IBAN, Sorgu No, etc.) to the field.
-  if (/[:：]/.test(String(label.text || ''))) return label;
+  const field = String(expectedField || label?.rule?.key || '');
+
+  // OCR frequently returns `LABEL : VALUE` as one region. Only accept it if
+  // the text before the colon is actually the same semantic field.
+  if (/[:：]/.test(String(label.text || ''))) {
+    const raw = String(label.text || '');
+    const left = rfLabelPart(raw);
+    const canonical = referenceFieldRuleForText(left);
+    const leftKey = canonical?.key || rfGenericFieldKey(left);
+    if (leftKey && (!field || leftKey === field)) {
+      const valueText = raw.split(/[:：]/).slice(1).join(':').trim();
+      if (rfValueTypeForField(field, valueText) !== 'other') return { ...label, text: valueText };
+    }
+    return null;
+  }
+
   const lr = label.region;
   const lh = Math.max(6, lr.y2 - lr.y1);
   const lx = (lr.x1 + lr.x2) / 2;
   const ly = (lr.y1 + lr.y2) / 2;
-  const expectedKind = rfExpectedValueKind(label);
+  const expectedTypes = new Set();
+  if (field) expectedTypes.add(rfValueTypeForField(field, 'PLACEHOLDER') === 'other' ? 'text' : rfValueTypeForField(field, 'PLACEHOLDER'));
+
   const candidates = regions
     .filter(x => x !== label && x?.region && String(x.text || '').trim())
     .map(v => {
-      const actualKind = rfValueKind(v.text);
-      // A known field type must never consume a clearly incompatible value.
-      if (expectedKind && !rfValueKindCompatible(expectedKind, actualKind)) return null;
-      // For text-valued fields, a nearby OCR label is NOT a valid value. This
-      // prevents pairs such as ALICI BANKA -> MASRAF TUTARI or
-      // MASRAF TUTARI -> ALICI AD SOYAD/UNVAN.
-      if (expectedKind === 'text' && rfLooksLikeFieldLabelText(v.text)) return null;
+      const text = String(v.text || '').trim();
+      // Never attach another recognized label as a value.
+      if (rfLooksLikeLabelRegion(v)) return null;
+      const type = rfValueTypeForField(field, text);
+      if (type === 'other' || type === 'empty' || type === 'known-static-value') return null;
       const r = v.region;
       const vertical = Math.min(lr.y2, r.y2) - Math.max(lr.y1, r.y1);
       const rightGap = r.x1 - lr.x2;
-      const sameLine = vertical >= -lh * 0.6;
+      const sameLine = vertical >= -lh * 0.55;
       let cost = Infinity;
-      if (sameLine && rightGap >= -lh * 0.5 && rightGap < Math.max(350, lh * 18)) {
-        cost = Math.abs(rightGap) / Math.max(1, lh) + Math.abs(((r.y1 + r.y2) / 2) - ly) / Math.max(1, lh) * 0.5;
+      if (sameLine && rightGap >= -lh * 0.35 && rightGap < Math.max(300, lh * 16)) {
+        cost = Math.abs(rightGap) / Math.max(1, lh) + Math.abs(((r.y1 + r.y2) / 2) - ly) / Math.max(1, lh) * 0.55;
       } else {
         const belowGap = r.y1 - lr.y2;
         const xGap = Math.abs(((r.x1 + r.x2) / 2) - lx);
-        if (belowGap >= -lh * 0.4 && belowGap < Math.max(220, lh * 10) && xGap < Math.max(350, lh * 18)) {
-          cost = 4 + Math.abs(belowGap) / Math.max(1, lh) + xGap / Math.max(1, lh) * 0.25;
+        if (belowGap >= -lh * 0.35 && belowGap < Math.max(180, lh * 8) && xGap < Math.max(280, lh * 14)) {
+          cost = 3.5 + Math.abs(belowGap) / Math.max(1, lh) + xGap / Math.max(1, lh) * 0.25;
         }
       }
       if (!Number.isFinite(cost)) return null;
-
-      // Prefer the semantic family strongly, then geometry. This keeps the
-      // geometry useful for choosing between two valid candidates of the same
-      // type without letting a nearby number beat the correct text value.
-      const semanticBonus = expectedKind === actualKind ? -1.5 : 0;
-      return { v, cost: cost + semanticBonus, actualKind };
+      // Type-specific candidates get a large preference over generic text.
+      if (field === 'amount' && type !== 'amount') return null;
+      if (field === 'iban' && type !== 'iban') return null;
+      if (['date','time'].includes(field) && type !== 'date-time') return null;
+      if (['transactionNo','accountNo','taxNo'].includes(field) && type !== 'numeric-id') return null;
+      return { v, cost, type };
     })
     .filter(Boolean);
   candidates.sort((a, b) => a.cost - b.cost);
@@ -5684,68 +5677,6 @@ function rfValueRenderComparable(refText, targetText) {
   const lenRatio = Math.min(a.length, b.length) / Math.max(a.length, b.length);
   // Very different text lengths are poor glyph-distribution comparisons.
   return lenRatio >= 0.45;
-}
-
-// V8 TELEGRAM QUALITY NORMALIZATION. Raster typography is only comparable when
-// target and reference went through a reasonably similar render/compression
-// pipeline. This is a confidence gate, not a blanket discount of typography.
-async function rfImageQualityProfile(buffer, meta = null) {
-  if (!buffer) return null;
-  try {
-    const m = meta || await sharp(buffer).metadata();
-    const width = Number(m?.width) || 0;
-    const height = Number(m?.height) || 0;
-    const pixels = width * height;
-    if (!width || !height || !pixels) return null;
-    const { data, info } = await sharp(buffer)
-      .resize({ width: 160, height: 160, fit: 'inside', withoutEnlargement: true })
-      .grayscale()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    let edge = 0, varianceSum = 0, mean = 0;
-    for (const v of data) mean += v;
-    mean /= Math.max(1, data.length);
-    for (let y = 0; y < info.height; y++) {
-      for (let x = 0; x < info.width; x++) {
-        const i = y * info.width + x;
-        const v = data[i];
-        varianceSum += (v - mean) * (v - mean);
-        if (x > 0 && Math.abs(v - data[i - 1]) > 42) edge++;
-        if (y > 0 && Math.abs(v - data[i - info.width]) > 42) edge++;
-      }
-    }
-    return {
-      width, height, pixels, bytes: buffer.length,
-      bytesPerPixel: buffer.length / pixels,
-      edgeDensity: edge / Math.max(1, data.length * 2),
-      variance: varianceSum / Math.max(1, data.length)
-    };
-  } catch {
-    return null;
-  }
-}
-
-function rfImageQualityGap(a, b) {
-  if (!a || !b) return { score: 0, level: 'unknown', resolutionGap: null, compressionGap: null };
-  const aDim = Math.sqrt(Math.max(1, a.pixels));
-  const bDim = Math.sqrt(Math.max(1, b.pixels));
-  const resolutionGap = Math.min(2, Math.abs(Math.log(aDim / bDim)));
-  const compressionGap = Math.min(2, Math.abs(Math.log(
-    Math.max(1e-9, a.bytesPerPixel) / Math.max(1e-9, b.bytesPerPixel)
-  )));
-  const edgeGap = Math.min(1, Math.abs(Number(a.edgeDensity || 0) - Number(b.edgeDensity || 0)) * 5);
-  const score = Math.min(1, resolutionGap * 0.55 + compressionGap * 0.35 + edgeGap * 0.10);
-  const level = score < 0.18 ? 'matched' : score < 0.35 ? 'mild' : score < 0.55 ? 'moderate' : 'severe';
-  return { score, level, resolutionGap, compressionGap, edgeGap };
-}
-
-function rfTypographyQualityGate(qualityGap) {
-  const score = Number(qualityGap?.score);
-  if (!Number.isFinite(score)) return { allow: true, factor: 1, minimumSeverity: 'medium' };
-  if (score < 0.18) return { allow: true, factor: 1, minimumSeverity: 'medium' };
-  if (score < 0.35) return { allow: true, factor: 0.92, minimumSeverity: 'medium' };
-  if (score < 0.55) return { allow: true, factor: 0.72, minimumSeverity: 'strong' };
-  return { allow: true, factor: 0.45, minimumSeverity: 'strong' };
 }
 
 
@@ -6456,8 +6387,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     const targetMeta = await sharp(targetBuffer).metadata();
     const targetSize = { width:Number(targetMeta.width)||0, height:Number(targetMeta.height)||0 };
     if (!targetSize.width || !targetSize.height) return null;
-    const targetQuality = await rfImageQualityProfile(targetBuffer, targetMeta);
-    console.log('REFERENCE TYPOGRAPHY TARGET QUALITY V8:', JSON.stringify(targetQuality));
 
     const allReferencePaths = await getReferenceFiles(normalizedBank);
     const requestedReferencePaths = Array.isArray(selectedReferencePath)
@@ -6484,6 +6413,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const label = rfLabelPart(raw);
         const key = canonical?.key || rfGenericFieldKey(label);
         if (!key) continue;
+        // V12: A generic OCR string is not a field label merely because it is
+        // text. Reject known/static/dynamic values (FAST text, bank names,
+        // names, footer values, etc.) before they can enter the label matcher.
+        if (!canonical && !rfLooksLikeLabelRegion(r)) continue;
         const role = classifyReferenceTemplateRole(key, raw);
         out.push({
           ...r,
@@ -6598,13 +6531,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const refMeta=await sharp(refBuffer).metadata();
         const refSize={width:Number(refMeta.width)||0,height:Number(refMeta.height)||0};
         if(!refSize.width||!refSize.height)continue;
-        const refImageQualityV8 = await rfImageQualityProfile(refBuffer, refMeta);
-        const qualityGap = rfImageQualityGap(targetQuality, refImageQualityV8);
-        const typographyQualityGate = rfTypographyQualityGate(qualityGap);
-        console.log('REFERENCE TYPOGRAPHY QUALITY GAP V8:', JSON.stringify({
-          reference:path.basename(referencePath),
-          target:targetQuality, referenceQuality:refImageQualityV8, qualityGap, typographyQualityGate
-        }));
 
         const refId=createHash('sha256').update(raw).digest('hex').slice(0,16);
         const cacheKey=`rfocr39:${normalizedBank}:${refId}`;
@@ -6682,7 +6608,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const tarStyle=await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize);
           const rawStyle=rfStyleResidual(refStyle,tarStyle);
           const styleResidual=rfStyleResidual(refStyle,tarStyle,globalStyleBaseline);
-          const refValue=rfFindValueRegion(refRegions,m.rl),tarValue=rfFindValueRegion(targetRegions,m.tl);
+          const refValue=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
           let valueRenderResidual=null;
           let valueGeometryResidual=null;
           if(refValue&&tarValue){
@@ -7023,8 +6949,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           let valueRefText='',valueTarText='';
           let refValueChar=null,tarValueChar=null;
           let sameValueGlyph=null;
-          const valueRefRaw=rfFindValueRegion(refRegions,m.rl);
-          const valueTarRaw=rfFindValueRegion(targetRegions,m.tl);
+          const valueRefRaw=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key);
+          const valueTarRaw=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
           if(valueRefRaw&&valueTarRaw){
             valueRefText=tpValueText(valueRefRaw.text);
             valueTarText=tpValueText(valueTarRaw.text);
@@ -7071,29 +6997,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           // V23 primary typography evidence: internal style substitution.
           // This compares value-vs-label typography relationship in target vs
           // reference, so a global camera/JPEG rendering shift largely cancels.
-          let internalStyleFinding=tpInternalStyleFinding(
+          const internalStyleFinding=tpInternalStyleFinding(
             key,refLabelText,valueTarText,refValueChar,tarValueChar,refChar,tarChar
           );
-          if(internalStyleFinding){
-            // JPEG/render mismatch can inflate local character relations. Do not
-            // erase the signal; require stronger evidence and attenuate its
-            // contribution when the target/reference quality pipelines diverge.
-            const originalDistance=Number(internalStyleFinding.characterDistance)||0;
-            const adjustedDistance=originalDistance * Number(typographyQualityGate.factor || 1);
-            const strongEvidence=Number(internalStyleFinding.relationComponents||0)>=5 && originalDistance>=0.52;
-            if(typographyQualityGate.minimumSeverity==='strong' && !strongEvidence){
-              internalStyleFinding=null;
-            }else if(internalStyleFinding){
-              internalStyleFinding.characterDistance=Number(adjustedDistance.toFixed(4));
-              internalStyleFinding.qualityGap=Number(qualityGap.score.toFixed(4));
-              internalStyleFinding.qualityLevel=qualityGap.level;
-              internalStyleFinding.qualityNormalizationFactor=typographyQualityGate.factor;
-              if(internalStyleFinding.severity==='strong' && adjustedDistance<0.42){
-                internalStyleFinding.severity='medium';
-              }
-              internalStyleFinding.evidence += ` Görüntü kalite farkı: ${qualityGap.level}; tipografi kanıtı ${typographyQualityGate.factor.toFixed(2)} katsayısıyla normalize edildi.`;
-            }
-          }
 
           const profile={
             field:key,
@@ -7194,7 +7100,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const typographyCredibility = credibleFieldCount>=3 ? 'strong' : credibleFieldCount>=2 ? 'medium' : credibleFieldCount===1 ? 'weak' : 'none';
         const suspiciousFields=fieldResults.filter(x=>x.suspicious);
         const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
-        const referenceQualitySummary={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
+        const referenceQuality={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
         referenceResults.push({
           file:path.basename(referencePath),fieldCount:fieldResults.length,
           styleScore:rfClamp100(rfMedian(fieldResults.map(x=>x.styleScore))),
@@ -7205,11 +7111,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           typographySeverity:typographyCredibility==='strong' ? 'strong' : typographyCredibility==='medium' ? 'medium' : typographyCredibility==='weak' ? 'low' : (typographyFieldProfiles.length?'insufficient-data':'insufficient-data'),
           typographyCredibility,
           typographyCredibleFieldCount:credibleFieldCount,
-          typographyQuality:{target:targetQuality,reference:refImageQualityV8,gap:qualityGap,gate:typographyQualityGate},
           characterFindingCount:typographyFindings.length,
           characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
-          fields:fieldResults,referenceQuality:referenceQualitySummary,
+          fields:fieldResults,referenceQuality,
         });
       }catch(error){
         console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:',path.basename(referencePath),error?.message||error);
@@ -7544,24 +7449,7 @@ async function getReferenceFiles(bank) {
     files.push(canonical);
   }
 
-  let uniqueFiles = [...new Set(files)].filter(p => !isStatementReferencePath(p));
-
-  // Telegram-delivered references are the cleanest apples-to-apples baseline
-  // for Telegram JPG targets. If at least one bank-specific Telegram reference
-  // exists, keep that family together and do not mix older high-quality JPGs
-  // into the same visual/typography ensemble.
-  if (requestedFormat === 'jpg') {
-    const telegramFiles = uniqueFiles.filter(p => /telegram/i.test(path.basename(p)));
-    if (telegramFiles.length) {
-      uniqueFiles = telegramFiles;
-      console.log('REFERENCE TELEGRAM JPG PRIORITY V8:', JSON.stringify({
-        selected: telegramFiles.map(p => path.basename(p)),
-        ignoredSameFormatReferences: files
-          .filter(p => !telegramFiles.includes(p))
-          .map(p => path.basename(p))
-      }));
-    }
-  }
+  const uniqueFiles = [...new Set(files)].filter(p => !isStatementReferencePath(p));
 
   // Hedefin işlem ailesi belirlendiyse diğer aileyi referans karşılaştırmasına
   // sokma. Böylece HVL dekontu EFT/FAST referansıyla karıştırılmaz.
@@ -12930,16 +12818,11 @@ if (type !== "video" && type !== "statement") {
 // =====================================================
 // PAIRED VISUAL REFERENCE HELPER
 // =====================================================
-function getVisualReferencePaths(reference) {
+function getVisualReferencePath(reference) {
   if (Array.isArray(reference?.visualReferencePaths) && reference.visualReferencePaths.length) {
     return reference.visualReferencePaths;
   }
-  const single = reference?.visualReferencePath || reference?.path || null;
-  return single ? [single] : [];
-}
-
-function getVisualReferencePath(reference) {
-  return getVisualReferencePaths(reference)[0] || null;
+  return reference?.visualReferencePath || reference?.path || null;
 }
 
 // =====================================================
@@ -12972,7 +12855,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePaths(reference)
+      getVisualReferencePath(reference)
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
@@ -13689,7 +13572,8 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunRefere
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
-    const trustedReferencePaths = getVisualReferencePaths(reference);
+    const visualReferencePath = getVisualReferencePath(reference);
+    const trustedReferencePaths = visualReferencePath ? [visualReferencePath] : [];
     pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
@@ -15623,30 +15507,22 @@ async function runEvidenceLinkedVisualAdjudicator({
     return best;
   };
 
-  const findSemanticValue = (labelBox, labelText='') => {
+  const findSemanticValue = (labelBox) => {
     if (!labelBox) return null;
     const lc = (labelBox.y1 + labelBox.y2) / 2;
     const lh = Math.max(4, labelBox.y2 - labelBox.y1);
-    const expectedKind = rfExpectedValueKind({ labelText, text: labelText, rule: { key: '' } });
     const choices = [];
     for (const item of ocrRegions) {
       const b = ocrBox(item); if (!b) continue;
       const text = String(item.text || '').trim(); if (!text) continue;
-      const actualKind = rfValueKind(text);
-      // V10: Terra/local-render candidates must also obey the same semantic
-      // field->value contract as the typography engine. Never let a nearby
-      // label, amount, IBAN or ID become the value ROI for another field.
-      if (expectedKind && !rfValueKindCompatible(expectedKind, actualKind)) continue;
-      if (rfLooksLikeFieldLabelText(text)) continue;
       const yc = (b.y1 + b.y2) / 2;
       const sameRow = Math.abs(yc - lc) <= Math.max(14, lh * 2.0);
       if (!sameRow || b.x1 < labelBox.x2 - Math.max(4, lh * 0.5)) continue;
       const gap = Math.max(0, b.x1 - labelBox.x2);
       if (gap > Math.max(520, tw * 0.60)) continue;
       const valueLike = /[0-9A-Za-zÇĞİÖŞÜçğıöşü]/.test(text);
-      const semanticBonus = expectedKind === actualKind ? 420 : 0;
-      const score = semanticBonus + (valueLike ? 300 : 0) - gap * 0.4 + Math.min(120, text.length * 2);
-      choices.push({item, box:b, score, actualKind});
+      const score = (valueLike ? 300 : 0) - gap * 0.4 + Math.min(120, text.length * 2);
+      choices.push({item, box:b, score});
     }
     choices.sort((a,b)=>b.score-a.score);
     return choices[0] || null;
@@ -15665,7 +15541,7 @@ async function runEvidenceLinkedVisualAdjudicator({
       const label = String(f?.targetLabel || f?.referenceLabel || '').trim();
       const lm = findSemanticLabel(label);
       if (!lm) continue;
-      const vm = findSemanticValue(lm.box, label);
+      const vm = findSemanticValue(lm.box);
       // Value ROI is required for typography/local-render adjudication. If OCR
       // cannot localize it, do not invent coordinates from the label.
       if (!vm?.box) continue;
@@ -16761,7 +16637,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 }
 
 // =====================================================
-// REFERENCE DIFFERENCE ANNOTATOR v11
+// REFERENCE DIFFERENCE ANNOTATOR v1
 // =====================================================
 // Amaç: Kullanıcıya bildirilen somut referans farklarını hedef dekont
 // üzerinde yaklaşık konumlarıyla göstermek. Bu katman karar üretmez;
@@ -16823,82 +16699,6 @@ async function buildAnnotatedReferenceDifferenceImage({
         y2: Math.max(0, Math.min(H, Math.round(y2)))
       };
       return b.x2 > b.x1 && b.y2 > b.y1 ? b : null;
-    };
-
-    // V11: Never trust an annotation box merely because it was emitted by an
-    // older evidence layer. If the box overlaps an OCR field label, it is not
-    // a valid fraud ROI for typography/local-render evidence. We either recover
-    // the actual value ROI or drop the annotation.
-    const boxOverlapRatio = (a,b) => {
-      if (!a || !b) return 0;
-      const ix = Math.max(0, Math.min(a.x2,b.x2)-Math.max(a.x1,b.x1));
-      const iy = Math.max(0, Math.min(a.y2,b.y2)-Math.max(a.y1,b.y1));
-      const inter = ix * iy;
-      const area = Math.max(1, Math.min((a.x2-a.x1)*(a.y2-a.y1),(b.x2-b.x1)*(b.y2-b.y1)));
-      return inter / area;
-    };
-    const regionForBox = (box) => {
-      let best = null, bestScore = 0;
-      for (const item of regions) {
-        const rb = boxOf(item);
-        if (!rb) continue;
-        const score = boxOverlapRatio(box, rb);
-        if (score > bestScore) { bestScore = score; best = item; }
-      }
-      return bestScore >= 0.45 ? best : null;
-    };
-    const isFieldLabelBox = (box) => {
-      const item = regionForBox(box);
-      return !!item && rfLooksLikeFieldLabelText(item.text);
-    };
-
-    // V11 STRICT VALUE ROI GATE:
-    // A red annotation is allowed only when the OCR region under the box is a
-    // real semantic VALUE for the named field. A non-label box is not enough;
-    // e.g. a nearby bank name/amount/ID must also have the expected value kind.
-    const expectedKindForAnnotationField = (fieldText='') => {
-      const raw = String(fieldText || '').trim();
-      if (!raw) return null;
-      try {
-        const rule = referenceFieldRuleForText(raw);
-        if (rule) {
-          const fakeLabel = { rule, labelText: raw, text: raw };
-          return rfExpectedValueKind(fakeLabel);
-        }
-      } catch {}
-      const t = normalizeFieldTextForMatch(raw);
-      if (/IBAN|HESAP NO/.test(t)) return 'iban';
-      if (/TUTAR|ÜCRET|UCRET|MASRAF|KOMISYON|KOMİSYON/.test(t)) return 'amount';
-      if (/TARIH|TARİH|DATE/.test(t)) return 'date';
-      if (/SAAT|TIME/.test(t)) return 'time';
-      if (/SORG|ISLEM NO|İŞLEM NO|FIS NO|FİŞ NO|REFERANS NO/.test(t)) return 'numeric-id';
-      if (/AD SOYAD|UNVAN|BANKA|ADRES|AÇIKLAMA|ACIKLAMA|ŞUBE|SUBE|TÜRÜ|TURU/.test(t)) return 'text';
-      return null;
-    };
-
-    const isValidValueBox = (box, fieldText='') => {
-      if (!box || isFieldLabelBox(box)) return false;
-      const item = regionForBox(box);
-      if (!item) return false;
-      const text = String(item.text || '').trim();
-      if (!text || rfLooksLikeFieldLabelText(text)) return false;
-      const expected = expectedKindForAnnotationField(fieldText);
-      const actual = rfValueKind(text);
-      if (expected && !rfValueKindCompatible(expected, actual)) return false;
-      return true;
-    };
-
-    const valueBoxForAnnotationRow = (row, fallbackLabelText='') => {
-      const fieldText = String(row?.field || fallbackLabelText || '').replace(/:value$/i,'').trim();
-      const explicit = boxOf(row?.targetValueBox);
-      if (explicit && isValidValueBox(explicit, fieldText)) return explicit;
-      const labelText = String(row?.targetLabelText || row?.labelText || fallbackLabelText || '').trim();
-      if (labelText) {
-        const labelBox = findExactLabelRegion(labelText);
-        const found = findValueNearLabel(labelBox, labelText);
-        if (found && isValidValueBox(found, fieldText || labelText)) return found;
-      }
-      return null;
     };
 
     const regionTextScore = (text, query) => {
@@ -16970,16 +16770,8 @@ async function buildAnnotatedReferenceDifferenceImage({
 
     // 1) Exact target boxes emitted by local forensic comparison.
     if (!useFinalAdjudicationOnly) for (const row of (referenceLocalCrop?.findings || [])) {
-      // V11: local-render alone is not enough for a user-facing red box. Require
-      // both local style AND character excess, or an explicitly corroborated
-      // targetValueBox from the comparator. Never fall back to targetBox here.
-      const localStyle = Number(row?.localStyleExcess);
-      const localChar = Number(row?.localCharacterExcess);
-      const localBothStrong = Number.isFinite(localStyle) && Number.isFinite(localChar) &&
-        localStyle >= 0.18 && localChar >= 0.16;
-      if (!localBothStrong) continue;
-      const b = valueBoxForAnnotationRow(row, row?.field || '');
-      if (!b || !isValidValueBox(b, row?.field || '')) continue;
+      const b = boxOf(row?.targetBox);
+      if (!b) continue;
       const key = `local|${row.field||''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
@@ -17014,15 +16806,21 @@ async function buildAnnotatedReferenceDifferenceImage({
     // new reference-difference core. Raw characterFindings are diagnostics and
     // must not create stale/unreported red boxes.
     if (!useFinalAdjudicationOnly) for (const row of ((humanReport?.findings || []).filter(x =>
-      x?.category === 'typography') || [])) {
-      const field = String(row?.field || '').replace(/:value$/i,'');
-      // Typography evidence must point to a VALUE ROI. If an older finding
-      // carries the label in targetBox, recover the value from targetValueBox or
-      // semantic OCR; never preserve the label box just because it exists.
-      const b = valueBoxForAnnotationRow(row, field);
-      if (!b || !isValidValueBox(b, field)) continue;
+      x?.category === 'typography' && x?.targetBox) || [])) {
+      let b = boxOf(row?.targetBox);
 
-      const key = `tp-value-v46|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      if (!b) {
+        const labelText = row?.targetLabelText || row?.labelText || '';
+        const labelBox = findExactLabelRegion(labelText);
+        b = findValueNearLabel(labelBox,labelText);
+      }
+
+      // V25: NEVER fall back to the label itself. If the value ROI cannot be
+      // located, omit the annotation rather than pointing at the wrong place.
+      if (!b) continue;
+
+      const field = String(row?.field || '').replace(/:value$/i,'');
+      const key = `tp-value-v45|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
       boxes.push({
@@ -17036,8 +16834,8 @@ async function buildAnnotatedReferenceDifferenceImage({
     // by the field-level Terra inspection. This is the only AI annotation source.
     if (useV29ConfirmedFindings) {
       for (const row of (finalAdjudication?.findings || []).slice(0,8)) {
-        const b = valueBoxForAnnotationRow(row, row?.field || '');
-        if (!b || !isValidValueBox(b, row?.field || '')) continue;
+        const b = boxOf(row?.targetBox);
+        if (!b) continue;
         const key = `terra-v29|${row?.field || ''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
         if (seenBox.has(key)) continue;
         seenBox.add(key);
@@ -17061,7 +16859,7 @@ async function buildAnnotatedReferenceDifferenceImage({
         if (!label) continue;
         const labelBox = findExactLabelRegion(label);
         const valueBox = findValueNearLabel(labelBox, label);
-        const b = valueBox && isValidValueBox(valueBox, label) ? valueBox : null;
+        const b = valueBox || labelBox;
         if (!b) continue;
         const key = `terra|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
         if (seenBox.has(key)) continue;
@@ -17070,17 +16868,24 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 6) V11: do NOT use generic human-report titles as an annotation source.
-    // The merged report also contains layout/content summaries that do not have
-    // an evidence-linked value ROI. Those summaries are useful as text, but they
-    // must never become red boxes. User-facing boxes come only from the strict
-    // value-linked sources above (local/typography/Terra).
+    // 6) V44 human-report findings. If a deterministic finding has an exact
+    // targetBox use it; otherwise resolve the semantic title against OCR.
+    // This is the fallback that V43 deliberately disabled and is what allows
+    // proven forensic differences to be shown even when Terra returns zero.
+    for (const row of (humanReport?.findings || []).slice(0,12)) {
+      let b = boxOf(row?.targetBox);
+      const label = String(row?.title || '').trim();
+      if (!b && label) {
+        const labelBox = findExactLabelRegion(label);
+        b = findValueNearLabel(labelBox, label) || labelBox;
+      }
+      if (!b) continue;
+      const key = `human|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      if (seenBox.has(key)) continue;
+      seenBox.add(key);
+      boxes.push({box:b,label:label || 'referans farkı',source:'deterministic-reference'});
+    }
 
-    console.log('ANNOTATION STRICT VALUE GATE V11:', JSON.stringify({
-      candidateBoxCount: boxes.length,
-      gapMarkerCount: gapMarkers.length,
-      droppedLabelOrInvalidValueBoxes: true
-    }));
     if (!boxes.length && !gapMarkers.length) return null;
 
     const sw = Math.max(3, Math.round(Math.min(W,H)*0.004));
@@ -17123,7 +16928,7 @@ async function buildAnnotatedReferenceDifferenceImage({
       gaps:gapMarkers.slice(0,8)
     };
   } catch (error) {
-    console.warn('REFERENCE DIFFERENCE ANNOTATOR V11 HATASI:', error?.message || error);
+    console.warn('REFERENCE DIFFERENCE ANNOTATOR V25 HATASI:', error?.message || error);
     return null;
   }
 }
