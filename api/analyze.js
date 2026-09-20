@@ -12735,12 +12735,55 @@ if (type !== "video" && type !== "statement") {
 // =====================================================
 // PAIRED VISUAL REFERENCE HELPER
 // =====================================================
-function getVisualReferencePath(reference) {
-  if (Array.isArray(reference?.visualReferencePaths) && reference.visualReferencePaths.length) {
-    return reference.visualReferencePaths;
+function normalizeReferencePath(value) {
+  // Some older deployments may have accidentally stored the visual reference
+  // as an array. Never let that array reach Node path.* APIs.
+  if (Array.isArray(value)) {
+    const first = value.find((item) => typeof item === "string" && item.trim());
+    return first ? first.trim() : null;
   }
-  return reference?.visualReferencePath || reference?.path || null;
+  return (typeof value === "string" && value.trim()) ? value.trim() : null;
 }
+
+function getVisualReferencePaths(reference) {
+  const multi = Array.isArray(reference?.visualReferencePaths)
+    ? reference.visualReferencePaths
+        .map(normalizeReferencePath)
+        .filter(Boolean)
+    : [];
+
+  if (multi.length) return [...new Set(multi)];
+
+  const single = normalizeReferencePath(reference?.visualReferencePath);
+  if (single) return [single];
+
+  const fallback = normalizeReferencePath(reference?.path);
+  return fallback ? [fallback] : [];
+}
+
+// Backward-compatible helper for engines that require ONE string path.
+// IMPORTANT: this function can ONLY return a string or null.
+// Multi-reference engines must use getVisualReferencePaths(reference).
+function getSingleVisualReferencePath(reference) {
+  // HARD GUARANTEE: callers of this helper receive ONLY a string or null.
+  // Never return reference.visualReferencePaths directly.
+  const raw = reference?.visualReferencePath ?? reference?.path ?? null;
+  if (typeof raw === "string" && raw.trim()) return raw.trim();
+
+  if (Array.isArray(raw)) {
+    const first = raw.find((item) => typeof item === "string" && item.trim());
+    return first ? first.trim() : null;
+  }
+
+  const multi = Array.isArray(reference?.visualReferencePaths)
+    ? reference.visualReferencePaths
+    : [];
+  const first = multi.find((item) => typeof item === "string" && item.trim());
+  return first ? first.trim() : null;
+}
+
+// Deployment marker for the format/path hardening patch.
+console.log("VERIFYDOC PATH HARDENING V3: ACTIVE");
 
 // =====================================================
 // PDF FONT FORENSICS + DETERMINISTIC REFERENCE FORENSICS
@@ -12772,7 +12815,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePath(reference)
+      getVisualReferencePaths(reference)
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
@@ -12789,8 +12832,10 @@ console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidat
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
 console.log("REFERENCE FORMAT:", reference?.referenceFormat || activeReferenceFormat || "AUTO");
 console.log("REFERENCE STRUCTURAL PDF:", reference?.path && path.extname(reference.path).toLowerCase() === '.pdf' ? path.basename(reference.path) : "YOK");
-console.log("REFERENCE VISUAL IMAGE:", reference?.visualReferencePath ? path.basename(reference.visualReferencePath) : "YOK");
-console.log("REFERENCE VISUAL IMAGES:", JSON.stringify((reference?.visualReferencePaths || []).map(p => path.basename(p))));
+const visualReferencePathForLog = getSingleVisualReferencePath(reference);
+const visualReferencePathsForLog = getVisualReferencePaths(reference);
+console.log("REFERENCE VISUAL IMAGE:", visualReferencePathForLog ? path.basename(visualReferencePathForLog) : "YOK");
+console.log("REFERENCE VISUAL IMAGES:", JSON.stringify(visualReferencePathsForLog.map(p => path.basename(p))));
 
 // Known-negative sample comparison is advisory. It never replaces the
 // trusted reference engine and does not by itself declare a document fake.
@@ -12838,7 +12883,7 @@ prepTasks.push((async () => {
       const arg = await runAzureReferenceGeometryComparison(
         al,
         bank,
-        getVisualReferencePath(reference)
+        getSingleVisualReferencePath(reference)
       );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
@@ -13381,7 +13426,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePath(reference)
+      getSingleVisualReferencePath(reference)
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
@@ -13451,7 +13496,7 @@ console.log("REFERENCE VISUAL GATE V67:", JSON.stringify({
 
 if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunReferenceVisualAdjudicator) {
   try {
-    const visualReference = getVisualReferencePath(reference);
+    const visualReference = getSingleVisualReferencePath(reference);
     const visualReferenceInfo = visualReference
       ? {
           ...reference,
@@ -13473,7 +13518,10 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunRefere
     available:true,
     skipped:true,
     engine:"gpt-5.6-terra-focused-zones-v43",
-    referenceFile:path.basename(getVisualReferencePath(reference)),
+    referenceFile:(() => {
+      const safePath = getSingleVisualReferencePath(reference);
+      return safePath ? path.basename(safePath) : null;
+    })(),
     findingCount:0,
     findings:[],
     zonesChecked:[],
@@ -13489,8 +13537,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunRefere
 // =====================================================
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
-    const visualReferencePath = getVisualReferencePath(reference);
-    const trustedReferencePaths = visualReferencePath ? [visualReferencePath] : [];
+    const trustedReferencePaths = getVisualReferencePaths(reference);
     pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
