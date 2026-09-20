@@ -16761,7 +16761,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 }
 
 // =====================================================
-// REFERENCE DIFFERENCE ANNOTATOR v1
+// REFERENCE DIFFERENCE ANNOTATOR v11
 // =====================================================
 // Amaç: Kullanıcıya bildirilen somut referans farklarını hedef dekont
 // üzerinde yaklaşık konumlarıyla göstermek. Bu katman karar üretmez;
@@ -16825,7 +16825,7 @@ async function buildAnnotatedReferenceDifferenceImage({
       return b.x2 > b.x1 && b.y2 > b.y1 ? b : null;
     };
 
-    // V10: Never trust an annotation box merely because it was emitted by an
+    // V11: Never trust an annotation box merely because it was emitted by an
     // older evidence layer. If the box overlaps an OCR field label, it is not
     // a valid fraud ROI for typography/local-render evidence. We either recover
     // the actual value ROI or drop the annotation.
@@ -16851,14 +16851,52 @@ async function buildAnnotatedReferenceDifferenceImage({
       const item = regionForBox(box);
       return !!item && rfLooksLikeFieldLabelText(item.text);
     };
+
+    // V11 STRICT VALUE ROI GATE:
+    // A red annotation is allowed only when the OCR region under the box is a
+    // real semantic VALUE for the named field. A non-label box is not enough;
+    // e.g. a nearby bank name/amount/ID must also have the expected value kind.
+    const expectedKindForAnnotationField = (fieldText='') => {
+      const raw = String(fieldText || '').trim();
+      if (!raw) return null;
+      try {
+        const rule = referenceFieldRuleForText(raw);
+        if (rule) {
+          const fakeLabel = { rule, labelText: raw, text: raw };
+          return rfExpectedValueKind(fakeLabel);
+        }
+      } catch {}
+      const t = normalizeFieldTextForMatch(raw);
+      if (/IBAN|HESAP NO/.test(t)) return 'iban';
+      if (/TUTAR|ÜCRET|UCRET|MASRAF|KOMISYON|KOMİSYON/.test(t)) return 'amount';
+      if (/TARIH|TARİH|DATE/.test(t)) return 'date';
+      if (/SAAT|TIME/.test(t)) return 'time';
+      if (/SORG|ISLEM NO|İŞLEM NO|FIS NO|FİŞ NO|REFERANS NO/.test(t)) return 'numeric-id';
+      if (/AD SOYAD|UNVAN|BANKA|ADRES|AÇIKLAMA|ACIKLAMA|ŞUBE|SUBE|TÜRÜ|TURU/.test(t)) return 'text';
+      return null;
+    };
+
+    const isValidValueBox = (box, fieldText='') => {
+      if (!box || isFieldLabelBox(box)) return false;
+      const item = regionForBox(box);
+      if (!item) return false;
+      const text = String(item.text || '').trim();
+      if (!text || rfLooksLikeFieldLabelText(text)) return false;
+      const expected = expectedKindForAnnotationField(fieldText);
+      const actual = rfValueKind(text);
+      if (expected && !rfValueKindCompatible(expected, actual)) return false;
+      return true;
+    };
+
     const valueBoxForAnnotationRow = (row, fallbackLabelText='') => {
+      const fieldText = String(row?.field || fallbackLabelText || '').replace(/:value$/i,'').trim();
       const explicit = boxOf(row?.targetValueBox);
-      if (explicit && !isFieldLabelBox(explicit)) return explicit;
+      if (explicit && isValidValueBox(explicit, fieldText)) return explicit;
       const labelText = String(row?.targetLabelText || row?.labelText || fallbackLabelText || '').trim();
       if (labelText) {
         const labelBox = findExactLabelRegion(labelText);
         const found = findValueNearLabel(labelBox, labelText);
-        if (found && !isFieldLabelBox(found)) return found;
+        if (found && isValidValueBox(found, fieldText || labelText)) return found;
       }
       return null;
     };
@@ -16932,13 +16970,16 @@ async function buildAnnotatedReferenceDifferenceImage({
 
     // 1) Exact target boxes emitted by local forensic comparison.
     if (!useFinalAdjudicationOnly) for (const row of (referenceLocalCrop?.findings || [])) {
-      let b = boxOf(row?.targetValueBox);
-      const rawTarget = boxOf(row?.targetBox);
-      if (!b && rawTarget && !isFieldLabelBox(rawTarget)) b = rawTarget;
-      if (!b) b = valueBoxForAnnotationRow(row, row?.field || '');
-      // V10: local-render findings may come from older engines that stored the
-      // label ROI in targetBox. Do not draw a red box on the label.
-      if (!b || isFieldLabelBox(b)) continue;
+      // V11: local-render alone is not enough for a user-facing red box. Require
+      // both local style AND character excess, or an explicitly corroborated
+      // targetValueBox from the comparator. Never fall back to targetBox here.
+      const localStyle = Number(row?.localStyleExcess);
+      const localChar = Number(row?.localCharacterExcess);
+      const localBothStrong = Number.isFinite(localStyle) && Number.isFinite(localChar) &&
+        localStyle >= 0.18 && localChar >= 0.16;
+      if (!localBothStrong) continue;
+      const b = valueBoxForAnnotationRow(row, row?.field || '');
+      if (!b || !isValidValueBox(b, row?.field || '')) continue;
       const key = `local|${row.field||''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
@@ -16978,12 +17019,8 @@ async function buildAnnotatedReferenceDifferenceImage({
       // Typography evidence must point to a VALUE ROI. If an older finding
       // carries the label in targetBox, recover the value from targetValueBox or
       // semantic OCR; never preserve the label box just because it exists.
-      let b = valueBoxForAnnotationRow(row, field);
-      if (!b) {
-        const raw = boxOf(row?.targetBox);
-        if (raw && !isFieldLabelBox(raw)) b = raw;
-      }
-      if (!b || isFieldLabelBox(b)) continue;
+      const b = valueBoxForAnnotationRow(row, field);
+      if (!b || !isValidValueBox(b, field)) continue;
 
       const key = `tp-value-v46|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
@@ -16999,10 +17036,8 @@ async function buildAnnotatedReferenceDifferenceImage({
     // by the field-level Terra inspection. This is the only AI annotation source.
     if (useV29ConfirmedFindings) {
       for (const row of (finalAdjudication?.findings || []).slice(0,8)) {
-        let b = valueBoxForAnnotationRow(row, row?.field || '');
-        const raw = boxOf(row?.targetBox);
-        if (!b && raw && !isFieldLabelBox(raw)) b = raw;
-        if (!b || isFieldLabelBox(b)) continue;
+        const b = valueBoxForAnnotationRow(row, row?.field || '');
+        if (!b || !isValidValueBox(b, row?.field || '')) continue;
         const key = `terra-v29|${row?.field || ''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
         if (seenBox.has(key)) continue;
         seenBox.add(key);
@@ -17026,7 +17061,7 @@ async function buildAnnotatedReferenceDifferenceImage({
         if (!label) continue;
         const labelBox = findExactLabelRegion(label);
         const valueBox = findValueNearLabel(labelBox, label);
-        const b = valueBox || labelBox;
+        const b = valueBox && isValidValueBox(valueBox, label) ? valueBox : null;
         if (!b) continue;
         const key = `terra|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
         if (seenBox.has(key)) continue;
@@ -17035,24 +17070,17 @@ async function buildAnnotatedReferenceDifferenceImage({
       }
     }
 
-    // 6) V44 human-report findings. If a deterministic finding has an exact
-    // targetBox use it; otherwise resolve the semantic title against OCR.
-    // This is the fallback that V43 deliberately disabled and is what allows
-    // proven forensic differences to be shown even when Terra returns zero.
-    for (const row of (humanReport?.findings || []).slice(0,12)) {
-      let b = boxOf(row?.targetBox);
-      const label = String(row?.title || '').trim();
-      if (!b && label) {
-        const labelBox = findExactLabelRegion(label);
-        b = findValueNearLabel(labelBox, label) || labelBox;
-      }
-      if (!b) continue;
-      const key = `human|${label}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
-      if (seenBox.has(key)) continue;
-      seenBox.add(key);
-      boxes.push({box:b,label:label || 'referans farkı',source:'deterministic-reference'});
-    }
+    // 6) V11: do NOT use generic human-report titles as an annotation source.
+    // The merged report also contains layout/content summaries that do not have
+    // an evidence-linked value ROI. Those summaries are useful as text, but they
+    // must never become red boxes. User-facing boxes come only from the strict
+    // value-linked sources above (local/typography/Terra).
 
+    console.log('ANNOTATION STRICT VALUE GATE V11:', JSON.stringify({
+      candidateBoxCount: boxes.length,
+      gapMarkerCount: gapMarkers.length,
+      droppedLabelOrInvalidValueBoxes: true
+    }));
     if (!boxes.length && !gapMarkers.length) return null;
 
     const sw = Math.max(3, Math.round(Math.min(W,H)*0.004));
@@ -17095,7 +17123,7 @@ async function buildAnnotatedReferenceDifferenceImage({
       gaps:gapMarkers.slice(0,8)
     };
   } catch (error) {
-    console.warn('REFERENCE DIFFERENCE ANNOTATOR V25 HATASI:', error?.message || error);
+    console.warn('REFERENCE DIFFERENCE ANNOTATOR V11 HATASI:', error?.message || error);
     return null;
   }
 }
