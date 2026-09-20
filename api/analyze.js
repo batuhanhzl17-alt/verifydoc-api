@@ -5271,6 +5271,30 @@ function rfValueKindCompatible(expected, actual) {
   return false;
 }
 
+// A nearby OCR region can itself be another FIELD LABEL (e.g. MASRAF TUTARI,
+// ALICI AD SOYAD/UNVAN). Treating that label as the value of ALICI BANKA was
+// one of the main false-positive paths in the previous typography run.
+function rfLooksLikeFieldLabelText(text) {
+  const raw = String(text || '').trim();
+  if (!raw || raw.length > 70) return false;
+  const normalized = normalizeFieldTextForMatch(raw).replace(/[:：]/g, '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+
+  const known = referenceFieldRuleForText(raw);
+  if (!known) return false;
+
+  // Labels in this bank template are predominantly uppercase and/or contain
+  // label punctuation. Do not reject normal title-case values such as
+  // "Türkiye Garanti Bankası A.Ş." merely because the word BANKA occurs.
+  const letters = raw.match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g) || [];
+  const upper = raw.match(/[A-ZÇĞİÖŞÜ]/g) || [];
+  const upperRatio = letters.length ? upper.length / letters.length : 0;
+  const hasSlash = /\//.test(raw);
+  const hasColon = /[:：]/.test(raw);
+  const looksLabelShape = upperRatio >= 0.72 || hasSlash || hasColon;
+  return looksLabelShape;
+}
+
 function rfFindValueRegion(regions, label) {
   if (!label?.region) return null;
   // OCR frequently returns `LABEL : VALUE` as one region. In that case the
@@ -5288,6 +5312,10 @@ function rfFindValueRegion(regions, label) {
       const actualKind = rfValueKind(v.text);
       // A known field type must never consume a clearly incompatible value.
       if (expectedKind && !rfValueKindCompatible(expectedKind, actualKind)) return null;
+      // For text-valued fields, a nearby OCR label is NOT a valid value. This
+      // prevents pairs such as ALICI BANKA -> MASRAF TUTARI or
+      // MASRAF TUTARI -> ALICI AD SOYAD/UNVAN.
+      if (expectedKind === 'text' && rfLooksLikeFieldLabelText(v.text)) return null;
       const r = v.region;
       const vertical = Math.min(lr.y2, r.y2) - Math.max(lr.y1, r.y1);
       const rightGap = r.x1 - lr.x2;
@@ -7516,7 +7544,24 @@ async function getReferenceFiles(bank) {
     files.push(canonical);
   }
 
-  const uniqueFiles = [...new Set(files)].filter(p => !isStatementReferencePath(p));
+  let uniqueFiles = [...new Set(files)].filter(p => !isStatementReferencePath(p));
+
+  // Telegram-delivered references are the cleanest apples-to-apples baseline
+  // for Telegram JPG targets. If at least one bank-specific Telegram reference
+  // exists, keep that family together and do not mix older high-quality JPGs
+  // into the same visual/typography ensemble.
+  if (requestedFormat === 'jpg') {
+    const telegramFiles = uniqueFiles.filter(p => /telegram/i.test(path.basename(p)));
+    if (telegramFiles.length) {
+      uniqueFiles = telegramFiles;
+      console.log('REFERENCE TELEGRAM JPG PRIORITY V8:', JSON.stringify({
+        selected: telegramFiles.map(p => path.basename(p)),
+        ignoredSameFormatReferences: files
+          .filter(p => !telegramFiles.includes(p))
+          .map(p => path.basename(p))
+      }));
+    }
+  }
 
   // Hedefin işlem ailesi belirlendiyse diğer aileyi referans karşılaştırmasına
   // sokma. Böylece HVL dekontu EFT/FAST referansıyla karıştırılmaz.
