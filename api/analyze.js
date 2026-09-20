@@ -13535,11 +13535,17 @@ console.log("REFERENCE VISUAL GATE V67:", JSON.stringify({
 if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunReferenceVisualAdjudicator) {
   try {
     const visualReference = getVisualReferencePath(reference);
-    const visualReferenceInfo = visualReference
+    // getVisualReferencePath may return the same-format reference ensemble.
+    // This direct visual engine is single-reference, so use the first verified
+    // visual reference instead of ever passing an array into path.basename/path APIs.
+    const visualReferenceForEngine = Array.isArray(visualReference)
+      ? visualReference[0]
+      : visualReference;
+    const visualReferenceInfo = visualReferenceForEngine
       ? {
           ...reference,
-          path: visualReference,
-          fileName: path.basename(visualReference),
+          path: visualReferenceForEngine,
+          fileName: path.basename(visualReferenceForEngine),
           base64: null,
         }
       : reference;
@@ -13556,7 +13562,11 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunRefere
     available:true,
     skipped:true,
     engine:"gpt-5.6-terra-focused-zones-v43",
-    referenceFile:path.basename(getVisualReferencePath(reference)),
+    referenceFile:(() => {
+      const visualReference = getVisualReferencePath(reference);
+      const firstVisualReference = Array.isArray(visualReference) ? visualReference[0] : visualReference;
+      return firstVisualReference ? path.basename(firstVisualReference) : null;
+    })(),
     findingCount:0,
     findings:[],
     zonesChecked:[],
