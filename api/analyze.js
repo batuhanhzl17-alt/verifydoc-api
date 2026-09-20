@@ -15623,22 +15623,30 @@ async function runEvidenceLinkedVisualAdjudicator({
     return best;
   };
 
-  const findSemanticValue = (labelBox) => {
+  const findSemanticValue = (labelBox, labelText='') => {
     if (!labelBox) return null;
     const lc = (labelBox.y1 + labelBox.y2) / 2;
     const lh = Math.max(4, labelBox.y2 - labelBox.y1);
+    const expectedKind = rfExpectedValueKind({ labelText, text: labelText, rule: { key: '' } });
     const choices = [];
     for (const item of ocrRegions) {
       const b = ocrBox(item); if (!b) continue;
       const text = String(item.text || '').trim(); if (!text) continue;
+      const actualKind = rfValueKind(text);
+      // V10: Terra/local-render candidates must also obey the same semantic
+      // field->value contract as the typography engine. Never let a nearby
+      // label, amount, IBAN or ID become the value ROI for another field.
+      if (expectedKind && !rfValueKindCompatible(expectedKind, actualKind)) continue;
+      if (rfLooksLikeFieldLabelText(text)) continue;
       const yc = (b.y1 + b.y2) / 2;
       const sameRow = Math.abs(yc - lc) <= Math.max(14, lh * 2.0);
       if (!sameRow || b.x1 < labelBox.x2 - Math.max(4, lh * 0.5)) continue;
       const gap = Math.max(0, b.x1 - labelBox.x2);
       if (gap > Math.max(520, tw * 0.60)) continue;
       const valueLike = /[0-9A-Za-zÇĞİÖŞÜçğıöşü]/.test(text);
-      const score = (valueLike ? 300 : 0) - gap * 0.4 + Math.min(120, text.length * 2);
-      choices.push({item, box:b, score});
+      const semanticBonus = expectedKind === actualKind ? 420 : 0;
+      const score = semanticBonus + (valueLike ? 300 : 0) - gap * 0.4 + Math.min(120, text.length * 2);
+      choices.push({item, box:b, score, actualKind});
     }
     choices.sort((a,b)=>b.score-a.score);
     return choices[0] || null;
@@ -15657,7 +15665,7 @@ async function runEvidenceLinkedVisualAdjudicator({
       const label = String(f?.targetLabel || f?.referenceLabel || '').trim();
       const lm = findSemanticLabel(label);
       if (!lm) continue;
-      const vm = findSemanticValue(lm.box);
+      const vm = findSemanticValue(lm.box, label);
       // Value ROI is required for typography/local-render adjudication. If OCR
       // cannot localize it, do not invent coordinates from the label.
       if (!vm?.box) continue;
@@ -16817,6 +16825,44 @@ async function buildAnnotatedReferenceDifferenceImage({
       return b.x2 > b.x1 && b.y2 > b.y1 ? b : null;
     };
 
+    // V10: Never trust an annotation box merely because it was emitted by an
+    // older evidence layer. If the box overlaps an OCR field label, it is not
+    // a valid fraud ROI for typography/local-render evidence. We either recover
+    // the actual value ROI or drop the annotation.
+    const boxOverlapRatio = (a,b) => {
+      if (!a || !b) return 0;
+      const ix = Math.max(0, Math.min(a.x2,b.x2)-Math.max(a.x1,b.x1));
+      const iy = Math.max(0, Math.min(a.y2,b.y2)-Math.max(a.y1,b.y1));
+      const inter = ix * iy;
+      const area = Math.max(1, Math.min((a.x2-a.x1)*(a.y2-a.y1),(b.x2-b.x1)*(b.y2-b.y1)));
+      return inter / area;
+    };
+    const regionForBox = (box) => {
+      let best = null, bestScore = 0;
+      for (const item of regions) {
+        const rb = boxOf(item);
+        if (!rb) continue;
+        const score = boxOverlapRatio(box, rb);
+        if (score > bestScore) { bestScore = score; best = item; }
+      }
+      return bestScore >= 0.45 ? best : null;
+    };
+    const isFieldLabelBox = (box) => {
+      const item = regionForBox(box);
+      return !!item && rfLooksLikeFieldLabelText(item.text);
+    };
+    const valueBoxForAnnotationRow = (row, fallbackLabelText='') => {
+      const explicit = boxOf(row?.targetValueBox);
+      if (explicit && !isFieldLabelBox(explicit)) return explicit;
+      const labelText = String(row?.targetLabelText || row?.labelText || fallbackLabelText || '').trim();
+      if (labelText) {
+        const labelBox = findExactLabelRegion(labelText);
+        const found = findValueNearLabel(labelBox, labelText);
+        if (found && !isFieldLabelBox(found)) return found;
+      }
+      return null;
+    };
+
     const regionTextScore = (text, query) => {
       const a = norm(text), b = norm(query);
       if (!a || !b) return 0;
@@ -16886,8 +16932,13 @@ async function buildAnnotatedReferenceDifferenceImage({
 
     // 1) Exact target boxes emitted by local forensic comparison.
     if (!useFinalAdjudicationOnly) for (const row of (referenceLocalCrop?.findings || [])) {
-      const b = boxOf(row?.targetBox);
-      if (!b) continue;
+      let b = boxOf(row?.targetValueBox);
+      const rawTarget = boxOf(row?.targetBox);
+      if (!b && rawTarget && !isFieldLabelBox(rawTarget)) b = rawTarget;
+      if (!b) b = valueBoxForAnnotationRow(row, row?.field || '');
+      // V10: local-render findings may come from older engines that stored the
+      // label ROI in targetBox. Do not draw a red box on the label.
+      if (!b || isFieldLabelBox(b)) continue;
       const key = `local|${row.field||''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
@@ -16922,21 +16973,19 @@ async function buildAnnotatedReferenceDifferenceImage({
     // new reference-difference core. Raw characterFindings are diagnostics and
     // must not create stale/unreported red boxes.
     if (!useFinalAdjudicationOnly) for (const row of ((humanReport?.findings || []).filter(x =>
-      x?.category === 'typography' && x?.targetBox) || [])) {
-      let b = boxOf(row?.targetBox);
-
-      if (!b) {
-        const labelText = row?.targetLabelText || row?.labelText || '';
-        const labelBox = findExactLabelRegion(labelText);
-        b = findValueNearLabel(labelBox,labelText);
-      }
-
-      // V25: NEVER fall back to the label itself. If the value ROI cannot be
-      // located, omit the annotation rather than pointing at the wrong place.
-      if (!b) continue;
-
+      x?.category === 'typography') || [])) {
       const field = String(row?.field || '').replace(/:value$/i,'');
-      const key = `tp-value-v45|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
+      // Typography evidence must point to a VALUE ROI. If an older finding
+      // carries the label in targetBox, recover the value from targetValueBox or
+      // semantic OCR; never preserve the label box just because it exists.
+      let b = valueBoxForAnnotationRow(row, field);
+      if (!b) {
+        const raw = boxOf(row?.targetBox);
+        if (raw && !isFieldLabelBox(raw)) b = raw;
+      }
+      if (!b || isFieldLabelBox(b)) continue;
+
+      const key = `tp-value-v46|${field}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
       if (seenBox.has(key)) continue;
       seenBox.add(key);
       boxes.push({
@@ -16950,8 +16999,10 @@ async function buildAnnotatedReferenceDifferenceImage({
     // by the field-level Terra inspection. This is the only AI annotation source.
     if (useV29ConfirmedFindings) {
       for (const row of (finalAdjudication?.findings || []).slice(0,8)) {
-        const b = boxOf(row?.targetBox);
-        if (!b) continue;
+        let b = valueBoxForAnnotationRow(row, row?.field || '');
+        const raw = boxOf(row?.targetBox);
+        if (!b && raw && !isFieldLabelBox(raw)) b = raw;
+        if (!b || isFieldLabelBox(b)) continue;
         const key = `terra-v29|${row?.field || ''}|${b.x1}|${b.y1}|${b.x2}|${b.y2}`;
         if (seenBox.has(key)) continue;
         seenBox.add(key);
