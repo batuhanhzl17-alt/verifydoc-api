@@ -2225,33 +2225,12 @@ totalWeight
 // RİSK ETİKETİ
 // =====================================================
 
-function getRiskLabel(
-score
-) {
-
-if (
-score <= 20
-) {
-return "LOW RISK"
-
-}
-
-if (
-score <= 45
-) {
-
-return "MODERATE RISK"
-
-}
-
-if (
-score <= 70
-) {
-return "HIGH RISK"
-}
-
-return "VERY HIGH RISK"
-
+function getRiskLabel(score) {
+  const n = Math.max(0, Math.min(100, Number(score) || 0));
+  if (n >= 85) return "VERY HIGH RISK";
+  if (n >= 60) return "HIGH RISK";
+  if (n >= 46) return "MODERATE RISK";
+  return "LOW RISK";
 }
 
 
@@ -14874,13 +14853,15 @@ if (openSourceForensics) {
   // Only strong, localized findings can enter the human-readable report.
   // Generic PDF metadata/signature differences remain diagnostic only.
   const osfRows = [];
-  if (openSourceForensics.copyMove?.severity === "strong") {
+  if (openSourceForensics.copyMove?.severity === "strong" && openSourceForensics.strongCorroboration === true) {
     osfRows.push({
       title: "Lokal kopyalama izi",
-      detail: "Belgede aynı yönde taşınmış ve birden fazla noktada tekrar eden lokal görüntü bölgeleri tespit edildi.",
+      detail: "Belgede aynı yönde taşınmış ve birden fazla noktada tekrar eden lokal görüntü bölgeleri tespit edildi; bağımsız yapısal kanıtla da desteklendi.",
       priority: 2,
       targetBox: openSourceForensics.copyMove.boxes?.[0] || null
     });
+  } else if (openSourceForensics.copyMove?.severity === "strong") {
+    console.log("COPY-MOVE NOT PROMOTED TO USER FINDING: NO STRONG CORROBORATION");
   }
   if (openSourceForensics.pdfStructural?.severity === "strong") {
     osfRows.push({
@@ -17035,28 +17016,35 @@ result
 // Güçlü karakter-düzeyi tutar anomalisi varsa risk motoruna
 // deterministik bir üst sınır uygula. Orta seviye sinyal
 // tek başına skoru değiştirmez.
-if (
-amountForensics?.status === "warning" &&
-amountForensics?.severity === "strong" &&
-result?.checks?.amountConsistency
-) {
-
-result.checks.amountConsistency.status =
-"fail";
-
-result.checks.amountConsistency.score =
-Math.max(
-Number(result.checks.amountConsistency.score) || 0,
-85
+const amountReferenceGuided = Boolean(
+  amountForensics?.referenceGuided === true ||
+  /reference-(?:roi|position)|reference-guided|reference-anchor/i.test(String(amountForensics?.selectionMethod || ""))
 );
 
-result.checks.amountConsistency.evidence =
-[
-result.checks.amountConsistency.evidence,
-amountForensics.evidence,
-]
-.filter(Boolean)
-.join(" ");
+if (
+  amountForensics?.status === "warning" &&
+  amountForensics?.severity === "strong" &&
+  result?.checks?.amountConsistency
+) {
+  if (amountReferenceGuided) {
+    result.checks.amountConsistency.status = "fail";
+    result.checks.amountConsistency.score = Math.max(
+      Number(result.checks.amountConsistency.score) || 0,
+      85
+    );
+    result.checks.amountConsistency.evidence = [
+      result.checks.amountConsistency.evidence,
+      amountForensics.evidence,
+    ].filter(Boolean).join(" ");
+    console.log("AMOUNT FORENSICS PROMOTED TO RISK: REFERENCE-GUIDED");
+  } else {
+    console.log("AMOUNT FORENSICS NOT PROMOTED TO RISK: NO REFERENCE ANCHOR", JSON.stringify({
+      selectionMethod: amountForensics.selectionMethod || null,
+      referenceGuided: amountForensics.referenceGuided ?? false,
+      score: amountForensics.score || 0,
+      severity: amountForensics.severity || null
+    }));
+  }
 }
 
 // Görsel forensics güçlü bir sapma bulduğunda, tek başına değil,
@@ -17218,7 +17206,8 @@ const strongUnifiedReferenceCount = unifiedReferenceFindings.filter((x) =>
 const strongAmountSignal =
   amountForensics?.available === true &&
   amountForensics?.severity === 'strong' &&
-  Number(amountForensics?.score || 0) >= 80;
+  Number(amountForensics?.score || 0) >= 80 &&
+  (amountReferenceGuided || amountForensics?.referenceGuided === true);
 const strongAzureSignal =
   Array.isArray(azureReferenceGeometry?.strongAnomalies) &&
   azureReferenceGeometry.strongAnomalies.some((x) => Number(x?.score) >= 90);
@@ -17263,21 +17252,9 @@ Math.max(
 Math.min(100, finalRiskScore)
 )
 );
-let finalRiskLabel;
-
-if (finalRiskScore >= 85) {
-finalRiskLabel = "VERY HIGH RISK"
-} else if (finalRiskScore >= 60) {
-finalRiskLabel = "HIGH RISK"
-} else if (finalRiskScore >= 46) {
-finalRiskLabel = "MODERATE RISK"
-} else {
-finalRiskLabel = "LOW RISK"
-}
-result.overallRisk =
-finalRiskScore;
-result.riskLabel =
-finalRiskLabel;
+const finalRiskLabel = getRiskLabel(finalRiskScore);
+result.overallRisk = finalRiskScore;
+result.riskLabel = finalRiskLabel;
 
 result.categories =
 finalDeterministicRisk.categories;
