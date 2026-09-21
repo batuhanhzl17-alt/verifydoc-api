@@ -4343,40 +4343,141 @@ count,
 async function getReferenceAmountAnchor(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
-  const cacheKey = `amount-anchor:${normalizedBank}`;
+  const cacheKey = `amount-anchor:v16:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
+  const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
+  const primaryLabelRe = /(?:giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|giden\s*tutar|\btutar\b)/i;
+  const negativeLabelRe = /(?:sorgu|sorgulama|işlem\s*no|islem\s*no|fiş|fis|referans|iban|hesap\s*no|müşteri|musteri|masraf|komisyon|ücret|ucret)/i;
+
+  const median = (values) => {
+    const v = values.filter(Number.isFinite).sort((a,b)=>a-b);
+    if (!v.length) return 0;
+    const m = Math.floor(v.length / 2);
+    return v.length % 2 ? v[m] : (v[m-1] + v[m]) / 2;
+  };
+
   try {
-    const profile = await buildReferenceTemplateProfile(normalizedBank);
-    const amountField = profile?.fields?.amount;
-    if (!amountField) {
+    const referencePaths = (await getReferenceFiles(normalizedBank))
+      .filter(p => /\.(?:jpe?g|png|webp)$/i.test(String(p || '')));
+    if (!referencePaths.length) {
       referenceAmountAnchorCache.set(cacheKey, null);
+      return null;
+    }
+
+    const entries = [];
+    for (const referencePath of referencePaths) {
+      try {
+        const stat = await fs.stat(referencePath);
+        const ocrKey = `ref-image-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
+        let cached = referenceRasterOcrCache.get(ocrKey);
+        let ocr = cached?.ocr || cached || null;
+        let rendered = cached?.rendered || null;
+
+        if (!cached) {
+          const buffer = await fs.readFile(referencePath);
+          const meta = await sharp(buffer).metadata();
+          rendered = { width: Number(meta?.width) || 0, height: Number(meta?.height) || 0 };
+          if (rendered.width && rendered.height) {
+            const tempPath = path.join('/tmp', `verifydoc-anchor-${createHash('sha256').update(ocrKey).digest('hex').slice(0,16)}${path.extname(referencePath).toLowerCase()}`);
+            await fs.writeFile(tempPath, buffer);
+            ocr = await runPaddleOCR(tempPath);
+            try { await fs.unlink(tempPath); } catch {}
+          }
+          referenceRasterOcrCache.set(ocrKey, { ocr: ocr || null, rendered });
+        }
+
+        const width = Number(rendered?.width) || 0;
+        const height = Number(rendered?.height) || 0;
+        const regions = Array.isArray(ocr?.regions)
+          ? ocr.regions.filter(x => x?.region && String(x.text || '').trim()).map(x => ({
+              text: String(x.text || '').trim(),
+              region: {
+                x1: Number(x.region.x1) || 0, y1: Number(x.region.y1) || 0,
+                x2: Number(x.region.x2) || 0, y2: Number(x.region.y2) || 0,
+              }
+            }))
+          : [];
+        if (!width || !height || !regions.length) continue;
+
+        const moneyCandidates = regions.filter(r => moneyRe.test(r.text) && /\d/.test(r.text));
+        if (!moneyCandidates.length) continue;
+
+        const scored = moneyCandidates.map(candidate => {
+          const cr = candidate.region;
+          const ccx = (cr.x1 + cr.x2) / 2;
+          const ccy = (cr.y1 + cr.y2) / 2;
+          let score = 0;
+          let primaryHits = 0;
+          let negativeHits = 0;
+          for (const other of regions) {
+            if (other === candidate) continue;
+            const t = other.text;
+            const or = other.region;
+            const oh = Math.max(8, or.y2 - or.y1);
+            const horizontal = cr.x1 - or.x2;
+            const verticalGap = Math.abs(ccy - ((or.y1 + or.y2) / 2));
+            const near = verticalGap <= Math.max(oh * 1.8, 45) && horizontal >= -oh * 1.0 && horizontal <= Math.max(280, oh * 14);
+            const belowOrAbove = Math.abs(cr.y1 - or.y2) <= Math.max(oh * 2.0, 70) && Math.abs(ccx - ((or.x1 + or.x2) / 2)) <= Math.max(320, oh * 14);
+            if (near || belowOrAbove) {
+              if (primaryLabelRe.test(t)) { score += 120; primaryHits++; }
+              if (negativeLabelRe.test(t)) { score -= 45; negativeHits++; }
+            }
+          }
+          // The main transaction amount is normally in the upper transaction
+          // information block; use this only as a weak tie-breaker.
+          const yNorm = cr.y1 / height;
+          if (yNorm > 0.12 && yNorm < 0.65) score += 8;
+          return { candidate, score, primaryHits, negativeHits };
+        }).sort((a,b) => b.score - a.score);
+
+        const best = scored.find(x => x.primaryHits > 0 && x.negativeHits === 0) || scored[0];
+        if (!best || best.score < 20) continue;
+        const r = best.candidate.region;
+        entries.push({
+          xNorm: r.x1 / width,
+          yNorm: r.y1 / height,
+          widthNorm: Math.max(0.001, (r.x2-r.x1) / width),
+          heightNorm: Math.max(0.001, (r.y2-r.y1) / height),
+          referenceFile: path.basename(referencePath),
+        });
+      } catch (error) {
+        console.warn('REFERENCE AMOUNT ANCHOR DOSYA HATASI:', path.basename(referencePath), error?.message || error);
+      }
+    }
+
+    if (!entries.length) {
+      referenceAmountAnchorCache.set(cacheKey, null);
+      console.warn('REFERENCE AMOUNT ANCHOR V16: UYGUN TUTAR ALANI BULUNAMADI');
       return null;
     }
 
     const anchor = {
       bank: normalizedBank,
-      pageNumber: Number(amountField.pageNumber) || 1,
-      xNorm: Number(amountField.xNorm) || null,
-      yNorm: Number(amountField.yNorm) || null,
-      widthNorm: Number(amountField.widthNorm) || null,
-      heightNorm: Number(amountField.heightNorm) || null,
-      // SECURITY: Referansın gerçek metni/tutarı kesinlikle taşınmaz.
-      // Yalnızca şablon koordinatı kullanılır.
-      referenceCount: Number(amountField.referenceCount) || 1,
-      spread: amountField.spread || null,
-      source: 'trusted-reference-ensemble',
+      pageNumber: 1,
+      xNorm: median(entries.map(x => x.xNorm)),
+      yNorm: median(entries.map(x => x.yNorm)),
+      widthNorm: median(entries.map(x => x.widthNorm)),
+      heightNorm: median(entries.map(x => x.heightNorm)),
+      referenceCount: entries.length,
+      spread: {
+        x: Math.max(...entries.map(x => x.xNorm)) - Math.min(...entries.map(x => x.xNorm)),
+        y: Math.max(...entries.map(x => x.yNorm)) - Math.min(...entries.map(x => x.yNorm)),
+        width: Math.max(...entries.map(x => x.widthNorm)) - Math.min(...entries.map(x => x.widthNorm)),
+        height: Math.max(...entries.map(x => x.heightNorm)) - Math.min(...entries.map(x => x.heightNorm)),
+      },
+      source: 'trusted-telegram-raster-ensemble-v16',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
-    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE (SAFE):', JSON.stringify({
+    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE V16:', JSON.stringify({
       bank: anchor.bank, pageNumber: anchor.pageNumber,
       xNorm: anchor.xNorm, yNorm: anchor.yNorm,
       widthNorm: anchor.widthNorm, heightNorm: anchor.heightNorm,
-      referenceCount: anchor.referenceCount, source: anchor.source
+      referenceCount: anchor.referenceCount, spread: anchor.spread, source: anchor.source
     }));
     return anchor;
   } catch (error) {
-    console.warn('REFERENCE AMOUNT ANCHOR ENSEMBLE HATASI:', normalizedBank, error?.message || error);
+    console.warn('REFERENCE AMOUNT ANCHOR ENSEMBLE V16 HATASI:', normalizedBank, error?.message || error);
     referenceAmountAnchorCache.set(cacheKey, null);
     return null;
   }
@@ -8736,6 +8837,13 @@ try {
 }
 
 const referenceAnchor = await getReferenceAmountAnchor(bank);
+// V16: Raster/Telegram anchor is authoritative for amount geometry when the
+// generic template profile could not expose an amount field. Reuse the same
+// geometry object for the hard selection gate; no reference amount text is retained.
+if (!referenceAmountField && referenceAnchor) {
+  referenceAmountField = { ...referenceAnchor, templateRole: "primaryAmount" };
+  referenceTemplateAvailable = true;
+}
 console.log("AMOUNT TEMPLATE ANCHOR:", JSON.stringify(referenceAnchor ? { bank: referenceAnchor.bank, pageNumber: referenceAnchor.pageNumber, xNorm: referenceAnchor.xNorm, yNorm: referenceAnchor.yNorm, widthNorm: referenceAnchor.widthNorm, heightNorm: referenceAnchor.heightNorm, referenceCount: referenceAnchor.referenceCount, source: referenceAnchor.source } : null));
 console.log("AMOUNT REFERENCE PROFILE AVAILABLE:", referenceTemplateAvailable, "ANCHOR AVAILABLE:", Boolean(referenceAmountField));
 
@@ -13758,7 +13866,9 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunRefere
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
     const visualReferencePath = getVisualReferencePath(reference);
-    const trustedReferencePaths = visualReferencePath ? [visualReferencePath] : [];
+    const trustedReferencePaths = Array.isArray(visualReferencePath)
+      ? visualReferencePath.filter(Boolean)
+      : (visualReferencePath ? [visualReferencePath] : []);
     pixelForensics = await runPixelForensics(forensicTargetPath, trustedReferencePaths);
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
