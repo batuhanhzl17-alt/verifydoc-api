@@ -7562,9 +7562,124 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
   const fields = {};
 
   if (ext !== '.pdf') {
-    // Görsel referanslar OCR olmadan alan koordinatı üretemez; dosyayı yine de
-    // trusted reference setinde tutuyoruz. PDF'ler alan kalibrasyonunun ana kaynağıdır.
-    return { bank: normalizedBank, referenceFile: path.basename(referencePath), fields, fieldCount: 0, referenceType: 'image' };
+    // V15: Telegram JPG/PNG referansları artık amount anchor üretiminin
+    // gerçek kaynağı olabilir. Önceden image referansları burada erken
+    // return ile atlanıyordu; bu nedenle buildReferenceTemplateProfile()
+    // aktif JPG ailesinde amount alanını hiç göremiyor ve
+    // `AMOUNT TEMPLATE ANCHOR: null` üretiyordu.
+    //
+    // Aynı PaddleOCR + normalize koordinat yaklaşımıyla görsel referansı
+    // kalibre ediyoruz. Referansın gerçek değer metni profile taşınmaz;
+    // yalnızca alan geometrisi/style metadata tutulur.
+    try {
+      const stat = await fs.stat(referencePath);
+      const cacheKey = `ref-image-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
+      let cached = referenceRasterOcrCache.get(cacheKey);
+      let ocr = cached?.ocr || cached || null;
+      let rendered = cached?.rendered || null;
+
+      if (!cached) {
+        const buffer = await fs.readFile(referencePath);
+        const meta = await sharp(buffer).metadata();
+        rendered = {
+          buffer,
+          width: Number(meta?.width) || 0,
+          height: Number(meta?.height) || 0,
+        };
+        if (rendered.width && rendered.height) {
+          const tempPath = path.join('/tmp', `verifydoc-ref-image-${normalizedBank}-${createHash('sha256').update(cacheKey).digest('hex').slice(0,16)}${ext}`);
+          await fs.writeFile(tempPath, buffer);
+          ocr = await runPaddleOCR(tempPath);
+          try { await fs.unlink(tempPath); } catch {}
+        }
+        referenceRasterOcrCache.set(cacheKey, { ocr: ocr || null, rendered: { width: rendered.width, height: rendered.height } });
+      }
+
+      const width = Number(rendered?.width) || 0;
+      const height = Number(rendered?.height) || 0;
+      const regions = Array.isArray(ocr?.regions)
+        ? ocr.regions.filter(x => x?.region && String(x.text || '').trim()).map(x => ({
+            ...x,
+            text: String(x.text || '').trim(),
+            region: {
+              x1: Number(x.region.x1) || 0,
+              y1: Number(x.region.y1) || 0,
+              x2: Number(x.region.x2) || 0,
+              y2: Number(x.region.y2) || 0,
+            },
+          }))
+        : [];
+
+      if (width && height && regions.length) {
+        const isMoney = (text) => /(?:₺|TL|TRY|EUR|USD|GBP)\s*\d|\d{1,3}(?:[. ]\d{3})+(?:[,.]\d{1,2})?|\d+[,.]\d{1,2}\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i.test(String(text || ''));
+        const isIban = (text) => /\bTR\d{2}\s*(?:[A-Z0-9]\s*){10,32}/i.test(String(text || '').replace(/\s+/g, ' '));
+        const isDate = (text) => /\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?\b/.test(String(text || ''));
+        const isId = (text) => /^\d{5,24}$/.test(String(text || '').replace(/\s+/g, ''));
+
+        const valueMatchesRule = (key, text) => {
+          const t = String(text || '').trim();
+          if (!t) return false;
+          if (key === 'amount') return isMoney(t);
+          if (key === 'iban') return isIban(t);
+          if (key === 'date' || key === 'time') return isDate(t) || /\b\d{1,2}:\d{2}(?::\d{2})?\b/.test(t);
+          if (key === 'transactionNo' || key === 'accountNo' || key === 'taxNo') return isId(t) || /\d/.test(t);
+          if (key === 'address') return t.length >= 8 && !isMoney(t);
+          if (key === 'description') return t.length >= 3;
+          return true;
+        };
+
+        for (const label of regions) {
+          const rule = referenceFieldRuleForText(label.text);
+          if (!rule) continue;
+          const lr = label.region;
+          const lh = Math.max(8, lr.y2 - lr.y1);
+          const candidates = regions.filter(v => v !== label).map(v => {
+            const vr = v.region;
+            const vh = Math.max(8, vr.y2 - vr.y1);
+            const verticalOverlap = Math.min(lr.y2, vr.y2) - Math.max(lr.y1, vr.y1);
+            const rightGap = vr.x1 - lr.x2;
+            const belowGap = vr.y1 - lr.y2;
+            let cost = Infinity;
+            if (rightGap >= -lh * 0.35 && rightGap <= Math.max(220, lh * 10) && verticalOverlap >= -lh * 0.60) {
+              cost = Math.abs(rightGap) / Math.max(1, lh) + Math.abs(((vr.y1 + vr.y2) / 2) - ((lr.y1 + lr.y2) / 2)) / Math.max(1, lh) * 0.45;
+            } else if (belowGap >= -lh * 0.30 && belowGap <= Math.max(150, lh * 7) && Math.abs(((vr.x1 + vr.x2) / 2) - ((lr.x1 + lr.x2) / 2)) <= Math.max(300, lh * 12)) {
+              cost = 3 + Math.abs(belowGap) / Math.max(1, lh);
+            }
+            return { v, cost };
+          }).filter(x => Number.isFinite(x.cost) && valueMatchesRule(rule.key, x.v.text));
+
+          candidates.sort((a, b) => a.cost - b.cost);
+          const value = candidates[0]?.v;
+          if (!value) continue;
+
+          const r = value.region;
+          const box = {
+            xNorm: r.x1 / width,
+            yNorm: r.y1 / height,
+            widthNorm: Math.max(0.001, (r.x2 - r.x1) / width),
+            heightNorm: Math.max(0.001, (r.y2 - r.y1) / height),
+            pageNumber: 1,
+            labelKey: rule.key,
+            labelPresent: true,
+            templateRole: classifyReferenceTemplateRole(rule.key, label.text),
+            style: { source: 'reference-image-ocr', fontNames: [], avgFontHeight: Math.max(1, r.y2 - r.y1), avgCharWidth: 0, itemCount: 1 },
+            referenceFile: path.basename(referencePath),
+          };
+          (fields[rule.key] ||= []).push(box);
+        }
+      }
+    } catch (error) {
+      console.warn('REFERENCE IMAGE OCR HATASI:', path.basename(referencePath), error?.message || error);
+    }
+
+    return {
+      bank: normalizedBank,
+      referenceFile: path.basename(referencePath),
+      fields,
+      fieldCount: Object.keys(fields).length,
+      referenceType: 'image',
+      styleSource: Object.keys(fields).length ? 'reference-image-ocr' : 'none',
+    };
   }
 
   const buffer = await fs.readFile(referencePath);
