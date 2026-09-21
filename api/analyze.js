@@ -1846,22 +1846,62 @@ if (!candidatePaths.length) {
 const targetText = String(targetOCR?.text || '');
 const detectedVariant = detectReferenceVariantFromText(targetText);
 let selectedPath = null;
+let selectedVariant = null;
+let variantMatchedCandidatePaths = [...candidatePaths];
 
 if (detectedVariant && detectedVariant !== 'mixed') {
   const variants = await Promise.all(candidatePaths.map(async p => ({
     path: p,
     variant: await readReferenceVariant(p)
   })));
-  selectedPath = variants.find(x => x.variant === detectedVariant)?.path || null;
+
+  // Only references explicitly identified as the same transaction family
+  // are allowed into the structural/visual ensemble. An unknown raster
+  // reference must NOT silently become a match for the wrong family.
+  const sameVariant = variants
+    .filter(x => x.variant === detectedVariant)
+    .map(x => x.path);
+
+  if (sameVariant.length) {
+    variantMatchedCandidatePaths = sameVariant;
+    selectedPath = sameVariant[0];
+  }
 }
 
 if (!selectedPath) {
   const canonical = getReferenceFile(normalizedBank);
-  selectedPath = candidatePaths.includes(canonical) ? canonical : candidatePaths[0];
+  const canonicalVariant = canonical ? await readReferenceVariant(canonical) : null;
+
+  // When the target family is known but no trusted reference of that family
+  // exists, do not silently fall back to another family (e.g. EFT -> HVL).
+  if (detectedVariant && detectedVariant !== 'mixed') {
+    if (canonical && canonicalVariant === detectedVariant) {
+      selectedPath = canonical;
+      variantMatchedCandidatePaths = [canonical];
+    } else {
+      console.warn('REFERENCE VARIANT MATCH BULUNAMADI:', JSON.stringify({
+        bank: normalizedBank,
+        detectedVariant,
+        candidateCount: candidatePaths.length,
+        candidates: candidatePaths.map(p => path.basename(p))
+      }));
+      return null;
+    }
+  } else {
+    selectedPath = candidatePaths.includes(canonical) ? canonical : candidatePaths[0];
+  }
 }
 
-const selectedVariant = await readReferenceVariant(selectedPath);
+selectedVariant = await readReferenceVariant(selectedPath);
 activeReferenceVariant = selectedVariant || detectedVariant || null;
+
+// If a target variant was detected and we found trusted same-variant raster
+// references, carry only those paths forward. This prevents Yapı Kredi FAST
+// from being compared against the HVL template just because directory order
+// returned `yapikredi-havale.jpg` first.
+if (detectedVariant && detectedVariant !== 'mixed' && variantMatchedCandidatePaths.length) {
+  candidatePaths.splice(0, candidatePaths.length, ...variantMatchedCandidatePaths);
+}
 
 // V8 FORMAT-MATCHED VISUAL REFERENCES:
 // Image hedeflerinde yalnızca aynı format ailesindeki raster referanslar
@@ -1879,7 +1919,8 @@ console.log("REFERENCE VARIANT SELECTION:", JSON.stringify({
   selectedVariant: selectedVariant || null,
   candidateCount: candidatePaths.length,
   candidates: candidatePaths.map(p => path.basename(p)),
-  selectedReference: path.basename(selectedPath)
+  selectedReference: path.basename(selectedPath),
+  variantMatchedCandidates: candidatePaths.map(p => path.basename(p))
 }));
 
 try {
@@ -7497,7 +7538,18 @@ function detectReferenceVariantFromText(text) {
 }
 
 function referenceVariantFromFileName(filePath) {
-  const name = normalizeFieldTextForMatch(path.basename(filePath || ''));
+  const base = path.basename(filePath || '');
+  const name = normalizeFieldTextForMatch(base);
+
+  // Explicit Yapı Kredi raster reference families.
+  // `yapikredi.jpg` is the FAST/EFT reference in the current reference set,
+  // while `yapikredi-havale.jpg` is the HVL reference and `yapikredi-kk1.jpg`
+  // belongs to the credit-card family and must never become a normal transfer
+  // reference.
+  if (/^yapikredi\.jpe?g$/i.test(base)) return 'eft';
+  if (/^yapikredi-havale\.jpe?g$/i.test(base)) return 'hvl';
+  if (/^yapikredi-kk1\.jpe?g$/i.test(base)) return 'credit-card';
+
   if (/HVL|HAVALE/.test(name)) return 'hvl';
   if (/EFT|FAST/.test(name)) return 'eft';
   return null;
@@ -13201,16 +13253,10 @@ prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
-      // V67 ARRAY/STRING FIX:
-      // Azure reference geometry kendi icinde getReferenceFiles() ile
-      // ayni-format referans ensemble'ini topluyor. Buraya visualReferencePaths
-      // dizisini vermek path.resolve()/includes() tarafinda Array -> string
-      // hatasina neden oluyordu. null verilince mevcut activeReferenceFormat
-      // kapsamindaki tum trusted referanslar ensemble olarak kullanilir.
       const arg = await runAzureReferenceGeometryComparison(
         al,
         bank,
-        null
+        getVisualReferencePath(reference)
       );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
@@ -13749,16 +13795,11 @@ let referenceLocalCrop = null;
 const localCropStartTime = Date.now();
 if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
   try {
-    // V67 ARRAY/STRING FIX:
-    // Local crop comparator da kendi icinde canonical reference resolver ile
-    // ensemble'i kuruyor. visualReferencePaths dizisini secili tek path gibi
-    // gecmek path.resolve() icinde Array hatasina yol aciyordu. null burada
-    // tum aktif-format trusted referanslarini korur.
     referenceLocalCrop = await runReferenceLocalCropComparator(
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      null
+      getVisualReferencePath(reference)
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
