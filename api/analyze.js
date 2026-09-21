@@ -1836,8 +1836,12 @@ if (!normalizedBank) {
 }
 
 // Bankaya ait tüm aday referansları al. Variant filtresi henüz aktif değil.
+// HARD FORMAT GATE: loadReferenceFile ikinci bir güvenlik katmanı olarak
+// getReferenceFiles sonucunu tekrar hedef formatla sınırlar. Böylece eski
+// resolver/deployment davranışı PDF'yi JPG hedefe fallback olarak taşıyamaz.
 const candidatePaths = (await getReferenceFiles(normalizedBank))
-  .filter(p => !isStatementReferencePath(p));
+  .filter(p => !isStatementReferencePath(p))
+  .filter(p => referenceFormatMatches(p, activeReferenceFormat));
 if (!candidatePaths.length) {
   console.log("REFERENCE PATH BULUNAMADI:", normalizedBank);
   return null;
@@ -1872,23 +1876,52 @@ if (!selectedPath) {
   const canonical = getReferenceFile(normalizedBank);
   const canonicalVariant = canonical ? await readReferenceVariant(canonical) : null;
 
-  // When the target family is known but no trusted reference of that family
-  // exists, do not silently fall back to another family (e.g. EFT -> HVL).
+  // Hedef ailesi biliniyorsa önce AYNI FORMAT içindeki referanslara bak.
+  // Örn. denizbank.jpg gibi raster referansın varyantı dosya adından
+  // belirlenemiyorsa, sırf canonical PDF aynı varyanta sahip diye PDF'ye
+  // düşmek yasaktır.
+  const sameFormatCandidates = candidatePaths.filter(p =>
+    referenceFormatMatches(p, activeReferenceFormat)
+  );
+  const unknownSameFormatCandidates = [];
+  for (const p of sameFormatCandidates) {
+    const v = await readReferenceVariant(p);
+    if (!v || v === 'mixed') unknownSameFormatCandidates.push(p);
+  }
+
   if (detectedVariant && detectedVariant !== 'mixed') {
-    if (canonical && canonicalVariant === detectedVariant) {
+    if (unknownSameFormatCandidates.length === 1) {
+      selectedPath = unknownSameFormatCandidates[0];
+      variantMatchedCandidatePaths = [selectedPath];
+      console.log('REFERENCE VARIANT UNKNOWN BUT FORMAT MATCHED:', JSON.stringify({
+        bank: normalizedBank,
+        detectedVariant,
+        selectedReference: path.basename(selectedPath),
+        format: activeReferenceFormat
+      }));
+    } else if (canonical &&
+               referenceFormatMatches(canonical, activeReferenceFormat) &&
+               canonicalVariant === detectedVariant) {
       selectedPath = canonical;
       variantMatchedCandidatePaths = [canonical];
     } else {
       console.warn('REFERENCE VARIANT MATCH BULUNAMADI:', JSON.stringify({
         bank: normalizedBank,
         detectedVariant,
+        referenceFormat: activeReferenceFormat,
         candidateCount: candidatePaths.length,
         candidates: candidatePaths.map(p => path.basename(p))
       }));
       return null;
     }
   } else {
-    selectedPath = candidatePaths.includes(canonical) ? canonical : candidatePaths[0];
+    // Variant bilinmiyorsa da canonical yalnızca hedef formatla aynıysa
+    // tercih edilebilir. Farklı format canonical asla fallback değildir.
+    selectedPath = (canonical &&
+      referenceFormatMatches(canonical, activeReferenceFormat) &&
+      candidatePaths.includes(canonical))
+      ? canonical
+      : candidatePaths[0];
   }
 }
 
