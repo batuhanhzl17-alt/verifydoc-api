@@ -13201,10 +13201,16 @@ prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
+      // V67 ARRAY/STRING FIX:
+      // Azure reference geometry kendi icinde getReferenceFiles() ile
+      // ayni-format referans ensemble'ini topluyor. Buraya visualReferencePaths
+      // dizisini vermek path.resolve()/includes() tarafinda Array -> string
+      // hatasina neden oluyordu. null verilince mevcut activeReferenceFormat
+      // kapsamindaki tum trusted referanslar ensemble olarak kullanilir.
       const arg = await runAzureReferenceGeometryComparison(
         al,
         bank,
-        getVisualReferencePath(reference)
+        null
       );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
@@ -13743,11 +13749,16 @@ let referenceLocalCrop = null;
 const localCropStartTime = Date.now();
 if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
   try {
+    // V67 ARRAY/STRING FIX:
+    // Local crop comparator da kendi icinde canonical reference resolver ile
+    // ensemble'i kuruyor. visualReferencePaths dizisini secili tek path gibi
+    // gecmek path.resolve() icinde Array hatasina yol aciyordu. null burada
+    // tum aktif-format trusted referanslarini korur.
     referenceLocalCrop = await runReferenceLocalCropComparator(
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePath(reference)
+      null
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
