@@ -2335,8 +2335,6 @@ async function sendAnalysisResult(
 
 `${emoji} VERIFYDOC ANALİZ SONUCU
 
-${bank ? `Banka: ${getBankDisplayName(bank)}\n` : ""}Risk Skoru: ${score}/100
-
 Risk Seviyesi:
 ${riskLabel}
 
