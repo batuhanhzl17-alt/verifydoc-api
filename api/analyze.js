@@ -1528,6 +1528,8 @@ const STATEMENT_REFERENCE_MAP = {
   akbank: ["akbank-hesap-hareketleri-1.pdf", "akbank-hesap-hareketleri-2.pdf"],
   ing: ["ing-hesap-hareketi1.pdf", "ing-hesap-hareketi2.pdf"],
   kuveytturk: ["kuveytturk-hesap-ozeti1.pdf", "kuveytturk-hesap-ozeti2.pdf"],
+  // Yapı Kredi hesap hareketleri / hesap özeti referansları
+  yapikredi: ["yapikredi-hesap-hareketi1.pdf", "yapikredi-hesap-hareketi2.pdf"],
 };
 
 function detectStatementBankFromText(text, fileName = "") {
@@ -1572,6 +1574,7 @@ function detectStatementBankFromText(text, fileName = "") {
     qnb: 0,
     akbank: 0,
     isbankasi: 0,
+    yapikredi: 0,
   };
 
   const add = (bank, points) => {
@@ -1594,6 +1597,12 @@ function detectStatementBankFromText(text, fileName = "") {
   if (fileText.includes("ziraat")) add("ziraat", 220);
   if (fileText.includes("garanti")) add("garanti", 220);
   if (fileText.includes("is bankasi") || fileText.includes("isbankasi")) add("isbankasi", 220);
+  if (
+    fileText.includes("yapikredi") ||
+    fileText.includes("yapi kredi") ||
+    fileText.includes("yapi-kredi") ||
+    fileText.includes("yapi_kredi")
+  ) add("yapikredi", 220);
 
   // Güçlü/header göstergeleri
   if (header.includes("akbank")) add("akbank", 120);
@@ -1629,6 +1638,11 @@ function detectStatementBankFromText(text, fileName = "") {
   if (header.includes("turkiye is bankasi")) add("isbankasi", 110);
   if (header.includes("isbankasi")) add("isbankasi", 100);
 
+  if (header.includes("yapi kredi")) add("yapikredi", 110);
+  if (header.includes("yapikredi")) add("yapikredi", 110);
+  if (header.includes("yapi kredi bankasi")) add("yapikredi", 120);
+  if (header.includes("yapi kredi finansal")) add("yapikredi", 80);
+
   // Header OCR'ı bozuk olsa bile compact metin üzerinden yardımcı sinyaller.
   if (compact.includes("akbank")) add("akbank", 70);
   if (compact.includes("qnbbankas")) add("qnb", 70);
@@ -1637,11 +1651,14 @@ function detectStatementBankFromText(text, fileName = "") {
   if (compact.includes("ziraatbankasi")) add("ziraat", 70);
   if (compact.includes("garantibbva")) add("garanti", 70);
   if (compact.includes("isbankasi")) add("isbankasi", 70);
+  if (compact.includes("yapikredi")) add("yapikredi", 80);
+  if (compact.includes("yapikredibankasi")) add("yapikredi", 90);
   if (compact.includes("enpara")) add("enpara", 70);
 
   const best = Object.entries(scores)
     .sort((a, b) => b[1] - a[1])[0];
 
+  console.log("HESAP ÖZETİ BANKA SKORLARI:", JSON.stringify(scores));
   return best && best[1] > 0 ? best[0] : null;
 }
 
