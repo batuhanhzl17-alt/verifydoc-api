@@ -328,24 +328,39 @@ function extractForensicWatchSignal(result = {}) {
     );
 
   // KRİTİK FİNANSAL TUTARSIZLIK:
-  // Ana tutar ile dekontun başka bir bölümünde yazan işlem/EFT tutarı
-  // birbirinden farklı olarak yakalanmışsa bu olay doğrudan BLACKLIST
-  // tetikleyicisidir. OverallRisk skoruna bakılmaz; örneğin 6/100 olsa bile
-  // bu somut bulgu kaçırılmamalıdır.
-  const amountConsistencyCheck = result?.checks?.amountConsistency || {};
-  const amountConsistencyEvidence = String(amountConsistencyCheck?.evidence || "").trim();
+  // BLACKLIST için yalnızca analiz motorunun ORIGINAL amountConsistency
+  // bulgusunu kullanıyoruz. Daha sonra Amount Forensics'in referans-guided
+  // raster farkı nedeniyle amountConsistency "fail" yapılmış olabilir;
+  // bu durum tek başına finansal tutarsızlık değildir ve blacklist
+  // tetiklememelidir.
+  const originalAmountConsistency =
+    result?.__watchlistOriginalAmountConsistency &&
+    typeof result.__watchlistOriginalAmountConsistency === "object"
+      ? result.__watchlistOriginalAmountConsistency
+      : (result?.checks?.amountConsistency || {});
+
+  const amountConsistencyEvidence =
+    String(originalAmountConsistency?.evidence || "").trim();
+
+  // Evidence içinde en az iki farklı okunabilir finansal sayı bulunması,
+  // "5.000,00 TL" vs "500,0 TL" gibi somut bir tutar uyuşmazlığını
+  // generic raster/reference farkından ayırır.
   const amountEvidenceNumbers = (amountConsistencyEvidence.match(/\d[\d.,]*/g) || [])
     .map(x => x.replace(/[^0-9]/g, ""))
     .filter(x => x.length >= 2);
+
   const distinctAmountEvidenceNumbers = [...new Set(amountEvidenceNumbers)];
-  const amountConsistencyFail =
-    String(amountConsistencyCheck?.status || "").toLowerCase() === "fail" &&
+
+  const explicitFinancialMismatch =
+    String(originalAmountConsistency?.status || "").toLowerCase() === "fail" &&
+    distinctAmountEvidenceNumbers.length >= 2 &&
     (
-      Number(amountConsistencyCheck?.score || 0) >= 80 ||
-      distinctAmountEvidenceNumbers.length >= 2
+      Number(originalAmountConsistency?.score || 0) >= 80 ||
+      /uyuş|uyus|tutar|miktar|amount|eft|işlem|islem|gönder|gonder|ödeme|odeme|toplam|ücret|ucret|komisyon|fee|deduct/i
+        .test(amountConsistencyEvidence)
     );
 
-  const immediateFinancialBlacklist = amountConsistencyFail;
+  const immediateFinancialBlacklist = explicitFinancialMismatch;
 
   const negativeSampleStrong =
     Number(result?.negativeSampleForensics?.bestMatchScore || 0) >= 80 &&
@@ -365,7 +380,7 @@ function extractForensicWatchSignal(result = {}) {
     strongReferenceCount >= 2 &&
     (
       amountStrong ||
-      amountConsistencyFail ||
+      explicitFinancialMismatch ||
       openSourceStrong ||
       (
         result?.azureReferenceGeometry?.strongAnomalies &&
@@ -374,7 +389,7 @@ function extractForensicWatchSignal(result = {}) {
       )
     );
 
-  if (!referenceDifference && !amountStrong && !amountConsistencyFail &&
+  if (!referenceDifference && !amountStrong && !explicitFinancialMismatch &&
       !negativeSampleStrong && !openSourceStrong && !strongIndependentReference) {
     return null;
   }
@@ -384,16 +399,16 @@ function extractForensicWatchSignal(result = {}) {
   let confidence = 82;
   let reason = "Referans karşılaştırmasında somut bir fark bulundu.";
 
-  if (negativeSampleStrong) {
+  if (explicitFinancialMismatch) {
+    eventType = "financial_inconsistency";
+    strongSignal = true;
+    confidence = 98;
+    reason = "Belgenin kendi içinde iki farklı finansal tutarın açıkça uyuşmadığı tespit edildi.";
+  } else if (negativeSampleStrong) {
     eventType = "known_negative_match";
     strongSignal = true;
     confidence = 92;
     reason = "Belge, daha önce manipüle edilmiş bilinen örnekle güçlü lokal benzerlik gösterdi.";
-  } else if (amountStrong || amountConsistencyFail) {
-    eventType = "financial_inconsistency";
-    strongSignal = true;
-    confidence = 95;
-    reason = "Belgede güçlü ve referansla desteklenen tutar/tutar tutarlılığı anomalisi bulundu.";
   } else if (openSourceStrong || strongIndependentReference) {
     eventType = "corroborated_forensic";
     strongSignal = true;
@@ -411,6 +426,17 @@ function extractForensicWatchSignal(result = {}) {
     }))
     .filter(x => x.title && x.detail);
 
+  // Finansal tutarsızlık evidence'ı referenceFindings'de olmayabilir;
+  // doğrudan amountConsistency evidence'ını da kayda ekle.
+  if (explicitFinancialMismatch && amountConsistencyEvidence) {
+    evidence.unshift({
+      title: "Tutar tutarsızlığı",
+      detail: amountConsistencyEvidence,
+      kind: "financial-inconsistency",
+      priority: 0,
+    });
+  }
+
   return {
     eventType,
     strongSignal,
@@ -418,11 +444,12 @@ function extractForensicWatchSignal(result = {}) {
     reason,
     referenceDifference,
     strongReferenceCount,
-    evidence,
+    evidence: evidence.slice(0, 5),
     riskScore: Number(result?.overallRisk ?? result?.score) || 0,
     immediateFinancialBlacklist,
   };
 }
+
 
 function buildForensicWatchIdentifiers(result = {}, type = "") {
   const identifiers = buildHistoryIdentifiers(result, type);
@@ -17690,6 +17717,25 @@ result
 // Güçlü karakter-düzeyi tutar anomalisi varsa risk motoruna
 // deterministik bir üst sınır uygula. Orta seviye sinyal
 // tek başına skoru değiştirmez.
+// WATCHLIST GÜVENLİK KORUMASI:
+// Amount Forensics'in referans kaynaklı güçlü raster farkı,
+// tek başına "ana tutar ile başka finansal tutar uyuşmuyor" anlamına gelmez.
+// Bu nedenle blacklist kararında kullanılacak amountConsistency kaynağını,
+// aşağıdaki referans-guided promotion işleminden ÖNCE saklıyoruz.
+const watchlistOriginalAmountConsistency =
+  result?.checks?.amountConsistency &&
+  typeof result.checks.amountConsistency === "object"
+    ? {
+        status: String(result.checks.amountConsistency.status || "").toLowerCase(),
+        score: Number(result.checks.amountConsistency.score || 0),
+        evidence: String(result.checks.amountConsistency.evidence || "").trim(),
+      }
+    : null;
+
+if (result && watchlistOriginalAmountConsistency) {
+  result.__watchlistOriginalAmountConsistency = watchlistOriginalAmountConsistency;
+}
+
 const amountReferenceGuided = Boolean(
   amountForensics?.referenceGuided === true ||
   /reference-(?:roi|position)|reference-guided|reference-anchor/i.test(String(amountForensics?.selectionMethod || ""))
@@ -18051,6 +18097,9 @@ const forensicWatchlist = await recordForensicWatchEvent({
   telegramUserId,
   telegramUsername,
 });
+
+// İç karar kaynağını API cevabına taşımıyoruz.
+delete result.__watchlistOriginalAmountConsistency;
 
 result.forensicWatchlist = {
   recorded: Boolean(forensicWatchlist?.recorded),
