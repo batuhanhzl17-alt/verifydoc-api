@@ -248,6 +248,338 @@ async function applyHistoricalSuspicion(result, { type, bank, fileFingerprint })
   return result;
 }
 
+
+// =====================================================
+// FORENSIC WATCHLIST — ŞÜPHELİ OLAY / BLACKLIST KAYDI
+// =====================================================
+// ÖNEMLİ:
+// - Bu katman analiz kullanımını KESMEZ.
+// - BLACKLISTED yalnızca veritabanındaki iç durumdur.
+// - İlk güçlü/konkret bulgu SUSPICIOUS olarak kaydedilir.
+// - Aynı Telegram üyesinde ikinci bağımsız güçlü olaydan sonra
+//   BLACKLISTED durumuna yükseltilebilir.
+// - Telegram User ID opsiyoneldir; backend mevcut haliyle ID gelmese de
+//   belge/olay kaydı oluşturabilir.
+// - Düz IBAN/ad-soyad saklanmaz; mevcut HMAC geçmiş-kayıt mekanizması kullanılır.
+
+const FORENSIC_WATCHLIST_TABLE = "verifydoc_forensic_watchlist";
+
+function forensicWatchlistConfigReady() {
+  return Boolean(
+    process.env.SUPABASE_URL &&
+    process.env.SUPABASE_SERVICE_ROLE_KEY &&
+    process.env.VERIFYDOC_HISTORY_SECRET
+  );
+}
+
+async function forensicWatchlistRequest(method, query = "", body = null) {
+  if (!forensicWatchlistConfigReady()) return null;
+
+  const base = String(process.env.SUPABASE_URL).replace(/\/$/, "");
+  const url = `${base}/rest/v1/${FORENSIC_WATCHLIST_TABLE}${query ? `?${query}` : ""}`;
+
+  const headers = {
+    apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+
+  if (method === "POST") {
+    headers.Prefer = "return=representation";
+  }
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Forensic Watchlist DB HTTP ${response.status}: ${text.slice(0, 500)}`);
+  }
+
+  if (!text) return [];
+  try {
+    return JSON.parse(text);
+  } catch {
+    return [];
+  }
+}
+
+function extractForensicWatchSignal(result = {}) {
+  const referenceFindings = Array.isArray(result?.referenceForensicReport?.findings)
+    ? result.referenceForensicReport.findings
+    : [];
+
+  const referenceDifference =
+    result?.referenceForensicReport?.status === "differences-found" &&
+    referenceFindings.length > 0;
+
+  const amountStrong =
+    result?.amountForensics?.available === true &&
+    String(result.amountForensics?.severity || "").toLowerCase() === "strong" &&
+    (
+      result.amountForensics?.referenceGuided === true ||
+      /reference-(?:roi|position)|reference-guided|reference-anchor/i.test(
+        String(result.amountForensics?.selectionMethod || "")
+      )
+    );
+
+  // KRİTİK FİNANSAL TUTARSIZLIK:
+  // Ana tutar ile dekontun başka bir bölümünde yazan işlem/EFT tutarı
+  // birbirinden farklı olarak yakalanmışsa bu olay doğrudan BLACKLIST
+  // tetikleyicisidir. OverallRisk skoruna bakılmaz; örneğin 6/100 olsa bile
+  // bu somut bulgu kaçırılmamalıdır.
+  const amountConsistencyCheck = result?.checks?.amountConsistency || {};
+  const amountConsistencyEvidence = String(amountConsistencyCheck?.evidence || "").trim();
+  const amountEvidenceNumbers = (amountConsistencyEvidence.match(/\d[\d.,]*/g) || [])
+    .map(x => x.replace(/[^0-9]/g, ""))
+    .filter(x => x.length >= 2);
+  const distinctAmountEvidenceNumbers = [...new Set(amountEvidenceNumbers)];
+  const amountConsistencyFail =
+    String(amountConsistencyCheck?.status || "").toLowerCase() === "fail" &&
+    (
+      Number(amountConsistencyCheck?.score || 0) >= 80 ||
+      distinctAmountEvidenceNumbers.length >= 2
+    );
+
+  const immediateFinancialBlacklist = amountConsistencyFail;
+
+  const negativeSampleStrong =
+    Number(result?.negativeSampleForensics?.bestMatchScore || 0) >= 80 &&
+    Array.isArray(result?.negativeSampleForensics?.findings) &&
+    result.negativeSampleForensics.findings.length > 0;
+
+  const openSourceStrong =
+    result?.openSourceForensics?.strongCorroboration === true;
+
+  const strongReferenceCount = referenceFindings.filter((x) =>
+    Number(x?.priority || 9) <= 1
+  ).length;
+
+  // En az iki ayrı referans bulgusu + bağımsız forensic desteği varsa
+  // güçlü korelasyon kabul edilir. Bu mevcut V67 mantığıyla uyumludur.
+  const strongIndependentReference =
+    strongReferenceCount >= 2 &&
+    (
+      amountStrong ||
+      amountConsistencyFail ||
+      openSourceStrong ||
+      (
+        result?.azureReferenceGeometry?.strongAnomalies &&
+        Array.isArray(result.azureReferenceGeometry.strongAnomalies) &&
+        result.azureReferenceGeometry.strongAnomalies.some(x => Number(x?.score || 0) >= 90)
+      )
+    );
+
+  if (!referenceDifference && !amountStrong && !amountConsistencyFail &&
+      !negativeSampleStrong && !openSourceStrong && !strongIndependentReference) {
+    return null;
+  }
+
+  let eventType = "reference_difference";
+  let strongSignal = false;
+  let confidence = 82;
+  let reason = "Referans karşılaştırmasında somut bir fark bulundu.";
+
+  if (negativeSampleStrong) {
+    eventType = "known_negative_match";
+    strongSignal = true;
+    confidence = 92;
+    reason = "Belge, daha önce manipüle edilmiş bilinen örnekle güçlü lokal benzerlik gösterdi.";
+  } else if (amountStrong || amountConsistencyFail) {
+    eventType = "financial_inconsistency";
+    strongSignal = true;
+    confidence = 95;
+    reason = "Belgede güçlü ve referansla desteklenen tutar/tutar tutarlılığı anomalisi bulundu.";
+  } else if (openSourceStrong || strongIndependentReference) {
+    eventType = "corroborated_forensic";
+    strongSignal = true;
+    confidence = 93;
+    reason = "Birden fazla bağımsız adli sinyal aynı belge üzerinde birleşti.";
+  }
+
+  const evidence = referenceFindings
+    .slice(0, 5)
+    .map((x) => ({
+      title: String(x?.title || "").trim(),
+      detail: String(x?.detail || "").trim(),
+      kind: String(x?.kind || "").trim() || null,
+      priority: Number(x?.priority || 0),
+    }))
+    .filter(x => x.title && x.detail);
+
+  return {
+    eventType,
+    strongSignal,
+    confidence,
+    reason,
+    referenceDifference,
+    strongReferenceCount,
+    evidence,
+    riskScore: Number(result?.overallRisk ?? result?.score) || 0,
+    immediateFinancialBlacklist,
+  };
+}
+
+function buildForensicWatchIdentifiers(result = {}, type = "") {
+  const identifiers = buildHistoryIdentifiers(result, type);
+  return identifiers;
+}
+
+async function recordForensicWatchEvent({
+  result,
+  type,
+  bank,
+  fileFingerprint,
+  telegramUserId = null,
+  telegramUsername = null,
+}) {
+  const signal = extractForensicWatchSignal(result);
+
+  if (!signal) {
+    return {
+      available: forensicWatchlistConfigReady(),
+      recorded: false,
+      status: null,
+      reason: "no-credible-forensic-signal",
+    };
+  }
+
+  if (!forensicWatchlistConfigReady()) {
+    console.warn("FORENSIC WATCHLIST DB DEVRE DIŞI: Supabase env değişkenleri eksik.");
+    return {
+      available: false,
+      recorded: false,
+      status: "SUSPICIOUS",
+      eventType: signal.eventType,
+      strongSignal: signal.strongSignal,
+    };
+  }
+
+  const identifiers = buildForensicWatchIdentifiers(result, type);
+  const normalizedTelegramUserId =
+    telegramUserId != null && String(telegramUserId).trim()
+      ? String(telegramUserId).trim()
+      : null;
+
+  // Aynı belge aynı event tipiyle tekrar gönderildiğinde yeni olay üretme.
+  // Böylece kullanıcı aynı dekontu 5 kez yüklese 5 ayrı şüpheli kayıt oluşmaz.
+  let duplicateRows = [];
+  if (fileFingerprint) {
+    const duplicateQuery = new URLSearchParams({
+      select: "id,status,event_type,created_at",
+      document_fingerprint: `eq.${fileFingerprint}`,
+      event_type: `eq.${signal.eventType}`,
+      limit: "1",
+    }).toString();
+
+    duplicateRows = await forensicWatchlistRequest("GET", duplicateQuery);
+  }
+
+  if (Array.isArray(duplicateRows) && duplicateRows.length) {
+    return {
+      available: true,
+      recorded: false,
+      duplicate: true,
+      status: duplicateRows[0]?.status || "SUSPICIOUS",
+      eventType: signal.eventType,
+      strongSignal: signal.strongSignal,
+      occurrenceCount: 1,
+    };
+  }
+
+  // BLACKLISTED kararı burada yalnızca İÇ DATABASE STATUSÜDÜR.
+  // Hiçbir şekilde analiz isteğini reddetmez.
+  let priorStrongCount = 0;
+
+  if (normalizedTelegramUserId && signal.strongSignal) {
+    const q = new URLSearchParams({
+      select: "id,status,event_type,created_at",
+      telegram_user_id: `eq.${normalizedTelegramUserId}`,
+      strong_signal: "eq.true",
+      limit: "100",
+    }).toString();
+
+    const previous = await forensicWatchlistRequest("GET", q);
+    priorStrongCount = Array.isArray(previous) ? previous.length : 0;
+  }
+
+  // KRİTİK KURAL:
+  // Ana tutar ile dekont içindeki başka bir finansal tutarın açıkça
+  // uyuşmadığı yakalanırsa bu kullanıcı için ilk olay olsa bile BLACKLISTED
+  // kaydı oluştur. Bu yalnızca database durumudur; analiz erişimi burada
+  // engellenmez. Diğer forensic bulgularında eski SUSPICIOUS -> tekrarında
+  // BLACKLISTED mantığı korunur.
+  const status =
+    signal.eventType === "financial_inconsistency"
+      ? "BLACKLISTED"
+      : signal.strongSignal && priorStrongCount >= 1
+        ? "BLACKLISTED"
+        : "SUSPICIOUS";
+
+  const payload = {
+    telegram_user_id: normalizedTelegramUserId,
+    telegram_username:
+      telegramUsername != null && String(telegramUsername).trim()
+        ? String(telegramUsername).trim().slice(0, 120)
+        : null,
+    bank: bank || null,
+    document_type: type || null,
+    event_type: signal.eventType,
+    status,
+    strong_signal: Boolean(signal.strongSignal),
+    confidence: signal.confidence,
+    risk_score: signal.riskScore,
+    reason: signal.reason,
+    evidence: signal.evidence,
+    sender_name_hash: identifiers.sender_name_hash,
+    recipient_name_hash: identifiers.recipient_name_hash,
+    iban_hash: identifiers.iban_hash,
+    account_no_hash: identifiers.account_no_hash,
+    branch_hash: identifiers.branch_hash,
+    tax_no_hash: identifiers.tax_no_hash,
+    address_hash: identifiers.address_hash,
+    document_fingerprint: fileFingerprint || null,
+  };
+
+  try {
+    const saved = await forensicWatchlistRequest(
+      "POST",
+      "",
+      payload
+    );
+
+    const occurrenceCount = priorStrongCount + (signal.strongSignal ? 1 : 0);
+
+    return {
+      available: true,
+      recorded: true,
+      duplicate: false,
+      status,
+      eventType: signal.eventType,
+      strongSignal: signal.strongSignal,
+      confidence: signal.confidence,
+      immediateFinancialBlacklist: Boolean(signal.immediateFinancialBlacklist),
+      occurrenceCount,
+      id: Array.isArray(saved) ? saved[0]?.id || null : null,
+    };
+  } catch (error) {
+    console.warn("FORENSIC WATCHLIST KAYIT HATASI:", error?.message || error);
+    return {
+      available: true,
+      recorded: false,
+      status: "SUSPICIOUS",
+      eventType: signal.eventType,
+      strongSignal: signal.strongSignal,
+      error: error?.message || "watchlist insert failed",
+    };
+  }
+}
+
+
 // =====================================================
 // PADDLEOCR CLIENT
 // =====================================================
@@ -12799,6 +13131,21 @@ fields?.fileName
 uploadedFile.originalFilename ||
 "document"
 
+// Telegram üyeliği opsiyoneldir.
+// Bu bilgi yalnızca olayın hangi üyeden geldiğini kaydetmek için kullanılır.
+// BLACKLISTED olsa bile analiz isteğini engelleyen hiçbir kontrol yoktur.
+const telegramUserId =
+first(fields?.telegramUserId) ||
+first(fields?.telegram_user_id) ||
+first(fields?.userId) ||
+null;
+
+const telegramUsername =
+first(fields?.telegramUsername) ||
+first(fields?.telegram_username) ||
+first(fields?.username) ||
+null;
+
 // =================================================
 // KULLANICININ VERDİĞİ KARŞILAŞTIRMA BİLGİLERİ
 // =================================================
@@ -17689,6 +18036,33 @@ if (paddleCriticalFailure) {
     bank: bank || null,
   });
 }
+
+// =====================================================
+// FORENSIC WATCHLIST / ŞÜPHELİ OLAY KAYDI
+// =====================================================
+// Bu kayıt analiz kullanımını engellemez.
+// Amaç: düşük overallRisk skoruna rağmen gerçekten somut bir forensic
+// fark bulunduğunda olayı veritabanında kaybetmemek.
+const forensicWatchlist = await recordForensicWatchEvent({
+  result,
+  type,
+  bank: bank || null,
+  fileFingerprint,
+  telegramUserId,
+  telegramUsername,
+});
+
+result.forensicWatchlist = {
+  recorded: Boolean(forensicWatchlist?.recorded),
+  duplicate: Boolean(forensicWatchlist?.duplicate),
+  status: forensicWatchlist?.status || null,
+  eventType: forensicWatchlist?.eventType || null,
+  strongSignal: Boolean(forensicWatchlist?.strongSignal),
+  immediateFinancialBlacklist: Boolean(forensicWatchlist?.immediateFinancialBlacklist),
+  occurrenceCount: Number(forensicWatchlist?.occurrenceCount || 0),
+};
+
+console.log("FORENSIC WATCHLIST:", JSON.stringify(result.forensicWatchlist));
 
 console.log(
 "ANALYSIS SUCCESS"
