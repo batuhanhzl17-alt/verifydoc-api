@@ -4121,13 +4121,10 @@ ffmpegPath,
 "-i",
 videoPath,
 "-vf",
-"fps=1/5,scale=1280:-2",
+"fps=1,scale=1280:-2",
 
-// 90 saniyelik videoda yaklaşık 18 kare.
-// Daha uzun videolarda da gereksiz şekilde yüzlerce kare üretmemek için
-// güvenli bir üst sınır bırakıyoruz.
 "-frames:v",
-"24",
+"4",
 "-q:v",
 "5",
 
