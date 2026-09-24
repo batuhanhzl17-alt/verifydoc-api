@@ -7143,6 +7143,33 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const anchorMedian=rfMedianSigned(anchorResiduals);
         const anchorMad=rfMedianSigned(anchorResiduals.map(v=>Math.abs(v-anchorMedian)));
 
+        // KUVEYTTURK-ONLY Y NORMALIZATION:
+        // Kuveyt Türk referanslarında Telegram/JPG yeniden ölçekleme veya sayfa
+        // kırpma nedeniyle bütün semantik alanlar aynı dikey yönde birlikte
+        // kayabiliyor. Bu ortak kayma tek tek "field-position" bulgusu değildir.
+        // Diğer bankaların geometri mantığına DOKUNMA.
+        const isKuveytTurkReference = normalizedBank === 'kuveytturk';
+        let kuveytGlobalYResidualOffset = 0;
+        if (isKuveytTurkReference && matches.length >= 3) {
+          const yResiduals = matches
+            .map(m => {
+              const rp0 = normPoint(m.rl,refSize);
+              const tp0 = normPoint(m.tl,targetSize);
+              const projected0 = rfApplyAffine(affine,rp0);
+              return Number(tp0.y) - Number(projected0.y);
+            })
+            .filter(Number.isFinite);
+
+          if (yResiduals.length >= 3) {
+            kuveytGlobalYResidualOffset = rfMedianSigned(yResiduals);
+            console.log('KUVEYTTURK GLOBAL Y NORMALIZATION:', JSON.stringify({
+              reference: path.basename(referencePath),
+              matchCount: matches.length,
+              medianYResidual: Number(kuveytGlobalYResidualOffset.toFixed(5))
+            }));
+          }
+        }
+
         const refRegions=rfPrepareRegions(refOCR),targetRegions=rfPrepareRegions(targetOCR);
         const stylePairs=[];
         for(const m of matches){
@@ -7175,7 +7202,17 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             valueGeometryResidual=Math.hypot(q.x-tc.x,q.y-tc.y);
           }
           const rp=normPoint(m.rl,refSize),tp=normPoint(m.tl,targetSize),projected=rfApplyAffine(affine,rp);
-          const positionResidual=Math.hypot(projected.x-tp.x,projected.y-tp.y);
+          const affineDx = projected.x - tp.x;
+          const affineDy = projected.y - tp.y;
+
+          // Only Kuveyt Türk: remove the common vertical residual shared by the
+          // semantic fields. A genuinely local displacement remains after this
+          // correction and can still raise positionScore.
+          const correctedDy = isKuveytTurkReference
+            ? affineDy + kuveytGlobalYResidualOffset
+            : affineDy;
+
+          const positionResidual=Math.hypot(affineDx,correctedDy);
           const normalizedPosition=Math.max(0,positionResidual-Math.max(anchorMedian+3*anchorMad,.006));
           const labelExact=normLabel(m.rl.labelText)===normLabel(m.tl.labelText);
           const styleScore=rfClamp100((styleResidual||0)*100);
