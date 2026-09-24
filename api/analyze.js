@@ -7143,33 +7143,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const anchorMedian=rfMedianSigned(anchorResiduals);
         const anchorMad=rfMedianSigned(anchorResiduals.map(v=>Math.abs(v-anchorMedian)));
 
-        // KUVEYTTURK-ONLY Y NORMALIZATION:
-        // Kuveyt Türk referanslarında Telegram/JPG yeniden ölçekleme veya sayfa
-        // kırpma nedeniyle bütün semantik alanlar aynı dikey yönde birlikte
-        // kayabiliyor. Bu ortak kayma tek tek "field-position" bulgusu değildir.
-        // Diğer bankaların geometri mantığına DOKUNMA.
-        const isKuveytTurkReference = normalizedBank === 'kuveytturk';
-        let kuveytGlobalYResidualOffset = 0;
-        if (isKuveytTurkReference && matches.length >= 3) {
-          const yResiduals = matches
-            .map(m => {
-              const rp0 = normPoint(m.rl,refSize);
-              const tp0 = normPoint(m.tl,targetSize);
-              const projected0 = rfApplyAffine(affine,rp0);
-              return Number(tp0.y) - Number(projected0.y);
-            })
-            .filter(Number.isFinite);
-
-          if (yResiduals.length >= 3) {
-            kuveytGlobalYResidualOffset = rfMedianSigned(yResiduals);
-            console.log('KUVEYTTURK GLOBAL Y NORMALIZATION:', JSON.stringify({
-              reference: path.basename(referencePath),
-              matchCount: matches.length,
-              medianYResidual: Number(kuveytGlobalYResidualOffset.toFixed(5))
-            }));
-          }
-        }
-
         const refRegions=rfPrepareRegions(refOCR),targetRegions=rfPrepareRegions(targetOCR);
         const stylePairs=[];
         for(const m of matches){
@@ -7202,17 +7175,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             valueGeometryResidual=Math.hypot(q.x-tc.x,q.y-tc.y);
           }
           const rp=normPoint(m.rl,refSize),tp=normPoint(m.tl,targetSize),projected=rfApplyAffine(affine,rp);
-          const affineDx = projected.x - tp.x;
-          const affineDy = projected.y - tp.y;
-
-          // Only Kuveyt Türk: remove the common vertical residual shared by the
-          // semantic fields. A genuinely local displacement remains after this
-          // correction and can still raise positionScore.
-          const correctedDy = isKuveytTurkReference
-            ? affineDy + kuveytGlobalYResidualOffset
-            : affineDy;
-
-          const positionResidual=Math.hypot(affineDx,correctedDy);
+          const positionResidual=Math.hypot(projected.x-tp.x,projected.y-tp.y);
           const normalizedPosition=Math.max(0,positionResidual-Math.max(anchorMedian+3*anchorMad,.006));
           const labelExact=normLabel(m.rl.labelText)===normLabel(m.tl.labelText);
           const styleScore=rfClamp100((styleResidual||0)*100);
@@ -7775,7 +7738,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         ? ((styleHits>=Math.ceil(rows.length*.5)&&medStyle>=58)||(posHits>=Math.ceil(rows.length*.5)&&medPos>=62&&styleHits>=Math.ceil(rows.length*.5)))
         : ((medStyle>=70&&medPos>=62)||(medStyle>=70&&medValue>=62));
       const best=[...rows].sort((a,b)=>b.combinedScore-a.combinedScore)[0];
-      const aggregate={...best,occurrenceKey,referenceCountForField:rows.length,ensembleMedianStyleScore:rfClamp100(medStyle),ensembleMedianValueStyleScore:rfClamp100(medValue),ensembleMedianPositionScore:rfClamp100(medPos),ensembleStyleHitCount:styleHits,ensemblePositionHitCount:posHits,ensembleConsensusRatio:Number((styleHits/Math.max(1,rows.length)).toFixed(3))};
+      const aggregate={...best,occurrenceKey,referenceCountForField:rows.length,ensembleMedianStyleScore:rfClamp100(medStyle),ensembleMedianValueStyleScore:rfClamp100(medValue),ensembleMedianPositionScore:rfClamp100(medPos),ensembleStyleHitCount:styleHits,ensemblePositionHitCount:posHits,ensembleConsensusRatio:Number((styleHits/Math.max(1,rows.length)).toFixed(3)),suspicious:Boolean(consensus)};
       fields.push(aggregate);
       fieldObservations.push({field:best.field,occurrenceKey,referenceCount:rows.length,suspicious:Boolean(consensus),medianStyleScore:rfClamp100(medStyle),medianValueStyleScore:rfClamp100(medValue),medianPositionScore:rfClamp100(medPos),styleHitCount:styleHits,positionHitCount:posHits});
       if(consensus)suspicious.push(aggregate);
@@ -15502,7 +15465,8 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     referenceForensics,
     layoutForensics,
     referenceLocalCrop,
-    azureReferenceGeometry
+    azureReferenceGeometry,
+    bank
   );
   const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
@@ -17081,7 +17045,7 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
   };
 }
 
-function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null) {
+function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null, bank = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
   // The reference is a whole-document fingerprint. Compare structure/spacing first,
   // then fields, typography and localized pixels. Raw scores remain hidden.
@@ -17373,8 +17337,14 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 
   // 5) Strong field placement is concrete even when no local pixel crop is
   // available. Sorgu Numarası gibi fields can be located from their OCR label.
+  // KUVEYT TÜRK: after the bank-specific global-Y normalization, a raw
+  // positionScore alone is not enough to expose a user-facing field-position
+  // finding. Require the engine's own consensus decision for this bank only.
+  const normalizedReportBank = normalizeBank(bank);
+  const kuveytTurkPositionGate = normalizedReportBank === 'kuveytturk';
   for (const f of (Array.isArray(forensic?.fields) ? forensic.fields : [])) {
     if (Number(f?.positionScore || 0) < 70) continue;
+    if (kuveytTurkPositionGate && f?.suspicious !== true) continue;
     const field = String(f?.field || '').replace(/:value$/i,'');
     if (!field) continue;
     const title = fieldName(field);
