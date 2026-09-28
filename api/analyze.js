@@ -11184,6 +11184,7 @@ async function runFieldTamperingForensics({
   bank = null,
   referencePaths = [],
   fileFingerprint = null,
+  amountForensics = null,
 }) {
   if (!targetPath || !targetOCR?.success || !Array.isArray(targetOCR?.regions) || !targetOCR.regions.length) {
     return null;
@@ -11225,6 +11226,117 @@ async function runFieldTamperingForensics({
   if (targetSize.width < 100 || targetSize.height < 100) return null;
 
   const targetRegions = rfPrepareRegions(targetOCR);
+
+  // GLOBAL JPEG/RASTER BASELINE V1:
+  // Build a document-wide baseline from ordinary OCR text regions in the SAME
+  // target image. This is deliberately target-only: no reference value is
+  // assumed. Its purpose is to answer: "Is this local field more anomalous
+  // than the rest of this JPG?" This helps separate global JPEG/Telegram/
+  // resize/render effects from a localized erase+rewrite event.
+  async function buildGlobalJpegRasterBaseline(buffer, regions, imageSize) {
+    try {
+      const candidates = (Array.isArray(regions) ? regions : [])
+        .filter(r => {
+          const w = Math.abs((Number(r?.x2) || 0) - (Number(r?.x1) || 0));
+          const h = Math.abs((Number(r?.y2) || 0) - (Number(r?.y1) || 0));
+          const text = String(r?.text || '').trim();
+          const looksLikeMoneyOrCriticalValue = /(?:\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*(?:TL|TRY|₺|USD|EUR|€|\$)?|IBAN|TR\d{20,26})/i.test(text);
+          return text && !looksLikeMoneyOrCriticalValue && w >= 8 && h >= 5 && w <= imageSize.width * .65 && h <= imageSize.height * .12;
+        })
+        .slice(0, 36);
+
+      const samples = [];
+      const elaSamples = [];
+      // Recompress once; repeated full-image JPEG recompression would be both
+      // expensive and more noisy.
+      const recompressed = await sharp(buffer)
+        .jpeg({ quality: 88, chromaSubsampling: '4:4:4' })
+        .toBuffer();
+
+      for (const r of candidates) {
+        const region = {
+          x1: Math.max(0, Number(r.x1) || 0),
+          y1: Math.max(0, Number(r.y1) || 0),
+          x2: Math.min(imageSize.width, Number(r.x2) || 0),
+          y2: Math.min(imageSize.height, Number(r.y2) || 0),
+        };
+        const metrics = await rfRasterMetrics(buffer, region, imageSize);
+        if (!metrics) continue;
+
+        let elaMean = null;
+        try {
+          const x = Math.max(0, Math.floor(region.x1));
+          const y = Math.max(0, Math.floor(region.y1));
+          const w = Math.max(4, Math.min(imageSize.width - x, Math.ceil(region.x2 - region.x1)));
+          const h = Math.max(4, Math.min(imageSize.height - y, Math.ceil(region.y2 - region.y1)));
+          const read = async (src) => sharp(src)
+            .extract({ left: x, top: y, width: w, height: h })
+            .resize({ width: 96, height: 40, fit: 'fill' })
+            .grayscale().raw().toBuffer();
+          const [a,b] = await Promise.all([read(buffer), read(recompressed)]);
+          let sum = 0;
+          for (let i=0;i<a.length;i++) sum += Math.abs(Number(a[i])-Number(b[i]));
+          elaMean = sum / Math.max(1,a.length);
+        } catch {}
+
+        samples.push(metrics);
+        if (Number.isFinite(elaMean)) elaSamples.push(elaMean);
+      }
+
+      if (samples.length < 6) return null;
+      const med = (key) => rfMedian(samples.map(x => Number(x?.[key])).filter(Number.isFinite));
+      const baseline = {
+        sampleCount: samples.length,
+        medianMeanLuma: med('meanLuma'),
+        medianLumaStd: med('lumaStd'),
+        medianDarkRatio: med('darkRatio'),
+        medianEdgeRatio: med('edgeRatio'),
+        medianRowVariance: med('rowVariance'),
+        medianColVariance: med('colVariance'),
+        elaMedian: rfMedian(elaSamples.filter(Number.isFinite)),
+        elaMad: null,
+      };
+      if (Number.isFinite(baseline.elaMedian)) {
+        const deviations = elaSamples.map(v => Math.abs(v-baseline.elaMedian)).filter(Number.isFinite);
+        baseline.elaMad = rfMedian(deviations);
+      }
+
+      const rasterDistance = (m) => {
+        if (!m) return null;
+        const parts = [
+          rfSafeRel(m.meanLuma, baseline.medianMeanLuma, 18),
+          rfSafeRel(m.lumaStd, baseline.medianLumaStd, 10),
+          rfSafeRel(m.darkRatio, baseline.medianDarkRatio, .08),
+          rfSafeRel(m.edgeRatio, baseline.medianEdgeRatio, .08),
+          rfSafeRel(m.rowVariance, baseline.medianRowVariance, .012),
+          rfSafeRel(m.colVariance, baseline.medianColVariance, .012),
+        ].filter(Number.isFinite);
+        return parts.length ? parts.reduce((a,b)=>a+b,0)/parts.length : null;
+      };
+
+      const sampleDistances = samples.map(rasterDistance).filter(Number.isFinite);
+      baseline.rasterDistanceMedian = rfMedian(sampleDistances);
+      baseline.rasterDistanceMad = rfMedian(sampleDistances.map(v => Math.abs(v-baseline.rasterDistanceMedian)));
+      baseline.rasterDistances = sampleDistances;
+      baseline._rasterDistance = rasterDistance;
+      return baseline;
+    } catch (error) {
+      console.warn('GLOBAL JPEG/RASTER BASELINE HATASI:', error?.message || error);
+      return null;
+    }
+  }
+
+  const globalJpegRasterBaseline = await buildGlobalJpegRasterBaseline(targetBuffer, targetRegions, targetSize);
+  console.log('GLOBAL JPEG/RASTER BASELINE V1:', JSON.stringify(globalJpegRasterBaseline ? {
+    sampleCount: globalJpegRasterBaseline.sampleCount,
+    medianMeanLuma: Number(globalJpegRasterBaseline.medianMeanLuma?.toFixed?.(3) || 0),
+    medianDarkRatio: Number(globalJpegRasterBaseline.medianDarkRatio?.toFixed?.(4) || 0),
+    medianEdgeRatio: Number(globalJpegRasterBaseline.medianEdgeRatio?.toFixed?.(4) || 0),
+    elaMedian: Number(globalJpegRasterBaseline.elaMedian?.toFixed?.(3) || 0),
+    elaMad: Number(globalJpegRasterBaseline.elaMad?.toFixed?.(3) || 0),
+    rasterDistanceMedian: Number(globalJpegRasterBaseline.rasterDistanceMedian?.toFixed?.(4) || 0),
+    rasterDistanceMad: Number(globalJpegRasterBaseline.rasterDistanceMad?.toFixed?.(4) || 0),
+  } : { available:false }));
 
   const isCriticalLabel = (row) => {
     const rule = referenceFieldRuleForText(row?.text || '');
@@ -11471,12 +11583,80 @@ async function runFieldTamperingForensics({
     // character differences are NOT sufficient because legitimate values can
     // differ (2.000 vs 10.000, one date vs another, different IBAN, etc.).
     // They remain diagnostics only.
+    // AMOUNT V3 BRIDGE: promote the existing amount micro-raster measurements
+    // into a field-level diagnostic. This is deliberately MEDIUM by itself;
+    // JPG/compression/render differences can also affect these metrics.
+    const amountV3Metrics = field === 'amount' && amountForensics?.metrics
+      ? amountForensics.metrics
+      : null;
+    const amountV3LocalizedSignal = Boolean(
+      amountV3Metrics &&
+      Number(amountV3Metrics.maxFeatureVotes) >= 4 &&
+      Number(amountV3Metrics.localAnomalyRatio) >= 0.15 &&
+      Number(amountV3Metrics.localAnomalyRatio) <= 0.70 &&
+      (
+        Number(amountV3Metrics.maxInkRatioDifference) >= 0.38 ||
+        Number(amountV3Metrics.maxStrokeProxyDifference) >= 0.38 ||
+        Number(amountV3Metrics.maxEdgeDensityDifference) >= 0.38 ||
+        Number(amountV3Metrics.maxDarknessDifference) >= 0.38
+      )
+    );
+
+    // Compare the candidate field against the document-wide SAME-JPG baseline.
+    // If the whole document shows similar raster/ELA deviation, do not treat
+    // the amount's local V3 values as strong evidence by themselves.
+    let globalBaselineDiagnostic = null;
+    let globalJpegLocalizedSignal = false;
+    if (globalJpegRasterBaseline && field === 'amount') {
+      const targetRasterDistance = globalJpegRasterBaseline._rasterDistance(targetValueMetrics);
+      const mad = Math.max(0.01, Number(globalJpegRasterBaseline.rasterDistanceMad) || 0.01);
+      const rasterRobustZ = Number.isFinite(targetRasterDistance)
+        ? (targetRasterDistance - Number(globalJpegRasterBaseline.rasterDistanceMedian || 0)) / mad
+        : null;
+      let elaRobustZ = null;
+      if (Number.isFinite(targetEla?.targetMean) && Number.isFinite(globalJpegRasterBaseline.elaMedian)) {
+        const elaMad = Math.max(0.5, Number(globalJpegRasterBaseline.elaMad) || 0.5);
+        elaRobustZ = (Number(targetEla.targetMean) - Number(globalJpegRasterBaseline.elaMedian)) / elaMad;
+      }
+      globalJpegLocalizedSignal = Boolean(
+        (Number.isFinite(rasterRobustZ) && rasterRobustZ >= 3) ||
+        (Number.isFinite(elaRobustZ) && elaRobustZ >= 3)
+      );
+      globalBaselineDiagnostic = {
+        sampleCount: globalJpegRasterBaseline.sampleCount,
+        targetRasterDistance: Number.isFinite(targetRasterDistance) ? Number(targetRasterDistance.toFixed(4)) : null,
+        rasterBaselineMedian: Number(globalJpegRasterBaseline.rasterDistanceMedian?.toFixed?.(4) || 0),
+        rasterBaselineMad: Number(globalJpegRasterBaseline.rasterDistanceMad?.toFixed?.(4) || 0),
+        rasterRobustZ: Number.isFinite(rasterRobustZ) ? Number(rasterRobustZ.toFixed(2)) : null,
+        targetElaMean: Number.isFinite(targetEla?.targetMean) ? Number(targetEla.targetMean.toFixed(3)) : null,
+        elaBaselineMedian: Number(globalJpegRasterBaseline.elaMedian?.toFixed?.(3) || 0),
+        elaBaselineMad: Number(globalJpegRasterBaseline.elaMad?.toFixed?.(3) || 0),
+        elaRobustZ: Number.isFinite(elaRobustZ) ? Number(elaRobustZ.toFixed(2)) : null,
+        localizedBeyondGlobalJpeg: globalJpegLocalizedSignal,
+      };
+    }
+
+    // V3 local raster evidence is promoted only when the same target image
+    // also shows that the field is unusually different from the document-wide
+    // JPEG/raster baseline. If the whole JPG is noisy, this gate prevents a
+    // global compression/render artifact from becoming a field finding.
+    const amountV3GlobalSupported = Boolean(
+      amountV3LocalizedSignal && (
+        globalJpegLocalizedSignal ||
+        !globalBaselineDiagnostic
+      )
+    );
+
     const contentIndependentStrong =
       (elaSignal && internalSignal) ||
       (elaSignal && sameFieldDigitSignal) ||
+      (amountV3GlobalSupported && (elaSignal || internalSignal || sameFieldDigitSignal)) ||
       (internalSignal && sameFieldDigitSignal && referenceSupport.length >= 1);
 
-    const signalCount = [elaSignal, internalSignal, characterSignal, valueRasterSignal, sameFieldDigitSignal].filter(Boolean).length;
+    const signalCount = [
+      elaSignal, internalSignal, characterSignal, valueRasterSignal,
+      sameFieldDigitSignal, amountV3GlobalSupported
+    ].filter(Boolean).length;
     const isCritical = field === 'amount' || field === 'date' || field === 'time' || field === 'iban' || field === 'transactionNo';
 
     // Do not call a field edited from a single weak signal. Critical fields may
@@ -11486,19 +11666,39 @@ async function runFieldTamperingForensics({
     const strong = Boolean(contentIndependentStrong) && (
       isCritical || referenceSupport.length >= 1
     );
-    const medium = !strong && signalCount >= 1 && (isCritical && (elaSignal || internalSignal));
+    const medium = !strong && signalCount >= 1 && (
+      isCritical && (elaSignal || internalSignal || amountV3LocalizedSignal)
+    );
 
     const diagnostic = {
       field,
       label: String(targetLabel.text || '').trim(),
       targetValue: String(targetValue.text || '').trim(),
       signalCount,
-      signals: { elaSignal, internalSignal, characterSignal, valueRasterSignal, sameFieldDigitSignal },
+      signals: {
+        elaSignal,
+        internalSignal,
+        characterSignal,
+        valueRasterSignal,
+        sameFieldDigitSignal,
+        amountV3LocalizedSignal,
+        amountV3GlobalSupported,
+        globalJpegLocalizedSignal,
+      },
       localEla: targetEla,
       referenceSupport,
       referenceInternalDeltaMedian: Number.isFinite(refInternalMedian) ? Number(refInternalMedian.toFixed(4)) : null,
       referenceCharacterResidualMedian: Number.isFinite(refCharacterMedian) ? Number(refCharacterMedian.toFixed(4)) : null,
       referenceValueStyleResidualMedian: Number.isFinite(refValueStyleMedian) ? Number(refValueStyleMedian.toFixed(4)) : null,
+      amountV3: amountV3Metrics ? {
+        maxFeatureVotes: Number(amountV3Metrics.maxFeatureVotes || 0),
+        maxInkRatioDifference: Number(amountV3Metrics.maxInkRatioDifference || 0),
+        maxStrokeProxyDifference: Number(amountV3Metrics.maxStrokeProxyDifference || 0),
+        maxEdgeDensityDifference: Number(amountV3Metrics.maxEdgeDensityDifference || 0),
+        maxDarknessDifference: Number(amountV3Metrics.maxDarknessDifference || 0),
+        localAnomalyRatio: Number(amountV3Metrics.localAnomalyRatio || 0),
+      } : null,
+      globalJpegBaseline: globalBaselineDiagnostic,
       targetBox: { ...targetValueRegion },
     };
     fieldDiagnostics.push(diagnostic);
@@ -11510,6 +11710,8 @@ async function runFieldTamperingForensics({
       if (characterSignal) reasons.push('karakter geometrisi referans profilinden ayrılıyor');
       if (valueRasterSignal) reasons.push('değer bölgesi raster/stroke yapısı belirgin farklı');
       if (sameFieldDigitSignal) reasons.push('aynı tutar alanında tekil karakter geometrisi aykırılığı');
+      if (amountV3GlobalSupported) reasons.push('tutar alanı global JPG/raster baseline üzerinde lokal anomali gösteriyor');
+      else if (amountV3LocalizedSignal) reasons.push('tutar alanında mikro-raster anomali bulundu ancak global JPG baseline tarafından henüz doğrulanmadı');
       findings.push({
         field,
         title: field === 'amount' ? 'Tutar' : field === 'date' ? 'Tarih' : field === 'time' ? 'Saat' : field === 'iban' ? 'IBAN' : field === 'transactionNo' ? 'İşlem No' : field,
@@ -14047,6 +14249,7 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
         ? tamperingReferencePaths
         : (tamperingReferencePaths ? [tamperingReferencePaths] : []),
       fileFingerprint,
+      amountForensics,
     });
     console.log("FIELD TAMPERING FORENSICS:", JSON.stringify(fieldTamperingForensics));
   } catch (error) {
@@ -15956,23 +16159,30 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
     console.log("HUMAN READABLE FORENSIC REPORT V64:", JSON.stringify(humanForensicReport));
 
-    // FIELD TAMPERING: strong, content-independent local evidence is promoted
-    // to the same user-facing reference report. Medium findings stay internal.
-    if (fieldTamperingForensics?.available === true && Number(fieldTamperingForensics.strongFindingCount) > 0) {
+    // FIELD TAMPERING: strong evidence is promoted directly. Medium critical-field
+    // findings are also surfaced with cautious wording so the user can see that
+    // a local anomaly exists without treating it as a definitive fake verdict.
+    if (fieldTamperingForensics?.available === true &&
+        (Number(fieldTamperingForensics.strongFindingCount) > 0 || Number(fieldTamperingForensics.mediumFindingCount) > 0)) {
       const existing = Array.isArray(result.referenceForensicReport.findings)
         ? result.referenceForensicReport.findings.slice()
         : [];
       const tamperRows = (fieldTamperingForensics.findings || [])
-        .filter(x => String(x?.severity || '') === 'strong')
+        .filter(x => String(x?.severity || '') === 'strong' || String(x?.severity || '') === 'medium')
         .slice(0, 4)
-        .map(x => ({
-          title: String(x.title || x.field || 'Alan'),
-          detail: String(x.evidence || 'Alan içinde çoklu lokal düzenleme sinyali tespit edildi.'),
-          kind: 'field-tampering',
-          priority: 0,
-          evidenceField: String(x.field || ''),
-          targetBox: x.targetBox || null,
-        }));
+        .map(x => {
+          const isStrong = String(x?.severity || '') === 'strong';
+          return {
+            title: String(x.title || x.field || 'Alan'),
+            detail: isStrong
+              ? String(x.evidence || 'Alan içinde çoklu lokal düzenleme sinyali tespit edildi.')
+              : `${String(x.evidence || 'Alan içinde lokal görsel anomali tespit edildi.')} Bu bulgu tek başına sahtecilik kanıtı değildir; JPG/sıkıştırma/render etkisi de mümkün olabilir.`,
+            kind: 'field-tampering',
+            priority: isStrong ? 0 : 1,
+            evidenceField: String(x.field || ''),
+            targetBox: x.targetBox || null,
+          };
+        });
       const merged = [...tamperRows, ...existing]
         .filter((row, index, arr) => index === arr.findIndex(x => String(x.title) === String(row.title) && String(x.detail) === String(row.detail)))
         .sort((a,b) => Number(a.priority || 9) - Number(b.priority || 9))
