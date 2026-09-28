@@ -11242,7 +11242,7 @@ async function runFieldTamperingForensics({
       // `available:false` on real receipts. We build the baseline from a
       // broader set of ordinary OCR text regions and later compare the target
       // field against the robust median/MAD of the whole document.
-      const candidates = (Array.isArray(regions) ? regions : [])
+      let candidates = (Array.isArray(regions) ? regions : [])
         .filter(r => {
           const w = Math.abs((Number(r?.x2) || 0) - (Number(r?.x1) || 0));
           const h = Math.abs((Number(r?.y2) || 0) - (Number(r?.y1) || 0));
@@ -11265,6 +11265,34 @@ async function runFieldTamperingForensics({
           );
         })
         .slice(0, 48);
+
+      // V5: OCR-only sampling can still produce too few usable regions on
+      // bank layouts where PaddleOCR returns merged or irregular boxes.
+      // Add document-grid patches so the JPEG/raster baseline is genuinely
+      // document-wide and does not depend on semantic OCR coverage.
+      if (candidates.length < 12) {
+        const cols = 4;
+        const rows = 6;
+        const patchW = Math.max(48, Math.round(imageSize.width * 0.14));
+        const patchH = Math.max(28, Math.round(imageSize.height * 0.065));
+        const usableW = Math.max(1, imageSize.width - patchW);
+        const usableH = Math.max(1, imageSize.height - patchH);
+        const gridCandidates = [];
+        for (let gy = 0; gy < rows; gy++) {
+          for (let gx = 0; gx < cols; gx++) {
+            const x1 = Math.round((gx / Math.max(1, cols - 1)) * usableW);
+            const y1 = Math.round((gy / Math.max(1, rows - 1)) * usableH);
+            gridCandidates.push({
+              x1, y1,
+              x2: Math.min(imageSize.width, x1 + patchW),
+              y2: Math.min(imageSize.height, y1 + patchH),
+              text: '__GLOBAL_GRID_SAMPLE__',
+              _globalGridSample: true,
+            });
+          }
+        }
+        candidates = candidates.concat(gridCandidates).slice(0, 24);
+      }
 
       const samples = [];
       const elaSamples = [];
@@ -11308,6 +11336,8 @@ async function runFieldTamperingForensics({
       const med = (key) => rfMedian(samples.map(x => Number(x?.[key])).filter(Number.isFinite));
       const baseline = {
         sampleCount: samples.length,
+        ocrSampleCount: candidates.filter(x => !x._globalGridSample).length,
+        gridSampleCount: candidates.filter(x => x._globalGridSample).length,
         medianMeanLuma: med('meanLuma'),
         medianLumaStd: med('lumaStd'),
         medianDarkRatio: med('darkRatio'),
@@ -11350,6 +11380,8 @@ async function runFieldTamperingForensics({
   const globalJpegRasterBaseline = await buildGlobalJpegRasterBaseline(targetBuffer, targetRegions, targetSize);
   console.log('GLOBAL JPEG/RASTER BASELINE V2:', JSON.stringify(globalJpegRasterBaseline ? {
     sampleCount: globalJpegRasterBaseline.sampleCount,
+    ocrSampleCount: globalJpegRasterBaseline.ocrSampleCount,
+    gridSampleCount: globalJpegRasterBaseline.gridSampleCount,
     medianMeanLuma: Number(globalJpegRasterBaseline.medianMeanLuma?.toFixed?.(3) || 0),
     medianDarkRatio: Number(globalJpegRasterBaseline.medianDarkRatio?.toFixed?.(4) || 0),
     medianEdgeRatio: Number(globalJpegRasterBaseline.medianEdgeRatio?.toFixed?.(4) || 0),
