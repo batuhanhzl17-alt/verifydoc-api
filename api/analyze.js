@@ -2693,6 +2693,7 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   const layoutScore = Number(forensic?.layoutForensics?.score);
   const ocrConfidence = Number(forensic?.paddleImageOCR?.confidence);
   const amount = forensic?.amountForensics || null;
+  const fieldTampering = forensic?.fieldTamperingForensics || null;
   const doc = result?.documentData || {};
   const template = forensic?.referenceTemplateAnalysis || null;
 
@@ -2778,6 +2779,16 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   }
   if (Number.isFinite(pixelScore)) {
     editingRisk = Math.max(editingRisk, Math.min(55, Math.round(pixelScore * 0.55)));
+  }
+
+  // FIELD TAMPERING V1: promote only strong multi-signal local field evidence.
+  // Medium findings remain diagnostic and do not move the final risk by themselves.
+  if (fieldTampering?.available === true) {
+    if (fieldTampering.severity === 'strong' && Number(fieldTampering.strongFindingCount) > 0) {
+      editingRisk = Math.max(editingRisk, 78);
+    } else if (fieldTampering.severity === 'medium' && Number(fieldTampering.mediumFindingCount) > 0) {
+      editingRisk = Math.max(editingRisk, 35);
+    }
   }
   // If the reference engine has a high-confidence semantic local-gap anomaly,
   // make it visible in the editing category even when the other visual signals
@@ -11149,6 +11160,402 @@ console.log("AMOUNT FORENSICS STRONG CACHED:", fileFingerprint);
 return finalForensics;
 }
 
+
+// =====================================================
+// FIELD TAMPERING FORENSICS V1 — GENERIC FIELD-LEVEL EDIT DETECTOR
+// =====================================================
+// Amaç: Referans motorunun "aynı alanın değeri farklı olabilir" kuralını
+// bozmadan, hedef dekontun kendi içindeki lokal düzenleme izlerini aramak.
+// Özellikle TUTAR / TARİH / SAAT / IBAN / işlem numaraları gibi kritik
+// alanlarda silme + yeniden yazma girişimleri için çalışır.
+//
+// Bu katman içerik eşitliği istemez. Bir tutarın 2.000 -> 10.000 olması
+// normal bir işlem değişikliği olabilir; bu nedenle yalnızca sayı farkına
+// göre alarm üretmez. Alarm için lokal raster / stil / yeniden-kodlama /
+// karakter tutarlılığı sinyallerinin birleşmesi gerekir.
+//
+// ÖNEMLİ: Kusursuz, iz bırakmadan yapılan piksel değişikliğinin tek görselden
+// kesin olarak tespit edilmesi mümkün değildir. Bu motor mevcut görselde
+// ölçülebilir iz varsa yakalamaya çalışır ve sonucu kanıt olarak sunar.
+
+async function runFieldTamperingForensics({
+  targetPath,
+  targetOCR,
+  bank = null,
+  referencePaths = [],
+  fileFingerprint = null,
+}) {
+  if (!targetPath || !targetOCR?.success || !Array.isArray(targetOCR?.regions) || !targetOCR.regions.length) {
+    return null;
+  }
+
+  const criticalFields = new Set([
+    'amount','date','time','iban','senderName','recipientName',
+    'transactionNo','accountNo','taxNo','description','branch',
+    'senderAddress','recipientAddress','address'
+  ]);
+
+  const genericCriticalPattern = /(sorgu|referans|fiş|fis|ettn|dok[üu]man|işlem\s*yeri|islem\s*yeri|banka|şube|sube)/i;
+
+  const normalizeKey = (v) => String(v || '').trim();
+  const regionCenter = (r) => ({
+    x: ((Number(r?.x1) || 0) + (Number(r?.x2) || 0)) / 2,
+    y: ((Number(r?.y1) || 0) + (Number(r?.y2) || 0)) / 2,
+  });
+
+  const safeLoadImage = async (filePath) => {
+    try {
+      const ext = path.extname(String(filePath || '')).toLowerCase();
+      if (ext === '.pdf') {
+        const raw = await fs.readFile(filePath);
+        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+        const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+        return rendered?.buffer || null;
+      }
+      return await fs.readFile(filePath);
+    } catch {
+      return null;
+    }
+  };
+
+  const targetBuffer = await safeLoadImage(targetPath);
+  if (!targetBuffer) return null;
+  const targetMeta = await sharp(targetBuffer).metadata();
+  const targetSize = { width: Number(targetMeta.width) || 0, height: Number(targetMeta.height) || 0 };
+  if (targetSize.width < 100 || targetSize.height < 100) return null;
+
+  const targetRegions = rfPrepareRegions(targetOCR);
+
+  const isCriticalLabel = (row) => {
+    const rule = referenceFieldRuleForText(row?.text || '');
+    if (rule?.key && criticalFields.has(rule.key)) return rule.key;
+    const raw = String(row?.text || '').trim();
+    const generic = rfGenericFieldKey(rfLabelPart(raw));
+    if (generic && genericCriticalPattern.test(raw)) return generic;
+    return null;
+  };
+
+  const targetLabels = [];
+  for (const row of targetRegions) {
+    const key = isCriticalLabel(row);
+    if (!key) continue;
+    if (!rfLooksLikeLabelRegion(row)) continue;
+    targetLabels.push({ ...row, fieldKey: key });
+  }
+
+  // A clean target-only local edit detector. Recompression residual is useful
+  // because a pasted/repainted ROI often has a different JPEG/raster response
+  // than untouched neighbouring text. It is intentionally normalized against
+  // control regions in the same document so Telegram/JPEG quality alone does
+  // not become a finding.
+  async function localElaProfile(buffer, region, imageSize) {
+    if (!buffer || !region || !imageSize?.width || !imageSize?.height) return null;
+    try {
+      const x = Math.max(0, Math.floor(Number(region.x1)));
+      const y = Math.max(0, Math.floor(Number(region.y1)));
+      const w = Math.max(4, Math.min(imageSize.width - x, Math.ceil(Number(region.x2) - Number(region.x1))));
+      const h = Math.max(4, Math.min(imageSize.height - y, Math.ceil(Number(region.y2) - Number(region.y1))));
+      if (w < 4 || h < 4) return null;
+
+      const recompressed = await sharp(buffer)
+        .jpeg({ quality: 88, chromaSubsampling: '4:4:4' })
+        .toBuffer();
+
+      const read = async (src) => sharp(src)
+        .extract({ left: x, top: y, width: w, height: h })
+        .resize({ width: 180, height: 72, fit: 'fill' })
+        .grayscale()
+        .raw()
+        .toBuffer();
+
+      const [a, b] = await Promise.all([read(buffer), read(recompressed)]);
+      let sum = 0, sum2 = 0;
+      for (let i = 0; i < a.length; i++) {
+        const d = Math.abs(Number(a[i]) - Number(b[i]));
+        sum += d;
+        sum2 += d * d;
+      }
+      const n = Math.max(1, a.length);
+      const mean = sum / n;
+      const variance = Math.max(0, sum2 / n - mean * mean);
+      return { mean, std: Math.sqrt(variance), max: Math.max(...Array.from(a, (v, i) => Math.abs(Number(v) - Number(b[i])))) };
+    } catch {
+      return null;
+    }
+  }
+
+  async function localElaOutlier(buffer, valueRegion) {
+    if (!valueRegion) return null;
+    const x1 = Number(valueRegion.x1), y1 = Number(valueRegion.y1);
+    const x2 = Number(valueRegion.x2), y2 = Number(valueRegion.y2);
+    const w = Math.max(4, x2 - x1), h = Math.max(4, y2 - y1);
+    const candidates = [
+      { x1: x1 - w * 1.25, y1, x2: x1 - w * 0.25, y2: y2 },
+      { x1: x2 + w * 0.25, y1, x2: x2 + w * 1.25, y2 },
+      { x1, y1: y1 - h * 1.5, x2, y2: y1 - h * 0.5 },
+      { x1, y1: y2 + h * 0.5, x2, y2: y2 + h * 1.5 },
+    ].map(r => ({
+      x1: Math.max(0, r.x1), y1: Math.max(0, r.y1),
+      x2: Math.min(targetSize.width, r.x2), y2: Math.min(targetSize.height, r.y2),
+    })).filter(r => r.x2 - r.x1 >= 4 && r.y2 - r.y1 >= 4);
+
+    const targetProfile = await localElaProfile(buffer, valueRegion, targetSize);
+    if (!targetProfile || candidates.length < 2) return null;
+    const controls = [];
+    for (const c of candidates.slice(0, 4)) {
+      const profile = await localElaProfile(buffer, c, targetSize);
+      if (profile) controls.push(profile.mean);
+    }
+    if (controls.length < 2) return null;
+    const baseline = rfMedian(controls);
+    const ratio = targetProfile.mean / Math.max(1, baseline);
+    const excess = Math.max(0, targetProfile.mean - baseline);
+    return {
+      targetMean: Number(targetProfile.mean.toFixed(3)),
+      controlMedian: Number(baseline.toFixed(3)),
+      ratio: Number(ratio.toFixed(3)),
+      excess: Number(excess.toFixed(3)),
+      controls: controls.map(x => Number(x.toFixed(3))),
+      outlier: ratio >= 1.75 && excess >= 2.5,
+    };
+  }
+
+  function metricRatio(a, b, scale) {
+    const x = Number(a), y = Number(b);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return Math.min(1, Math.abs(x - y) / Math.max(scale, 1e-6));
+  }
+
+  function internalStyleResidual(labelMetrics, valueMetrics) {
+    if (!labelMetrics || !valueMetrics) return null;
+    const parts = [
+      metricRatio(valueMetrics.inkRatio, labelMetrics.inkRatio, .08),
+      metricRatio(valueMetrics.inkWidthNorm, labelMetrics.inkWidthNorm, .22),
+      metricRatio(valueMetrics.inkHeightNorm, labelMetrics.inkHeightNorm, .18),
+      metricRatio(valueMetrics.aspect, labelMetrics.aspect, .65),
+      metricRatio(valueMetrics.edgeDensity, labelMetrics.edgeDensity, .08),
+      metricRatio(valueMetrics.textHeightNorm, labelMetrics.textHeightNorm, .16),
+      metricRatio(valueMetrics.rowPeak, labelMetrics.rowPeak, .22),
+    ].filter(Number.isFinite);
+    return parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : null;
+  }
+
+  // Load reference OCR/images only when references are available. The target
+  // local detector remains useful without a reference.
+  const refEntries = [];
+  for (const refPath of (Array.isArray(referencePaths) ? referencePaths : []).slice(0, 5)) {
+    const refBuffer = await safeLoadImage(refPath);
+    if (!refBuffer) continue;
+    const refMeta = await sharp(refBuffer).metadata();
+    const refSize = { width: Number(refMeta.width) || 0, height: Number(refMeta.height) || 0 };
+    if (refSize.width < 100 || refSize.height < 100) continue;
+    const raw = await fs.readFile(refPath);
+    const refId = createHash('sha256').update(raw).digest('hex').slice(0, 16);
+    const cacheKey = `field-tamper-ocr:${normalizeBank(bank)}:${refId}`;
+    let refOCR = paddleOCRCache.get(cacheKey);
+    if (!refOCR?.success) {
+      const tmp = path.join('/tmp', `verifydoc-ft-${normalizeBank(bank) || 'bank'}-${refId}.png`);
+      try {
+        await fs.writeFile(tmp, refBuffer);
+        refOCR = await runPaddleOCR(tmp);
+        if (refOCR?.success) paddleOCRCache.set(cacheKey, refOCR);
+      } finally {
+        try { await fs.unlink(tmp); } catch {}
+      }
+    }
+    if (!refOCR?.success) continue;
+    const refRegions = rfPrepareRegions(refOCR);
+    const refLabels = [];
+    for (const row of refRegions) {
+      const key = isCriticalLabel(row);
+      if (!key || !rfLooksLikeLabelRegion(row)) continue;
+      refLabels.push({ ...row, fieldKey: key });
+    }
+    refEntries.push({ path: refPath, buffer: refBuffer, size: refSize, regions: refRegions, labels: refLabels });
+  }
+
+  const findings = [];
+  const fieldDiagnostics = [];
+
+  for (const targetLabel of targetLabels) {
+    const field = normalizeKey(targetLabel.fieldKey);
+    const targetValue = rfFindValueRegion(targetRegions, targetLabel, field);
+    if (!targetValue?.region) continue;
+
+    const targetLabelRegion = rfFocusLabelRegion(targetLabel.region, targetLabel.text);
+    const targetValueRegion = rfFocusValueRegion(targetValue.region, targetValue.text, field);
+    if (!targetValueRegion) continue;
+
+    const targetLabelMetrics = await rfRasterMetrics(targetBuffer, targetLabelRegion, targetSize);
+    const targetValueMetrics = await rfRasterMetrics(targetBuffer, targetValueRegion, targetSize);
+    const targetCharacterMetrics = await rfCharacterMetrics(targetBuffer, targetValueRegion, targetSize);
+    const targetEla = await localElaOutlier(targetBuffer, targetValueRegion);
+    const localStyle = internalStyleResidual(targetLabelMetrics, targetValueMetrics);
+
+    let referenceSupport = [];
+    for (const ref of refEntries) {
+      const candidates = ref.labels
+        .filter(x => x.fieldKey === field)
+        .map(x => {
+          const a = regionCenter(targetLabel.region);
+          const b = regionCenter(x.region);
+          const targetNorm = { x: a.x / targetSize.width, y: a.y / targetSize.height };
+          const refNorm = { x: b.x / ref.size.width, y: b.y / ref.size.height };
+          return { row: x, distance: Math.hypot(targetNorm.x - refNorm.x, targetNorm.y - refNorm.y) };
+        })
+        .sort((a, b) => a.distance - b.distance);
+      const refLabel = candidates[0]?.row;
+      if (!refLabel) continue;
+      const refValue = rfFindValueRegion(ref.regions, refLabel, field);
+      if (!refValue?.region) continue;
+      const refLabelRegion = rfFocusLabelRegion(refLabel.region, refLabel.text);
+      const refValueRegion = rfFocusValueRegion(refValue.region, refValue.text, field);
+      const refLabelMetrics = await rfRasterMetrics(ref.buffer, refLabelRegion, ref.size);
+      const refValueMetrics = await rfRasterMetrics(ref.buffer, refValueRegion, ref.size);
+      const refCharacterMetrics = await rfCharacterMetrics(ref.buffer, refValueRegion, ref.size);
+      const targetToRefValueResidual = rfStyleResidual(refValueMetrics, targetValueMetrics);
+      const targetToRefCharacterResidual = rfCharacterMetrics && targetCharacterMetrics && refCharacterMetrics
+        ? rfSafeRel(targetCharacterMetrics.characterWidthToHeight, refCharacterMetrics.characterWidthToHeight, .42) * .25 +
+          rfSafeRel(targetCharacterMetrics.characterFillRatio, refCharacterMetrics.characterFillRatio, .16) * .30 +
+          rfSafeRel(targetCharacterMetrics.characterGapToHeight, refCharacterMetrics.characterGapToHeight, .55) * .25 +
+          rfSafeRel(targetCharacterMetrics.inkAspect, refCharacterMetrics.inkAspect, .55) * .20
+        : null;
+      const referenceInternal = internalStyleResidual(refLabelMetrics, refValueMetrics);
+      const targetInternal = localStyle;
+      const internalDelta = Number.isFinite(targetInternal) && Number.isFinite(referenceInternal)
+        ? Math.abs(targetInternal - referenceInternal)
+        : null;
+
+      referenceSupport.push({
+        reference: path.basename(ref.path),
+        targetValueText: String(targetValue.text || '').trim(),
+        referenceValueText: String(refValue.text || '').trim(),
+        valueStyleResidual: Number.isFinite(targetToRefValueResidual) ? Number(targetToRefValueResidual.toFixed(4)) : null,
+        characterResidual: Number.isFinite(targetToRefCharacterResidual) ? Number(targetToRefCharacterResidual.toFixed(4)) : null,
+        targetInternalStyle: Number.isFinite(targetInternal) ? Number(targetInternal.toFixed(4)) : null,
+        referenceInternalStyle: Number.isFinite(referenceInternal) ? Number(referenceInternal.toFixed(4)) : null,
+        internalStyleDelta: Number.isFinite(internalDelta) ? Number(internalDelta.toFixed(4)) : null,
+      });
+    }
+
+    const refInternalMedian = rfMedian(referenceSupport.map(x => Number(x.internalStyleDelta)).filter(Number.isFinite));
+    const refCharacterMedian = rfMedian(referenceSupport.map(x => Number(x.characterResidual)).filter(Number.isFinite));
+    const refValueStyleMedian = rfMedian(referenceSupport.map(x => Number(x.valueStyleResidual)).filter(Number.isFinite));
+
+    // For the amount field, an unusually high local ELA residual is particularly
+    // useful after a clean-looking erase/rewrite. For other fields it remains
+    // corroborating evidence only.
+    const elaSignal = Boolean(targetEla?.outlier);
+    const internalSignal = Number.isFinite(refInternalMedian) && refInternalMedian >= 0.22;
+    const characterSignal = Number.isFinite(refCharacterMedian) && refCharacterMedian >= 0.24;
+    const valueRasterSignal = Number.isFinite(refValueStyleMedian) && refValueStyleMedian >= 0.48;
+
+    let sameFieldDigitSignal = false;
+    if (field === 'amount' && targetValue.text) {
+      try {
+        const numeric = await rfNumericGlyphSequence(targetBuffer, targetValueRegion, targetSize, targetValue.text);
+        if (numeric?.slots?.length >= 3) {
+          const widths = numeric.slots.map(x => x.width / Math.max(1, x.height));
+          const fills = numeric.slots.map(x => x.fill);
+          const medW = rfMedian(widths), medF = rfMedian(fills);
+          const outlierCount = numeric.slots.filter(x =>
+            Math.abs((x.width / Math.max(1, x.height)) - medW) / Math.max(.05, Math.abs(medW)) > .22 ||
+            Math.abs(x.fill - medF) / Math.max(.05, Math.abs(medF)) > .22
+          ).length;
+          sameFieldDigitSignal = outlierCount >= 1 && outlierCount <= Math.ceil(numeric.slots.length * .30);
+        }
+      } catch {}
+    }
+
+    // Content-independent signals are preferred. Raw target-vs-reference
+    // character differences are NOT sufficient because legitimate values can
+    // differ (2.000 vs 10.000, one date vs another, different IBAN, etc.).
+    // They remain diagnostics only.
+    const contentIndependentStrong =
+      (elaSignal && internalSignal) ||
+      (elaSignal && sameFieldDigitSignal) ||
+      (internalSignal && sameFieldDigitSignal && referenceSupport.length >= 1);
+
+    const signalCount = [elaSignal, internalSignal, characterSignal, valueRasterSignal, sameFieldDigitSignal].filter(Boolean).length;
+    const isCritical = field === 'amount' || field === 'date' || field === 'time' || field === 'iban' || field === 'transactionNo';
+
+    // Do not call a field edited from a single weak signal. Critical fields may
+    // surface only when at least two content-independent/local signals agree.
+    // This is deliberately conservative to avoid treating normal dynamic-value
+    // changes as tampering.
+    const strong = Boolean(contentIndependentStrong) && (
+      isCritical || referenceSupport.length >= 1
+    );
+    const medium = !strong && signalCount >= 1 && (isCritical && (elaSignal || internalSignal));
+
+    const diagnostic = {
+      field,
+      label: String(targetLabel.text || '').trim(),
+      targetValue: String(targetValue.text || '').trim(),
+      signalCount,
+      signals: { elaSignal, internalSignal, characterSignal, valueRasterSignal, sameFieldDigitSignal },
+      localEla: targetEla,
+      referenceSupport,
+      referenceInternalDeltaMedian: Number.isFinite(refInternalMedian) ? Number(refInternalMedian.toFixed(4)) : null,
+      referenceCharacterResidualMedian: Number.isFinite(refCharacterMedian) ? Number(refCharacterMedian.toFixed(4)) : null,
+      referenceValueStyleResidualMedian: Number.isFinite(refValueStyleMedian) ? Number(refValueStyleMedian.toFixed(4)) : null,
+      targetBox: { ...targetValueRegion },
+    };
+    fieldDiagnostics.push(diagnostic);
+
+    if (strong || medium) {
+      const reasons = [];
+      if (elaSignal) reasons.push('lokal yeniden-kodlama/ELA artışı');
+      if (internalSignal) reasons.push('etiket-değer raster ilişkisi referans davranışından ayrılıyor');
+      if (characterSignal) reasons.push('karakter geometrisi referans profilinden ayrılıyor');
+      if (valueRasterSignal) reasons.push('değer bölgesi raster/stroke yapısı belirgin farklı');
+      if (sameFieldDigitSignal) reasons.push('aynı tutar alanında tekil karakter geometrisi aykırılığı');
+      findings.push({
+        field,
+        title: field === 'amount' ? 'Tutar' : field === 'date' ? 'Tarih' : field === 'time' ? 'Saat' : field === 'iban' ? 'IBAN' : field === 'transactionNo' ? 'İşlem No' : field,
+        severity: strong ? 'strong' : 'medium',
+        confidence: Math.min(98, 68 + signalCount * 9 + (referenceSupport.length >= 2 ? 8 : referenceSupport.length ? 4 : 0)),
+        evidence: `Alan içinde olası sonradan düzenleme izi: ${reasons.join('; ')}.`,
+        targetBox: { ...targetValueRegion },
+        signals: diagnostic.signals,
+      });
+    }
+  }
+
+  findings.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  const strongFindings = findings.filter(x => x.severity === 'strong');
+  const mediumFindings = findings.filter(x => x.severity === 'medium');
+
+  const result = {
+    available: true,
+    engine: 'field-tampering-forensics-v1-local-raster-ela-style',
+    bank: normalizeBank(bank),
+    fileFingerprint: fileFingerprint || null,
+    checkedFieldCount: fieldDiagnostics.length,
+    strongFindingCount: strongFindings.length,
+    mediumFindingCount: mediumFindings.length,
+    findings: findings.slice(0, 12),
+    diagnostics: fieldDiagnostics.slice(0, 40),
+    status: strongFindings.length ? 'warning' : mediumFindings.length ? 'caution' : 'pass',
+    severity: strongFindings.length ? 'strong' : mediumFindings.length ? 'medium' : 'none',
+    evidence: strongFindings.length
+      ? `Alan düzeyinde ${strongFindings.length} güçlü lokal düzenleme sinyali bulundu.`
+      : mediumFindings.length
+        ? `Alan düzeyinde ${mediumFindings.length} orta kuvvette lokal sinyal bulundu; tek başına sahtecilik kanıtı değildir.`
+        : 'Kritik alanlarda çoklu ve lokal düzenleme sinyali bulunmadı.',
+  };
+
+  console.log('FIELD TAMPERING FORENSICS V1:', JSON.stringify({
+    bank: normalizeBank(bank),
+    checkedFieldCount: result.checkedFieldCount,
+    strongFindingCount: result.strongFindingCount,
+    mediumFindingCount: result.mediumFindingCount,
+    findings: result.findings.slice(0, 8).map(x => ({ field: x.field, severity: x.severity, confidence: x.confidence, signals: x.signals })),
+  }));
+
+  return result;
+}
+
 // =====================================================
 // JSON RESPONSE
 // =====================================================
@@ -13483,6 +13890,7 @@ let negativeSampleForensics = null;
 let pixelForensics = null;
 let openSourceForensics = null;
 let fontForensics = null;
+let fieldTamperingForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -13621,6 +14029,29 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
   } catch (error) {
     console.warn("REFERENCE FORENSIC ENGINE V26 HATASI:", error?.message || error);
     referenceForensics = null;
+  }
+}
+
+// FIELD TAMPERING FORENSICS: referans karşılaştırmasından ayrı olarak
+// hedef belgenin kritik alanlarında lokal silme/yeniden-yazma izlerini ara.
+// Bu katman kullanıcıya tek başına "sahte" kararı vermez; ölçülebilir çoklu
+// sinyalleri üst risk motoruna kanıt olarak sağlar.
+if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
+  try {
+    const tamperingReferencePaths = getVisualReferencePath(reference);
+    fieldTamperingForensics = await runFieldTamperingForensics({
+      targetPath: forensicTargetPath,
+      targetOCR: paddleImageOCR,
+      bank,
+      referencePaths: Array.isArray(tamperingReferencePaths)
+        ? tamperingReferencePaths
+        : (tamperingReferencePaths ? [tamperingReferencePaths] : []),
+      fileFingerprint,
+    });
+    console.log("FIELD TAMPERING FORENSICS:", JSON.stringify(fieldTamperingForensics));
+  } catch (error) {
+    console.warn("FIELD TAMPERING FORENSICS HATASI:", error?.message || error);
+    fieldTamperingForensics = null;
   }
 }
 
@@ -15525,6 +15956,40 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
     console.log("HUMAN READABLE FORENSIC REPORT V64:", JSON.stringify(humanForensicReport));
 
+    // FIELD TAMPERING: strong, content-independent local evidence is promoted
+    // to the same user-facing reference report. Medium findings stay internal.
+    if (fieldTamperingForensics?.available === true && Number(fieldTamperingForensics.strongFindingCount) > 0) {
+      const existing = Array.isArray(result.referenceForensicReport.findings)
+        ? result.referenceForensicReport.findings.slice()
+        : [];
+      const tamperRows = (fieldTamperingForensics.findings || [])
+        .filter(x => String(x?.severity || '') === 'strong')
+        .slice(0, 4)
+        .map(x => ({
+          title: String(x.title || x.field || 'Alan'),
+          detail: String(x.evidence || 'Alan içinde çoklu lokal düzenleme sinyali tespit edildi.'),
+          kind: 'field-tampering',
+          priority: 0,
+          evidenceField: String(x.field || ''),
+          targetBox: x.targetBox || null,
+        }));
+      const merged = [...tamperRows, ...existing]
+        .filter((row, index, arr) => index === arr.findIndex(x => String(x.title) === String(row.title) && String(x.detail) === String(row.detail)))
+        .sort((a,b) => Number(a.priority || 9) - Number(b.priority || 9))
+        .slice(0, 8);
+      result.referenceForensicReport.findings = merged;
+      result.referenceForensicReport.differenceCount = merged.length;
+      result.referenceForensicReport.strongDifferenceCount = merged.filter(x => Number(x.priority || 9) <= 1).length;
+      result.referenceForensicReport.status = merged.length ? 'differences-found' : result.referenceForensicReport.status;
+      result.referenceForensicReport.userText = [
+        '🔎 REFERANS / LOKAL FORENSIC KARŞILAŞTIRMASI', '',
+        '🔴 BULGULAR',
+        ...merged.map(x => `• ${x.title}: ${x.detail}`)
+      ].join('\n');
+      result.summary = [result.summary, result.referenceForensicReport.userText].filter(Boolean).join("\n\n");
+      console.log('FIELD TAMPERING PROMOTED TO USER REPORT:', JSON.stringify(tamperRows));
+    }
+
     try {
       const annotatedReferenceDifference = await buildAnnotatedReferenceDifferenceImage({
         targetPath: forensicTargetPath,
@@ -15594,6 +16059,10 @@ if (openSourceForensics) {
 
 if (pixelForensics) {
   result.pixelForensics = pixelForensics;
+}
+
+if (fieldTamperingForensics) {
+  result.fieldTamperingForensics = fieldTamperingForensics;
 }
 
 if (amountForensics) {
@@ -17804,6 +18273,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   visualForensics,
   layoutForensics,
   amountForensics,
+  fieldTamperingForensics,
   paddleImageOCR,
   referenceTemplateAnalysis,
   referenceForensics,
