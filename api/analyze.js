@@ -11235,15 +11235,36 @@ async function runFieldTamperingForensics({
   // resize/render effects from a localized erase+rewrite event.
   async function buildGlobalJpegRasterBaseline(buffer, regions, imageSize) {
     try {
+      // V4: Do NOT reject every OCR region containing digits. Bank receipts
+      // naturally contain dates, times, IDs and numeric labels, and PaddleOCR
+      // often groups a label + value into one region. The previous V3 filter
+      // therefore discarded too many usable samples and produced
+      // `available:false` on real receipts. We build the baseline from a
+      // broader set of ordinary OCR text regions and later compare the target
+      // field against the robust median/MAD of the whole document.
       const candidates = (Array.isArray(regions) ? regions : [])
         .filter(r => {
           const w = Math.abs((Number(r?.x2) || 0) - (Number(r?.x1) || 0));
           const h = Math.abs((Number(r?.y2) || 0) - (Number(r?.y1) || 0));
           const text = String(r?.text || '').trim();
-          const looksLikeMoneyOrCriticalValue = /(?:\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*(?:TL|TRY|₺|USD|EUR|€|\$)?|IBAN|TR\d{20,26})/i.test(text);
-          return text && !looksLikeMoneyOrCriticalValue && w >= 8 && h >= 5 && w <= imageSize.width * .65 && h <= imageSize.height * .12;
+          const upper = text.toUpperCase();
+          const looksLikeWholePage = w > imageSize.width * .75 || h > imageSize.height * .18;
+          const looksLikePureImageArtifact = !text || /^(?:[|_\-\.=]{3,})$/.test(text);
+          const isHugeIBAN = /\bTR\d{18,28}\b/i.test(text);
+          const isHugeURL = /https?:\/\//i.test(text);
+          return Boolean(
+            text &&
+            !looksLikeWholePage &&
+            !looksLikePureImageArtifact &&
+            !isHugeIBAN &&
+            !isHugeURL &&
+            w >= 8 && h >= 5 &&
+            w <= imageSize.width * .65 &&
+            h <= imageSize.height * .12 &&
+            upper.length <= 180
+          );
         })
-        .slice(0, 36);
+        .slice(0, 48);
 
       const samples = [];
       const elaSamples = [];
@@ -11283,7 +11304,7 @@ async function runFieldTamperingForensics({
         if (Number.isFinite(elaMean)) elaSamples.push(elaMean);
       }
 
-      if (samples.length < 6) return null;
+      if (samples.length < 4) return null;
       const med = (key) => rfMedian(samples.map(x => Number(x?.[key])).filter(Number.isFinite));
       const baseline = {
         sampleCount: samples.length,
@@ -11327,7 +11348,7 @@ async function runFieldTamperingForensics({
   }
 
   const globalJpegRasterBaseline = await buildGlobalJpegRasterBaseline(targetBuffer, targetRegions, targetSize);
-  console.log('GLOBAL JPEG/RASTER BASELINE V1:', JSON.stringify(globalJpegRasterBaseline ? {
+  console.log('GLOBAL JPEG/RASTER BASELINE V2:', JSON.stringify(globalJpegRasterBaseline ? {
     sampleCount: globalJpegRasterBaseline.sampleCount,
     medianMeanLuma: Number(globalJpegRasterBaseline.medianMeanLuma?.toFixed?.(3) || 0),
     medianDarkRatio: Number(globalJpegRasterBaseline.medianDarkRatio?.toFixed?.(4) || 0),
@@ -11730,7 +11751,7 @@ async function runFieldTamperingForensics({
 
   const result = {
     available: true,
-    engine: 'field-tampering-forensics-v1-local-raster-ela-style',
+    engine: 'field-tampering-forensics-v2-local-raster-ela-style-global-baseline',
     bank: normalizeBank(bank),
     fileFingerprint: fileFingerprint || null,
     checkedFieldCount: fieldDiagnostics.length,
