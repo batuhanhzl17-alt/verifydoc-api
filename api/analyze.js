@@ -11910,20 +11910,71 @@ async function runFieldTamperingForensics({
           Number(fallbackMetrics.maxDarknessDifference) >= 0.38
         )
       );
-      if (fallbackGlyph?.signal && fallbackV3Signal) {
+
+      // COMPRESSION-AWARE AMOUNT GATE:
+      // V3 alone is never enough because JPEG quality/recompression can alter
+      // local ink/edge metrics. We therefore require an independent local ELA
+      // contrast against neighbouring regions from the SAME uploaded JPG.
+      // This is deliberately target-only: it does not depend on the reference
+      // amount value, so a forged 2.000 -> 10.000 change cannot hide merely
+      // because the reference itself also contains 10.000.
+      const fallbackEla = await localElaOutlier(targetBuffer, fallbackRegion || amountForensics.region);
+      const fallbackElaModerate = Boolean(
+        fallbackEla &&
+        Number(fallbackEla.ratio) >= 1.35 &&
+        Number(fallbackEla.excess) >= 1.50
+      );
+      const fallbackCompressionAwareSignal = Boolean(
+        fallbackV3Signal &&
+        (fallbackElaModerate || fallbackEla?.outlier)
+      );
+
+      // A same-field glyph-shape signal can corroborate the local ELA/V3 pair,
+      // but it is never allowed to create a finding by itself.
+      let fallbackSameFieldDigitSignal = false;
+      try {
+        const numeric = await rfNumericGlyphSequence(
+          targetBuffer,
+          fallbackRegion || amountForensics.region,
+          targetSize,
+          fallbackText
+        );
+        if (numeric?.slots?.length >= 3) {
+          const widths = numeric.slots.map(x => Number(x.width) / Math.max(1, Number(x.height)));
+          const fills = numeric.slots.map(x => Number(x.fill));
+          const medW = rfMedian(widths);
+          const medF = rfMedian(fills);
+          const outlierCount = numeric.slots.filter(x =>
+            Math.abs((Number(x.width) / Math.max(1, Number(x.height))) - medW) / Math.max(.05, Math.abs(medW)) > .22 ||
+            Math.abs(Number(x.fill) - medF) / Math.max(.05, Math.abs(medF)) > .22
+          ).length;
+          fallbackSameFieldDigitSignal = outlierCount >= 1 && outlierCount <= Math.ceil(numeric.slots.length * .30);
+        }
+      } catch {}
+
+      const fallbackConvergentSignal = Boolean(
+        fallbackV3Signal &&
+        (fallbackCompressionAwareSignal || (fallbackSameFieldDigitSignal && fallbackElaModerate))
+      );
+
+      if (fallbackConvergentSignal) {
         const fallbackStrong = Boolean(fallbackGlyph.strong);
         const fallbackFinding = {
           field: 'amount',
           title: 'Tutar',
-          severity: fallbackStrong ? 'strong' : 'medium',
-          confidence: fallbackStrong ? 88 : 78,
-          evidence: `Tutar alanında aynı rakamların belge içi karakter profiline göre lokal geometri/dolgu ayrışması tespit edildi. ${fallbackGlyph.outlierCount} karakter aykırı; mevcut Amount Forensics V3 de aynı bölgede çoklu mikro-raster anomali gösteriyor. Bu bulgu tek başına sahtecilik kanıtı değildir.`,
+          severity: fallbackStrong && fallbackCompressionAwareSignal ? 'strong' : 'medium',
+          confidence: fallbackStrong && fallbackCompressionAwareSignal ? 90 : 82,
+          evidence: `Tutar alanında olası sonradan düzenleme sinyali bulundu. Amount Forensics V3 lokal mikro-raster anomali gösterirken aynı JPG içindeki komşu kontrol bölgelerine göre yeniden-kodlama/ELA kontrastı da ayrışıyor. ${fallbackGlyph.outlierCount} karakter aykırı; bu bulgu JPEG sıkıştırmasının tek başına oluşturabileceği farklardan ayrıştırılmak üzere aynı-belge kontrol bölgeleriyle doğrulandı ve tek başına sahtecilik kanıtı değildir.`,
           targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
           signals: {
             documentNumericGlyphSignal: true,
             documentNumericGlyphStrong: fallbackStrong,
             amountV3LocalizedSignal: true,
-            source: 'amount-forensics-direct-fallback',
+            compressionAwareSignal: fallbackCompressionAwareSignal,
+            localElaRatio: Number(fallbackEla?.ratio || 0),
+            localElaExcess: Number(fallbackEla?.excess || 0),
+            sameFieldDigitSignal: fallbackSameFieldDigitSignal,
+            source: 'amount-forensics-direct-fallback-v2',
           },
         };
         findings.push(fallbackFinding);
@@ -11951,12 +12002,26 @@ async function runFieldTamperingForensics({
           outlierCount: fallbackGlyph.outlierCount,
           comparableGlyphCount: fallbackGlyph.comparableGlyphCount,
           amountV3Signal: fallbackV3Signal,
+          elaModerateSignal: fallbackElaModerate,
+          elaOutlier: Boolean(fallbackEla?.outlier),
+          elaRatio: Number(fallbackEla?.ratio || 0),
+          elaExcess: Number(fallbackEla?.excess || 0),
+          sameFieldDigitSignal: fallbackSameFieldDigitSignal,
+          compressionAwareSignal: fallbackCompressionAwareSignal,
+          convergentSignal: fallbackConvergentSignal,
         }));
       } else {
         console.log('V6 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
           amountText: fallbackText,
           numericGlyphSignal: Boolean(fallbackGlyph?.signal),
           amountV3Signal: fallbackV3Signal,
+          elaModerateSignal: fallbackElaModerate,
+          elaOutlier: Boolean(fallbackEla?.outlier),
+          elaRatio: Number(fallbackEla?.ratio || 0),
+          elaExcess: Number(fallbackEla?.excess || 0),
+          sameFieldDigitSignal: fallbackSameFieldDigitSignal,
+          compressionAwareSignal: fallbackCompressionAwareSignal,
+          convergentSignal: fallbackConvergentSignal,
         }));
       }
     } catch (error) {
