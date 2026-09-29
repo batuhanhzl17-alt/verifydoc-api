@@ -11886,7 +11886,84 @@ async function runFieldTamperingForensics({
     }
   }
 
-  // V6 AMOUNT FALLBACK: The amount candidate is already selected by the\n  // dedicated Amount Forensics engine. If semantic label->value pairing did\n  // not expose an `amount` field in the generic loop, do not lose the amount\n  // evidence. Re-run the same-character baseline directly on the selected\n  // amount ROI. This path is only promoted when the existing Amount V3 local\n  // raster signal corroborates it, so a harmless numeric field is not enough.\n  if (amountForensics?.region && !fieldDiagnostics.some(x => x.field === 'amount')) {\n    try {\n      const fallbackRegion = rfFocusValueRegion(amountForensics.region, amountForensics.amountText || amountForensics.selectedAmountText, 'amount');\n      const fallbackText = String(amountForensics.amountText || amountForensics.selectedAmountText || '').trim();\n      const fallbackGlyph = await analyzeAmountAgainstNumericBaseline(fallbackRegion, fallbackText);\n      const fallbackMetrics = amountForensics?.metrics || null;\n      const fallbackV3Signal = Boolean(\n        fallbackMetrics &&\n        Number(fallbackMetrics.maxFeatureVotes) >= 4 &&\n        Number(fallbackMetrics.localAnomalyRatio) >= 0.15 &&\n        Number(fallbackMetrics.localAnomalyRatio) <= 0.70 &&\n        (\n          Number(fallbackMetrics.maxInkRatioDifference) >= 0.38 ||\n          Number(fallbackMetrics.maxStrokeProxyDifference) >= 0.38 ||\n          Number(fallbackMetrics.maxEdgeDensityDifference) >= 0.38 ||\n          Number(fallbackMetrics.maxDarknessDifference) >= 0.38\n        )\n      );\n      if (fallbackGlyph?.signal && fallbackV3Signal) {\n        const fallbackStrong = Boolean(fallbackGlyph.strong);\n        const fallbackFinding = {\n          field: 'amount',\n          title: 'Tutar',\n          severity: fallbackStrong ? 'strong' : 'medium',\n          confidence: fallbackStrong ? 88 : 78,\n          evidence: `Tutar alanında aynı rakamların belge içi karakter profiline göre lokal geometri/dolgu ayrışması tespit edildi. ${fallbackGlyph.outlierCount} karakter aykırı; mevcut Amount Forensics V3 de aynı bölgede çoklu mikro-raster anomali gösteriyor. Bu bulgu tek başına sahtecilik kanıtı değildir.`,\n          targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },\n          signals: {\n            documentNumericGlyphSignal: true,\n            documentNumericGlyphStrong: fallbackStrong,\n            amountV3LocalizedSignal: true,\n            source: 'amount-forensics-direct-fallback',\n          },\n        };\n        findings.push(fallbackFinding);\n        fieldDiagnostics.push({\n          field: 'amount',\n          label: 'Tutar',\n          targetValue: fallbackText,\n          signalCount: 2,\n          signals: fallbackFinding.signals,\n          documentNumericGlyph: fallbackGlyph,\n          amountV3: fallbackMetrics ? {\n            maxFeatureVotes: Number(fallbackMetrics.maxFeatureVotes || 0),\n            maxInkRatioDifference: Number(fallbackMetrics.maxInkRatioDifference || 0),\n            maxStrokeProxyDifference: Number(fallbackMetrics.maxStrokeProxyDifference || 0),\n            maxEdgeDensityDifference: Number(fallbackMetrics.maxEdgeDensityDifference || 0),\n            maxDarknessDifference: Number(fallbackMetrics.maxDarknessDifference || 0),\n            localAnomalyRatio: Number(fallbackMetrics.localAnomalyRatio || 0),\n          } : null,\n          targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },\n        });\n        console.log('V6 AMOUNT DIRECT FALLBACK:', JSON.stringify({\n          amountText: fallbackText,\n          numericGlyphSignal: fallbackGlyph.signal,\n          numericGlyphStrong: fallbackGlyph.strong,\n          outlierCount: fallbackGlyph.outlierCount,\n          comparableGlyphCount: fallbackGlyph.comparableGlyphCount,\n          amountV3Signal: fallbackV3Signal,\n        }));\n      } else {\n        console.log('V6 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({\n          amountText: fallbackText,\n          numericGlyphSignal: Boolean(fallbackGlyph?.signal),\n          amountV3Signal: fallbackV3Signal,\n        }));\n      }\n    } catch (error) {\n      console.warn('V6 AMOUNT DIRECT FALLBACK HATASI:', error?.message || error);\n    }\n  }\n\n  findings.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  // V6 AMOUNT FALLBACK: The amount candidate is already selected by the
+  // dedicated Amount Forensics engine. If semantic label->value pairing did
+  // not expose an `amount` field in the generic loop, do not lose the amount
+  // evidence. Re-run the same-character baseline directly on the selected
+  // amount ROI. This path is only promoted when the existing Amount V3 local
+  // raster signal corroborates it, so a harmless numeric field is not enough.
+  if (amountForensics?.region && !fieldDiagnostics.some(x => x.field === 'amount')) {
+    try {
+      const fallbackRegion = rfFocusValueRegion(amountForensics.region, amountForensics.amountText || amountForensics.selectedAmountText, 'amount');
+      const fallbackText = String(amountForensics.amountText || amountForensics.selectedAmountText || '').trim();
+      const fallbackGlyph = await analyzeAmountAgainstNumericBaseline(fallbackRegion, fallbackText);
+      const fallbackMetrics = amountForensics?.metrics || null;
+      const fallbackV3Signal = Boolean(
+        fallbackMetrics &&
+        Number(fallbackMetrics.maxFeatureVotes) >= 4 &&
+        Number(fallbackMetrics.localAnomalyRatio) >= 0.15 &&
+        Number(fallbackMetrics.localAnomalyRatio) <= 0.70 &&
+        (
+          Number(fallbackMetrics.maxInkRatioDifference) >= 0.38 ||
+          Number(fallbackMetrics.maxStrokeProxyDifference) >= 0.38 ||
+          Number(fallbackMetrics.maxEdgeDensityDifference) >= 0.38 ||
+          Number(fallbackMetrics.maxDarknessDifference) >= 0.38
+        )
+      );
+      if (fallbackGlyph?.signal && fallbackV3Signal) {
+        const fallbackStrong = Boolean(fallbackGlyph.strong);
+        const fallbackFinding = {
+          field: 'amount',
+          title: 'Tutar',
+          severity: fallbackStrong ? 'strong' : 'medium',
+          confidence: fallbackStrong ? 88 : 78,
+          evidence: `Tutar alanında aynı rakamların belge içi karakter profiline göre lokal geometri/dolgu ayrışması tespit edildi. ${fallbackGlyph.outlierCount} karakter aykırı; mevcut Amount Forensics V3 de aynı bölgede çoklu mikro-raster anomali gösteriyor. Bu bulgu tek başına sahtecilik kanıtı değildir.`,
+          targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
+          signals: {
+            documentNumericGlyphSignal: true,
+            documentNumericGlyphStrong: fallbackStrong,
+            amountV3LocalizedSignal: true,
+            source: 'amount-forensics-direct-fallback',
+          },
+        };
+        findings.push(fallbackFinding);
+        fieldDiagnostics.push({
+          field: 'amount',
+          label: 'Tutar',
+          targetValue: fallbackText,
+          signalCount: 2,
+          signals: fallbackFinding.signals,
+          documentNumericGlyph: fallbackGlyph,
+          amountV3: fallbackMetrics ? {
+            maxFeatureVotes: Number(fallbackMetrics.maxFeatureVotes || 0),
+            maxInkRatioDifference: Number(fallbackMetrics.maxInkRatioDifference || 0),
+            maxStrokeProxyDifference: Number(fallbackMetrics.maxStrokeProxyDifference || 0),
+            maxEdgeDensityDifference: Number(fallbackMetrics.maxEdgeDensityDifference || 0),
+            maxDarknessDifference: Number(fallbackMetrics.maxDarknessDifference || 0),
+            localAnomalyRatio: Number(fallbackMetrics.localAnomalyRatio || 0),
+          } : null,
+          targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
+        });
+        console.log('V6 AMOUNT DIRECT FALLBACK:', JSON.stringify({
+          amountText: fallbackText,
+          numericGlyphSignal: fallbackGlyph.signal,
+          numericGlyphStrong: fallbackGlyph.strong,
+          outlierCount: fallbackGlyph.outlierCount,
+          comparableGlyphCount: fallbackGlyph.comparableGlyphCount,
+          amountV3Signal: fallbackV3Signal,
+        }));
+      } else {
+        console.log('V6 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
+          amountText: fallbackText,
+          numericGlyphSignal: Boolean(fallbackGlyph?.signal),
+          amountV3Signal: fallbackV3Signal,
+        }));
+      }
+    } catch (error) {
+      console.warn('V6 AMOUNT DIRECT FALLBACK HATASI:', error?.message || error);
+    }
+  }
+\n  findings.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
   const strongFindings = findings.filter(x => x.severity === 'strong');
   const mediumFindings = findings.filter(x => x.severity === 'medium');
 
