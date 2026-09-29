@@ -2932,6 +2932,11 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
       financialDataRisk = Math.max(financialDataRisk, hasStrongAmountTamper ? 60 : 35);
     }
   }
+  const localEditEvidence = forensic?.localEditEvidenceV14_2 || null;
+  if (localEditEvidence?.available === true && localEditEvidence?.signal === true) {
+    editingRisk = Math.max(editingRisk, Math.min(90, Number(localEditEvidence.score || 0)));
+  }
+
   // If the reference engine has a high-confidence semantic local-gap anomaly,
   // make it visible in the editing category even when the other visual signals
   // are quiet. Require a strong anomaly score and a healthy reference match.
@@ -12490,7 +12495,8 @@ async function runFieldTamperingForensics({
             fallbackGlyph?.strong &&
             (
               fallbackLocalJpegSignal ||
-              v9JpegAwareLocalizedSignal
+              v9JpegAwareLocalizedSignal ||
+              amountFormatMismatch
             )
           ) ||
           (
@@ -12626,6 +12632,137 @@ async function runFieldTamperingForensics({
   }));
 
   return result;
+}
+
+// =====================================================
+// LOCAL EDIT EVIDENCE V14.2 — METHOD-AGNOSTIC LOCAL TAMPER DETECTOR
+// =====================================================
+async function runLocalEditEvidenceV14_2({ targetPath, targetOCR, referencePath = null, amountForensics = null }) {
+  if (!targetPath || !targetOCR?.success) return null;
+  const loadRaster = async (filePath) => {
+    try {
+      if (!filePath) return null;
+      if (path.extname(String(filePath)).toLowerCase() === '.pdf') {
+        const raw = await fs.readFile(filePath);
+        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+        const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+        return rendered?.buffer || null;
+      }
+      return await fs.readFile(filePath);
+    } catch { return null; }
+  };
+  const targetBuffer = await loadRaster(targetPath);
+  if (!targetBuffer) return null;
+  const tm = await sharp(targetBuffer).metadata();
+  const tw = Number(tm.width) || 0, th = Number(tm.height) || 0;
+  if (tw < 100 || th < 100) return null;
+  let refBuffer = null, rw = 0, rh = 0;
+  if (referencePath) {
+    refBuffer = await loadRaster(referencePath);
+    if (refBuffer) {
+      const rm = await sharp(refBuffer).metadata();
+      rw = Number(rm.width) || 0; rh = Number(rm.height) || 0;
+      if (!rw || !rh) refBuffer = null;
+    }
+  }
+  const box = (r, w, h, pad=0) => {
+    const x1=Math.max(0,Math.floor(Number(r?.x1||0)-pad)), y1=Math.max(0,Math.floor(Number(r?.y1||0)-pad));
+    const x2=Math.min(w,Math.ceil(Number(r?.x2||0)+pad)), y2=Math.min(h,Math.ceil(Number(r?.y2||0)+pad));
+    return x2-x1>=6 && y2-y1>=5 ? {x1,y1,x2,y2} : null;
+  };
+  const norm = (r,w,h) => ({x1:Number(r.x1)/w,y1:Number(r.y1)/h,x2:Number(r.x2)/w,y2:Number(r.y2)/h});
+  const denorm = (n,w,h,pad=0) => box({x1:n.x1*w,y1:n.y1*h,x2:n.x2*w,y2:n.y2*h},w,h,pad);
+  const rawGray = async (buffer,b,outW=180,outH=72) => {
+    try { return await sharp(buffer).extract({left:b.x1,top:b.y1,width:b.x2-b.x1,height:b.y2-b.y1}).resize({width:outW,height:outH,fit:'fill'}).grayscale().raw().toBuffer({resolveWithObject:true}); }
+    catch { return null; }
+  };
+  const stats = (arr) => {
+    const a=Array.from(arr||[],Number).filter(Number.isFinite).sort((x,y)=>x-y); if(!a.length) return {mean:0,median:0,p95:0};
+    const q=p=>a[Math.min(a.length-1,Math.floor((a.length-1)*p))];
+    return {mean:a.reduce((s,x)=>s+x,0)/a.length,median:q(.5),p95:q(.95)};
+  };
+  const rasterProfile = async (buffer,b) => {
+    const raw=await rawGray(buffer,b); if(!raw) return null;
+    const {data,info}=raw,w=info.width,h=info.height,res=[],blk=[];
+    const bgRes=[], bgBlk=[];
+    for(let y=1;y<h-1;y++) for(let x=1;x<w-1;x++){
+      const i=y*w+x, v=data[i], nb=(data[i-1]+data[i+1]+data[i-w]+data[i+w])/4;
+      const light=v>=218 && data[i-1]>=218 && data[i+1]>=218 && data[i-w]>=218 && data[i+w]>=218;
+      const rv=Math.abs(v-nb); res.push(rv); if(light) bgRes.push(rv);
+    }
+    for(let y=8;y<h;y+=8) for(let x=0;x<w;x++){
+      const a=data[y*w+x], b=data[(y-1)*w+x], v=Math.abs(a-b); blk.push(v); if(a>=218&&b>=218) bgBlk.push(v);
+    }
+    for(let x=8;x<w;x+=8) for(let y=0;y<h;y++){
+      const a=data[y*w+x], b=data[y*w+x-1], v=Math.abs(a-b); blk.push(v); if(a>=218&&b>=218) bgBlk.push(v);
+    }
+    return {noise:stats(res),block:stats(blk),backgroundNoise:stats(bgRes),backgroundBlock:stats(bgBlk)};
+  };
+  const backgroundResidual = async (tb,rb) => {
+    if(!refBuffer) return null;
+    const a=await rawGray(targetBuffer,tb), b=await rawGray(refBuffer,rb); if(!a||!b||a.data.length!==b.data.length) return null;
+    const d=[]; let changed=0, count=0;
+    for(let i=0;i<a.data.length;i++){const av=a.data[i],bv=b.data[i]; if(av>=218&&bv>=218){const x=Math.abs(av-bv);d.push(x);count++;if(x>=8)changed++;}}
+    const st=stats(d); return {available:count>=80,count,changed,changedRatio:count?changed/count:0,mean:Number(st.mean.toFixed(3)),p95:Number(st.p95.toFixed(3))};
+  };
+  const candidates=[], seen=new Set();
+  const add=(r,field,text,source)=>{const b=box(r,tw,th);if(!b)return;const k=[b.x1,b.y1,b.x2,b.y2].map(v=>Math.round(v/3)).join(':');if(seen.has(k))return;seen.add(k);candidates.push({r:b,field:field||'unknown',text:String(text||'').trim(),source});};
+  if(amountForensics?.region) add(amountForensics.region,'amount',amountForensics.amountText||amountForensics.selectedAmountText,'amount-forensics');
+  for(const row of (Array.isArray(targetOCR.regions)?targetOCR.regions:[])){
+    const text=String(row?.text||'').trim(), r=row?.region||row; if(!text||!r)continue;
+    const w=Math.abs(Number(r.x2||0)-Number(r.x1||0)), h=Math.abs(Number(r.y2||0)-Number(r.y1||0));
+    if(w<8||h<5||w>tw*.55||h>th*.10||text.length>160)continue;
+    let field='unknown'; try{field=String(referenceFieldRuleForText(text)?.key||'unknown')}catch{}
+    if(field==='unknown'&&/(IBAN|TUTAR|TL|EUR|USD|TARİH|TARIH|SAAT|FİŞ|FIS|SORGU|REFERANS|AÇIKLAMA|ACIKLAMA|ÜNVANI|UNVANI|HESAP|KART|ADRES|ŞUBE|SUBE)/i.test(text))field='critical';
+    add(r,field,text,'ocr');
+  }
+  candidates.sort((a,b)=>(a.field==='amount'?0:a.field==='critical'?1:2)-(b.field==='amount'?0:b.field==='critical'?1:2)||a.r.y1-b.r.y1);
+  const obs=[];
+  for(const c of candidates.slice(0,24)){
+    const n=norm(c.r,tw,th), pad=(c.field==='amount'?0:4), tb=denorm(n,tw,th,pad); if(!tb)continue;
+    const tp=await rasterProfile(targetBuffer,tb); if(!tp)continue;
+    let rp=null, ref=null; if(refBuffer){const rb=denorm(n,rw,rh,pad);if(rb){rp=await rasterProfile(refBuffer,rb);ref=await backgroundResidual(tb,rb);}}
+    obs.push({field:c.field,text:c.text,source:c.source,norm:n,target:tp,reference:rp,background:ref});
+  }
+  if(!obs.length)return null;
+  const med=a=>stats(a).median;
+  const nm=med(obs.map(x=>x.target.noise.mean)), bm=med(obs.map(x=>x.target.block.mean));
+  const rm=med(obs.map(x=>x.background?.mean||0).filter(Number.isFinite)), cm=med(obs.map(x=>x.background?.changedRatio||0).filter(Number.isFinite));
+  const bgNoiseMedian=med(obs.map(x=>x.target.backgroundNoise?.mean||0));
+  const bgBlockMedian=med(obs.map(x=>x.target.backgroundBlock?.mean||0));
+  for(const o of obs){
+    const nr=nm>0?o.target.noise.mean/nm:1, br=bm>0?o.target.block.mean/bm:1;
+    const bnr=bgNoiseMedian>0?o.target.backgroundNoise.mean/bgNoiseMedian:1;
+    const bbr=bgBlockMedian>0?o.target.backgroundBlock.mean/bgBlockMedian:1;
+    const rd=o.background?.mean||0, rc=o.background?.changedRatio||0;
+    const refNoiseRatio=(o.reference?.backgroundNoise?.mean||0)>0?o.target.backgroundNoise.mean/o.reference.backgroundNoise.mean:1;
+    const refBlockRatio=(o.reference?.backgroundBlock?.mean||0)>0?o.target.backgroundBlock.mean/o.reference.backgroundBlock.mean:1;
+    // Target-only family: background texture/noise is unusually different from
+    // the other fields in the same document. Text pixels are excluded.
+    const noise=bnr>=1.55&&o.target.backgroundNoise.mean>=1.5;
+    const block=bbr>=1.55&&o.target.backgroundBlock.mean>=0.7;
+    // Reference family: compare only light/background pixels and background
+    // raster behavior. Literal value/text differences are excluded.
+    const refNoise=Boolean(o.reference?.backgroundNoise&&refNoiseRatio>=1.30&&Math.abs(o.target.backgroundNoise.mean-o.reference.backgroundNoise.mean)>=0.35);
+    const refBlock=Boolean(o.reference?.backgroundBlock&&refBlockRatio>=1.55&&Math.abs(o.target.backgroundBlock.mean-o.reference.backgroundBlock.mean)>=0.20);
+    const refBg=Boolean(o.background?.available&&((rd>=Math.max(1.15,rm*1.60)&&rc>=.020)||(rd>=1.60&&o.background.p95>=10&&rc>=.015)));
+    const texture=Boolean(o.background?.available&&((Number(o.background.backgroundStdRatio||1)>=1.30&&Number(o.background.backgroundMeanDrop||0)>=1.0)||(Number(o.background.backgroundStdRatio||1)>=1.45)));
+    const strongRef=refBg&&rd>=1.45&&rc>=.030;
+    const strongTexture=texture&&Number(o.background.backgroundStdRatio||1)>=1.40&&Number(o.background.backgroundMeanDrop||0)>=1.5;
+    const refFamilies=[refNoise,refBlock,refBg,texture].filter(Boolean).length;
+    const strongRefFamilies=[refNoise&&refNoiseRatio>=1.55,refBlock&&refBlockRatio>=1.80,strongRef,strongTexture].filter(Boolean).length;
+    const amountReferenceCorroboration=Boolean(o.field==='amount'&&o.background?.available&&rd>=3.5&&rc>=.12);
+    const amountRasterCorroboration=Boolean(o.field==='amount'&&amountForensics?.available===true&&Number(amountForensics?.metrics?.maxFeatureVotes||0)>=4&&Number(amountForensics?.metrics?.localAnomalyRatio||0)>=.30&&Number(amountForensics?.metrics?.localAnomalyRatio||0)<=.70);
+    const amountStrongFusion=amountReferenceCorroboration&&amountRasterCorroboration;
+    const families=[noise,block,refFamilies>=1,amountStrongFusion].filter(Boolean).length;
+    const strongFamilies=[noise&&bnr>=1.9,block&&bbr>=1.9,strongRefFamilies>=2].filter(Boolean).length + (amountStrongFusion ? 2 : 0);
+    const score=Math.min(100,(noise?24:0)+(block?24:0)+(refFamilies?26:0)+(amountStrongFusion?48:0)+(strongRefFamilies>=2?18:strongRefFamilies===1?7:0)+(families>=2?8:0));
+    o.evidence={noiseRatio:Number(nr.toFixed(2)),blockRatio:Number(br.toFixed(2)),backgroundNoiseRatio:Number(bnr.toFixed(2)),backgroundBlockRatio:Number(bbr.toFixed(2)),referenceDiffRatio:Number((rm>0?rd/rm:1).toFixed(2)),referenceChangedRatio:Number((cm>0?rc/cm:1).toFixed(2)),referenceNoiseRatio:Number(refNoiseRatio.toFixed(2)),referenceBlockRatio:Number(refBlockRatio.toFixed(2)),referenceBackgroundTexture:Boolean(texture),strongReferenceBackgroundTexture:Boolean(strongTexture),noiseSignal:noise,blockSignal:block,referenceBackgroundSignal:refBg,referenceNoiseSignal:refNoise,referenceBlockSignal:refBlock,referenceFamilyCount:refFamilies,strongReferenceFamilyCount:strongRefFamilies,amountReferenceCorroboration,amountRasterCorroboration,amountStrongFusion,familyCount:families,strongFamilyCount:strongFamilies,score};
+  }
+  const ranked=obs.slice().sort((a,b)=>Number(b.evidence.score)-Number(a.evidence.score));
+  const strong=ranked.filter(o=>o.evidence.strongFamilyCount>=2&&o.evidence.score>=70);
+  const top=ranked[0]||null;
+  return {available:true,engine:'local-edit-evidence-v14.2-method-agnostic',referenceAvailable:Boolean(refBuffer),candidateCount:obs.length,suspiciousFieldCount:ranked.filter(o=>o.evidence.familyCount>=2).length,strongFieldCount:strong.length,signal:strong.length>0,severity:strong.length?'strong':ranked.some(o=>o.evidence.familyCount>=2)?'medium':'none',score:Number(top?.evidence?.score||0),targetField:top?.field||null,evidenceFamilies:top?{noiseResidual:top.evidence.noiseSignal,jpegBlockBoundary:top.evidence.blockSignal,referenceBackground:top.evidence.referenceBackgroundSignal,referenceNoise:top.evidence.referenceNoiseSignal,referenceBlock:top.evidence.referenceBlockSignal,referenceBackgroundTexture:top.evidence.referenceBackgroundTexture}:{},topObservation:top?{field:top.field,text:top.text,normalizedRegion:top.norm,targetNoiseMean:Number(top.target.noise.mean||0),targetBlockMean:Number(top.target.block.mean||0),referenceBackground:top.background||null,evidence:top.evidence}:null,observations:ranked.slice(0,12).map(o=>({field:o.field,text:o.text,normalizedRegion:o.norm,evidence:o.evidence,referenceBackground:o.background||null})),baselines:{noiseMedian:Number(nm.toFixed(3)),blockMedian:Number(bm.toFixed(3)),referenceBackgroundDiffMedian:Number(rm.toFixed(3)),referenceBackgroundChangedMedian:Number(cm.toFixed(4)),backgroundNoiseMedian:Number(bgNoiseMedian.toFixed(3)),backgroundBlockMedian:Number(bgBlockMedian.toFixed(3))},methodology:'Yöntem bağımsız lokal raster kanıtı; paint-over/copy-paste/erase-fill ayrımı yapılmaz.'};
 }
 
 // =====================================================
@@ -14947,80 +15084,13 @@ buffer.toString(
 "base64"
 );
 // =====================================================
-// V14.1 PAINT-OVER LOCAL CONTINUITY ENGINE
-// =====================================================
-// Tekil JPEG/raster farkını değil, aynı tutar ROI içinde birden fazla
-// karakter slotunda birleşen lokal erase/rewrite izini arar.
-function analyzePaintOverLocalContinuity(amountForensics) {
-  const metrics = amountForensics?.metrics || null;
-  const segments = Array.isArray(amountForensics?.segmentFeatures)
-    ? amountForensics.segmentFeatures : [];
-  if (!metrics || segments.length < 4) {
-    return { available:false, status:'unknown', severity:'none', score:0, signal:false,
-      reason:'Yeterli tutar karakter slotu bulunamadı.' };
-  }
-  const votes = segments.map((x,index)=>({
-    index, votes:Number(x?.votes||0), width:Number(x?.width||0), height:Number(x?.height||0),
-    inkRatio:Number(x?.inkRatio||0), edgeDensity:Number(x?.edgeDensity||0), darkness:Number(x?.darkness||0)
-  }));
-  const maxVotes=Math.max(...votes.map(x=>x.votes),0);
-  // V3 canonical sayımını kullan: ham segment oylarını yeniden saymak JPEG
-  // kaynaklı false-positive'ları geri getirebilir.
-  const canonicalHighVoteCount=Number(metrics.highVoteSegmentCount||0);
-  const high=votes.filter(x=>x.votes>=3);
-  const strong=votes.filter(x=>x.votes>=4);
-  const featureDiversity=[
-    Number(metrics.maxInkRatioDifference||0)>=0.38,
-    Number(metrics.maxStrokeProxyDifference||0)>=0.38,
-    Number(metrics.maxEdgeDensityDifference||0)>=0.38,
-    Number(metrics.maxDarknessDifference||0)>=0.18
-  ].filter(Boolean).length;
-  const highIndices=high.map(x=>x.index);
-  let maxSpan=0;
-  for(let i=0;i<highIndices.length;i++){
-    for(let j=i+1;j<highIndices.length;j++){
-      maxSpan=Math.max(maxSpan,Math.abs(highIndices[i]-highIndices[j]));
-    }
-  }
-  const multiSlot=canonicalHighVoteCount>=2;
-  const spread=multiSlot && maxSpan>=2;
-  const convergent=Number(metrics.paintOverConvergentFeatureCount||0)>=3;
-  const anomalyRatio=Number(metrics.localAnomalyRatio||0);
-  const localized=anomalyRatio>=0.30 && anomalyRatio<=0.70;
-  const signal=Boolean(multiSlot && spread && convergent && localized && maxVotes>=4 && featureDiversity>=2);
-  let score=0;
-  if(multiSlot) score+=25;
-  if(spread) score+=15;
-  if(convergent) score+=20;
-  if(localized) score+=10;
-  if(maxVotes>=4) score+=15;
-  if(featureDiversity>=2) score+=15;
-  return {
-    available:true, engine:'paint-over-local-continuity-v14.1', status:signal?'suspicious':'pass',
-    severity:signal?'strong':'none', score:Math.min(100,score), signal,
-    metrics:{
-      characterCount:votes.length, maxFeatureVotes:maxVotes, highVoteSegmentCount:canonicalHighVoteCount,
-      strongVoteSegmentCount:strong.length, highVoteIndices:highIndices, highVoteSpan:maxSpan,
-      paintOverConvergentFeatureCount:Number(metrics.paintOverConvergentFeatureCount||0),
-      localAnomalyRatio:anomalyRatio, featureDiversity,
-      maxInkRatioDifference:Number(metrics.maxInkRatioDifference||0),
-      maxStrokeProxyDifference:Number(metrics.maxStrokeProxyDifference||0),
-      maxEdgeDensityDifference:Number(metrics.maxEdgeDensityDifference||0),
-      maxDarknessDifference:Number(metrics.maxDarknessDifference||0)
-    },
-    evidence:signal
-      ? 'Aynı tutar ROI içinde birden fazla karakter slotunda birleşen ink/stroke/edge raster anomalileri bulundu. Tekil JPEG veya noktalama slotu anomalisi olarak değerlendirilmedi; lokal çoklu-slot yakınsaması erase/rewrite (paint-over) adayı olarak işaretlendi.'
-      : 'Tutar ROI içinde JPEG/raster kaynaklı olabilecek tekil veya dağınık anomaliler var; çoklu-slot paint-over yakınsaması oluşmadı.'
-  };
-}
-
-// =====================================================
 // PADDLEOCR IMAGE OCR
 // =====================================================
 
 let paddleImageOCR = null;
 let paddleCriticalFailure = false;
 let amountForensics = null;
+let localEditEvidenceV14_2 = null;
 let referenceTemplateAnalysis = null;
 let visualForensics = null;
 let layoutForensics = null;
@@ -15031,7 +15101,6 @@ let pixelForensics = null;
 let openSourceForensics = null;
 let fontForensics = null;
 let fieldTamperingForensics = null;
-let paintOverLocalForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -15197,6 +15266,18 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
   } catch (error) {
     console.warn("FIELD TAMPERING FORENSICS HATASI:", error?.message || error);
     fieldTamperingForensics = null;
+  }
+}
+
+if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
+  try {
+    const vr = getVisualReferencePath(reference);
+    const localEditReference = Array.isArray(vr) ? vr[0] : vr;
+    localEditEvidenceV14_2 = await runLocalEditEvidenceV14_2({ targetPath: forensicTargetPath, targetOCR: paddleImageOCR, referencePath: localEditReference, amountForensics });
+    console.log("LOCAL EDIT EVIDENCE V14.2:", JSON.stringify(localEditEvidenceV14_2));
+  } catch (error) {
+    console.warn("LOCAL EDIT EVIDENCE V14.2 HATASI:", error?.message || error);
+    localEditEvidenceV14_2 = null;
   }
 }
 
@@ -17278,11 +17359,10 @@ if (fieldTamperingForensics) {
   result.fieldTamperingForensics = fieldTamperingForensics;
 }
 
+if (localEditEvidenceV14_2) result.localEditEvidenceV14_2 = localEditEvidenceV14_2;
+
 if (amountForensics) {
   result.amountForensics = amountForensics;
-  paintOverLocalForensics = analyzePaintOverLocalContinuity(amountForensics);
-  result.paintOverLocalForensics = paintOverLocalForensics;
-  console.log("PAINT-OVER LOCAL CONTINUITY V14.1:", JSON.stringify(paintOverLocalForensics));
   if (amountForensics.selectedAmountText) {
     console.log("AMOUNT FORENSICS FINAL SELECTION:", JSON.stringify({
       selectedAmountText: amountForensics.selectedAmountText,
@@ -19493,6 +19573,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   visualForensics,
   layoutForensics,
   amountForensics,
+  localEditEvidenceV14_2,
   fieldTamperingForensics,
   paddleImageOCR,
   referenceTemplateAnalysis,
@@ -19529,8 +19610,31 @@ Number(deterministicRiskAfterForensics.overallRisk) || 0;
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
 
-// Amount format comparison is diagnostic only. Nokta/virgül farkı, locale veya
-// referans varyantı nedeniyle oluşabilir; tek başına risk tabanı oluşturamaz.
+// V13: a high-confidence amount-format mismatch is a semantic content
+// discrepancy, not a raster artifact. Do not let weighted category averaging
+// dilute it back into LOW RISK. Keep the floor at MODERATE RISK; this is not a
+// standalone "fake" verdict, but it makes the discrepancy visible in the
+// final risk score.
+const finalAmountFormatComparison =
+  referenceTemplateAnalysis?.amountFormatComparison || null;
+if (
+  finalAmountFormatComparison?.available === true &&
+  finalAmountFormatComparison?.mismatch === true &&
+  Number(finalAmountFormatComparison?.confidence || 0) >= 80
+) {
+  calculatedRisk.overallRisk = Math.max(
+    46,
+    Number(calculatedRisk.overallRisk) || 0
+  );
+  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
+  console.log('V13 AMOUNT FORMAT RISK FLOOR:', JSON.stringify({
+    applied: true,
+    floor: 46,
+    confidence: Number(finalAmountFormatComparison.confidence || 0),
+    score: Number(finalAmountFormatComparison.score || 0),
+    reasons: finalAmountFormatComparison.reasons || []
+  }));
+}
 
 // A very strong, semantically matched local geometry anomaly is a deterministic
 // forensic finding. Keep the user-facing suspicious threshold aligned with that
@@ -19609,21 +19713,12 @@ const finalDeterministicRisk = calculateOverallRisk(result);
 finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
 result.categories = finalDeterministicRisk.categories;
 
-// V14.1: sadece çoklu-slot lokal paint-over yakınsaması risk tabanı oluşturur.
-if (paintOverLocalForensics?.signal === true && Number(paintOverLocalForensics?.score || 0) >= 80) {
+if (localEditEvidenceV14_2?.signal === true && Number(localEditEvidenceV14_2?.score || 0) >= 70) {
   finalRiskScore = Math.max(finalRiskScore, 46);
-  result.categories = {
-    ...(result.categories || {}),
-    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 75)
-  };
-  console.log("V14.1 PAINT-OVER LOCAL FLOOR:", JSON.stringify({
-    applied:true, floor:46, score:paintOverLocalForensics.score, metrics:paintOverLocalForensics.metrics
-  }));
+  result.categories = { ...(result.categories || {}), editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 78) };
+  console.log("V14.2 LOCAL EDIT FLOOR:", JSON.stringify({ applied:true, floor:46, score:localEditEvidenceV14_2.score, targetField:localEditEvidenceV14_2.targetField, evidenceFamilies:localEditEvidenceV14_2.evidenceFamilies }));
 } else {
-  console.log("V14.1 PAINT-OVER LOCAL FLOOR:", JSON.stringify({
-    applied:false, signal:Boolean(paintOverLocalForensics?.signal),
-    score:Number(paintOverLocalForensics?.score||0), metrics:paintOverLocalForensics?.metrics||null
-  }));
+  console.log("V14.2 LOCAL EDIT FLOOR:", JSON.stringify({ applied:false, signal:Boolean(localEditEvidenceV14_2?.signal), score:Number(localEditEvidenceV14_2?.score||0), targetField:localEditEvidenceV14_2?.targetField||null, evidenceFamilies:localEditEvidenceV14_2?.evidenceFamilies||null }));
 }
 
 // =====================================================
@@ -19693,9 +19788,8 @@ const finalRiskLabel = getRiskLabel(finalRiskScore);
 result.overallRisk = finalRiskScore;
 result.riskLabel = finalRiskLabel;
 
-result.categories = {
-  ...(result.categories || finalDeterministicRisk.categories || {})
-};
+result.categories =
+finalDeterministicRisk.categories;
 
 // AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
@@ -19734,20 +19828,13 @@ finalScore >= 46;
 // =====================================================
 // UI tarafı farklı alanları tüketse bile somut referans farkları tek bir
 // standart alanda hazır bulunsun. Ham engine skorları burada gösterilmez.
-const primaryForensicFindings = [
-  ...(result?.paintOverLocalForensics?.signal === true ? [{
-    title: 'Tutar alanı — lokal paint-over / erase-rewrite adayı',
-    detail: result.paintOverLocalForensics.evidence || 'Tutar ROI içinde çoklu-slot lokal raster yakınsaması bulundu.',
-    confidence: Math.min(99, Math.max(88, Number(result.paintOverLocalForensics.score || 0)))
-  }] : []),
-  ...(Array.isArray(result?.referenceForensicReport?.findings)
-    ? result.referenceForensicReport.findings
-    : [])
-].slice(0, 8).map((x) => ({
+const primaryForensicFindings = Array.isArray(result?.referenceForensicReport?.findings)
+  ? result.referenceForensicReport.findings.slice(0, 8).map((x) => ({
       title: String(x?.title || '').trim(),
       detail: String(x?.detail || '').trim(),
       confidence: Number(x?.confidence || 0)
-    })).filter((x) => x.title && x.detail);
+    })).filter((x) => x.title && x.detail)
+  : [];
 
 const canonicalReferenceText = result?.referenceForensicReport?.userText ||
   "🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.";
@@ -19772,7 +19859,7 @@ console.log(
 "FINAL SCORE:",
 finalScore
 );
-console.log("FINAL RISK SOURCE: deterministic checks + V14.1 local paint-over gate; amount-format floor disabled");
+console.log("FINAL RISK SOURCE: deterministic checks only; amountAnalysis direct floor disabled");
 
 
 console.log(
