@@ -11510,7 +11510,7 @@ async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePat
     const median=a=>{const z=a.filter(Number.isFinite).sort((x,y)=>x-y);return z.length?z[Math.floor(z.length/2)]:0;};
     const names=['luma','color','textureVariance','edge','sharpness','jpegBlock'];
     const obs=[];
-    const regions=targetOCR.regions.map((r,index)=>({r,index,text:String(r?.text||'').trim()})).filter(q=>q.text.length>=2&&Number(q.r?.x2)>Number(q.r?.x1)&&Number(q.r?.y2)>Number(q.r?.y1)).slice(0,100);
+    const regions=targetOCR.regions.map((r,index)=>({r:r?.region||r,index,text:String(r?.text||'').trim()})).filter(q=>q.text.length>=2&&Number(q.r?.x2)>Number(q.r?.x1)&&Number(q.r?.y2)>Number(q.r?.y1)).slice(0,100);
     for(const q of regions){
       const x1=clamp(Math.floor(Number(q.r.x1)),1,W-2),y1=clamp(Math.floor(Number(q.r.y1)),1,H-2),x2=clamp(Math.ceil(Number(q.r.x2)),1,W-2),y2=clamp(Math.ceil(Number(q.r.y2)),1,H-2);
       if(x2-x1<5||y2-y1<3||x2-x1>W*.7||y2-y1>H*.15)continue;
@@ -11551,7 +11551,7 @@ async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePat
     const duplicateGroups=[];for(const [value,items] of groups)if(items.length>1)duplicateGroups.push({normalizedValue:value,fieldCount:items.length,regionIndices:items.map(x=>x.regionIndex),metricSupport:names.map(metric=>({metric,normalizedExcess:Number(median(items.map(o=>median(o.rings.map(r=>r.metrics[metric].normalizedExcess)))).toFixed(3)),supportingFields:items.length}))});
     return {available:true,engine:'paint-over-residual-lab-v14.5',bank:bank||null,diagnosticOnly:true,riskContribution:0,
       alignment:{method:'reference-resized-to-target-canvas-then-sparse-translation-search',dx:best.dx,dy:best.dy,meanLumaResidual:Number(best.loss.toFixed(3)),targetDimensions:{width:W,height:H},referenceDimensions:{width:Number(rm.width),height:Number(rm.height)},aspectRatioDelta:Number(aspectRatioDelta.toFixed(5)),referenceResizedToTargetCanvas:true,geometryCaution:aspectRatioDelta>.025?'aspect ratio differs by over 2.5%; interpret residuals cautiously':'aspect ratio is close',referencePath:path.basename(refPath)},
-      ringWidthsPx:['1-2','2-4','4-7'],metrics:names,documentBaseline:baseline,duplicateFieldSupport:{groupCount:duplicateGroups.length,groups:duplicateGroups},fieldCount:obs.length,observations:obs.slice(0,40),
+      ringWidthsPx:['1-2','2-4','4-7'],metrics:names,documentBaseline:baseline,duplicateFieldSupport:{groupCount:duplicateGroups.length,groups:duplicateGroups},ocrRegionCount:targetOCR.regions.length,boxedOcrFieldCount:regions.length,fieldCount:obs.length,observations:obs.slice(0,40),
       note:'Aligned target-reference residual measured outside the union of inferred glyph masks; normalized against document-internal medians. Diagnostic only; riskContribution is zero.'};
   }catch(error){return unavailable(error?.message||String(error));}
 }
