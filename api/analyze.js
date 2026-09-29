@@ -11792,9 +11792,85 @@ async function runFieldTamperingForensics({
     // also shows that the field is unusually different from the document-wide
     // JPEG/raster baseline. If the whole JPG is noisy, this gate prevents a
     // global compression/render artifact from becoming a field finding.
+    // V7 AMOUNT JPEG-AWARE LOCAL CONTRAST:
+    // A rewritten amount can have only a modest absolute ELA value. We therefore
+    // compare the amount ROI against immediate same-document neighbours and then
+    // use the document-wide JPEG/raster baseline as a second guard.
+    let localJpegContrastSignal = false;
+    let localJpegContrastDiagnostic = null;
+    if (field === 'amount' && amountV3LocalizedSignal && targetValueRegion) {
+      try {
+        const x1 = Number(targetValueRegion.x1), y1 = Number(targetValueRegion.y1);
+        const x2 = Number(targetValueRegion.x2), y2 = Number(targetValueRegion.y2);
+        const w = Math.max(8, x2 - x1), h = Math.max(8, y2 - y1);
+        const controls = [
+          {x1:x1-w*1.20,y1:y1,x2:x1-w*0.20,y2:y2},
+          {x1:x2+w*0.20,y1:y1,x2:x2+w*1.20,y2:y2},
+          {x1:x1,y1:y1-h*1.20,x2:x2,y2:y1-h*0.20},
+          {x1:x1,y1:y2+h*0.20,x2:x2,y2:y2+h*1.20}
+        ].map(r => ({
+          x1:Math.max(0,r.x1), y1:Math.max(0,r.y1),
+          x2:Math.min(targetSize.width,r.x2), y2:Math.min(targetSize.height,r.y2)
+        })).filter(r => r.x2-r.x1>=8 && r.y2-r.y1>=8);
+
+        const targetRaster = await rfRasterMetrics(targetBuffer,targetValueRegion,targetSize);
+        const controlRaster = [];
+        for (const c of controls.slice(0,4)) {
+          const m = await rfRasterMetrics(targetBuffer,c,targetSize);
+          if (m) controlRaster.push(m);
+        }
+
+        if (targetRaster && controlRaster.length >= 2) {
+          const distanceTo = (m) => {
+            const parts = [
+              rfSafeRel(targetRaster.meanLuma,m.meanLuma,18),
+              rfSafeRel(targetRaster.lumaStd,m.lumaStd,10),
+              rfSafeRel(targetRaster.darkRatio,m.darkRatio,.08),
+              rfSafeRel(targetRaster.edgeRatio,m.edgeRatio,.08),
+              rfSafeRel(targetRaster.rowVariance,m.rowVariance,.012),
+              rfSafeRel(targetRaster.colVariance,m.colVariance,.012)
+            ].filter(Number.isFinite);
+            return parts.length ? parts.reduce((a,b)=>a+b,0)/parts.length : null;
+          };
+          const localDistances = controlRaster.map(distanceTo).filter(Number.isFinite);
+          const localMedian = rfMedian(localDistances);
+          const globalMedian = Number(globalJpegRasterBaseline?.rasterDistanceMedian);
+          const globalMad = Math.max(.01,Number(globalJpegRasterBaseline?.rasterDistanceMad)||.01);
+          const globalFieldDistance = globalJpegRasterBaseline && typeof globalJpegRasterBaseline._rasterDistance === 'function'
+            ? globalJpegRasterBaseline._rasterDistance(targetRaster) : null;
+          const globalRobustZ = Number.isFinite(globalFieldDistance)
+            ? (globalFieldDistance-globalMedian)/globalMad : null;
+          const localVsGlobalRatio = Number.isFinite(localMedian) && Number.isFinite(globalMedian)
+            ? localMedian / Math.max(.05,globalMedian) : null;
+
+          // V3 is required first. Then require a meaningful local contrast.
+          // If the document-wide baseline exists, also require the amount ROI
+          // to be elevated relative to that baseline. This is the JPEG guard.
+          localJpegContrastSignal = Boolean(
+            amountV3LocalizedSignal &&
+            Number.isFinite(localVsGlobalRatio) && localVsGlobalRatio >= 1.45 &&
+            (!Number.isFinite(globalRobustZ) || globalRobustZ >= 1.75)
+          );
+          localJpegContrastDiagnostic = {
+            controlCount: controlRaster.length,
+            localDistances: localDistances.map(v=>Number(v.toFixed(4))),
+            localMedian: Number(localMedian.toFixed(4)),
+            globalMedian: Number.isFinite(globalMedian)?Number(globalMedian.toFixed(4)):null,
+            localVsGlobalRatio: Number.isFinite(localVsGlobalRatio)?Number(localVsGlobalRatio.toFixed(2)):null,
+            globalFieldDistance: Number.isFinite(globalFieldDistance)?Number(globalFieldDistance.toFixed(4)):null,
+            globalRobustZ: Number.isFinite(globalRobustZ)?Number(globalRobustZ.toFixed(2)):null,
+            signal: localJpegContrastSignal
+          };
+        }
+      } catch (error) {
+        console.warn('V7 AMOUNT LOCAL JPEG CONTRAST HATASI:', error?.message || error);
+      }
+    }
+
     const amountV3GlobalSupported = Boolean(
       amountV3LocalizedSignal && (
         globalJpegLocalizedSignal ||
+        localJpegContrastSignal ||
         !globalBaselineDiagnostic
       )
     );
@@ -11844,6 +11920,7 @@ async function runFieldTamperingForensics({
         amountV3LocalizedSignal,
         amountV3GlobalSupported,
         globalJpegLocalizedSignal,
+        localJpegContrastSignal,
       },
       localEla: targetEla,
       referenceSupport,
@@ -11860,6 +11937,7 @@ async function runFieldTamperingForensics({
         localAnomalyRatio: Number(amountV3Metrics.localAnomalyRatio || 0),
       } : null,
       globalJpegBaseline: globalBaselineDiagnostic,
+      localJpegContrast: localJpegContrastDiagnostic,
       targetBox: { ...targetValueRegion },
     };
     fieldDiagnostics.push(diagnostic);
@@ -11910,71 +11988,20 @@ async function runFieldTamperingForensics({
           Number(fallbackMetrics.maxDarknessDifference) >= 0.38
         )
       );
-
-      // COMPRESSION-AWARE AMOUNT GATE:
-      // V3 alone is never enough because JPEG quality/recompression can alter
-      // local ink/edge metrics. We therefore require an independent local ELA
-      // contrast against neighbouring regions from the SAME uploaded JPG.
-      // This is deliberately target-only: it does not depend on the reference
-      // amount value, so a forged 2.000 -> 10.000 change cannot hide merely
-      // because the reference itself also contains 10.000.
-      const fallbackEla = await localElaOutlier(targetBuffer, fallbackRegion || amountForensics.region);
-      const fallbackElaModerate = Boolean(
-        fallbackEla &&
-        Number(fallbackEla.ratio) >= 1.35 &&
-        Number(fallbackEla.excess) >= 1.50
-      );
-      const fallbackCompressionAwareSignal = Boolean(
-        fallbackV3Signal &&
-        (fallbackElaModerate || fallbackEla?.outlier)
-      );
-
-      // A same-field glyph-shape signal can corroborate the local ELA/V3 pair,
-      // but it is never allowed to create a finding by itself.
-      let fallbackSameFieldDigitSignal = false;
-      try {
-        const numeric = await rfNumericGlyphSequence(
-          targetBuffer,
-          fallbackRegion || amountForensics.region,
-          targetSize,
-          fallbackText
-        );
-        if (numeric?.slots?.length >= 3) {
-          const widths = numeric.slots.map(x => Number(x.width) / Math.max(1, Number(x.height)));
-          const fills = numeric.slots.map(x => Number(x.fill));
-          const medW = rfMedian(widths);
-          const medF = rfMedian(fills);
-          const outlierCount = numeric.slots.filter(x =>
-            Math.abs((Number(x.width) / Math.max(1, Number(x.height))) - medW) / Math.max(.05, Math.abs(medW)) > .22 ||
-            Math.abs(Number(x.fill) - medF) / Math.max(.05, Math.abs(medF)) > .22
-          ).length;
-          fallbackSameFieldDigitSignal = outlierCount >= 1 && outlierCount <= Math.ceil(numeric.slots.length * .30);
-        }
-      } catch {}
-
-      const fallbackConvergentSignal = Boolean(
-        fallbackV3Signal &&
-        (fallbackCompressionAwareSignal || (fallbackSameFieldDigitSignal && fallbackElaModerate))
-      );
-
-      if (fallbackConvergentSignal) {
+      if (fallbackGlyph?.signal && fallbackV3Signal) {
         const fallbackStrong = Boolean(fallbackGlyph.strong);
         const fallbackFinding = {
           field: 'amount',
           title: 'Tutar',
-          severity: fallbackStrong && fallbackCompressionAwareSignal ? 'strong' : 'medium',
-          confidence: fallbackStrong && fallbackCompressionAwareSignal ? 90 : 82,
-          evidence: `Tutar alanında olası sonradan düzenleme sinyali bulundu. Amount Forensics V3 lokal mikro-raster anomali gösterirken aynı JPG içindeki komşu kontrol bölgelerine göre yeniden-kodlama/ELA kontrastı da ayrışıyor. ${fallbackGlyph.outlierCount} karakter aykırı; bu bulgu JPEG sıkıştırmasının tek başına oluşturabileceği farklardan ayrıştırılmak üzere aynı-belge kontrol bölgeleriyle doğrulandı ve tek başına sahtecilik kanıtı değildir.`,
+          severity: fallbackStrong ? 'strong' : 'medium',
+          confidence: fallbackStrong ? 88 : 78,
+          evidence: `Tutar alanında aynı rakamların belge içi karakter profiline göre lokal geometri/dolgu ayrışması tespit edildi. ${fallbackGlyph.outlierCount} karakter aykırı; mevcut Amount Forensics V3 de aynı bölgede çoklu mikro-raster anomali gösteriyor. Bu bulgu tek başına sahtecilik kanıtı değildir.`,
           targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
           signals: {
             documentNumericGlyphSignal: true,
             documentNumericGlyphStrong: fallbackStrong,
             amountV3LocalizedSignal: true,
-            compressionAwareSignal: fallbackCompressionAwareSignal,
-            localElaRatio: Number(fallbackEla?.ratio || 0),
-            localElaExcess: Number(fallbackEla?.excess || 0),
-            sameFieldDigitSignal: fallbackSameFieldDigitSignal,
-            source: 'amount-forensics-direct-fallback-v2',
+            source: 'amount-forensics-direct-fallback',
           },
         };
         findings.push(fallbackFinding);
@@ -11995,33 +12022,19 @@ async function runFieldTamperingForensics({
           } : null,
           targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
         });
-        console.log('V6 AMOUNT DIRECT FALLBACK:', JSON.stringify({
+        console.log('V7 AMOUNT DIRECT FALLBACK:', JSON.stringify({
           amountText: fallbackText,
           numericGlyphSignal: fallbackGlyph.signal,
           numericGlyphStrong: fallbackGlyph.strong,
           outlierCount: fallbackGlyph.outlierCount,
           comparableGlyphCount: fallbackGlyph.comparableGlyphCount,
           amountV3Signal: fallbackV3Signal,
-          elaModerateSignal: fallbackElaModerate,
-          elaOutlier: Boolean(fallbackEla?.outlier),
-          elaRatio: Number(fallbackEla?.ratio || 0),
-          elaExcess: Number(fallbackEla?.excess || 0),
-          sameFieldDigitSignal: fallbackSameFieldDigitSignal,
-          compressionAwareSignal: fallbackCompressionAwareSignal,
-          convergentSignal: fallbackConvergentSignal,
         }));
       } else {
-        console.log('V6 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
+        console.log('V7 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
           amountText: fallbackText,
           numericGlyphSignal: Boolean(fallbackGlyph?.signal),
           amountV3Signal: fallbackV3Signal,
-          elaModerateSignal: fallbackElaModerate,
-          elaOutlier: Boolean(fallbackEla?.outlier),
-          elaRatio: Number(fallbackEla?.ratio || 0),
-          elaExcess: Number(fallbackEla?.excess || 0),
-          sameFieldDigitSignal: fallbackSameFieldDigitSignal,
-          compressionAwareSignal: fallbackCompressionAwareSignal,
-          convergentSignal: fallbackConvergentSignal,
         }));
       }
     } catch (error) {
