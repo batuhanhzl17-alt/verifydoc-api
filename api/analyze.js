@@ -11988,20 +11988,143 @@ async function runFieldTamperingForensics({
           Number(fallbackMetrics.maxDarknessDifference) >= 0.38
         )
       );
-      if (fallbackGlyph?.signal && fallbackV3Signal) {
-        const fallbackStrong = Boolean(fallbackGlyph.strong);
+      // V8 AMOUNT LOCAL-EDIT FALLBACK:
+      // The generic field loop can miss the amount field because semantic
+      // label/value pairing is conservative. The dedicated Amount Forensics
+      // engine, however, already selected the correct amount ROI.
+      //
+      // Important: JPEG/ELA is NOT required to be positive here. We compare
+      // the amount ROI against immediate same-document neighbours and against
+      // the global JPEG baseline. This is specifically designed to distinguish
+      // a local rewrite such as 2.000 -> 10.000 from document-wide JPEG noise.
+      let fallbackLocalJpegSignal = false;
+      let fallbackLocalJpegDiagnostic = null;
+
+      if (fallbackV3Signal && fallbackRegion) {
+        try {
+          const fx1 = Number(fallbackRegion.x1), fy1 = Number(fallbackRegion.y1);
+          const fx2 = Number(fallbackRegion.x2), fy2 = Number(fallbackRegion.y2);
+          const fw = Math.max(8, fx2 - fx1), fh = Math.max(8, fy2 - fy1);
+          const fallbackControls = [
+            {x1:fx1-fw*1.25,y1:fy1,x2:fx1-fw*0.15,y2:fy2},
+            {x1:fx2+fw*0.15,y1:fy1,x2:fx2+fw*1.25,y2:fy2},
+            {x1:fx1,y1:fy1-fh*1.25,x2:fx2,y2:fy1-fh*0.15},
+            {x1:fx1,y1:fy2+fh*0.15,x2:fx2,y2:fy2+fh*1.25}
+          ].map(r => ({
+            x1:Math.max(0,r.x1), y1:Math.max(0,r.y1),
+            x2:Math.min(targetSize.width,r.x2), y2:Math.min(targetSize.height,r.y2)
+          })).filter(r => r.x2-r.x1>=8 && r.y2-r.y1>=8);
+
+          const fallbackTargetRaster = await rfRasterMetrics(targetBuffer, fallbackRegion, targetSize);
+          const fallbackControlRaster = [];
+          for (const c of fallbackControls.slice(0,4)) {
+            const m = await rfRasterMetrics(targetBuffer, c, targetSize);
+            if (m) fallbackControlRaster.push(m);
+          }
+
+          if (fallbackTargetRaster && fallbackControlRaster.length >= 2) {
+            const fallbackDistanceTo = (m) => {
+              const parts = [
+                rfSafeRel(fallbackTargetRaster.meanLuma,m.meanLuma,18),
+                rfSafeRel(fallbackTargetRaster.lumaStd,m.lumaStd,10),
+                rfSafeRel(fallbackTargetRaster.darkRatio,m.darkRatio,.08),
+                rfSafeRel(fallbackTargetRaster.edgeRatio,m.edgeRatio,.08),
+                rfSafeRel(fallbackTargetRaster.rowVariance,m.rowVariance,.012),
+                rfSafeRel(fallbackTargetRaster.colVariance,m.colVariance,.012)
+              ].filter(Number.isFinite);
+              return parts.length ? parts.reduce((a,b)=>a+b,0)/parts.length : null;
+            };
+
+            const fallbackLocalDistances = fallbackControlRaster
+              .map(fallbackDistanceTo).filter(Number.isFinite);
+            const fallbackLocalMedian = rfMedian(fallbackLocalDistances);
+            const fallbackGlobalMedian = Number(globalJpegRasterBaseline?.rasterDistanceMedian);
+            const fallbackGlobalMad = Math.max(
+              .01,
+              Number(globalJpegRasterBaseline?.rasterDistanceMad) || .01
+            );
+
+            const fallbackGlobalFieldDistance =
+              globalJpegRasterBaseline &&
+              typeof globalJpegRasterBaseline._rasterDistance === 'function'
+                ? globalJpegRasterBaseline._rasterDistance(fallbackTargetRaster)
+                : null;
+
+            const fallbackGlobalRobustZ = Number.isFinite(fallbackGlobalFieldDistance)
+              ? (fallbackGlobalFieldDistance-fallbackGlobalMedian)/fallbackGlobalMad
+              : null;
+
+            const fallbackLocalVsGlobalRatio =
+              Number.isFinite(fallbackLocalMedian) &&
+              Number.isFinite(fallbackGlobalMedian)
+                ? fallbackLocalMedian / Math.max(.05,fallbackGlobalMedian)
+                : null;
+
+            // V8 uses V3 as the localized trigger and then asks whether the
+            // amount ROI is measurably different from its immediate controls.
+            // The global baseline prevents ordinary JPEG noise from becoming
+            // a finding. ELA is deliberately NOT required.
+            fallbackLocalJpegSignal = Boolean(
+              fallbackV3Signal &&
+              Number.isFinite(fallbackLocalVsGlobalRatio) &&
+              fallbackLocalVsGlobalRatio >= 1.25 &&
+              (
+                !Number.isFinite(fallbackGlobalRobustZ) ||
+                fallbackGlobalRobustZ >= 1.0
+              )
+            );
+
+            fallbackLocalJpegDiagnostic = {
+              controlCount: fallbackControlRaster.length,
+              localDistances: fallbackLocalDistances.map(v=>Number(v.toFixed(4))),
+              localMedian: Number.isFinite(fallbackLocalMedian)
+                ? Number(fallbackLocalMedian.toFixed(4)) : null,
+              globalMedian: Number.isFinite(fallbackGlobalMedian)
+                ? Number(fallbackGlobalMedian.toFixed(4)) : null,
+              globalFieldDistance: Number.isFinite(fallbackGlobalFieldDistance)
+                ? Number(fallbackGlobalFieldDistance.toFixed(4)) : null,
+              localVsGlobalRatio: Number.isFinite(fallbackLocalVsGlobalRatio)
+                ? Number(fallbackLocalVsGlobalRatio.toFixed(2)) : null,
+              globalRobustZ: Number.isFinite(fallbackGlobalRobustZ)
+                ? Number(fallbackGlobalRobustZ.toFixed(2)) : null,
+              signal: fallbackLocalJpegSignal
+            };
+          }
+        } catch (error) {
+          console.warn('V8 AMOUNT LOCAL EDIT CONTRAST HATASI:', error?.message || error);
+        }
+      }
+
+      const fallbackConvergentSignal = Boolean(
+        fallbackV3Signal && (Boolean(fallbackGlyph?.signal) || fallbackLocalJpegSignal)
+      );
+
+      if (fallbackConvergentSignal) {
+        const fallbackStrong = Boolean(
+          fallbackGlyph?.strong ||
+          (fallbackLocalJpegSignal && Number(fallbackMetrics?.maxFeatureVotes || 0) >= 5)
+        );
         const fallbackFinding = {
           field: 'amount',
           title: 'Tutar',
           severity: fallbackStrong ? 'strong' : 'medium',
-          confidence: fallbackStrong ? 88 : 78,
-          evidence: `Tutar alanında aynı rakamların belge içi karakter profiline göre lokal geometri/dolgu ayrışması tespit edildi. ${fallbackGlyph.outlierCount} karakter aykırı; mevcut Amount Forensics V3 de aynı bölgede çoklu mikro-raster anomali gösteriyor. Bu bulgu tek başına sahtecilik kanıtı değildir.`,
+          confidence: fallbackStrong ? 91 : 84,
+          evidence: `Tutar alanında lokal raster/karakter ayrışması tespit edildi. ${
+            fallbackGlyph?.signal
+              ? `${fallbackGlyph.outlierCount} karakter belge içi karakter profiline göre aykırı. `
+              : ''
+          }Amount Forensics V3 aynı bölgede çoklu mikro-raster anomali gösteriyor${
+            fallbackLocalJpegSignal
+              ? ' ve tutar ROI’si aynı JPG içindeki komşu bölgelerden belirgin şekilde ayrışıyor.'
+              : '.'
+          } JPEG sıkıştırması tek başına bulgu olarak kullanılmadı.`,
           targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
           signals: {
-            documentNumericGlyphSignal: true,
-            documentNumericGlyphStrong: fallbackStrong,
+            documentNumericGlyphSignal: Boolean(fallbackGlyph?.signal),
+            documentNumericGlyphStrong: Boolean(fallbackGlyph?.strong),
             amountV3LocalizedSignal: true,
-            source: 'amount-forensics-direct-fallback',
+            localJpegContrastSignal: fallbackLocalJpegSignal,
+            source: 'amount-forensics-v8-local-edit-fallback',
           },
         };
         findings.push(fallbackFinding);
@@ -12020,21 +12143,28 @@ async function runFieldTamperingForensics({
             maxDarknessDifference: Number(fallbackMetrics.maxDarknessDifference || 0),
             localAnomalyRatio: Number(fallbackMetrics.localAnomalyRatio || 0),
           } : null,
+          localJpegContrast: fallbackLocalJpegDiagnostic,
           targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
         });
-        console.log('V7 AMOUNT DIRECT FALLBACK:', JSON.stringify({
+        console.log('V8 AMOUNT DIRECT FALLBACK:', JSON.stringify({
           amountText: fallbackText,
-          numericGlyphSignal: fallbackGlyph.signal,
-          numericGlyphStrong: fallbackGlyph.strong,
-          outlierCount: fallbackGlyph.outlierCount,
-          comparableGlyphCount: fallbackGlyph.comparableGlyphCount,
+          numericGlyphSignal: Boolean(fallbackGlyph?.signal),
+          numericGlyphStrong: Boolean(fallbackGlyph?.strong),
+          outlierCount: Number(fallbackGlyph?.outlierCount || 0),
+          comparableGlyphCount: Number(fallbackGlyph?.comparableGlyphCount || 0),
           amountV3Signal: fallbackV3Signal,
+          localJpegContrastSignal: fallbackLocalJpegSignal,
+          localJpegContrast: fallbackLocalJpegDiagnostic,
+          convergentSignal: fallbackConvergentSignal,
         }));
       } else {
-        console.log('V7 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
+        console.log('V8 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
           amountText: fallbackText,
           numericGlyphSignal: Boolean(fallbackGlyph?.signal),
           amountV3Signal: fallbackV3Signal,
+          localJpegContrastSignal: fallbackLocalJpegSignal,
+          localJpegContrast: fallbackLocalJpegDiagnostic,
+          convergentSignal: fallbackConvergentSignal,
         }));
       }
     } catch (error) {
@@ -12047,7 +12177,7 @@ async function runFieldTamperingForensics({
 
   const result = {
     available: true,
-    engine: 'field-tampering-forensics-v2-local-raster-ela-style-global-baseline',
+    engine: 'field-tampering-forensics-v8-local-edit-jpeg-aware',
     bank: normalizeBank(bank),
     fileFingerprint: fileFingerprint || null,
     checkedFieldCount: fieldDiagnostics.length,
