@@ -2932,6 +2932,17 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
       financialDataRisk = Math.max(financialDataRisk, hasStrongAmountTamper ? 60 : 35);
     }
   }
+  // V13.3 PAINT-OVER FORENSICS: only a convergent local raster candidate
+  // can influence deterministic editing risk. Reference-format differences,
+  // global JPEG/ELA and OCR semantics are deliberately excluded here.
+  const paintOverCandidateRisk = amountForensics?.paintOverCandidate === true;
+  const paintOverFeatureCountRisk = Number(amountForensics?.paintOverConvergentFeatureCount || 0);
+  const paintOverSlotCountRisk = Number(amountForensics?.highVoteSegmentCount || 0);
+  if (paintOverCandidateRisk && paintOverFeatureCountRisk >= 2 && paintOverSlotCountRisk >= 3) {
+    editingRisk = Math.max(editingRisk, 72);
+    financialDataRisk = Math.max(financialDataRisk, 50);
+  }
+
   // If the reference engine has a high-confidence semantic local-gap anomaly,
   // make it visible in the editing category even when the other visual signals
   // are quiet. Require a strong anomaly score and a healthy reference match.
@@ -11301,12 +11312,36 @@ const maxDarkDifference = Math.max(
 const anomalousCount = anomalyScores.filter((x) => x.votes >= 3).length;
 const anomalyRatio = features.length ? anomalousCount / features.length : 0;
 
-// Özellikle tek bir karakterin diğerlerinden ayrılması değerlidir.
-// Çok sayıda karakter aynı şekilde değişmişse bunun belge/render etkisi
-// olma ihtimali daha yüksektir.
+// V13.2 PAINT-OVER: Eski gate anomalyRatio <= 0.35 idi. Bu, üstü
+// boyanıp yeniden yazılan bir alanın birden fazla komşu karakterinde
+// iz oluştuğu durumları yanlışlıkla PASS'e düşürüyordu.
+// Burada artık oran tek başına karar vermez; lokal yakınsaklık aranır.
+const highVoteSegments = anomalyScores
+  .map((x, i) => ({ ...x, index: i }))
+  .filter((x) => x.votes >= 3);
+
+const paintOverConvergentFeatureCount = [
+  maxInkDifference >= 0.35,
+  maxStrokeProxyDifference >= 0.35,
+  maxEdgeDifference >= 0.35,
+  maxDarkDifference >= 0.20,
+].filter(Boolean).length;
+
+// Paint-over/rewrite için güvenli aday: en az üç karakter slotunda çoklu
+// mikro-raster sapması + en az iki bağımsız görsel özellikte belirgin fark.
+// Darkness tek başına yeterli değildir; JPEG/render etkisini sınırlamak için
+// ink + stroke + edge yakınsaklığı tercih edilir.
+const paintOverCandidate =
+  estimatedCharacterSlots &&
+  highVoteSegments.length >= 3 &&
+  maxScore >= 4 &&
+  anomalyRatio >= 0.30 &&
+  anomalyRatio <= 0.70 &&
+  paintOverConvergentFeatureCount >= 2;
+
 const localized =
-maxScore >= 3 &&
-anomalyRatio <= 0.35;
+  maxScore >= 3 &&
+  (anomalyRatio <= 0.55 || paintOverCandidate);
 
 const repeatedStrong =
 repeatedCharacterAnalysis.strongGroups.length >= 1;
@@ -11325,9 +11360,18 @@ let status = "pass";
 let severity = "none";
 let score = 0;
 
+// Paint-over adayı mevcutsa bunu açıkça raporla. Bu bir "sahte" hükmü
+// değildir; yalnızca aynı alan içinde çoklu lokal raster ayrışmasının
+// erase/rewrite ile uyumlu olduğunu belirtir.
+if (paintOverCandidate) {
+  status = "warning";
+  severity = "moderate";
+  score = 68;
+}
+
 // Aynı rakamın (özellikle 0'ın) bir kopyası diğerlerinden belirgin
 // biçimde farklıysa, genel medyan testi güçlü çıkmasa bile bunu yakala.
-if (
+if (!paintOverCandidate && (
 repeatedVeryStrong ||
 (
 repeatedStrong &&
@@ -11391,6 +11435,9 @@ maxStrokeProxyDifference,
 maxEdgeDifference,
 maxDarkDifference,
 anomalyRatio,
+paintOverCandidate,
+paintOverConvergentFeatureCount,
+highVoteSegmentCount: highVoteSegments.length,
 repeatedCharacterAnalysis,
 outlierFeature,
 })
@@ -11422,6 +11469,9 @@ maxStrokeProxyDifference: Number(maxStrokeProxyDifference.toFixed(3)),
 maxEdgeDensityDifference: Number(maxEdgeDifference.toFixed(3)),
 maxDarknessDifference: Number(maxDarkDifference.toFixed(3)),
 localAnomalyRatio: Number(anomalyRatio.toFixed(3)),
+paintOverCandidate,
+paintOverConvergentFeatureCount,
+highVoteSegmentCount: highVoteSegments.length,
 repeatedCharacterAvailable: repeatedCharacterAnalysis.available,
 repeatedCharacterMaxDifference: Number((repeatedCharacterAnalysis.maxDifference || 0).toFixed(3)),
 repeatedCharacterGroups: repeatedCharacterAnalysis.strongGroups.slice(0, 8),
@@ -11437,6 +11487,9 @@ amountLabelEvidence: candidate.labelEvidence?.positive || [],
 directAmountLabelScore: Number(candidate.directLabelEvidence?.score || 0),
 directAmountLabel: candidate.directLabelEvidence?.label || null,
 },
+paintOverCandidate,
+paintOverConvergentFeatureCount,
+highVoteSegmentCount: highVoteSegments.length,
 selectionMethod,
 selectedAmountText: normalizeOCRAmountLiteral(candidate.text),
 referenceAmountText: null,
@@ -19458,32 +19511,9 @@ Number(deterministicRiskAfterForensics.overallRisk) || 0;
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
 
-// V13: a high-confidence amount-format mismatch is a semantic content
-// discrepancy, not a raster artifact. Do not let weighted category averaging
-// dilute it back into LOW RISK. Keep the floor at MODERATE RISK; this is not a
-// standalone "fake" verdict, but it makes the discrepancy visible in the
-// final risk score.
-const finalAmountFormatComparison =
-  referenceTemplateAnalysis?.amountFormatComparison || null;
-if (
-  finalAmountFormatComparison?.available === true &&
-  finalAmountFormatComparison?.mismatch === true &&
-  Number(finalAmountFormatComparison?.confidence || 0) >= 80
-) {
-  calculatedRisk.overallRisk = Math.max(
-    46,
-    Number(calculatedRisk.overallRisk) || 0
-  );
-  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
-  console.log('V13 AMOUNT FORMAT RISK FLOOR:', JSON.stringify({
-    applied: true,
-    floor: 46,
-    confidence: Number(finalAmountFormatComparison.confidence || 0),
-    score: Number(finalAmountFormatComparison.score || 0),
-    reasons: finalAmountFormatComparison.reasons || []
-  }));
-}
-
+// V13.3: Amount format mismatch remains diagnostic only.
+// Decimal/thousands separator differences are not paint-over evidence and
+// must not create a final risk floor.
 // A very strong, semantically matched local geometry anomaly is a deterministic
 // forensic finding. Keep the user-facing suspicious threshold aligned with that
 // evidence instead of allowing a quiet visual/text category mix to dilute it.
@@ -19560,6 +19590,23 @@ if (hasMajorAmountMismatch || hasSevereAmountMismatch) {
 const finalDeterministicRisk = calculateOverallRisk(result);
 finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
 result.categories = finalDeterministicRisk.categories;
+
+// V13.3: Strong local paint-over candidate gets a measured floor. This is
+// intentionally lower than a confirmed fraud verdict and is based only on
+// convergent local raster evidence.
+const finalPaintOverCandidate = amountForensics?.paintOverCandidate === true;
+if (finalPaintOverCandidate &&
+    Number(amountForensics?.paintOverConvergentFeatureCount || 0) >= 2 &&
+    Number(amountForensics?.highVoteSegmentCount || 0) >= 3) {
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  console.log('V13.3 PAINT-OVER LOCAL FLOOR:', JSON.stringify({
+    applied: true,
+    floor: 46,
+    convergentFeatureCount: Number(amountForensics?.paintOverConvergentFeatureCount || 0),
+    highVoteSegmentCount: Number(amountForensics?.highVoteSegmentCount || 0),
+    anomalyRatio: Number(amountForensics?.metrics?.localAnomalyRatio || 0)
+  }));
+}
 
 // =====================================================
 // V67: KANIT KORELASYON KÖPRÜSÜ
