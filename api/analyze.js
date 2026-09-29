@@ -1,3 +1,6 @@
+// VERIFYDOC V13.4 PAINT-OVER FORENSICS FIXED
+// Core rule: REFERENCE DIFFERENCE != FRAUD.
+
 import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
@@ -394,12 +397,21 @@ function extractForensicWatchSignal(result = {}) {
     return null;
   }
 
+  const watchPaintOver = result?.amountForensics?.paintOverCandidate === true &&
+    Number(result?.amountForensics?.paintOverConvergentFeatureCount || 0) >= 2 &&
+    Number(result?.amountForensics?.highVoteSegmentCount || 0) >= 2;
+
   let eventType = "reference_difference";
   let strongSignal = false;
   let confidence = 82;
   let reason = "Referans karşılaştırmasında somut bir fark bulundu.";
 
-  if (explicitFinancialMismatch) {
+  if (watchPaintOver) {
+    eventType = "paint_over_local_forensics";
+    strongSignal = true;
+    confidence = 90;
+    reason = "Tutar alanında birden fazla mikro-raster özelliğinin aynı lokal bölgede birlikte ayrıştığı tespit edildi; bu sinyal paint-over/erase-rewrite izi ile uyumludur.";
+  } else if (explicitFinancialMismatch) {
     eventType = "financial_inconsistency";
     strongSignal = true;
     confidence = 98;
@@ -2860,14 +2872,9 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     );
   }
 
-  // V10: amount formatting is retained as an independent, low-to-medium
-  // financial/document signal. It must never be treated as proof of fraud by
-  // itself, but a high-confidence mismatch in decimal/thousands separators or
-  // currency placement is too important to disappear after numeric normalization.
+  // V13.4: amount formatting is diagnostic only. Locale/format differences are
+  // not local edit evidence and contribute zero deterministic risk.
   const amountFormatComparison = forensic?.referenceTemplateAnalysis?.amountFormatComparison || null;
-  if (amountFormatComparison?.available === true && amountFormatComparison.mismatch === true) {
-    financialDataRisk = Math.max(financialDataRisk, Math.min(45, Number(amountFormatComparison.score) || 25));
-  }
 
   // Validate any visible IBAN deterministically. This does not prove that an
   // IBAN belongs to the named recipient; it only detects checksum/format errors.
@@ -2912,6 +2919,15 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     editingRisk = Math.max(editingRisk, Math.min(55, Math.round(pixelScore * 0.55)));
   }
 
+  // V13.4: local multi-feature paint-over candidate.
+  const paintOverCandidate = amount?.paintOverCandidate === true;
+  const paintOverConvergentFeatureCount = Number(amount?.paintOverConvergentFeatureCount || 0);
+  const paintOverHighVoteSegmentCount = Number(amount?.highVoteSegmentCount || 0);
+  const paintOverAnomalyRatio = Number(amount?.metrics?.localAnomalyRatio || 0);
+  if (paintOverCandidate && paintOverConvergentFeatureCount >= 2 && paintOverHighVoteSegmentCount >= 2 && paintOverAnomalyRatio >= 0.30 && paintOverAnomalyRatio <= 0.70) {
+    editingRisk = Math.max(editingRisk, 75);
+  }
+
   // FIELD TAMPERING V1: promote only strong multi-signal local field evidence.
   // Medium findings remain diagnostic and do not move the final risk by themselves.
   if (fieldTampering?.available === true) {
@@ -2932,17 +2948,6 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
       financialDataRisk = Math.max(financialDataRisk, hasStrongAmountTamper ? 60 : 35);
     }
   }
-  // V13.3 PAINT-OVER FORENSICS: only a convergent local raster candidate
-  // can influence deterministic editing risk. Reference-format differences,
-  // global JPEG/ELA and OCR semantics are deliberately excluded here.
-  const paintOverCandidateRisk = amount?.paintOverCandidate === true;
-  const paintOverFeatureCountRisk = Number(amount?.paintOverConvergentFeatureCount || 0);
-  const paintOverSlotCountRisk = Number(amount?.highVoteSegmentCount || 0);
-  if (paintOverCandidateRisk && paintOverFeatureCountRisk >= 2 && paintOverSlotCountRisk >= 3) {
-    editingRisk = Math.max(editingRisk, 72);
-    financialDataRisk = Math.max(financialDataRisk, 50);
-  }
-
   // If the reference engine has a high-confidence semantic local-gap anomaly,
   // make it visible in the editing category even when the other visual signals
   // are quiet. Require a strong anomaly score and a healthy reference match.
@@ -11312,36 +11317,26 @@ const maxDarkDifference = Math.max(
 const anomalousCount = anomalyScores.filter((x) => x.votes >= 3).length;
 const anomalyRatio = features.length ? anomalousCount / features.length : 0;
 
-// V13.2 PAINT-OVER: Eski gate anomalyRatio <= 0.35 idi. Bu, üstü
-// boyanıp yeniden yazılan bir alanın birden fazla komşu karakterinde
-// iz oluştuğu durumları yanlışlıkla PASS'e düşürüyordu.
-// Burada artık oran tek başına karar vermez; lokal yakınsaklık aranır.
-const highVoteSegments = anomalyScores
-  .map((x, i) => ({ ...x, index: i }))
-  .filter((x) => x.votes >= 3);
+// V13.4 PAINT-OVER FORENSICS: local raster only; reference value/format is excluded.
+const paintOverFeatureFlags = {
+  ink: (Number.isFinite(maxInkDifference) ? maxInkDifference : 0) >= 0.38,
+  stroke: (Number.isFinite(maxStrokeProxyDifference) ? maxStrokeProxyDifference : 0) >= 0.38,
+  edge: (Number.isFinite(maxEdgeDifference) ? maxEdgeDifference : 0) >= 0.38,
+  dark: (Number.isFinite(maxDarkDifference) ? maxDarkDifference : 0) >= 0.18,
+};
+const paintOverConvergentFeatureCount = Object.values(paintOverFeatureFlags).filter(Boolean).length;
+const highVoteSegmentCount = anomalyScores.filter((x) => x.votes >= 4).length;
+const paintOverCandidate = Boolean(
+  features.length >= 6 && maxScore >= 4 && highVoteSegmentCount >= 2 &&
+  paintOverConvergentFeatureCount >= 2 && anomalyRatio >= 0.30 && anomalyRatio <= 0.70
+);
 
-const paintOverConvergentFeatureCount = [
-  maxInkDifference >= 0.35,
-  maxStrokeProxyDifference >= 0.35,
-  maxEdgeDifference >= 0.35,
-  maxDarkDifference >= 0.20,
-].filter(Boolean).length;
-
-// Paint-over/rewrite için güvenli aday: en az üç karakter slotunda çoklu
-// mikro-raster sapması + en az iki bağımsız görsel özellikte belirgin fark.
-// Darkness tek başına yeterli değildir; JPEG/render etkisini sınırlamak için
-// ink + stroke + edge yakınsaklığı tercih edilir.
-const paintOverCandidate =
-  estimatedCharacterSlots &&
-  highVoteSegments.length >= 3 &&
-  maxScore >= 4 &&
-  anomalyRatio >= 0.30 &&
-  anomalyRatio <= 0.70 &&
-  paintOverConvergentFeatureCount >= 2;
-
+// Özellikle tek bir karakterin diğerlerinden ayrılması değerlidir.
+// Çok sayıda karakter aynı şekilde değişmişse bunun belge/render etkisi
+// olma ihtimali daha yüksektir.
 const localized =
-  maxScore >= 3 &&
-  (anomalyRatio <= 0.55 || paintOverCandidate);
+maxScore >= 3 &&
+anomalyRatio <= 0.35;
 
 const repeatedStrong =
 repeatedCharacterAnalysis.strongGroups.length >= 1;
@@ -11360,18 +11355,9 @@ let status = "pass";
 let severity = "none";
 let score = 0;
 
-// Paint-over adayı mevcutsa bunu açıkça raporla. Bu bir "sahte" hükmü
-// değildir; yalnızca aynı alan içinde çoklu lokal raster ayrışmasının
-// erase/rewrite ile uyumlu olduğunu belirtir.
-if (paintOverCandidate) {
-  status = "warning";
-  severity = "moderate";
-  score = 68;
-}
-
 // Aynı rakamın (özellikle 0'ın) bir kopyası diğerlerinden belirgin
 // biçimde farklıysa, genel medyan testi güçlü çıkmasa bile bunu yakala.
-if (!paintOverCandidate && (
+if (
 repeatedVeryStrong ||
 (
 repeatedStrong &&
@@ -11381,7 +11367,7 @@ maxStrokeProxyDifference >= 0.18 ||
 maxDarkDifference >= 0.18
 )
 )
-)) {
+) {
 status = "warning";
 severity = "strong";
 score = 85;
@@ -11437,7 +11423,8 @@ maxDarkDifference,
 anomalyRatio,
 paintOverCandidate,
 paintOverConvergentFeatureCount,
-highVoteSegmentCount: highVoteSegments.length,
+highVoteSegmentCount,
+paintOverFeatureFlags,
 repeatedCharacterAnalysis,
 outlierFeature,
 })
@@ -11471,7 +11458,8 @@ maxDarknessDifference: Number(maxDarkDifference.toFixed(3)),
 localAnomalyRatio: Number(anomalyRatio.toFixed(3)),
 paintOverCandidate,
 paintOverConvergentFeatureCount,
-highVoteSegmentCount: highVoteSegments.length,
+highVoteSegmentCount,
+paintOverFeatureFlags,
 repeatedCharacterAvailable: repeatedCharacterAnalysis.available,
 repeatedCharacterMaxDifference: Number((repeatedCharacterAnalysis.maxDifference || 0).toFixed(3)),
 repeatedCharacterGroups: repeatedCharacterAnalysis.strongGroups.slice(0, 8),
@@ -11487,12 +11475,13 @@ amountLabelEvidence: candidate.labelEvidence?.positive || [],
 directAmountLabelScore: Number(candidate.directLabelEvidence?.score || 0),
 directAmountLabel: candidate.directLabelEvidence?.label || null,
 },
-paintOverCandidate,
-paintOverConvergentFeatureCount,
-highVoteSegmentCount: highVoteSegments.length,
 selectionMethod,
 selectedAmountText: normalizeOCRAmountLiteral(candidate.text),
 referenceAmountText: null,
+paintOverCandidate,
+paintOverConvergentFeatureCount,
+highVoteSegmentCount,
+paintOverFeatureFlags,
 segmentFeatures: features.map((feature, index) => ({
 index,
 width: Number(feature.width.toFixed(2)),
@@ -12543,8 +12532,7 @@ async function runFieldTamperingForensics({
             fallbackGlyph?.strong &&
             (
               fallbackLocalJpegSignal ||
-              v9JpegAwareLocalizedSignal ||
-              amountFormatMismatch
+              v9JpegAwareLocalizedSignal
             )
           ) ||
           (
@@ -15827,10 +15815,7 @@ if (referenceForensics?.available === true && (
   Number(referenceForensics.maxSpacingScore || 0) >= 85 ||
   Number(referenceForensics.suspiciousFieldCount || 0) >= 1
 )) terraGateReasons.push("forensic-strong-signal");
-if (referenceTemplateAnalysis?.amountFormatComparison?.available === true &&
-    referenceTemplateAnalysis.amountFormatComparison.mismatch === true) {
-  terraGateReasons.push("amount-format-mismatch");
-}
+// V13.4: amount-format mismatch is diagnostic only and never triggers Terra.
 
 // V64 SPEED GATE: Terra is the expensive path (~90-100s in recent runs).
 // A single soft/local signal is not enough to pay that cost.
@@ -15839,8 +15824,7 @@ if (referenceTemplateAnalysis?.amountFormatComparison?.available === true &&
 // cases while skipping the common one-signal false-positive path.
 const hardTerraReasons = terraGateReasons.filter((reason) =>
   reason === "azure-strong-anomaly" ||
-  reason === "forensic-strong-signal" ||
-  reason === "amount-format-mismatch"
+  reason === "forensic-strong-signal"
 );
 const softTerraReasons = terraGateReasons.filter((reason) =>
   reason === "template-strong-geometry" || reason === "local-render-outlier"
@@ -15868,7 +15852,6 @@ referenceVisualAdjudication = null;
 // Keep the dedicated visual adjudicator only for the softer two-signal path,
 // where it adds a genuinely independent visual arbitration layer.
 const shouldRunReferenceVisualAdjudicator =
-  (referenceTemplateAnalysis?.amountFormatComparison?.mismatch === true) ||
   (shouldRunTerra && hardTerraReasons.length === 0 && terraGateReasons.length >= 2);
 
 console.log("REFERENCE VISUAL GATE V67:", JSON.stringify({
@@ -17147,8 +17130,9 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
     console.log("HUMAN READABLE FORENSIC REPORT V64:", JSON.stringify(humanForensicReport));
 
-    // FIELD TAMPERING: strong evidence is promoted directly. Medium critical-field
-    // findings are also surfaced with cautious wording so the user can see that
+    // FIELD TAMPERING: local raster evidence is promoted. Amount-format reference
+    // differences remain diagnostic and are not treated as tampering evidence.
+    // Medium critical-field findings are surfaced with cautious wording so the user can see that
     // a local anomaly exists without treating it as a definitive fake verdict.
     if (fieldTamperingForensics?.available === true &&
         (Number(fieldTamperingForensics.strongFindingCount) > 0 || Number(fieldTamperingForensics.mediumFindingCount) > 0)) {
@@ -19511,9 +19495,27 @@ Number(deterministicRiskAfterForensics.overallRisk) || 0;
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
 
-// V13.3: Amount format mismatch remains diagnostic only.
-// Decimal/thousands separator differences are not paint-over evidence and
-// must not create a final risk floor.
+// V13.4: only local multi-feature paint-over evidence can create a risk floor.
+const finalAmountForensics = result?.amountForensics || amountForensics || null;
+const finalPaintOverCandidate = finalAmountForensics?.paintOverCandidate === true;
+const finalPaintOverConvergent = Number(finalAmountForensics?.paintOverConvergentFeatureCount || 0);
+const finalPaintOverHighVotes = Number(finalAmountForensics?.highVoteSegmentCount || 0);
+const finalPaintOverRatio = Number(finalAmountForensics?.metrics?.localAnomalyRatio || 0);
+if (finalPaintOverCandidate && finalPaintOverConvergent >= 2 && finalPaintOverHighVotes >= 2 && finalPaintOverRatio >= 0.30 && finalPaintOverRatio <= 0.70) {
+  calculatedRisk.overallRisk = Math.max(46, Number(calculatedRisk.overallRisk) || 0);
+  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
+  calculatedRisk.categories = {
+    ...(calculatedRisk.categories || {}),
+    editingRisk: Math.max(Number(calculatedRisk.categories?.editingRisk || 0), 75)
+  };
+  console.log('V13.4 PAINT-OVER LOCAL FLOOR:', JSON.stringify({
+    applied: true, floor: 46,
+    convergentFeatureCount: finalPaintOverConvergent,
+    highVoteSegmentCount: finalPaintOverHighVotes,
+    anomalyRatio: finalPaintOverRatio
+  }));
+}
+
 // A very strong, semantically matched local geometry anomaly is a deterministic
 // forensic finding. Keep the user-facing suspicious threshold aligned with that
 // evidence instead of allowing a quiet visual/text category mix to dilute it.
@@ -19591,20 +19593,26 @@ const finalDeterministicRisk = calculateOverallRisk(result);
 finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
 result.categories = finalDeterministicRisk.categories;
 
-// V13.3: Strong local paint-over candidate gets a measured floor. This is
-// intentionally lower than a confirmed fraud verdict and is based only on
-// convergent local raster evidence.
-const finalPaintOverCandidate = amountForensics?.paintOverCandidate === true;
-if (finalPaintOverCandidate &&
-    Number(amountForensics?.paintOverConvergentFeatureCount || 0) >= 2 &&
-    Number(amountForensics?.highVoteSegmentCount || 0) >= 3) {
-  finalRiskScore = Math.max(finalRiskScore, 46);
-  console.log('V13.3 PAINT-OVER LOCAL FLOOR:', JSON.stringify({
+// V13.4 FINAL GUARD: the final score is recalculated from deterministic checks,
+// so re-apply the same paint-over floor here; otherwise the earlier floor can
+// be overwritten by the weighted category recomputation.
+if (
+  finalPaintOverCandidate &&
+  finalPaintOverConvergent >= 2 &&
+  finalPaintOverHighVotes >= 2 &&
+  finalPaintOverRatio >= 0.30 &&
+  finalPaintOverRatio <= 0.70
+) {
+  finalRiskScore = Math.max(46, finalRiskScore);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 75)
+  };
+  console.log('V13.4 FINAL PAINT-OVER FLOOR:', JSON.stringify({
     applied: true,
     floor: 46,
-    convergentFeatureCount: Number(amountForensics?.paintOverConvergentFeatureCount || 0),
-    highVoteSegmentCount: Number(amountForensics?.highVoteSegmentCount || 0),
-    anomalyRatio: Number(amountForensics?.metrics?.localAnomalyRatio || 0)
+    scoreBeforeFloor: Number(finalDeterministicRisk.overallRisk) || 0,
+    scoreAfterFloor: finalRiskScore
   }));
 }
 
