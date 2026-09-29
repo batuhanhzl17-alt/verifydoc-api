@@ -11471,7 +11471,9 @@ return finalForensics;
 // V14.5 — PAINT-OVER RESIDUAL LAB (DIAGNOSTIC ONLY)
 // =====================================================
 // Measures reference-aligned residuals outside the union of inferred target
-// and reference glyph masks. This output is diagnostic only and never enters risk.
+// and reference glyph masks. A bank/layout reference is not an authenticated
+// copy of this exact receipt, so these measurements describe differences only;
+// they cannot establish Photoshop editing. This output never enters risk.
 async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePaths = [], bank = null }) {
   const unavailable = reason => ({ available:false, engine:'paint-over-residual-lab-v14.5', diagnosticOnly:true, riskContribution:0, bank:bank||null, reason });
   if (!targetPath || !targetOCR?.success || !Array.isArray(targetOCR?.regions)) return unavailable('target-or-ocr-unavailable');
@@ -11542,17 +11544,39 @@ async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePat
         }
         rows.push({ring:name,metrics:Object.fromEntries(names.map(k=>[k,{mean:v[k].length?v[k].reduce((a,b)=>a+b,0)/v[k].length:0,samples:v[k].length}]))});
       }
-      obs.push({regionIndex:q.index,field:(rfLabelPart(q.text)?.text||'unknown'),text:q.text,targetBox:{x1,y1,x2,y2},glyphPixels:glyph.length,rings:rows});
+      obs.push({regionIndex:q.index,field:rfLabelPart(q.text)||'unknown',text:q.text,targetBox:{x1,y1,x2,y2},glyphPixels:glyph.length,rings:rows});
     }
     const baseline={};for(const ring of ['1-2px','2-4px','4-7px']){baseline[ring]={};for(const metric of names)baseline[ring][metric]=median(obs.map(o=>o.rings.find(r=>r.ring===ring)?.metrics[metric].mean||0).filter(x=>x>0));}
     for(const o of obs)for(const row of o.rings)for(const metric of names){const m=row.metrics[metric],b=baseline[row.ring][metric];m.documentBaseline=Number(b.toFixed(4));m.normalizedExcess=Number((m.mean/(b+.25)).toFixed(3));}
-    const norm=s=>String(s||'').toLocaleUpperCase('tr-TR').replace(/[^\p{L}\p{N}]/gu,'');const groups=new Map();
-    for(const o of obs){const k=norm(o.text);if(k.length>=3){if(!groups.has(k))groups.set(k,[]);groups.get(k).push(o);}}
-    const duplicateGroups=[];for(const [value,items] of groups)if(items.length>1)duplicateGroups.push({normalizedValue:value,fieldCount:items.length,regionIndices:items.map(x=>x.regionIndex),metricSupport:names.map(metric=>({metric,normalizedExcess:Number(median(items.map(o=>median(o.rings.map(r=>r.metrics[metric].normalizedExcess)))).toFixed(3)),supportingFields:items.length}))});
+    const norm=s=>String(s||'').toLocaleUpperCase('tr-TR').replace(/[^\p{L}\p{N}]/gu,'');
+    const amountValueKey=token=>{
+      const cut=Math.max(token.lastIndexOf(','),token.lastIndexOf('.'));if(cut<0)return null;
+      const integer=token.slice(0,cut).replace(/\D/g,'');const fraction=token.slice(cut+1).replace(/\D/g,'').padEnd(2,'0').slice(0,2);
+      if(!integer||!fraction)return null;return `${integer.replace(/^0+(?=\d)/,'')}.${fraction}`;
+    };
+    const amountGroups=new Map();
+    for(const o of obs){
+      const text=String(o.text||'');const dateLike=/\b(?:tarih|date|saat|time)\b/i.test(text);
+      const matches=[...text.matchAll(/(?<!\d)(?:\d{1,3}(?:[., ]\d{3})+|\d+)[.,]\d{1,2}(?!\d)/g)];
+      for(const m of matches){
+        const token=m[0],context=/(?:tutar|amount|\bTL\b|\bTRY\b|\bEUR\b|\bUSD\b|\bGBP\b|₺)/i.test(text)||norm(text)===norm(token);
+        if(!context||dateLike&&!/tutar|amount/i.test(text))continue;
+        const value=amountValueKey(token);if(!value)continue;
+        if(!amountGroups.has(value))amountGroups.set(value,[]);
+        amountGroups.get(value).push({observation:o,token,textStart:m.index,textEnd:m.index+token.length});
+      }
+    }
+    const duplicateGroups=[];
+    for(const [value,items] of amountGroups){
+      const distinct=[...new Map(items.map(item=>[item.observation.regionIndex,item])).values()];if(distinct.length<2)continue;
+      const metricSupportByRing=Object.fromEntries(['1-2px','2-4px','4-7px'].map(ring=>[ring,Object.fromEntries(names.map(metric=>[metric,Number(median(distinct.map(item=>item.observation.rings.find(r=>r.ring===ring)?.metrics[metric]?.normalizedExcess||0)).toFixed(3))]))]));
+      duplicateGroups.push({kind:'repeated-amount-value',normalizedValue:value,occurrenceCount:items.length,fieldCount:distinct.length,regionIndices:distinct.map(item=>item.observation.regionIndex),occurrences:items.map(item=>({regionIndex:item.observation.regionIndex,token:item.token,text:item.observation.text,textSpan:{start:item.textStart,end:item.textEnd},targetBox:item.observation.targetBox})),metricSupportByRing,measurementScope:'whole OCR region; amount token is not isolated when OCR grouped it with neighboring text'});
+    }
     return {available:true,engine:'paint-over-residual-lab-v14.5',bank:bank||null,diagnosticOnly:true,riskContribution:0,
+      forensicInterpretation:{status:'indeterminate',referenceScope:'bank-layout-reference-not-verified-as-the-same-receipt',exactOriginalAvailable:false,canProvePhotoshopFromTheseMeasurements:false,reason:'A different transaction or generic bank template cannot serve as a pixel-authentic original. Seamless removal on a flat background may leave no target-only trace; replacement traces require validation against genuine and edited Telegram-transcoded pairs.'},
       alignment:{method:'reference-resized-to-target-canvas-then-sparse-translation-search',dx:best.dx,dy:best.dy,meanLumaResidual:Number(best.loss.toFixed(3)),targetDimensions:{width:W,height:H},referenceDimensions:{width:Number(rm.width),height:Number(rm.height)},aspectRatioDelta:Number(aspectRatioDelta.toFixed(5)),referenceResizedToTargetCanvas:true,geometryCaution:aspectRatioDelta>.025?'aspect ratio differs by over 2.5%; interpret residuals cautiously':'aspect ratio is close',referencePath:path.basename(refPath)},
       ringWidthsPx:['1-2','2-4','4-7'],metrics:names,documentBaseline:baseline,duplicateFieldSupport:{groupCount:duplicateGroups.length,groups:duplicateGroups},ocrRegionCount:targetOCR.regions.length,boxedOcrFieldCount:regions.length,fieldCount:obs.length,observations:obs.slice(0,40),
-      note:'Aligned target-reference residual measured outside the union of inferred glyph masks; normalized against document-internal medians. Diagnostic only; riskContribution is zero.'};
+      note:'Aligned residuals are descriptive because the available reference is not verified as the exact original receipt. Do not interpret them as Photoshop evidence. Diagnostic only; riskContribution is zero.'};
   }catch(error){return unavailable(error?.message||String(error));}
 }
 
