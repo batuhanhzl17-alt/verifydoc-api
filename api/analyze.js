@@ -1066,7 +1066,10 @@ async function getAzureReferenceLayouts(bank, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return [];
 
-  const selectedKey = selectedReferencePath ? path.resolve(selectedReferencePath) : "ALL";
+  const selectedReferenceForCache = Array.isArray(selectedReferencePath)
+    ? selectedReferencePath.find(Boolean)
+    : selectedReferencePath;
+  const selectedKey = selectedReferenceForCache ? path.resolve(selectedReferenceForCache) : "ALL";
   const cacheKey = `azure-reference-layout:v2:${normalizedBank}:${selectedKey}`;
   if (azureReferenceLayoutCache.has(cacheKey)) {
     return azureReferenceLayoutCache.get(cacheKey);
@@ -8550,7 +8553,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         const width = Number(rendered?.width) || 0;
         const height = Number(rendered?.height) || 0;
 
-        function addRasterField(key, labelRegion, valueRegion, labelText) {
+        function addRasterField(key, labelRegion, valueRegion, labelText, valueText = '') {
           if (!width || !height || !valueRegion) return;
           const r = valueRegion;
           const box = {
@@ -8562,6 +8565,9 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
             labelKey: key,
             labelPresent: true,
             templateRole: classifyReferenceTemplateRole(key, labelText),
+            valueFormatSignature: key === 'amount'
+              ? buildAmountFormatSignature(String(valueText || ''))
+              : null,
             style: { source:'reference-raster-ocr', fontNames:[], avgFontHeight:Math.max(1,r.y2-r.y1), avgCharWidth:0, itemCount:1 },
             referenceFile: path.basename(referencePath),
           };
@@ -8604,9 +8610,18 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
           }
           if (!value) continue;
 
+          if (rule.key === 'amount') {
+            console.log('REFERENCE PDF RASTER AMOUNT FORMAT V12:', JSON.stringify({
+              bank: normalizedBank,
+              referenceFile: path.basename(referencePath),
+              text: String(value.text || ''),
+              formatSignature: buildAmountFormatSignature(String(value.text || '')),
+            }));
+          }
+
           // Primary amount fields must contain a numeric/currency value.
           if (rule.key === 'amount' && !/(?:\d|TL|TRY|₺|EUR|USD|GBP)/i.test(String(value.text || ''))) continue;
-          addRasterField(rule.key, lr, value.region, label.text);
+          addRasterField(rule.key, lr, value.region, label.text, value.text);
         }
       }
     } catch (error) {
@@ -15680,11 +15695,15 @@ let referenceLocalCrop = null;
 const localCropStartTime = Date.now();
 if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
   try {
+    const localCropReference = getVisualReferencePath(reference);
+    const localCropReferencePath = Array.isArray(localCropReference)
+      ? localCropReference.find(Boolean)
+      : localCropReference;
     referenceLocalCrop = await runReferenceLocalCropComparator(
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePath(reference)
+      localCropReferencePath
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
