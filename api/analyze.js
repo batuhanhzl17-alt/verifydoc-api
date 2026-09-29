@@ -2953,35 +2953,7 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     editingRisk,
   };
 
-  // V13: A high-confidence amount-format mismatch is an independent textual
-  // integrity signal, not a JPEG/raster signal. If the same-bank reference
-  // agrees on the format across at least two collected signatures and both
-  // separators differ, keep a visible risk floor so the signal cannot be
-  // diluted into LOW RISK by unrelated zero categories. This does NOT create
-  // a blacklist/financial-inconsistency event by itself.
-  const afc = amountFormatComparison;
-  const amountFormatHighConfidence = Boolean(
-    afc?.available === true &&
-    afc?.mismatch === true &&
-    Number(afc?.confidence || 0) >= 85 &&
-    Number(afc?.mismatchVotes || 0) >= 1 &&
-    (Number(afc?.referenceCount || 0) >= 1 || Number(afc?.referenceFormatCount || 0) >= 1) &&
-    Array.isArray(afc?.reasons) &&
-    afc.reasons.some(x => /ondal[ıi]k ay[ıi]r[ıi]c[ıi]/i.test(String(x))) &&
-    afc.reasons.some(x => /binlik ay[ıi]r[ıi]c[ıi]/i.test(String(x)))
-  );
-
-  const weightedRisk = Math.round((
-    categories.visualRisk * RISK_CATEGORY_WEIGHTS.visualRisk +
-    categories.textRisk * RISK_CATEGORY_WEIGHTS.textRisk +
-    categories.layoutRisk * RISK_CATEGORY_WEIGHTS.layoutRisk +
-    categories.financialDataRisk * RISK_CATEGORY_WEIGHTS.financialDataRisk +
-    categories.editingRisk * RISK_CATEGORY_WEIGHTS.editingRisk
-  ) / 100);
-
-  const overallRisk = amountFormatHighConfidence
-    ? Math.max(46, weightedRisk)
-    : weightedRisk;
+  const overallRisk = Math.round((
     categories.visualRisk * RISK_CATEGORY_WEIGHTS.visualRisk +
     categories.textRisk * RISK_CATEGORY_WEIGHTS.textRisk +
     categories.layoutRisk * RISK_CATEGORY_WEIGHTS.layoutRisk +
@@ -11532,12 +11504,6 @@ async function runFieldTamperingForensics({
 
   const genericCriticalPattern = /(sorgu|referans|fiş|fis|ettn|dok[üu]man|işlem\s*yeri|islem\s*yeri|banka|şube|sube)/i;
 
-  // V13 SCOPE FIX: these fallback metrics are used after the local comparison
-  // block. Keep them in the enclosing function scope so a JPG target cannot
-  // throw ReferenceError when the V8/V9 diagnostics read them.
-  let fallbackGlobalRobustZ = null;
-  let fallbackLocalVsGlobalRatio = null;
-
   const normalizeKey = (v) => String(v || '').trim();
   const regionCenter = (r) => ({
     x: ((Number(r?.x1) || 0) + (Number(r?.x2) || 0)) / 2,
@@ -12343,6 +12309,13 @@ async function runFieldTamperingForensics({
       // a local rewrite such as 2.000 -> 10.000 from document-wide JPEG noise.
       let fallbackLocalJpegSignal = false;
       let fallbackLocalJpegDiagnostic = null;
+
+      // V13 SCOPE FIX: these values are consumed by the V9/V10 convergence
+      // logic below and must survive outside the inner raster-analysis block.
+      // Initialize them in the surrounding request scope instead of creating
+      // block-local bindings.
+      let fallbackGlobalRobustZ = null;
+      let fallbackLocalVsGlobalRatio = null;
 
       if (fallbackV3Signal && fallbackRegion) {
         try {
@@ -17038,50 +17011,46 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     };
   };
 
+  // V13: amount-format mismatch is a deterministic semantic/reference
+  // finding. It must not disappear merely because pixel/geometry comparators
+  // are quiet. It is content-format evidence, not JPEG/raster evidence.
+  const amountFormatReport = (() => {
+    const cmp = referenceTemplateAnalysis?.amountFormatComparison;
+    if (!cmp?.available || cmp.mismatch !== true) return null;
+    const confidence = Number(cmp.confidence || 0);
+    const score = Number(cmp.score || 0);
+    if (confidence < 80) return null;
+
+    const reasons = Array.isArray(cmp.reasons) ? cmp.reasons.filter(Boolean) : [];
+    const reasonText = reasons.length
+      ? reasons.join(', ')
+      : 'Tutarın görünür sayı biçimi referans formatından farklı.';
+
+    return {
+      engine: 'amount-format-forensics-v13',
+      findings: [{
+        title: 'İşlem tutarı formatı',
+        detail: `İşlem tutarının sayı yazım biçimi referans dekonttan farklı: ${reasonText}. Bu bulgu piksel/JPEG sıkıştırma farkına değil, OCR ile doğrulanan tutar yazım biçimine dayanır.`,
+        kind: 'amount-format-mismatch',
+        priority: 0,
+        evidenceField: 'amount',
+        targetBox: amountForensics?.region || null,
+        score,
+        confidence,
+      }]
+    };
+  })();
+
   const humanForensicReport = mergeReferenceReports([
     deterministicReport,
     detailedDeterministicReport,
-    aiReport
+    aiReport,
+    amountFormatReport
   ]);
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
     console.log("HUMAN READABLE FORENSIC REPORT V64:", JSON.stringify(humanForensicReport));
-
-    // V13: Promote a high-confidence amount-format mismatch to the human
-    // forensic report. It is intentionally a forensic finding, not a claim
-    // of financial inconsistency and not a blacklist trigger by itself.
-    const reportAmountFormat = result?.referenceTemplateAnalysis?.amountFormatComparison || null;
-    if (reportAmountFormat?.available === true && reportAmountFormat?.mismatch === true) {
-      const existing = Array.isArray(result.referenceForensicReport.findings)
-        ? result.referenceForensicReport.findings.slice()
-        : [];
-      const targetFmt = reportAmountFormat.target || {};
-      const refFmt = reportAmountFormat.comparisons?.[0]?.reference || null;
-      const detail = `Tutarın görünür yazım biçimi referanstan farklı: hedef ${targetFmt.rawPattern || 'bilinmeyen format'}; referans ${refFmt?.rawPattern || '#,###.##'}. Ondalık/binlik ayraç yapısı uyuşmuyor (güven ${Number(reportAmountFormat.confidence || 0)}/100). Bu bulgu tek başına finansal tutarsızlık veya sahtecilik kanıtı değildir.`;
-      const row = {
-        title: 'Tutar yazım formatı referanstan farklı',
-        detail,
-        kind: 'amount-format-mismatch',
-        priority: 1,
-        confidence: Number(reportAmountFormat.confidence || 0),
-      };
-      const merged = [row, ...existing]
-        .filter((x, i, arr) => i === arr.findIndex(y => String(y.title) === String(x.title) && String(y.detail) === String(x.detail)))
-        .sort((a,b) => Number(a.priority || 9) - Number(b.priority || 9))
-        .slice(0, 8);
-      result.referenceForensicReport.findings = merged;
-      result.referenceForensicReport.differenceCount = merged.length;
-      result.referenceForensicReport.strongDifferenceCount = merged.filter(x => Number(x.priority || 9) <= 1).length;
-      result.referenceForensicReport.status = 'differences-found';
-      result.referenceForensicReport.userText = [
-        '🔎 REFERANS / LOKAL FORENSIC KARŞILAŞTIRMASI', '',
-        '🔴 BULGULAR',
-        ...merged.map(x => `• ${x.title}: ${x.detail}`)
-      ].join('\n');
-      result.summary = [result.summary, result.referenceForensicReport.userText].filter(Boolean).join('\n\n');
-      console.log('AMOUNT FORMAT MISMATCH PROMOTED TO USER REPORT V13:', JSON.stringify(row));
-    }
 
     // FIELD TAMPERING: strong evidence is promoted directly. Medium critical-field
     // findings are also surfaced with cautious wording so the user can see that
@@ -19446,6 +19415,32 @@ Number(deterministicRiskAfterForensics.overallRisk) || 0;
 
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
+
+// V13: a high-confidence amount-format mismatch is a semantic content
+// discrepancy, not a raster artifact. Do not let weighted category averaging
+// dilute it back into LOW RISK. Keep the floor at MODERATE RISK; this is not a
+// standalone "fake" verdict, but it makes the discrepancy visible in the
+// final risk score.
+const finalAmountFormatComparison =
+  referenceTemplateAnalysis?.amountFormatComparison || null;
+if (
+  finalAmountFormatComparison?.available === true &&
+  finalAmountFormatComparison?.mismatch === true &&
+  Number(finalAmountFormatComparison?.confidence || 0) >= 80
+) {
+  calculatedRisk.overallRisk = Math.max(
+    46,
+    Number(calculatedRisk.overallRisk) || 0
+  );
+  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
+  console.log('V13 AMOUNT FORMAT RISK FLOOR:', JSON.stringify({
+    applied: true,
+    floor: 46,
+    confidence: Number(finalAmountFormatComparison.confidence || 0),
+    score: Number(finalAmountFormatComparison.score || 0),
+    reasons: finalAmountFormatComparison.reasons || []
+  }));
+}
 
 // A very strong, semantically matched local geometry anomaly is a deterministic
 // forensic finding. Keep the user-facing suspicious threshold aligned with that
