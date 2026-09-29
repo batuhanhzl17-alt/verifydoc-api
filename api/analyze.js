@@ -14946,12 +14946,11 @@ const base64 =
 buffer.toString(
 "base64"
 );
-
 // =====================================================
-// V14 PAINT-OVER LOCAL CONTINUITY ENGINE
+// V14.1 PAINT-OVER LOCAL CONTINUITY ENGINE
 // =====================================================
-// JPEG/raster farkını değil, aynı tutar ROI'si içinde birden fazla karakter
-// slotunda birleşen lokal erase/rewrite izini arar.
+// Tekil JPEG/raster farkını değil, aynı tutar ROI içinde birden fazla
+// karakter slotunda birleşen lokal erase/rewrite izini arar.
 function analyzePaintOverLocalContinuity(amountForensics) {
   const metrics = amountForensics?.metrics || null;
   const segments = Array.isArray(amountForensics?.segmentFeatures)
@@ -14965,9 +14964,8 @@ function analyzePaintOverLocalContinuity(amountForensics) {
     inkRatio:Number(x?.inkRatio||0), edgeDensity:Number(x?.edgeDensity||0), darkness:Number(x?.darkness||0)
   }));
   const maxVotes=Math.max(...votes.map(x=>x.votes),0);
-  // Use the canonical V3 high-vote count. The raw segment vote list can include
-  // punctuation/slot candidates that V3 deliberately excludes from its final
-  // highVoteSegmentCount. Recomputing it here would re-introduce JPEG false positives.
+  // V3 canonical sayımını kullan: ham segment oylarını yeniden saymak JPEG
+  // kaynaklı false-positive'ları geri getirebilir.
   const canonicalHighVoteCount=Number(metrics.highVoteSegmentCount||0);
   const high=votes.filter(x=>x.votes>=3);
   const strong=votes.filter(x=>x.votes>=4);
@@ -14979,15 +14977,16 @@ function analyzePaintOverLocalContinuity(amountForensics) {
   ].filter(Boolean).length;
   const highIndices=high.map(x=>x.index);
   let maxSpan=0;
-  for(let i=0;i<highIndices.length;i++) for(let j=i+1;j<highIndices.length;j++)
-    maxSpan=Math.max(maxSpan,Math.abs(highIndices[i]-highIndices[j]));
+  for(let i=0;i<highIndices.length;i++){
+    for(let j=i+1;j<highIndices.length;j++){
+      maxSpan=Math.max(maxSpan,Math.abs(highIndices[i]-highIndices[j]));
+    }
+  }
   const multiSlot=canonicalHighVoteCount>=2;
-  const spread=canonicalHighVoteCount>=2 && maxSpan>=2;
+  const spread=multiSlot && maxSpan>=2;
   const convergent=Number(metrics.paintOverConvergentFeatureCount||0)>=3;
   const anomalyRatio=Number(metrics.localAnomalyRatio||0);
   const localized=anomalyRatio>=0.30 && anomalyRatio<=0.70;
-  // Tek bir ondalık/noktalama outlier'ı JPEG/raster kaynaklı olabilir.
-  // Paint-over için birden fazla slotta birleşen kanıt gerekir.
   const signal=Boolean(multiSlot && spread && convergent && localized && maxVotes>=4 && featureDiversity>=2);
   let score=0;
   if(multiSlot) score+=25;
@@ -14997,18 +14996,20 @@ function analyzePaintOverLocalContinuity(amountForensics) {
   if(maxVotes>=4) score+=15;
   if(featureDiversity>=2) score+=15;
   return {
-    available:true, engine:'paint-over-local-continuity-v14', status:signal?'suspicious':'pass',
+    available:true, engine:'paint-over-local-continuity-v14.1', status:signal?'suspicious':'pass',
     severity:signal?'strong':'none', score:Math.min(100,score), signal,
-    metrics:{characterCount:votes.length,maxFeatureVotes:maxVotes,highVoteSegmentCount:canonicalHighVoteCount,
-      strongVoteSegmentCount:strong.length,highVoteIndices:highIndices,highVoteSpan:maxSpan,
+    metrics:{
+      characterCount:votes.length, maxFeatureVotes:maxVotes, highVoteSegmentCount:canonicalHighVoteCount,
+      strongVoteSegmentCount:strong.length, highVoteIndices:highIndices, highVoteSpan:maxSpan,
       paintOverConvergentFeatureCount:Number(metrics.paintOverConvergentFeatureCount||0),
-      localAnomalyRatio:anomalyRatio,featureDiversity,
+      localAnomalyRatio:anomalyRatio, featureDiversity,
       maxInkRatioDifference:Number(metrics.maxInkRatioDifference||0),
       maxStrokeProxyDifference:Number(metrics.maxStrokeProxyDifference||0),
       maxEdgeDensityDifference:Number(metrics.maxEdgeDensityDifference||0),
-      maxDarknessDifference:Number(metrics.maxDarknessDifference||0)},
+      maxDarknessDifference:Number(metrics.maxDarknessDifference||0)
+    },
     evidence:signal
-      ? 'Aynı tutar ROI içinde birden fazla karakter slotunda birleşen ink/stroke/edge raster anomalileri bulundu. Tekil JPEG/ondalık slot anomalisi olarak değerlendirilmedi; lokal çoklu-slot yakınsaması erase/rewrite (paint-over) adayı olarak işaretlendi.'
+      ? 'Aynı tutar ROI içinde birden fazla karakter slotunda birleşen ink/stroke/edge raster anomalileri bulundu. Tekil JPEG veya noktalama slotu anomalisi olarak değerlendirilmedi; lokal çoklu-slot yakınsaması erase/rewrite (paint-over) adayı olarak işaretlendi.'
       : 'Tutar ROI içinde JPEG/raster kaynaklı olabilecek tekil veya dağınık anomaliler var; çoklu-slot paint-over yakınsaması oluşmadı.'
   };
 }
@@ -17281,7 +17282,7 @@ if (amountForensics) {
   result.amountForensics = amountForensics;
   paintOverLocalForensics = analyzePaintOverLocalContinuity(amountForensics);
   result.paintOverLocalForensics = paintOverLocalForensics;
-  console.log("PAINT-OVER LOCAL CONTINUITY V14:", JSON.stringify(paintOverLocalForensics));
+  console.log("PAINT-OVER LOCAL CONTINUITY V14.1:", JSON.stringify(paintOverLocalForensics));
   if (amountForensics.selectedAmountText) {
     console.log("AMOUNT FORENSICS FINAL SELECTION:", JSON.stringify({
       selectedAmountText: amountForensics.selectedAmountText,
@@ -19528,8 +19529,8 @@ Number(deterministicRiskAfterForensics.overallRisk) || 0;
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
 
-// Amount format comparison is diagnostic only. It MUST NOT create a risk floor.
-// JPEG, locale and reference-template variants can legitimately change separators.
+// Amount format comparison is diagnostic only. Nokta/virgül farkı, locale veya
+// referans varyantı nedeniyle oluşabilir; tek başına risk tabanı oluşturamaz.
 
 // A very strong, semantically matched local geometry anomaly is a deterministic
 // forensic finding. Keep the user-facing suspicious threshold aligned with that
@@ -19608,17 +19609,21 @@ const finalDeterministicRisk = calculateOverallRisk(result);
 finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
 result.categories = finalDeterministicRisk.categories;
 
-// V14 PAINT-OVER DECISION GATE: only multi-slot local continuity can create
-// this floor. Reference-format differences and ordinary JPEG differences do not.
+// V14.1: sadece çoklu-slot lokal paint-over yakınsaması risk tabanı oluşturur.
 if (paintOverLocalForensics?.signal === true && Number(paintOverLocalForensics?.score || 0) >= 80) {
   finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 75)
   };
-  console.log("V14 PAINT-OVER LOCAL FLOOR:", JSON.stringify({applied:true,floor:46,score:paintOverLocalForensics.score,metrics:paintOverLocalForensics.metrics}));
+  console.log("V14.1 PAINT-OVER LOCAL FLOOR:", JSON.stringify({
+    applied:true, floor:46, score:paintOverLocalForensics.score, metrics:paintOverLocalForensics.metrics
+  }));
 } else {
-  console.log("V14 PAINT-OVER LOCAL FLOOR:", JSON.stringify({applied:false,signal:Boolean(paintOverLocalForensics?.signal),score:Number(paintOverLocalForensics?.score||0),metrics:paintOverLocalForensics?.metrics||null}));
+  console.log("V14.1 PAINT-OVER LOCAL FLOOR:", JSON.stringify({
+    applied:false, signal:Boolean(paintOverLocalForensics?.signal),
+    score:Number(paintOverLocalForensics?.score||0), metrics:paintOverLocalForensics?.metrics||null
+  }));
 }
 
 // =====================================================
@@ -19735,7 +19740,9 @@ const primaryForensicFindings = [
     detail: result.paintOverLocalForensics.evidence || 'Tutar ROI içinde çoklu-slot lokal raster yakınsaması bulundu.',
     confidence: Math.min(99, Math.max(88, Number(result.paintOverLocalForensics.score || 0)))
   }] : []),
-  ...(Array.isArray(result?.referenceForensicReport?.findings) ? result.referenceForensicReport.findings : [])
+  ...(Array.isArray(result?.referenceForensicReport?.findings)
+    ? result.referenceForensicReport.findings
+    : [])
 ].slice(0, 8).map((x) => ({
       title: String(x?.title || '').trim(),
       detail: String(x?.detail || '').trim(),
@@ -19766,7 +19773,7 @@ console.log(
 "FINAL SCORE:",
 finalScore
 );
-console.log("FINAL RISK SOURCE: deterministic checks + V14 local paint-over gate; amount-format floor disabled");
+console.log("FINAL RISK SOURCE: deterministic checks + V14.1 local paint-over gate; amount-format floor disabled");
 
 
 console.log(
