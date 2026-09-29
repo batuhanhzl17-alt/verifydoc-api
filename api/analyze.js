@@ -11381,7 +11381,7 @@ maxStrokeProxyDifference >= 0.18 ||
 maxDarkDifference >= 0.18
 )
 )
-) {
+)) {
 status = "warning";
 severity = "strong";
 score = 85;
