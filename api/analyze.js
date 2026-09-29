@@ -11490,7 +11490,9 @@ async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePat
     const [tm,rm]=await Promise.all([sharp(tb).metadata(),sharp(rb).metadata()]);
     const W=Number(tm.width)||0,H=Number(tm.height)||0;
     if(W<100||H<100||!rm.width||!rm.height)return unavailable('invalid-image-dimensions');
-    if(Math.abs((rm.width/rm.height)/(W/H)-1)>.025)return unavailable('reference-aspect-ratio-mismatch');
+    const aspectRatioDelta=Math.abs((rm.width/rm.height)/(W/H)-1);
+    // Keep a mismatched canvas measurable; report the resize explicitly instead
+    // of silently returning no diagnostics. The metric remains diagnostic only.
     const [td,rd]=await Promise.all([
       sharp(tb).removeAlpha().toColourspace('srgb').resize(W,H,{fit:'fill'}).raw().toBuffer(),
       sharp(rb).removeAlpha().toColourspace('srgb').resize(W,H,{fit:'fill'}).raw().toBuffer()
@@ -11518,9 +11520,15 @@ async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePat
       for(let y=y1;y<=y2;y++)for(let x=x1;x<=x2;x++){const p=refAt(x,y);if(lum(td,x,y)<=tth||(p.x>=0&&p.x<W&&p.y>=0&&p.y<H&&lum(rd,p.x,p.y)<=rth))glyph.push([x,y]);}
       if(glyph.length<3)continue;
       const rings=[['1-2px',1,2],['2-4px',3,4],['4-7px',5,7]],rows=[];
+      const ax=Math.max(1,x1-7),ay=Math.max(1,y1-7),bx=Math.min(W-2,x2+7),by=Math.min(H-2,y2+7),roiW=bx-ax+1;
+      const distance=new Uint8Array(roiW*(by-ay+1));distance.fill(255);
+      for(const [gx,gy] of glyph)for(let oy=-7;oy<=7;oy++)for(let ox=-7;ox<=7;ox++){
+        const xx=gx+ox,yy=gy+oy;if(xx<ax||xx>bx||yy<ay||yy>by)continue;
+        const d=Math.max(Math.abs(ox),Math.abs(oy)),di=(yy-ay)*roiW+(xx-ax);if(d<distance[di])distance[di]=d;
+      }
       for(const [name,lo,hi] of rings){const v=Object.fromEntries(names.map(k=>[k,[]]));
-        for(let y=Math.max(1,y1-7);y<=Math.min(H-2,y2+7);y++)for(let x=Math.max(1,x1-7);x<=Math.min(W-2,x2+7);x++){
-          let d=99;for(const [gx,gy] of glyph){d=Math.min(d,Math.max(Math.abs(x-gx),Math.abs(y-gy)));if(d===0)break;}if(d<lo||d>hi)continue;
+        for(let y=ay;y<=by;y++)for(let x=ax;x<=bx;x++){
+          const d=distance[(y-ay)*roiW+(x-ax)];if(d<lo||d>hi)continue;
           const p=refAt(x,y);if(p.x<1||p.y<1||p.x>=W-1||p.y>=H-1)continue;
           const a=lum(td,x,y),b=lum(rd,p.x,p.y),i=(y*W+x)*3,j=(p.y*W+p.x)*3;
           v.luma.push(Math.abs(a-b));v.color.push((Math.abs(td[i]-rd[j])+Math.abs(td[i+1]-rd[j+1])+Math.abs(td[i+2]-rd[j+2]))/3);
@@ -11542,7 +11550,7 @@ async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePat
     for(const o of obs){const k=norm(o.text);if(k.length>=3){if(!groups.has(k))groups.set(k,[]);groups.get(k).push(o);}}
     const duplicateGroups=[];for(const [value,items] of groups)if(items.length>1)duplicateGroups.push({normalizedValue:value,fieldCount:items.length,regionIndices:items.map(x=>x.regionIndex),metricSupport:names.map(metric=>({metric,normalizedExcess:Number(median(items.map(o=>median(o.rings.map(r=>r.metrics[metric].normalizedExcess)))).toFixed(3)),supportingFields:items.length}))});
     return {available:true,engine:'paint-over-residual-lab-v14.5',bank:bank||null,diagnosticOnly:true,riskContribution:0,
-      alignment:{method:'sparse-global-translation-search',dx:best.dx,dy:best.dy,meanLumaResidual:Number(best.loss.toFixed(3)),referencePath:path.basename(refPath)},
+      alignment:{method:'reference-resized-to-target-canvas-then-sparse-translation-search',dx:best.dx,dy:best.dy,meanLumaResidual:Number(best.loss.toFixed(3)),targetDimensions:{width:W,height:H},referenceDimensions:{width:Number(rm.width),height:Number(rm.height)},aspectRatioDelta:Number(aspectRatioDelta.toFixed(5)),referenceResizedToTargetCanvas:true,geometryCaution:aspectRatioDelta>.025?'aspect ratio differs by over 2.5%; interpret residuals cautiously':'aspect ratio is close',referencePath:path.basename(refPath)},
       ringWidthsPx:['1-2','2-4','4-7'],metrics:names,documentBaseline:baseline,duplicateFieldSupport:{groupCount:duplicateGroups.length,groups:duplicateGroups},fieldCount:obs.length,observations:obs.slice(0,40),
       note:'Aligned target-reference residual measured outside the union of inferred glyph masks; normalized against document-internal medians. Diagnostic only; riskContribution is zero.'};
   }catch(error){return unavailable(error?.message||String(error));}
