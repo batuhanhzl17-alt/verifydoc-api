@@ -19747,8 +19747,7 @@ const primaryForensicFindings = [
       title: String(x?.title || '').trim(),
       detail: String(x?.detail || '').trim(),
       confidence: Number(x?.confidence || 0)
-    })).filter((x) => x.title && x.detail)
-  : [];
+    })).filter((x) => x.title && x.detail);
 
 const canonicalReferenceText = result?.referenceForensicReport?.userText ||
   "🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.";
