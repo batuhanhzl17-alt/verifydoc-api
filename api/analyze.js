@@ -11468,14 +11468,14 @@ return finalForensics;
 
 
 // =====================================================
-// V14.3 — TARGET-ONLY PAINT-OVER / BACKGROUND CONTINUITY FORENSICS
+// V14.4 — TARGET-ONLY PAINT-OVER / BACKGROUND CONTINUITY DIAGNOSTIC
 // =====================================================
 // Amaç: OCR karakterinin kendisini "farklı" bulmak yerine, yazının hemen
 // çevresindeki arka planın doğal devamlılığında lokal bir kırılma olup
 // olmadığını ölçmek. Bu katman özellikle şu manipülasyon zincirini hedefler:
 //     eski yazıyı boya/erase -> arka planı yeniden oluştur -> yeni yazıyı yaz
 //
-// ÖNEMLİ V14.3 KURALI:
+// ÖNEMLİ V14.4 KURALI:
 //   - Referans farkı ana kanıt değildir.
 //   - amount/font/format farkı ana kanıt değildir.
 //   - maxInk/maxStroke/maxEdge/anomalyRatio tek başına alarm değildir.
@@ -11667,29 +11667,37 @@ async function runPaintOverBackgroundContinuityV143({
       const footprintAxisSupport =
         Number(gxStats.mean > 2.2) + Number(gyStats.mean > 2.2);
 
+      // V14.4 DIAGNOSTIC CHANGE:
+      // V14.3'ün "3 bağımsız sinyal" kapısı fazla katıydı ve hem sahte hem
+      // orijinalde 0 aday üretti. V14.4 burada risk kararı vermiyor; önce
+      // ham adayları görünür hale getiriyor. Bu nedenle tek bir orta kuvvette
+      // arka-plan kırılması bile diagnostic candidate olarak kaydedilebilir.
+      // Ancak salt harf kenarı/edge davranışı tek başına yeterli değildir.
       const signals = {
-        backgroundLumaBreak: lumaBreak >= 7.5,
-        backgroundTextureBreak: textureRatio >= 1.35 || textureRatio <= 0.72,
-        backgroundEdgeBreak: edgeRatio >= 1.45,
-        rectangularFootprint: footprintAxisSupport >= 2,
-        multiSideSupport: populatedSides >= 3 && sideMeanSpread >= 5,
+        backgroundLumaBreak: lumaBreak >= 3.2,
+        backgroundTextureBreak: textureRatio >= 1.20 || textureRatio <= 0.82,
+        backgroundEdgeBreak: edgeRatio >= 1.22,
+        rectangularFootprint: footprintAxisSupport >= 1,
+        multiSideSupport: populatedSides >= 3 && sideMeanSpread >= 2.5,
       };
       const signalCount = Object.values(signals).filter(Boolean).length;
 
-      // V14.3: tek bir özellikte alarm verme. Paint-over adayı için en az
-      // üç bağımsız arka plan davranışı ve iki farklı mekanizma gerekir.
       const backgroundEvidence =
-        signalCount >= 3 &&
-        (signals.backgroundLumaBreak || signals.backgroundTextureBreak) &&
+        signalCount >= 1 &&
+        (signals.backgroundLumaBreak || signals.backgroundTextureBreak || signals.multiSideSupport) &&
         (signals.backgroundEdgeBreak || signals.rectangularFootprint || signals.multiSideSupport);
 
       if (!backgroundEvidence) continue;
 
+      // Daha sonra V14.5'te kalibre edilecek ham diagnostic score. Bu skor
+      // kesinlikle risk motoruna bağlanmaz; üç testteki dağılımı karşılaştırmak
+      // için loglanır.
       const score = Math.min(100,
-        signalCount * 16 +
-        (signals.rectangularFootprint ? 16 : 0) +
-        (signals.multiSideSupport ? 10 : 0) +
-        Math.min(14, Math.round(lumaBreak))
+        signalCount * 14 +
+        (signals.rectangularFootprint ? 12 : 0) +
+        (signals.multiSideSupport ? 14 : 0) +
+        Math.min(18, Math.round(lumaBreak * 1.5)) +
+        Math.min(12, Math.round(Math.abs(textureRatio - 1) * 35))
       );
 
       observations.push({
@@ -11742,7 +11750,7 @@ async function runPaintOverBackgroundContinuityV143({
 
     return {
       available: true,
-      engine: 'paint-over-background-continuity-v14.3',
+      engine: 'paint-over-background-continuity-v14.4-diagnostic',
       bank: bank || null,
       targetOnly: true,
       referenceUsedAsPrimaryEvidence: false,
@@ -11753,16 +11761,18 @@ async function runPaintOverBackgroundContinuityV143({
       neighboringStrongPairs: neighboringStrongPairs ? 1 : 0,
       signal: Boolean(strong.length),
       severity,
+      diagnosticOnly: true,
+      riskContribution: 0,
       score: strong.length ? Math.max(...strong.map(x => Number(x.score) || 0)) : (medium.length ? Math.max(...medium.map(x => Number(x.score) || 0)) : 0),
       observations: observations.slice(0, 12),
       evidence: observations.length
-        ? 'Hedef görüntü içinde yazı çevresi arka planında lokal luma/texture/edge/footprint sürekliliği adayları bulundu. Bu V14.3 ilk sürümünde risk skoruna otomatik katkı yoktur.'
+        ? 'Hedef görüntü içinde yazı çevresi arka planında lokal luma/texture/edge/footprint sürekliliği adayları bulundu. Bu V14.4 diagnostic sürümünde risk skoruna otomatik katkı yoktur.'
         : 'Hedef görüntü içinde çoklu bağımsız arka plan sürekliliği sinyali veren paint-over adayı bulunmadı.',
     };
   } catch (error) {
     return {
       available: false,
-      engine: 'paint-over-background-continuity-v14.3',
+      engine: 'paint-over-background-continuity-v14.4-diagnostic',
       targetOnly: true,
       error: error?.message || String(error),
     };
@@ -15449,9 +15459,9 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
         ? paintRefPaths
         : (paintRefPaths ? [paintRefPaths] : []),
     });
-    console.log("PAINT-OVER BACKGROUND FORENSICS V14.3:", JSON.stringify(paintOverBackgroundForensicsV143));
+    console.log("PAINT-OVER BACKGROUND FORENSICS V14.4:", JSON.stringify(paintOverBackgroundForensicsV143));
   } catch (error) {
-    console.warn("PAINT-OVER BACKGROUND FORENSICS V14.3 HATASI:", error?.message || error);
+    console.warn("PAINT-OVER BACKGROUND FORENSICS V14.4 HATASI:", error?.message || error);
     paintOverBackgroundForensicsV143 = null;
   }
 }
