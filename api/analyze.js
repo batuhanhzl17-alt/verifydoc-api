@@ -4946,7 +4946,11 @@ async function getReferenceAmountAnchor(bank) {
   const cacheKey = `amount-anchor:v16:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
-  const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
+  // V11: Accept both Turkish and US-style grouping without relying on a
+  // substring match (e.g. `2,000.00` must be recognized as one amount, not
+  // accidentally as `000.00`). This is used only to locate the reference
+  // amount; the exact visible format is preserved separately by the signature.
+  const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?(?:(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?)|(?:\d+(?:[.,]\d{1,2})?))\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
   const primaryLabelRe = /(?:giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|giden\s*tutar|\btutar\b)/i;
   const negativeLabelRe = /(?:sorgu|sorgulama|işlem\s*no|islem\s*no|fiş|fis|referans|iban|hesap\s*no|müşteri|musteri|masraf|komisyon|ücret|ucret)/i;
 
@@ -5040,6 +5044,9 @@ async function getReferenceAmountAnchor(bank) {
           widthNorm: Math.max(0.001, (r.x2-r.x1) / width),
           heightNorm: Math.max(0.001, (r.y2-r.y1) / height),
           referenceFile: path.basename(referencePath),
+          // SECURITY: retain only the value-independent formatting signature,
+          // never the dynamic reference amount itself.
+          valueFormatSignature: buildAmountFormatSignature(best.candidate.text),
         });
       } catch (error) {
         console.warn('REFERENCE AMOUNT ANCHOR DOSYA HATASI:', path.basename(referencePath), error?.message || error);
@@ -5052,6 +5059,25 @@ async function getReferenceAmountAnchor(bank) {
       return null;
     }
 
+    const formatSignatureKey = (sig) => sig ? JSON.stringify({
+      rawPattern: sig.rawPattern,
+      thousandsSeparator: sig.thousandsSeparator,
+      decimalSeparator: sig.decimalSeparator,
+      decimalDigits: sig.decimalDigits,
+      integerGroupCount: sig.integerGroupCount,
+      hasThousandsSeparator: sig.hasThousandsSeparator,
+      currency: sig.currency,
+      currencyPosition: sig.currencyPosition,
+      hasSuperscript: sig.hasSuperscript,
+    }) : null;
+    const formatSignatures = [];
+    for (const entry of entries) {
+      const sig = entry.valueFormatSignature;
+      const key = formatSignatureKey(sig);
+      if (!sig || !key || formatSignatures.some(x => formatSignatureKey(x) === key)) continue;
+      formatSignatures.push(sig);
+    }
+
     const anchor = {
       bank: normalizedBank,
       pageNumber: 1,
@@ -5060,6 +5086,8 @@ async function getReferenceAmountAnchor(bank) {
       widthNorm: median(entries.map(x => x.widthNorm)),
       heightNorm: median(entries.map(x => x.heightNorm)),
       referenceCount: entries.length,
+      formatSignatures,
+      formatSignatureCount: formatSignatures.length,
       spread: {
         x: Math.max(...entries.map(x => x.xNorm)) - Math.min(...entries.map(x => x.xNorm)),
         y: Math.max(...entries.map(x => x.yNorm)) - Math.min(...entries.map(x => x.yNorm)),
@@ -5073,7 +5101,11 @@ async function getReferenceAmountAnchor(bank) {
       bank: anchor.bank, pageNumber: anchor.pageNumber,
       xNorm: anchor.xNorm, yNorm: anchor.yNorm,
       widthNorm: anchor.widthNorm, heightNorm: anchor.heightNorm,
-      referenceCount: anchor.referenceCount, spread: anchor.spread, source: anchor.source
+      referenceCount: anchor.referenceCount,
+      formatSignatureCount: anchor.formatSignatureCount,
+      formatSignatures: anchor.formatSignatures,
+      spread: anchor.spread,
+      source: anchor.source
     }));
     return anchor;
   } catch (error) {
@@ -8661,6 +8693,93 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
       fields[field] = aggregateReferenceField(usableEntries);
     }
 
+    // V11 AMOUNT FORMAT BRIDGE:
+    // The V16 trusted Telegram raster anchor already knows where the primary
+    // amount lives, but some Enpara references expose the label/value as one
+    // OCR region (or only through the raster anchor), so the generic template
+    // field extractor can legitimately end up with no `amount` field.
+    // Bridge the two pipelines here: use only the anchor geometry + the
+    // value-independent format signature. Never retain the actual reference
+    // amount text.
+    try {
+      const amountAnchor = await getReferenceAmountAnchor(normalizedBank);
+      const anchorFormats = Array.isArray(amountAnchor?.formatSignatures)
+        ? amountAnchor.formatSignatures.filter(Boolean)
+        : [];
+
+      if (amountAnchor && anchorFormats.length) {
+        if (!fields.amount) {
+          const anchorVariants = anchorFormats.map(sig => ({
+            xNorm: amountAnchor.xNorm,
+            yNorm: amountAnchor.yNorm,
+            widthNorm: amountAnchor.widthNorm,
+            heightNorm: amountAnchor.heightNorm,
+            pageNumber: amountAnchor.pageNumber || 1,
+            labelKey: 'amount',
+            labelPresent: true,
+            templateRole: 'primaryAmount',
+            valueFormatSignature: sig,
+            style: {
+              source: 'trusted-telegram-raster-amount-anchor-v16',
+              fontNames: [],
+              avgFontHeight: 0,
+              avgCharWidth: 0,
+              itemCount: 1,
+            },
+            referenceFile: 'trusted-amount-anchor-ensemble',
+          }));
+          fields.amount = {
+            ...anchorVariants[0],
+            referenceCount: amountAnchor.referenceCount || 1,
+            variants: anchorVariants,
+            spread: amountAnchor.spread || null,
+            valueFormatSignature: anchorVariants[0]?.valueFormatSignature || null,
+            amountFormatSource: 'trusted-telegram-raster-amount-anchor-v16',
+          };
+          console.log('REFERENCE TEMPLATE AMOUNT V11: ANCHOR FORMAT BRIDGE', JSON.stringify({
+            bank: normalizedBank,
+            referenceCount: amountAnchor.referenceCount || 0,
+            formatSignatureCount: anchorFormats.length,
+            formatSignatures: anchorFormats,
+          }));
+        } else {
+          // Generic template extraction found an amount field. If its format
+          // signature is missing, enrich it from the trusted anchor instead of
+          // replacing the geometry/content classification.
+          const currentFormats = [
+            fields.amount?.valueFormatSignature,
+            ...(Array.isArray(fields.amount?.variants)
+              ? fields.amount.variants.map(v => v?.valueFormatSignature)
+              : [])
+          ].filter(Boolean);
+
+          if (!currentFormats.length) {
+            fields.amount.valueFormatSignature = anchorFormats[0] || null;
+            fields.amount.amountFormatSource = 'trusted-telegram-raster-amount-anchor-v16';
+            if (Array.isArray(fields.amount.variants) && fields.amount.variants.length) {
+              fields.amount.variants = fields.amount.variants.map((v, i) => ({
+                ...v,
+                valueFormatSignature: anchorFormats[i] || anchorFormats[0] || null,
+              }));
+            }
+            console.log('REFERENCE TEMPLATE AMOUNT V11: FORMAT ENRICHED FROM ANCHOR', JSON.stringify({
+              bank: normalizedBank,
+              formatSignatureCount: anchorFormats.length,
+              formatSignatures: anchorFormats,
+            }));
+          }
+        }
+      } else {
+        console.log('REFERENCE TEMPLATE AMOUNT V11: ANCHOR FORMAT UNAVAILABLE', JSON.stringify({
+          bank: normalizedBank,
+          anchorAvailable: Boolean(amountAnchor),
+          formatSignatureCount: anchorFormats.length,
+        }));
+      }
+    } catch (error) {
+      console.warn('REFERENCE TEMPLATE AMOUNT V11 ANCHOR BRIDGE HATASI:', error?.message || error);
+    }
+
     // SECURITY BOUNDARY: extracted reference PDF text is used only while
     // constructing geometry/style. Do not retain reference document values
     // (names, IBANs, amounts, account/ref numbers) in the final profile.
@@ -9108,6 +9227,17 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
   const amountFormatComparison = targetAmountText && referenceAmountFormats.length
     ? compareAmountFormatSignatures(buildAmountFormatSignature(targetAmountText), referenceAmountFormats)
     : { available:false, mismatch:false, score:0, confidence:0, reasons:[] };
+
+  console.log('AMOUNT FORMAT FORENSICS V11 DETAIL:', JSON.stringify({
+    available: Boolean(amountFormatComparison.available),
+    mismatch: Boolean(amountFormatComparison.mismatch),
+    score: Number(amountFormatComparison.score || 0),
+    confidence: Number(amountFormatComparison.confidence || 0),
+    reasons: amountFormatComparison.reasons || [],
+    targetAmountFormat: targetAmountText ? buildAmountFormatSignature(targetAmountText) : null,
+    referenceFormatCount: referenceAmountFormats.length,
+    referenceFormatSource: amountMatch?.reference?.amountFormatSource || null,
+  }));
 
   const strongGeometry = matched.filter(x=>x.geometryScore>=60);
   const weakPlacement = matched.filter(x=>x.geometryScore>=35);
@@ -15622,6 +15752,8 @@ const shouldRunReferenceVisualAdjudicator =
 
 console.log("REFERENCE VISUAL GATE V67:", JSON.stringify({
   shouldRun: shouldRunReferenceVisualAdjudicator,
+  amountFormatMismatch: Boolean(referenceTemplateAnalysis?.amountFormatComparison?.mismatch),
+  amountFormatScore: Number(referenceTemplateAnalysis?.amountFormatComparison?.score || 0),
   reasons: terraGateReasons,
   hardReasons: hardTerraReasons,
   rule: hardTerraReasons.length > 0
