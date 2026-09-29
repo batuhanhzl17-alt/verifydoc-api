@@ -11963,7 +11963,7 @@ async function runFieldTamperingForensics({
       console.warn('V6 AMOUNT DIRECT FALLBACK HATASI:', error?.message || error);
     }
   }
-\n  findings.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  findings.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
   const strongFindings = findings.filter(x => x.severity === 'strong');
   const mediumFindings = findings.filter(x => x.severity === 'medium');
 
