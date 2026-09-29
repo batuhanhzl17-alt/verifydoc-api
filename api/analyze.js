@@ -11539,6 +11539,99 @@ async function runFieldTamperingForensics({
     refEntries.push({ path: refPath, buffer: refBuffer, size: refSize, regions: refRegions, labels: refLabels });
   }
 
+  // V6: DOCUMENT-WIDE SAME-CHARACTER GLYPH BASELINE
+  // Compare critical numeric fields against the SAME JPG's other numeric
+  // characters. This is intentionally target-only: legitimate value changes
+  // such as 2.000 -> 10.000 are allowed, but a newly rendered/repainted glyph
+  // can still be detected when its shape/fill/height differs from the same
+  // character elsewhere in the document.
+  async function buildNumericGlyphBaseline(excludeRegion) {
+    const profile = new Map();
+    let regionCount = 0;
+    try {
+      const overlaps = (a, b) => {
+        if (!a || !b) return false;
+        const ax1=Number(a.x1)||0, ay1=Number(a.y1)||0, ax2=Number(a.x2)||0, ay2=Number(a.y2)||0;
+        const bx1=Number(b.x1)||0, by1=Number(b.y1)||0, bx2=Number(b.x2)||0, by2=Number(b.y2)||0;
+        const ix=Math.max(0, Math.min(ax2,bx2)-Math.max(ax1,bx1));
+        const iy=Math.max(0, Math.min(ay2,by2)-Math.max(ay1,by1));
+        return ix*iy > 0;
+      };
+      for (const row of targetRegions) {
+        const text=String(row?.text||'').trim();
+        if (!/\d/.test(text) || overlaps(row, excludeRegion)) continue;
+        if (++regionCount > 40) break;
+        const seq=await rfNumericGlyphSequence(targetBuffer, row, targetSize, text);
+        if (!seq?.slots?.length || !seq?.chars?.length) continue;
+        const n=Math.min(seq.slots.length, seq.chars.length);
+        for (let i=0;i<n;i++) {
+          const ch=seq.chars[i];
+          if (!/\d/.test(ch)) continue;
+          const g=seq.slots[i];
+          const item={
+            aspect:Number(g.width)/Math.max(1,Number(g.height)),
+            fill:Number(g.fill),
+            heightNorm:Number(g.height)/Math.max(1,Number(seq.medianH)||1),
+          };
+          if (![item.aspect,item.fill,item.heightNorm].every(Number.isFinite)) continue;
+          if (!profile.has(ch)) profile.set(ch,[]);
+          profile.get(ch).push(item);
+        }
+      }
+      const baseline={};
+      for (const [ch,items] of profile.entries()) {
+        if (items.length < 2) continue;
+        baseline[ch]={
+          count:items.length,
+          aspect:rfMedian(items.map(x=>x.aspect)),
+          fill:rfMedian(items.map(x=>x.fill)),
+          heightNorm:rfMedian(items.map(x=>x.heightNorm)),
+        };
+      }
+      return {baseline, regionCount};
+    } catch(error) {
+      console.warn('DOCUMENT NUMERIC GLYPH BASELINE HATASI:', error?.message || error);
+      return {baseline:{}, regionCount};
+    }
+  }
+
+  async function analyzeAmountAgainstNumericBaseline(amountRegion, amountText) {
+    if (!amountRegion || !/\d/.test(String(amountText||''))) return null;
+    const built=await buildNumericGlyphBaseline(amountRegion);
+    const seq=await rfNumericGlyphSequence(targetBuffer, amountRegion, targetSize, amountText);
+    if (!seq?.slots?.length || !seq?.chars?.length) return null;
+    const n=Math.min(seq.slots.length, seq.chars.length);
+    const perGlyph=[];
+    for(let i=0;i<n;i++) {
+      const ch=seq.chars[i];
+      const base=built.baseline[ch];
+      if(!base || base.count<2) continue;
+      const g=seq.slots[i];
+      const diffs={
+        aspect:rfSafeRel(Number(g.width)/Math.max(1,Number(g.height)),base.aspect,.30),
+        fill:rfSafeRel(Number(g.fill),base.fill,.16),
+        height:rfSafeRel(Number(g.height)/Math.max(1,Number(seq.medianH)||1),base.heightNorm,.18),
+      };
+      const finite=Object.values(diffs).filter(Number.isFinite);
+      const votes=finite.filter(v=>v>=.18).length;
+      const max=finite.length?Math.max(...finite):0;
+      perGlyph.push({index:i,char:ch,baselineCount:base.count,diffs,votes,max});
+    }
+    const outliers=perGlyph.filter(x=>x.votes>=2 && x.max>=.18);
+    const strongOutliers=perGlyph.filter(x=>x.votes>=2 && x.max>=.28);
+    const signal=outliers.length>=1 && outliers.length<=Math.max(2,Math.ceil(perGlyph.length*.40));
+    return {
+      available:perGlyph.length>=2,
+      signal,
+      strong:strongOutliers.length>=1,
+      regionCount:built.regionCount,
+      comparableGlyphCount:perGlyph.length,
+      outlierCount:outliers.length,
+      strongOutlierCount:strongOutliers.length,
+      perGlyph:perGlyph.slice(0,16),
+    };
+  }
+
   const findings = [];
   const fieldDiagnostics = [];
 
@@ -11632,6 +11725,12 @@ async function runFieldTamperingForensics({
       } catch {}
     }
 
+    const numericBaselineAnalysis = field === 'amount' && targetValue.text
+      ? await analyzeAmountAgainstNumericBaseline(targetValueRegion, targetValue.text)
+      : null;
+    const documentNumericGlyphSignal = Boolean(numericBaselineAnalysis?.signal);
+    const documentNumericGlyphStrong = Boolean(numericBaselineAnalysis?.strong);
+
     // Content-independent signals are preferred. Raw target-vs-reference
     // character differences are NOT sufficient because legitimate values can
     // differ (2.000 vs 10.000, one date vs another, different IBAN, etc.).
@@ -11704,11 +11803,12 @@ async function runFieldTamperingForensics({
       (elaSignal && internalSignal) ||
       (elaSignal && sameFieldDigitSignal) ||
       (amountV3GlobalSupported && (elaSignal || internalSignal || sameFieldDigitSignal)) ||
+      (documentNumericGlyphStrong && amountV3GlobalSupported) ||
       (internalSignal && sameFieldDigitSignal && referenceSupport.length >= 1);
 
     const signalCount = [
       elaSignal, internalSignal, characterSignal, valueRasterSignal,
-      sameFieldDigitSignal, amountV3GlobalSupported
+      sameFieldDigitSignal, amountV3GlobalSupported, documentNumericGlyphSignal
     ].filter(Boolean).length;
     const isCritical = field === 'amount' || field === 'date' || field === 'time' || field === 'iban' || field === 'transactionNo';
 
@@ -11720,7 +11820,12 @@ async function runFieldTamperingForensics({
       isCritical || referenceSupport.length >= 1
     );
     const medium = !strong && signalCount >= 1 && (
-      isCritical && (elaSignal || internalSignal || amountV3LocalizedSignal)
+      isCritical && (
+        elaSignal ||
+        internalSignal ||
+        amountV3LocalizedSignal ||
+        (field === 'amount' && documentNumericGlyphSignal && (amountV3LocalizedSignal || globalJpegLocalizedSignal))
+      )
     );
 
     const diagnostic = {
@@ -11734,6 +11839,8 @@ async function runFieldTamperingForensics({
         characterSignal,
         valueRasterSignal,
         sameFieldDigitSignal,
+        documentNumericGlyphSignal,
+        documentNumericGlyphStrong,
         amountV3LocalizedSignal,
         amountV3GlobalSupported,
         globalJpegLocalizedSignal,
@@ -11743,6 +11850,7 @@ async function runFieldTamperingForensics({
       referenceInternalDeltaMedian: Number.isFinite(refInternalMedian) ? Number(refInternalMedian.toFixed(4)) : null,
       referenceCharacterResidualMedian: Number.isFinite(refCharacterMedian) ? Number(refCharacterMedian.toFixed(4)) : null,
       referenceValueStyleResidualMedian: Number.isFinite(refValueStyleMedian) ? Number(refValueStyleMedian.toFixed(4)) : null,
+      documentNumericGlyph: numericBaselineAnalysis,
       amountV3: amountV3Metrics ? {
         maxFeatureVotes: Number(amountV3Metrics.maxFeatureVotes || 0),
         maxInkRatioDifference: Number(amountV3Metrics.maxInkRatioDifference || 0),
@@ -11763,6 +11871,7 @@ async function runFieldTamperingForensics({
       if (characterSignal) reasons.push('karakter geometrisi referans profilinden ayrılıyor');
       if (valueRasterSignal) reasons.push('değer bölgesi raster/stroke yapısı belirgin farklı');
       if (sameFieldDigitSignal) reasons.push('aynı tutar alanında tekil karakter geometrisi aykırılığı');
+      if (documentNumericGlyphSignal) reasons.push('aynı rakamların belge içi karakter profiline göre lokal geometri/dolgu ayrışması');
       if (amountV3GlobalSupported) reasons.push('tutar alanı global JPG/raster baseline üzerinde lokal anomali gösteriyor');
       else if (amountV3LocalizedSignal) reasons.push('tutar alanında mikro-raster anomali bulundu ancak global JPG baseline tarafından henüz doğrulanmadı');
       findings.push({
@@ -11777,7 +11886,7 @@ async function runFieldTamperingForensics({
     }
   }
 
-  findings.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  // V6 AMOUNT FALLBACK: The amount candidate is already selected by the\n  // dedicated Amount Forensics engine. If semantic label->value pairing did\n  // not expose an `amount` field in the generic loop, do not lose the amount\n  // evidence. Re-run the same-character baseline directly on the selected\n  // amount ROI. This path is only promoted when the existing Amount V3 local\n  // raster signal corroborates it, so a harmless numeric field is not enough.\n  if (amountForensics?.region && !fieldDiagnostics.some(x => x.field === 'amount')) {\n    try {\n      const fallbackRegion = rfFocusValueRegion(amountForensics.region, amountForensics.amountText || amountForensics.selectedAmountText, 'amount');\n      const fallbackText = String(amountForensics.amountText || amountForensics.selectedAmountText || '').trim();\n      const fallbackGlyph = await analyzeAmountAgainstNumericBaseline(fallbackRegion, fallbackText);\n      const fallbackMetrics = amountForensics?.metrics || null;\n      const fallbackV3Signal = Boolean(\n        fallbackMetrics &&\n        Number(fallbackMetrics.maxFeatureVotes) >= 4 &&\n        Number(fallbackMetrics.localAnomalyRatio) >= 0.15 &&\n        Number(fallbackMetrics.localAnomalyRatio) <= 0.70 &&\n        (\n          Number(fallbackMetrics.maxInkRatioDifference) >= 0.38 ||\n          Number(fallbackMetrics.maxStrokeProxyDifference) >= 0.38 ||\n          Number(fallbackMetrics.maxEdgeDensityDifference) >= 0.38 ||\n          Number(fallbackMetrics.maxDarknessDifference) >= 0.38\n        )\n      );\n      if (fallbackGlyph?.signal && fallbackV3Signal) {\n        const fallbackStrong = Boolean(fallbackGlyph.strong);\n        const fallbackFinding = {\n          field: 'amount',\n          title: 'Tutar',\n          severity: fallbackStrong ? 'strong' : 'medium',\n          confidence: fallbackStrong ? 88 : 78,\n          evidence: `Tutar alanında aynı rakamların belge içi karakter profiline göre lokal geometri/dolgu ayrışması tespit edildi. ${fallbackGlyph.outlierCount} karakter aykırı; mevcut Amount Forensics V3 de aynı bölgede çoklu mikro-raster anomali gösteriyor. Bu bulgu tek başına sahtecilik kanıtı değildir.`,\n          targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },\n          signals: {\n            documentNumericGlyphSignal: true,\n            documentNumericGlyphStrong: fallbackStrong,\n            amountV3LocalizedSignal: true,\n            source: 'amount-forensics-direct-fallback',\n          },\n        };\n        findings.push(fallbackFinding);\n        fieldDiagnostics.push({\n          field: 'amount',\n          label: 'Tutar',\n          targetValue: fallbackText,\n          signalCount: 2,\n          signals: fallbackFinding.signals,\n          documentNumericGlyph: fallbackGlyph,\n          amountV3: fallbackMetrics ? {\n            maxFeatureVotes: Number(fallbackMetrics.maxFeatureVotes || 0),\n            maxInkRatioDifference: Number(fallbackMetrics.maxInkRatioDifference || 0),\n            maxStrokeProxyDifference: Number(fallbackMetrics.maxStrokeProxyDifference || 0),\n            maxEdgeDensityDifference: Number(fallbackMetrics.maxEdgeDensityDifference || 0),\n            maxDarknessDifference: Number(fallbackMetrics.maxDarknessDifference || 0),\n            localAnomalyRatio: Number(fallbackMetrics.localAnomalyRatio || 0),\n          } : null,\n          targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },\n        });\n        console.log('V6 AMOUNT DIRECT FALLBACK:', JSON.stringify({\n          amountText: fallbackText,\n          numericGlyphSignal: fallbackGlyph.signal,\n          numericGlyphStrong: fallbackGlyph.strong,\n          outlierCount: fallbackGlyph.outlierCount,\n          comparableGlyphCount: fallbackGlyph.comparableGlyphCount,\n          amountV3Signal: fallbackV3Signal,\n        }));\n      } else {\n        console.log('V6 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({\n          amountText: fallbackText,\n          numericGlyphSignal: Boolean(fallbackGlyph?.signal),\n          amountV3Signal: fallbackV3Signal,\n        }));\n      }\n    } catch (error) {\n      console.warn('V6 AMOUNT DIRECT FALLBACK HATASI:', error?.message || error);\n    }\n  }\n\n  findings.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
   const strongFindings = findings.filter(x => x.severity === 'strong');
   const mediumFindings = findings.filter(x => x.severity === 'medium');
 
