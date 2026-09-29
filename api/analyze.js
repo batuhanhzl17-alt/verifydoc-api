@@ -12467,10 +12467,43 @@ async function runFieldTamperingForensics({
       );
 
       if (fallbackConvergentSignal) {
+        // V13.1 AMOUNT STRONG GATE:
+        // Amount V3/V9 are intentionally sensitive detectors, but they are not
+        // sufficient by themselves for a STRONG field-tampering finding.
+        // A normal original Enpara JPG can legitimately produce a localized
+        // V3/V9 raster outlier because of rendering, resizing or compression.
+        //
+        // STRONG therefore requires a second, independent corroborating family:
+        //   1) strong same-document numeric-glyph evidence PLUS
+        //      local-JPEG contrast, V9 localized raster evidence, OR a real
+        //      reference-format mismatch; OR
+        //   2) very strong local-JPEG evidence with >=5 V3 feature votes; OR
+        //   3) V9 localized raster evidence PLUS a numeric-glyph signal.
+        //
+        // Crucially, V3/V9 alone can remain MEDIUM/diagnostic but cannot promote
+        // an otherwise clean original amount to STRONG.
+        const amountFormatMismatch = Boolean(
+          amountForensics?.amountFormatComparison?.mismatch
+        );
         const fallbackStrong = Boolean(
-          fallbackGlyph?.strong ||
-          (v9JpegAwareLocalizedSignal && v9StrongFeatureCount >= 3 && v9AnomalyRatio >= 0.38) ||
-          (fallbackLocalJpegSignal && Number(fallbackMetrics?.maxFeatureVotes || 0) >= 5)
+          (
+            fallbackGlyph?.strong &&
+            (
+              fallbackLocalJpegSignal ||
+              v9JpegAwareLocalizedSignal ||
+              amountFormatMismatch
+            )
+          ) ||
+          (
+            fallbackLocalJpegSignal &&
+            Number(fallbackMetrics?.maxFeatureVotes || 0) >= 5
+          ) ||
+          (
+            v9JpegAwareLocalizedSignal &&
+            Boolean(fallbackGlyph?.signal) &&
+            v9StrongFeatureCount >= 3 &&
+            v9AnomalyRatio >= 0.38
+          )
         );
         const fallbackFinding = {
           field: 'amount',
@@ -12490,6 +12523,7 @@ async function runFieldTamperingForensics({
           signals: {
             documentNumericGlyphSignal: Boolean(fallbackGlyph?.signal),
             documentNumericGlyphStrong: Boolean(fallbackGlyph?.strong),
+            amountFormatMismatch,
             amountV3LocalizedSignal: true,
             localJpegContrastSignal: fallbackLocalJpegSignal,
             v9LocalizedRasterSignal: v9LocalizedRasterSignal,
@@ -12533,6 +12567,14 @@ async function runFieldTamperingForensics({
           v9CompressionDominated,
           v9StrongFeatureCount,
           v9AnomalyRatio: Number.isFinite(v9AnomalyRatio) ? Number(v9AnomalyRatio.toFixed(3)) : null,
+          strongGate: {
+            amountFormatMismatch,
+            glyphStrong: Boolean(fallbackGlyph?.strong),
+            glyphSignal: Boolean(fallbackGlyph?.signal),
+            localJpegContrastSignal: fallbackLocalJpegSignal,
+            v9JpegAwareLocalizedSignal,
+            promotedStrong: fallbackStrong,
+          },
         }));
       } else {
         console.log('V9 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
