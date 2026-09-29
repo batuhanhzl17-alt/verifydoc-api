@@ -652,6 +652,125 @@ function normalizeOCRAmountLiteral(value) {
   return sign + raw.replace(/[.,]/g, "");
 }
 
+
+// V10 AMOUNT FORMAT FORENSICS:
+// Keep the visible formatting of a monetary value separate from numeric-value
+// normalization. `10.000,00` and `10000,00` are numerically equal but visually
+// different. That difference is useful forensic evidence and must not be erased.
+function buildAmountFormatSignature(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+
+  const compact = raw.replace(/\u00a0/g, ' ');
+  const numberMatch = compact.match(/[+-]?\d[\d.,\s]*/);
+  if (!numberMatch) return null;
+  const numberLiteral = numberMatch[0].trim();
+  const unsigned = numberLiteral.replace(/^[+-]/, '');
+  const sign = /^[+-]/.test(numberLiteral) ? numberLiteral[0] : '';
+
+  const commaCount = (unsigned.match(/,/g) || []).length;
+  const dotCount = (unsigned.match(/\./g) || []).length;
+  const commaPositions = [...unsigned].map((c,i)=>c===','?i:-1).filter(i=>i>=0);
+  const dotPositions = [...unsigned].map((c,i)=>c==='.'?i:-1).filter(i=>i>=0);
+  const lastComma = unsigned.lastIndexOf(',');
+  const lastDot = unsigned.lastIndexOf('.');
+  const lastSep = Math.max(lastComma, lastDot);
+  const digitsAfter = lastSep >= 0 ? unsigned.length-lastSep-1 : 0;
+  const decimalSeparator = (lastSep >= 0 && digitsAfter >= 1 && digitsAfter <= 2)
+    ? unsigned[lastSep]
+    : null;
+  const decimalDigits = decimalSeparator ? digitsAfter : 0;
+  const integerPart = decimalSeparator ? unsigned.slice(0,lastSep) : unsigned;
+  const integerDigits = integerPart.replace(/[.,\s]/g,'').length;
+  const groups = integerPart.split(/[.,\s]/).filter(Boolean);
+  const thousandsSeparator = groups.length > 1
+    ? (integerPart.match(/[.,\s]+/g)?.[0]?.[0] || null)
+    : null;
+
+  const currencyMatch = compact.match(/(₺|TL|TRY|EUR|USD|GBP|€|\$|£)/i);
+  const currency = currencyMatch ? currencyMatch[1].toUpperCase() : null;
+  const currencyIndex = currencyMatch ? currencyMatch.index : -1;
+  const numberIndex = numberMatch.index ?? compact.indexOf(numberLiteral);
+  const currencyPosition = currencyMatch
+    ? (currencyIndex < numberIndex ? 'prefix' : 'suffix')
+    : 'none';
+  const beforeNumber = numberIndex > 0 ? compact.slice(0, numberIndex) : '';
+  const afterNumber = compact.slice(numberIndex + numberLiteral.length);
+  const superscriptChars = [...compact].filter(c => /[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁽⁾]/.test(c));
+
+  // A stable, value-independent pattern. Numeric digits are replaced so this
+  // can safely be retained with the reference template metadata.
+  const normalizedPattern = numberLiteral
+    .replace(/[0-9]/g, '#')
+    .replace(/\s+/g,' ')
+    .trim();
+
+  return {
+    rawPattern: normalizedPattern,
+    sign: sign || null,
+    thousandsSeparator,
+    decimalSeparator,
+    decimalDigits,
+    integerDigits,
+    integerGroupCount: Math.max(1, groups.length),
+    hasThousandsSeparator: groups.length > 1,
+    hasCurrency: Boolean(currency),
+    currency,
+    currencyPosition,
+    spaceBeforeCurrency: currencyPosition === 'suffix' ? /\s$/.test(beforeNumber + numberLiteral) : false,
+    spaceAfterCurrency: currencyPosition === 'prefix' ? /\s/.test(afterNumber) : false,
+    superscriptChars,
+    hasSuperscript: superscriptChars.length > 0,
+    literalLength: raw.length,
+  };
+}
+
+function compareAmountFormatSignatures(targetSignature, referenceSignatures) {
+  const refs = (Array.isArray(referenceSignatures) ? referenceSignatures : [referenceSignatures])
+    .filter(Boolean);
+  if (!targetSignature || !refs.length) {
+    return { available:false, mismatch:false, score:0, confidence:0, reasons:[] };
+  }
+
+  const compareOne = (ref) => {
+    const reasons=[];
+    if (targetSignature.decimalSeparator !== ref.decimalSeparator) reasons.push('ondalık ayırıcı farklı');
+    if (Boolean(targetSignature.hasThousandsSeparator) !== Boolean(ref.hasThousandsSeparator)) reasons.push('binlik ayırıcı kullanımı farklı');
+    else if (targetSignature.hasThousandsSeparator && targetSignature.thousandsSeparator !== ref.thousandsSeparator) reasons.push('binlik ayırıcı farklı');
+    if (targetSignature.decimalDigits !== ref.decimalDigits) reasons.push('ondalık basamak sayısı farklı');
+    if (targetSignature.currency !== ref.currency) reasons.push('para birimi gösterimi farklı');
+    if (targetSignature.currencyPosition !== ref.currencyPosition) reasons.push('para biriminin konumu farklı');
+    if (Boolean(targetSignature.hasSuperscript) !== Boolean(ref.hasSuperscript)) reasons.push('üst simge karakter kullanımı farklı');
+    if (targetSignature.rawPattern !== ref.rawPattern) reasons.push('tutarın görünür yazım biçimi farklı');
+    const mismatchCount = reasons.length;
+    return { mismatchCount, reasons };
+  };
+
+  const comparisons = refs.map(compareOne);
+  comparisons.sort((a,b)=>b.mismatchCount-a.mismatchCount);
+  const worst = comparisons[0];
+  const mismatchVotes = comparisons.filter(x=>x.mismatchCount>0).length;
+  const matchingVotes = comparisons.length - mismatchVotes;
+  const consensusMismatch = mismatchVotes >= Math.max(1, Math.ceil(comparisons.length * 0.5));
+  const score = consensusMismatch
+    ? Math.min(70, 28 + worst.mismatchCount * 9 + (mismatchVotes >= 2 ? 10 : 0))
+    : Math.min(25, worst.mismatchCount * 8);
+
+  return {
+    available:true,
+    mismatch: consensusMismatch,
+    score,
+    confidence: Math.min(99, 72 + (mismatchVotes >= 2 ? 12 : 0) + (comparisons.length >= 2 ? 6 : 0)),
+    target: targetSignature,
+    referenceCount: refs.length,
+    mismatchVotes,
+    matchingVotes,
+    consensusMismatch,
+    reasons:[...new Set(worst.reasons)],
+    comparisons,
+  };
+}
+
 // V56: PaddleOCR sometimes produces mixed thousands/decimal separators such as
 // "1.004.19" or "1,004.19".  These are OCR formatting artifacts, not amount
 // mismatches. Normalize only the numeric literal while preserving the actual
@@ -2738,6 +2857,15 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     );
   }
 
+  // V10: amount formatting is retained as an independent, low-to-medium
+  // financial/document signal. It must never be treated as proof of fraud by
+  // itself, but a high-confidence mismatch in decimal/thousands separators or
+  // currency placement is too important to disappear after numeric normalization.
+  const amountFormatComparison = forensic?.referenceTemplateAnalysis?.amountFormatComparison || null;
+  if (amountFormatComparison?.available === true && amountFormatComparison.mismatch === true) {
+    financialDataRisk = Math.max(financialDataRisk, Math.min(45, Number(amountFormatComparison.score) || 25));
+  }
+
   // Validate any visible IBAN deterministically. This does not prove that an
   // IBAN belongs to the named recipient; it only detects checksum/format errors.
   const ibanCandidates = [doc.recipientIban, doc.iban].filter(Boolean);
@@ -2788,6 +2916,17 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
       editingRisk = Math.max(editingRisk, 78);
     } else if (fieldTampering.severity === 'medium' && Number(fieldTampering.mediumFindingCount) > 0) {
       editingRisk = Math.max(editingRisk, 35);
+    }
+
+    // Only an amount-field tampering finding feeds financialDataRisk. Other
+    // fields (IBAN/date/name/layout) belong to editingRisk and must not be
+    // mislabeled as a financial arithmetic inconsistency.
+    const amountTamperFindings = (Array.isArray(fieldTampering.findings) ? fieldTampering.findings : [])
+      .filter(x => String(x?.field || '').toLowerCase() === 'amount' &&
+        (String(x?.severity || '') === 'strong' || String(x?.severity || '') === 'medium'));
+    if (amountTamperFindings.length) {
+      const hasStrongAmountTamper = amountTamperFindings.some(x => String(x?.severity || '') === 'strong');
+      financialDataRisk = Math.max(financialDataRisk, hasStrongAmountTamper ? 60 : 35);
     }
   }
   // If the reference engine has a high-confidence semantic local-gap anomaly,
@@ -8235,6 +8374,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
             labelKey: rule.key,
             labelPresent: true,
             templateRole: classifyReferenceTemplateRole(rule.key, label.text),
+            valueFormatSignature: rule.key === 'amount' ? buildAmountFormatSignature(value.text) : null,
             style: { source: 'reference-image-ocr', fontNames: [], avgFontHeight: Math.max(1, r.y2 - r.y1), avgCharWidth: 0, itemCount: 1 },
             referenceFile: path.basename(referencePath),
           };
@@ -8311,6 +8451,9 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         labelPresent: Boolean(labelItem),
         valueTextLength: chars,
         templateRole: classifyReferenceTemplateRole(rule.key, row.text),
+        valueFormatSignature: rule.key === 'amount'
+          ? buildAmountFormatSignature(valueItems.map(x => String(x.str || '')).join(''))
+          : null,
         style: { source:'pdf-text-metadata', fontNames, avgFontHeight, avgCharWidth, itemCount:valueItems.length },
         referenceFile: path.basename(referencePath),
       };
@@ -8807,6 +8950,10 @@ function sanitizeReferenceTemplateForOutput(analysis) {
       } : undefined,
       referenceCount: f.reference.referenceCount,
       spread: f.reference.spread,
+      valueFormatSignature: f.field === 'amount' ? f.reference.valueFormatSignature : undefined,
+      variants: f.field === 'amount' && Array.isArray(f.reference.variants)
+        ? f.reference.variants.map(v => ({ valueFormatSignature: v?.valueFormatSignature || null }))
+        : undefined,
     } : undefined,
     target: f.target ? {
       xNorm: f.target.xNorm,
@@ -8837,6 +8984,7 @@ function sanitizeReferenceTemplateForOutput(analysis) {
     weakPlacementCount: analysis.weakPlacementCount,
     strongStyleCount: analysis.strongStyleCount,
     styleComparisonNote: analysis.styleComparisonNote,
+    amountFormatComparison: analysis.amountFormatComparison || null,
     fields: safeFields,
     evidence: analysis.evidence,
   };
@@ -8939,7 +9087,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
     matches.push({
       field,
       status:"matched",
-      reference:{xNorm:nearestRef.xNorm,yNorm:nearestRef.yNorm,widthNorm:nearestRef.widthNorm,heightNorm:nearestRef.heightNorm,pageNumber:nearestRef.pageNumber,style:nearestRef.style,referenceFile:nearestRef.referenceFile,referenceCount:ref.referenceCount,spread:ref.spread},
+      reference:{xNorm:nearestRef.xNorm,yNorm:nearestRef.yNorm,widthNorm:nearestRef.widthNorm,heightNorm:nearestRef.heightNorm,pageNumber:nearestRef.pageNumber,style:nearestRef.style,referenceFile:nearestRef.referenceFile,referenceCount:ref.referenceCount,spread:ref.spread,valueFormatSignature: field === 'amount' ? ref.valueFormatSignature : null,variants: field === 'amount' ? (ref.variants || []) : undefined},
       target:{...target,pageIndex:Number(best.item.pageIndex)||0,text:targetText,ocrScore:Number(best.item.score)||0},
       matchScore:Math.max(0,Math.round(best.score)),
       geometryScore,
@@ -8949,6 +9097,18 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
 
   const matched = matches.filter(x=>x.status==="matched");
   const missing = matches.filter(x=>x.status==="missing");
+
+  const amountMatch = matched.find(x => x.field === 'amount');
+  const referenceAmountFormats = amountMatch?.reference
+    ? [amountMatch.reference.valueFormatSignature, ...(Array.isArray(amountMatch.reference.variants)
+        ? amountMatch.reference.variants.map(v => v?.valueFormatSignature)
+        : [])].filter(Boolean)
+    : [];
+  const targetAmountText = amountMatch?.target?.text || null;
+  const amountFormatComparison = targetAmountText && referenceAmountFormats.length
+    ? compareAmountFormatSignatures(buildAmountFormatSignature(targetAmountText), referenceAmountFormats)
+    : { available:false, mismatch:false, score:0, confidence:0, reasons:[] };
+
   const strongGeometry = matched.filter(x=>x.geometryScore>=60);
   const weakPlacement = matched.filter(x=>x.geometryScore>=35);
 
@@ -8964,6 +9124,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
     weakPlacementCount:weakPlacement.length,
     strongStyleCount:0,
     styleComparisonNote:"JPG'de PDF font adı birebir ölçülemez; PDF font metadata'sı referans profiline, gerçek piksel yoğunluğu ise JPG tarafına ayrı sinyal olarak kaydedilir.",
+    amountFormatComparison,
     fields:matches,
     evidence: strongGeometry.length || missing.length
       ? `Referans şablonuyla ${matched.length} alan eşleştirildi; ${strongGeometry.length} alanda belirgin geometri farkı, ${missing.length} alanda beklenen alan bulunamadı.`
@@ -11940,6 +12101,10 @@ async function runFieldTamperingForensics({
       localJpegContrast: localJpegContrastDiagnostic,
       targetBox: { ...targetValueRegion },
     };
+    if (field === 'amount' && amountForensics?.amountFormatComparison?.mismatch) {
+      diagnostic.signals.amountFormatMismatch = true;
+      diagnostic.amountFormatComparison = amountForensics.amountFormatComparison;
+    }
     fieldDiagnostics.push(diagnostic);
 
     if (strong || medium) {
@@ -11999,10 +12164,6 @@ async function runFieldTamperingForensics({
       // a local rewrite such as 2.000 -> 10.000 from document-wide JPEG noise.
       let fallbackLocalJpegSignal = false;
       let fallbackLocalJpegDiagnostic = null;
-      // V9 scope fix: these values are also consumed after the inner JPEG
-      // diagnostic block, so they must live in the outer fallback scope.
-      let fallbackGlobalRobustZ = null;
-      let fallbackLocalVsGlobalRatio = null;
 
       if (fallbackV3Signal && fallbackRegion) {
         try {
@@ -12058,7 +12219,7 @@ async function runFieldTamperingForensics({
               ? (fallbackGlobalFieldDistance-fallbackGlobalMedian)/fallbackGlobalMad
               : null;
 
-            fallbackLocalVsGlobalRatio =
+            const fallbackLocalVsGlobalRatio =
               Number.isFinite(fallbackLocalMedian) &&
               Number.isFinite(fallbackGlobalMedian)
                 ? fallbackLocalMedian / Math.max(.05,fallbackGlobalMedian)
@@ -14740,7 +14901,10 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePath(reference)
+      (() => {
+        const visualReference = getVisualReferencePath(reference);
+        return Array.isArray(visualReference) ? visualReference[0] : visualReference;
+      })()
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
@@ -14827,10 +14991,12 @@ prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
+      const visualReference = getVisualReferencePath(reference);
+      const primaryVisualReference = Array.isArray(visualReference) ? visualReference[0] : visualReference;
       const arg = await runAzureReferenceGeometryComparison(
         al,
         bank,
-        getVisualReferencePath(reference)
+        primaryVisualReference
       );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
@@ -14849,6 +15015,9 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         forensicTargetPath, forensicTargetMime, bank, paddleImageOCR, reference.path
       );
       console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(ta));
+      if (ta?.amountFormatComparison) {
+        console.log("AMOUNT FORMAT FORENSICS V10:", JSON.stringify(ta.amountFormatComparison));
+      }
       return { kind:"template", referenceTemplateAnalysis:ta };
     } catch (error) {
       console.warn("REFERENCE TEMPLATE ANALYSIS HATASI:", error?.message || error);
@@ -14869,6 +15038,18 @@ for (const pr of prepResults) {
   }
 }
 console.log("V63 PREP SURE:", ((Date.now() - prepStartTime) / 1000).toFixed(2), "seconds");
+
+// V10: carry the non-normalized amount-format evidence into the amount
+// forensic object so downstream risk/report/watchlist layers see the same
+// evidence. Numeric normalization remains available separately.
+if (amountForensics && referenceTemplateAnalysis?.amountFormatComparison?.available) {
+  amountForensics.amountFormatComparison = referenceTemplateAnalysis.amountFormatComparison;
+  console.log("AMOUNT FORMAT FORENSICS ATTACHED:", JSON.stringify({
+    mismatch: Boolean(amountForensics.amountFormatComparison.mismatch),
+    score: Number(amountForensics.amountFormatComparison.score || 0),
+    reasons: amountForensics.amountFormatComparison.reasons || []
+  }));
+}
 
 // V56: Duplicate Terra passes V27 and V29 were diagnostic/legacy paths.
 // The V39 focused direct-reference pass below is the sole Terra reference
@@ -15395,6 +15576,10 @@ if (referenceForensics?.available === true && (
   Number(referenceForensics.maxSpacingScore || 0) >= 85 ||
   Number(referenceForensics.suspiciousFieldCount || 0) >= 1
 )) terraGateReasons.push("forensic-strong-signal");
+if (referenceTemplateAnalysis?.amountFormatComparison?.available === true &&
+    referenceTemplateAnalysis.amountFormatComparison.mismatch === true) {
+  terraGateReasons.push("amount-format-mismatch");
+}
 
 // V64 SPEED GATE: Terra is the expensive path (~90-100s in recent runs).
 // A single soft/local signal is not enough to pay that cost.
@@ -15402,7 +15587,9 @@ if (referenceForensics?.available === true && (
 // two independent pre-Terra signals. This preserves Terra for corroborated
 // cases while skipping the common one-signal false-positive path.
 const hardTerraReasons = terraGateReasons.filter((reason) =>
-  reason === "azure-strong-anomaly" || reason === "forensic-strong-signal"
+  reason === "azure-strong-anomaly" ||
+  reason === "forensic-strong-signal" ||
+  reason === "amount-format-mismatch"
 );
 const softTerraReasons = terraGateReasons.filter((reason) =>
   reason === "template-strong-geometry" || reason === "local-render-outlier"
@@ -15430,7 +15617,8 @@ referenceVisualAdjudication = null;
 // Keep the dedicated visual adjudicator only for the softer two-signal path,
 // where it adds a genuinely independent visual arbitration layer.
 const shouldRunReferenceVisualAdjudicator =
-  shouldRunTerra && hardTerraReasons.length === 0 && terraGateReasons.length >= 2;
+  (referenceTemplateAnalysis?.amountFormatComparison?.mismatch === true) ||
+  (shouldRunTerra && hardTerraReasons.length === 0 && terraGateReasons.length >= 2);
 
 console.log("REFERENCE VISUAL GATE V67:", JSON.stringify({
   shouldRun: shouldRunReferenceVisualAdjudicator,
@@ -16827,9 +17015,13 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
     // profile.referenceFiles intentionally stores only basenames (security boundary).
     // Resolve the real absolute reference path again through the canonical resolver.
     const referencePaths = await getReferenceFiles(bank);
+    const selectedPath = Array.isArray(selectedReferencePath)
+      ? selectedReferencePath.find(Boolean)
+      : selectedReferencePath;
     const referencePath =
-      referencePaths.find(p => /\.(pdf)$/i.test(String(p))) ||
-      referencePaths.find(p => /\.(png|jpe?g|webp)$/i.test(String(p)));
+      (selectedPath && referencePaths.includes(selectedPath) ? selectedPath : null) ||
+      referencePaths.find(p => /\.(png|jpe?g|webp)$/i.test(String(p))) ||
+      referencePaths.find(p => /\.(pdf)$/i.test(String(p)));
     if (!referencePath) return null;
 
     const refExt = path.extname(referencePath).toLowerCase();
