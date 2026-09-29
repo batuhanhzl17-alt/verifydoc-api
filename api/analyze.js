@@ -2935,9 +2935,9 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   // V13.3 PAINT-OVER FORENSICS: only a convergent local raster candidate
   // can influence deterministic editing risk. Reference-format differences,
   // global JPEG/ELA and OCR semantics are deliberately excluded here.
-  const paintOverCandidateRisk = amountForensics?.paintOverCandidate === true;
-  const paintOverFeatureCountRisk = Number(amountForensics?.paintOverConvergentFeatureCount || 0);
-  const paintOverSlotCountRisk = Number(amountForensics?.highVoteSegmentCount || 0);
+  const paintOverCandidateRisk = amount?.paintOverCandidate === true;
+  const paintOverFeatureCountRisk = Number(amount?.paintOverConvergentFeatureCount || 0);
+  const paintOverSlotCountRisk = Number(amount?.highVoteSegmentCount || 0);
   if (paintOverCandidateRisk && paintOverFeatureCountRisk >= 2 && paintOverSlotCountRisk >= 3) {
     editingRisk = Math.max(editingRisk, 72);
     financialDataRisk = Math.max(financialDataRisk, 50);
