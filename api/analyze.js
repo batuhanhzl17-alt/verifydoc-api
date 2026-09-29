@@ -11999,6 +11999,10 @@ async function runFieldTamperingForensics({
       // a local rewrite such as 2.000 -> 10.000 from document-wide JPEG noise.
       let fallbackLocalJpegSignal = false;
       let fallbackLocalJpegDiagnostic = null;
+      // V9 scope fix: these values are also consumed after the inner JPEG
+      // diagnostic block, so they must live in the outer fallback scope.
+      let fallbackGlobalRobustZ = null;
+      let fallbackLocalVsGlobalRatio = null;
 
       if (fallbackV3Signal && fallbackRegion) {
         try {
@@ -12050,11 +12054,11 @@ async function runFieldTamperingForensics({
                 ? globalJpegRasterBaseline._rasterDistance(fallbackTargetRaster)
                 : null;
 
-            const fallbackGlobalRobustZ = Number.isFinite(fallbackGlobalFieldDistance)
+            fallbackGlobalRobustZ = Number.isFinite(fallbackGlobalFieldDistance)
               ? (fallbackGlobalFieldDistance-fallbackGlobalMedian)/fallbackGlobalMad
               : null;
 
-            const fallbackLocalVsGlobalRatio =
+            fallbackLocalVsGlobalRatio =
               Number.isFinite(fallbackLocalMedian) &&
               Number.isFinite(fallbackGlobalMedian)
                 ? fallbackLocalMedian / Math.max(.05,fallbackGlobalMedian)
@@ -12095,13 +12099,64 @@ async function runFieldTamperingForensics({
         }
       }
 
+      // V9 AMOUNT CONVERGENCE:
+      // V8 was deliberately conservative: Amount V3 had to be corroborated
+      // by either the numeric-glyph baseline or the local-JPEG contrast test.
+      // That caused a real local rewrite such as 2.000 -> 10.000 to disappear
+      // when the whole JPG had been recompressed and the global JPEG baseline
+      // was not very different from the amount ROI.
+      //
+      // V9 keeps the global JPEG baseline, but uses it as a COMPRESSION VETO,
+      // not as a mandatory positive signal. A localized V3 anomaly can therefore
+      // survive normal document-wide JPEG compression. The V3 signal itself must
+      // still be multi-feature and spatially bounded; we never promote a single
+      // ink/edge metric on its own.
+      const v9Ink = Number(fallbackMetrics?.maxInkRatioDifference || 0);
+      const v9Stroke = Number(fallbackMetrics?.maxStrokeProxyDifference || 0);
+      const v9Edge = Number(fallbackMetrics?.maxEdgeDensityDifference || 0);
+      const v9Darkness = Number(fallbackMetrics?.maxDarknessDifference || 0);
+      const v9AnomalyRatio = Number(fallbackMetrics?.localAnomalyRatio || 0);
+      const v9FeatureVotes = Number(fallbackMetrics?.maxFeatureVotes || 0);
+      const v9StrongFeatureCount = [v9Ink, v9Stroke, v9Edge, v9Darkness]
+        .filter(v => Number.isFinite(v) && v >= 0.42).length;
+
+      const v9LocalizedRasterSignal = Boolean(
+        fallbackV3Signal &&
+        v9FeatureVotes >= 4 &&
+        v9AnomalyRatio >= 0.30 &&
+        v9AnomalyRatio <= 0.70 &&
+        v9StrongFeatureCount >= 2
+      );
+
+      // If the global JPEG baseline itself is extremely abnormal AND the local
+      // ROI is not materially more abnormal than the document background, treat
+      // the V3 result as compression noise. Otherwise preserve the localized
+      // V3 signal. This is the important distinction between document-wide JPG
+      // damage and a small rewritten amount region.
+      const v9CompressionDominated = Boolean(
+        Number.isFinite(fallbackGlobalRobustZ) &&
+        fallbackGlobalRobustZ >= 2.5 &&
+        Number.isFinite(fallbackLocalVsGlobalRatio) &&
+        fallbackLocalVsGlobalRatio < 1.20
+      );
+
+      const v9JpegAwareLocalizedSignal = Boolean(
+        v9LocalizedRasterSignal && !v9CompressionDominated
+      );
+
       const fallbackConvergentSignal = Boolean(
-        fallbackV3Signal && (Boolean(fallbackGlyph?.signal) || fallbackLocalJpegSignal)
+        fallbackV3Signal &&
+        (
+          Boolean(fallbackGlyph?.signal) ||
+          fallbackLocalJpegSignal ||
+          v9JpegAwareLocalizedSignal
+        )
       );
 
       if (fallbackConvergentSignal) {
         const fallbackStrong = Boolean(
           fallbackGlyph?.strong ||
+          (v9JpegAwareLocalizedSignal && v9StrongFeatureCount >= 3 && v9AnomalyRatio >= 0.38) ||
           (fallbackLocalJpegSignal && Number(fallbackMetrics?.maxFeatureVotes || 0) >= 5)
         );
         const fallbackFinding = {
@@ -12124,7 +12179,11 @@ async function runFieldTamperingForensics({
             documentNumericGlyphStrong: Boolean(fallbackGlyph?.strong),
             amountV3LocalizedSignal: true,
             localJpegContrastSignal: fallbackLocalJpegSignal,
-            source: 'amount-forensics-v8-local-edit-fallback',
+            v9LocalizedRasterSignal: v9LocalizedRasterSignal,
+            v9JpegAwareLocalizedSignal: v9JpegAwareLocalizedSignal,
+            v9CompressionDominated: v9CompressionDominated,
+            v9StrongFeatureCount,
+            source: 'amount-forensics-v9-local-edit-jpeg-aware',
           },
         };
         findings.push(fallbackFinding);
@@ -12156,14 +12215,24 @@ async function runFieldTamperingForensics({
           localJpegContrastSignal: fallbackLocalJpegSignal,
           localJpegContrast: fallbackLocalJpegDiagnostic,
           convergentSignal: fallbackConvergentSignal,
+          v9LocalizedRasterSignal,
+          v9JpegAwareLocalizedSignal,
+          v9CompressionDominated,
+          v9StrongFeatureCount,
+          v9AnomalyRatio: Number.isFinite(v9AnomalyRatio) ? Number(v9AnomalyRatio.toFixed(3)) : null,
         }));
       } else {
-        console.log('V8 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
+        console.log('V9 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
           amountText: fallbackText,
           numericGlyphSignal: Boolean(fallbackGlyph?.signal),
           amountV3Signal: fallbackV3Signal,
           localJpegContrastSignal: fallbackLocalJpegSignal,
           localJpegContrast: fallbackLocalJpegDiagnostic,
+          v9LocalizedRasterSignal,
+          v9JpegAwareLocalizedSignal,
+          v9CompressionDominated,
+          v9StrongFeatureCount,
+          v9AnomalyRatio: Number.isFinite(v9AnomalyRatio) ? Number(v9AnomalyRatio.toFixed(3)) : null,
           convergentSignal: fallbackConvergentSignal,
         }));
       }
@@ -12177,7 +12246,7 @@ async function runFieldTamperingForensics({
 
   const result = {
     available: true,
-    engine: 'field-tampering-forensics-v8-local-edit-jpeg-aware',
+    engine: 'field-tampering-forensics-v9-local-edit-jpeg-aware',
     bank: normalizeBank(bank),
     fileFingerprint: fileFingerprint || null,
     checkedFieldCount: fieldDiagnostics.length,
