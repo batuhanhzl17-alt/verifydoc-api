@@ -2842,10 +2842,13 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     else if (ocrConfidence < 92) textRisk = 10;
   }
 
-  // V13.2: reference placement/geometry is diagnostic only. A normal
-  // IBAN/date/name shift, OCR box difference or template spacing change must
-  // NOT inflate the risk score by itself. It remains available in the
-  // reference forensic report for human inspection.
+  // Reference field geometry is a deterministic structural signal. Keep it
+  // capped here so a single OCR placement error cannot dominate the score.
+  if (template?.available) {
+    const strong = Number(template.strongGeometryCount) || 0;
+    const missing = Number(template.missingFieldCount) || 0;
+    textRisk = Math.max(textRisk, Math.min(45, strong * 6 + missing * 4));
+  }
 
   let financialDataRisk = 0;
   const amountText = String(amount?.amountText || doc.amount || '').trim();
@@ -2857,10 +2860,14 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     );
   }
 
-  // V13.2: amount punctuation/format differences are diagnostic only.
-  // A reference using 1.000,00 while the target uses 1000,00 (or a different
-  // currency placement) is not a Photoshop finding by itself. The comparison
-  // is still returned in amountFormatComparison for forensic reporting.
+  // V10: amount formatting is retained as an independent, low-to-medium
+  // financial/document signal. It must never be treated as proof of fraud by
+  // itself, but a high-confidence mismatch in decimal/thousands separators or
+  // currency placement is too important to disappear after numeric normalization.
+  const amountFormatComparison = forensic?.referenceTemplateAnalysis?.amountFormatComparison || null;
+  if (amountFormatComparison?.available === true && amountFormatComparison.mismatch === true) {
+    financialDataRisk = Math.max(financialDataRisk, Math.min(45, Number(amountFormatComparison.score) || 25));
+  }
 
   // Validate any visible IBAN deterministically. This does not prove that an
   // IBAN belongs to the named recipient; it only detects checksum/format errors.
@@ -2878,11 +2885,9 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   const referenceForensicScore = Number(forensic?.referenceForensics?.score);
   const referenceMaxSpacing = Number(forensic?.referenceForensics?.maxSpacingScore);
   const pixelScore = Number(forensic?.pixelForensics?.score);
-  // V13.2: trusted-reference differences are diagnostic, NOT an editing score.
-  // The previous implementation let ordinary IBAN/value/font/layout differences
-  // directly become editingRisk. Real edit risk is driven by localized field
-  // tampering evidence below.
-  let editingRisk = 0;
+  let editingRisk = Number.isFinite(referenceForensicScore)
+    ? Math.max(0, Math.min(100, Math.round(referenceForensicScore)))
+    : 0;
   // V21: feed only dynamic-value same-character typography into deterministic risk. This prevents
   // normal PDF/JPEG label rendering differences from inflating risk, while still
   // allowing repeated value-render anomalies to support an editing signal.
@@ -2903,9 +2908,9 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
       editingRisk = Math.max(editingRisk, 25);
     }
   }
-  // Generic pixel/reference distance remains diagnostic only. It is not a
-  // standalone Photoshop signal because JPEG, scaling, screenshots and camera
-  // capture can all change it.
+  if (Number.isFinite(pixelScore)) {
+    editingRisk = Math.max(editingRisk, Math.min(55, Math.round(pixelScore * 0.55)));
+  }
 
   // FIELD TAMPERING V1: promote only strong multi-signal local field evidence.
   // Medium findings remain diagnostic and do not move the final risk by themselves.
@@ -2927,14 +2932,23 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
       financialDataRisk = Math.max(financialDataRisk, hasStrongAmountTamper ? 60 : 35);
     }
   }
-  // V13.2: reference spacing/anchor residual is diagnostic only.
-  // It cannot create editing risk without localized field-tampering evidence.
+  // If the reference engine has a high-confidence semantic local-gap anomaly,
+  // make it visible in the editing category even when the other visual signals
+  // are quiet. Require a strong anomaly score and a healthy reference match.
+  const anchorResidual = Number(forensic?.referenceForensics?.references?.[0]?.referenceQuality?.anchorMedianResidual);
+  if (
+    forensic?.referenceForensics?.available === true &&
+    forensic?.referenceForensics?.severity === 'strong' &&
+    Number.isFinite(referenceMaxSpacing) && referenceMaxSpacing >= 85 &&
+    (!Number.isFinite(anchorResidual) || anchorResidual <= 0.06)
+  ) {
+    editingRisk = Math.max(editingRisk, 85);
+  }
 
   const categories = {
     visualRisk,
     textRisk,
-    layoutRisk,
-    // structuralLayoutRisk is diagnostic only in V13.2; it cannot inflate risk.
+    layoutRisk: Math.max(layoutRisk, structuralLayoutRisk),
     financialDataRisk,
     editingRisk,
   };
@@ -19444,8 +19458,43 @@ Number(deterministicRiskAfterForensics.overallRisk) || 0;
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
 
-// V13.2: no reference-format or reference-spacing risk floor.
-// Those differences remain visible in diagnostics only.
+// V13: a high-confidence amount-format mismatch is a semantic content
+// discrepancy, not a raster artifact. Do not let weighted category averaging
+// dilute it back into LOW RISK. Keep the floor at MODERATE RISK; this is not a
+// standalone "fake" verdict, but it makes the discrepancy visible in the
+// final risk score.
+const finalAmountFormatComparison =
+  referenceTemplateAnalysis?.amountFormatComparison || null;
+if (
+  finalAmountFormatComparison?.available === true &&
+  finalAmountFormatComparison?.mismatch === true &&
+  Number(finalAmountFormatComparison?.confidence || 0) >= 80
+) {
+  calculatedRisk.overallRisk = Math.max(
+    46,
+    Number(calculatedRisk.overallRisk) || 0
+  );
+  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
+  console.log('V13 AMOUNT FORMAT RISK FLOOR:', JSON.stringify({
+    applied: true,
+    floor: 46,
+    confidence: Number(finalAmountFormatComparison.confidence || 0),
+    score: Number(finalAmountFormatComparison.score || 0),
+    reasons: finalAmountFormatComparison.reasons || []
+  }));
+}
+
+// A very strong, semantically matched local geometry anomaly is a deterministic
+// forensic finding. Keep the user-facing suspicious threshold aligned with that
+// evidence instead of allowing a quiet visual/text category mix to dilute it.
+if (
+  referenceForensics?.available === true &&
+  referenceForensics?.severity === 'strong' &&
+  Number(referenceForensics?.maxSpacingScore) >= 85
+) {
+  calculatedRisk.overallRisk = Math.max(46, Number(calculatedRisk.overallRisk) || 0);
+  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
+}
 
 console.log("FINAL RISK RECOMPUTED FROM UPDATED CHECKS:", JSON.stringify({
   overallRisk: calculatedRisk.overallRisk,
@@ -19483,9 +19532,15 @@ Math.abs(amountDifference) >= 1000;
 let finalRiskScore =
 Number(calculatedRisk.overallRisk) || 0;
 
-// V13.2: generic visual/layout/reference anomalies do not create a final
-// risk floor. They are supporting diagnostics only. Local field-tampering
-// evidence is handled by the deterministic risk motor.
+if (visualForensics?.available && visualForensics?.severity === "strong") {
+  const structuralSupport =
+    Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
+    Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
+  if (structuralSupport) finalRiskScore = Math.max(finalRiskScore, 70);
+}
+if (layoutForensics?.available && layoutForensics.severity === "strong") {
+  finalRiskScore = Math.max(finalRiskScore, 70);
+}
 // KRİTİK: amountAnalysis tek başına nihai risk tabanı oluşturmaz.
 // Bu alan AI tarafından çıkarılmış toplam/hesaplanan tutar verisidir;
 // tek başına 60/85 puan zorlamak, kullanıcı arayüzünde "tutar tutarsızlığı"
@@ -19507,28 +19562,55 @@ finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
 result.categories = finalDeterministicRisk.categories;
 
 // =====================================================
-// V13.2: REFERENCE DIFFERENCES ARE NOT A RISK FLOOR.
-// A reference mismatch may be caused by legitimate dynamic values, OCR box
-// placement, rendering, JPEG compression, screenshot/camera capture or a
-// different document variant. Only localized field-tampering evidence may
-// promote the final risk here.
-const strongFieldTamper =
-  fieldTamperingForensics?.available === true &&
-  fieldTamperingForensics?.severity === 'strong' &&
-  Number(fieldTamperingForensics?.strongFindingCount || 0) > 0;
+// V67: KANIT KORELASYON KÖPRÜSÜ
+// =====================================================
+// Tek başına Terra/reference bulgusu nihai riski yükseltmez; gerçek
+// dekontlarda OCR/render/layout farkları görülebilir. Ancak güçlü ve
+// lokal referans farkları, bağımsız bir forensic sinyalle (ör. strong
+// amount, güçlü Azure geometri veya anlamlı pixel/reference sapması)
+// aynı belgede birleşirse bu bulgu artık karar motoruna yansıtılır.
+const unifiedReferenceFindings = Array.isArray(result?.referenceForensicReport?.findings)
+  ? result.referenceForensicReport.findings
+  : [];
+const strongUnifiedReferenceCount = unifiedReferenceFindings.filter((x) =>
+  Number(x?.confidence) >= 90 || Number(x?.priority) === 1
+).length;
+const strongAmountSignal =
+  amountForensics?.available === true &&
+  amountForensics?.severity === 'strong' &&
+  Number(amountForensics?.score || 0) >= 80 &&
+  (amountReferenceGuided || amountForensics?.referenceGuided === true);
+const strongAzureSignal =
+  Array.isArray(azureReferenceGeometry?.strongAnomalies) &&
+  azureReferenceGeometry.strongAnomalies.some((x) => Number(x?.score) >= 90);
+const meaningfulPixelReferenceSignal =
+  pixelForensics?.available === true &&
+  Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 45 &&
+  Number(pixelForensics?.score || 0) >= 35;
 
-if (strongFieldTamper) {
-  finalRiskScore = Math.max(finalRiskScore, 60);
+const independentForensicSupportCount = [
+  strongAmountSignal,
+  strongAzureSignal,
+  meaningfulPixelReferenceSignal
+].filter(Boolean).length;
+
+if (strongUnifiedReferenceCount >= 2 && independentForensicSupportCount >= 1) {
+  // Güçlü lokal referans farkı + bağımsız forensic destek: LOW/MODERATE
+  // ağırlıklı ortalamanın altında kalmasın. Bu bir "kesin sahte" hükmü değildir.
+  finalRiskScore = Math.max(finalRiskScore, 70);
   result.categories = {
     ...(result.categories || {}),
-    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 78)
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 70)
   };
-  console.log('V13.2 LOCAL PAINT/TAMPER SUPPORT:', JSON.stringify({
-    strongFindingCount: Number(fieldTamperingForensics?.strongFindingCount || 0),
-    appliedRiskFloor: 60
+  console.log('V67 CORRELATED FORENSIC FLOOR:', JSON.stringify({
+    strongUnifiedReferenceCount,
+    independentForensicSupportCount,
+    strongAmountSignal,
+    strongAzureSignal,
+    meaningfulPixelReferenceSignal,
+    appliedFloor: 70
   }));
 }
-
 console.log("FINAL RISK CONSISTENCY:", JSON.stringify({
   overallRisk: finalRiskScore,
   categories: result.categories,
