@@ -11581,6 +11581,146 @@ async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePat
 }
 
 // =====================================================
+// V15 — SINGLE-IMAGE EDIT TRACE LAB (DIAGNOSTIC ONLY)
+// =====================================================
+// Runtime input is ONE candidate image. No transaction-specific original or
+// generic bank-template pixel comparison is used here. OCR boxes are unwrapped
+// explicitly because PaddleOCR returns coordinates under `region`; controls
+// are selected from similarly sized regions in this same image.
+// This is an exploratory feature logger, not a calibrated Photoshop verdict.
+async function runSingleImageEditTraceLabV15({ targetPath, targetOCR }) {
+  const unavailable = reason => ({
+    available: false,
+    engine: 'single-image-edit-trace-lab-v15',
+    diagnosticOnly: true,
+    riskContribution: 0,
+    inputImages: 1,
+    referenceUsed: false,
+    calibrationStatus: 'uncalibrated',
+    reason,
+  });
+  if (!targetPath || !targetOCR?.success || !Array.isArray(targetOCR?.regions)) {
+    return unavailable('target-image-or-ocr-unavailable');
+  }
+  try {
+    const buffer = await fs.readFile(targetPath);
+    const { data, info } = await sharp(buffer)
+      .removeAlpha()
+      .toColourspace('srgb')
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const W = Number(info.width) || 0;
+    const H = Number(info.height) || 0;
+    const C = Number(info.channels) || 3;
+    if (W < 100 || H < 100 || C < 3) return unavailable('invalid-raster-dimensions');
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const regions = targetOCR.regions.map((entry, index) => {
+      const r = entry?.region || entry?.box || entry;
+      const x1 = Number(r?.x1), y1 = Number(r?.y1), x2 = Number(r?.x2), y2 = Number(r?.y2);
+      if (![x1,y1,x2,y2].every(Number.isFinite)) return null;
+      const box = {
+        x1: clamp(Math.floor(Math.min(x1,x2)), 0, W-1),
+        y1: clamp(Math.floor(Math.min(y1,y2)), 0, H-1),
+        x2: clamp(Math.ceil(Math.max(x1,x2)), 0, W-1),
+        y2: clamp(Math.ceil(Math.max(y1,y2)), 0, H-1),
+      };
+      const text = String(entry?.text || '').trim();
+      if (!text || box.x2-box.x1 < 4 || box.y2-box.y1 < 4) return null;
+      const width = box.x2-box.x1+1, height = box.y2-box.y1+1;
+      if (width > W*.75 || height > H*.18) return null;
+      return { index, text, box, width, height, aspect: width/Math.max(1,height), hasDigits: /\d{2,}/.test(text) };
+    }).filter(Boolean).slice(0,120);
+    if (regions.length < 4) return unavailable('too-few-usable-ocr-regions');
+
+    const lumAt = (x,y) => {
+      const i = (y*W+x)*C;
+      return .2126*data[i] + .7152*data[i+1] + .0722*data[i+2];
+    };
+    const featureNames = ['inkRatio','edgeMean','laplacianMean','jpegBoundaryRatio','chromaMean'];
+    const featuresFor = region => {
+      const {x1,y1,x2,y2} = region.box;
+      let count=0,dark=0,edgeSum=0,lapSum=0,chromaSum=0,boundarySum=0,interiorSum=0,boundaryCount=0,interiorCount=0;
+      for(let y=y1;y<=y2;y++) for(let x=x1;x<=x2;x++) {
+        const i=(y*W+x)*C, r=data[i],g=data[i+1],b=data[i+2], l=.2126*r+.7152*g+.0722*b;
+        count++; if(l<190) dark++;
+        chromaSum += Math.max(r,g,b)-Math.min(r,g,b);
+        if(x>0&&y>0&&x<W-1&&y<H-1) {
+          const gx=lumAt(x+1,y)-lumAt(x-1,y), gy=lumAt(x,y+1)-lumAt(x,y-1);
+          const e=(Math.abs(gx)+Math.abs(gy))*.5;
+          const lap=Math.abs(4*l-lumAt(x-1,y)-lumAt(x+1,y)-lumAt(x,y-1)-lumAt(x,y+1));
+          edgeSum+=e; lapSum+=lap;
+          if(x%8===0||y%8===0){boundarySum+=e;boundaryCount++;}else{interiorSum+=e;interiorCount++;}
+        }
+      }
+      const boundaryMean=boundaryCount?boundarySum/boundaryCount:0;
+      const interiorMean=interiorCount?interiorSum/interiorCount:0;
+      return {
+        inkRatio: count?dark/count:0,
+        edgeMean: edgeSum/Math.max(1,count),
+        laplacianMean: lapSum/Math.max(1,count),
+        jpegBoundaryRatio: boundaryMean/(interiorMean+.05),
+        chromaMean: chromaSum/Math.max(1,count),
+      };
+    };
+    const median = values => {
+      const a=values.filter(Number.isFinite).sort((x,y)=>x-y);
+      if(!a.length)return null;
+      const m=Math.floor(a.length/2);
+      return a.length%2?a[m]:(a[m-1]+a[m])/2;
+    };
+    const all = regions.map(r => ({...r, features:featuresFor(r)}));
+    const candidateRows = all.filter(r => r.hasDigits || /tutar|amount|eft|fast|tl|try|iban|tarih|işlem|islem|fiş|fis/i.test(r.text));
+    const observations = candidateRows.slice(0,40).map(row => {
+      const peers = all.filter(peer => peer.index!==row.index &&
+        peer.height >= row.height*.78 && peer.height <= row.height*1.28 &&
+        peer.aspect >= row.aspect*.35 && peer.aspect <= row.aspect*2.85 &&
+        (!row.hasDigits || peer.hasDigits));
+      const control = {};
+      for(const metric of featureNames) {
+        const values=peers.map(p=>p.features[metric]);
+        const med=median(values);
+        const mad=med==null?null:median(values.map(v=>Math.abs(v-med)));
+        const scale=mad==null?null:1.4826*mad;
+        const raw=med==null||!Number.isFinite(scale)||scale<1e-6?null:(row.features[metric]-med)/scale;
+        control[metric]={value:Number(row.features[metric].toFixed(5)),peerMedian:med==null?null:Number(med.toFixed(5)),peerMad:mad==null?null:Number(mad.toFixed(5)),robustZ:raw==null?null:Number(raw.toFixed(3)),peerCount:values.length};
+      }
+      const outlierMetrics=featureNames.filter(k=>Number.isFinite(control[k].robustZ)&&Math.abs(control[k].robustZ)>=3.5);
+      return {
+        regionIndex:row.index,
+        text:row.text.slice(0,120),
+        targetBox:row.box,
+        targetKind:row.hasDigits?'numeric-or-mixed':'critical-label-or-field',
+        matchedPeerCount:peers.length,
+        features:control,
+        exploratoryOutlierMetrics:outlierMetrics,
+        exploratoryOutlierHint:peers.length>=4&&outlierMetrics.length>=2,
+      };
+    });
+    return {
+      available:true,
+      engine:'single-image-edit-trace-lab-v15',
+      diagnosticOnly:true,
+      riskContribution:0,
+      inputImages:1,
+      referenceUsed:false,
+      calibrationStatus:'uncalibrated',
+      imageDimensions:{width:W,height:H},
+      ocrRegionCount:targetOCR.regions.length,
+      usableRegionCount:regions.length,
+      candidateFieldCount:candidateRows.length,
+      controlMethod:'same-image OCR regions with similar box height/aspect; numeric fields use numeric peers',
+      metrics:featureNames,
+      exploratoryHintCount:observations.filter(x=>x.exploratoryOutlierHint).length,
+      observations,
+      interpretation:{status:'diagnostic-only',meaning:'Local statistical outliers are investigation hints, not proof of Photoshop editing.',importantLimit:'A seamless erase on a uniform background may leave no detectable single-image trace. Missing OCR text alone is not treated as an edit signal.'},
+    };
+  } catch(error) {
+    return unavailable(error?.message||String(error));
+  }
+}
+
+// =====================================================
 // V14.4 — TARGET-ONLY PAINT-OVER / BACKGROUND CONTINUITY DIAGNOSTIC
 // =====================================================
 // Amaç: OCR karakterinin kendisini "farklı" bulmak yerine, yazının hemen
@@ -15391,6 +15531,7 @@ let fontForensics = null;
 let fieldTamperingForensics = null;
 let paintOverBackgroundForensicsV143 = null;
 let paintOverResidualLabV145 = null;
+let singleImageEditTraceLabV15 = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -15580,6 +15721,21 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
   } catch (error) {
     console.warn("PAINT-OVER BACKGROUND FORENSICS V14.4 HATASI:", error?.message || error);
     paintOverBackgroundForensicsV143 = null;
+  }
+}
+
+// V15: one-image forensic feature lab. It runs on the submitted image only;
+// its exploratory statistics are diagnostic and have no risk contribution.
+if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
+  try {
+    singleImageEditTraceLabV15 = await runSingleImageEditTraceLabV15({
+      targetPath: forensicTargetPath,
+      targetOCR: paddleImageOCR,
+    });
+    console.log("SINGLE-IMAGE EDIT TRACE LAB V15:", JSON.stringify(singleImageEditTraceLabV15));
+  } catch (error) {
+    console.warn("SINGLE-IMAGE EDIT TRACE LAB V15 ERROR:", error?.message || error);
+    singleImageEditTraceLabV15 = null;
   }
 }
 
@@ -17665,6 +17821,7 @@ if (paintOverBackgroundForensicsV143) {
   result.paintOverBackgroundForensicsV143 = paintOverBackgroundForensicsV143;
 }
 if (paintOverResidualLabV145) result.paintOverResidualLabV145 = paintOverResidualLabV145;
+if (singleImageEditTraceLabV15) result.singleImageEditTraceLabV15 = singleImageEditTraceLabV15;
 
 if (amountForensics) {
   result.amountForensics = amountForensics;
