@@ -2753,6 +2753,7 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   const referenceForensicScore = Number(forensic?.referenceForensics?.score);
   const referenceMaxSpacing = Number(forensic?.referenceForensics?.maxSpacingScore);
   const pixelScore = Number(forensic?.pixelForensics?.score);
+  const advancedForensicsScore = Number(forensic?.advancedForensics?.score);
   let editingRisk = Number.isFinite(referenceForensicScore)
     ? Math.max(0, Math.min(100, Math.round(referenceForensicScore)))
     : 0;
@@ -2778,6 +2779,11 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   }
   if (Number.isFinite(pixelScore)) {
     editingRisk = Math.max(editingRisk, Math.min(55, Math.round(pixelScore * 0.55)));
+  }
+  // V68: RGB/CFA-like chroma + JPEG 8x8 residual + amount-tone is a corroborating
+  // local signal. It is deliberately capped so one forensic family cannot dominate.
+  if (Number.isFinite(advancedForensicsScore) && forensic?.advancedForensics?.available === true) {
+    editingRisk = Math.max(editingRisk, Math.min(70, Math.round(advancedForensicsScore * 0.70)));
   }
   // If the reference engine has a high-confidence semantic local-gap anomaly,
   // make it visible in the editing category even when the other visual signals
@@ -3843,6 +3849,203 @@ async function runPixelForensics(targetPath, referencePaths = []) {
       error: message,
       evidence:'Piksel/görüntü adli incelemesi teknik nedenle tamamlanamadı; bu nedenle piksel skoru olumlu/olumsuz kanıt olarak kullanılmadı.'
     };
+  }
+}
+
+// =====================================================
+// V68 — RGB / CFA-LIKE CHROMA / JPEG GRID / AMOUNT TONE FORENSICS
+// =====================================================
+// Bu katman gerçekten görüntü pikselleri üzerinde çalışır. OCR/reference
+// metin farklarını tek başına sahtecilik sinyali saymaz.
+//
+// Not: JPEG/PNG/WebP gibi zaten demosaiced görüntülerde sensörün fiziksel CFA
+// matrisini geri kurmak mümkün değildir. Buradaki CFA sinyali, kanal seviyesinde
+// RGB ilişki/chroma tutarlılığı için kullanılan "CFA-like" bir proxy'dir.
+// =====================================================
+const advancedForensicsCache = new Map();
+
+function v68Stats(values) {
+  const a = values.filter(Number.isFinite);
+  if (!a.length) return { mean:0, std:0, median:0, p10:0, p90:0 };
+  const sorted = [...a].sort((x,y)=>x-y);
+  const q = p => sorted[Math.max(0, Math.min(sorted.length-1, Math.floor((sorted.length-1)*p)))];
+  const mean = a.reduce((x,y)=>x+y,0)/a.length;
+  const variance = a.reduce((x,y)=>x+(y-mean)*(y-mean),0)/a.length;
+  return { mean, std:Math.sqrt(variance), median:q(.5), p10:q(.1), p90:q(.9) };
+}
+
+function v68Clamp(v) { return Math.max(0, Math.min(100, Number(v)||0)); }
+
+function v68RegionTo512(region, sourceW, sourceH, W=512, H=512) {
+  if (!region || !sourceW || !sourceH) return null;
+  const x1=Math.max(0,Math.min(W-1,Math.round(Number(region.x1)*W/sourceW)));
+  const y1=Math.max(0,Math.min(H-1,Math.round(Number(region.y1)*H/sourceH)));
+  const x2=Math.max(x1+2,Math.min(W,Math.round(Number(region.x2)*W/sourceW)));
+  const y2=Math.max(y1+2,Math.min(H,Math.round(Number(region.y2)*H/sourceH)));
+  return {x1,y1,x2,y2};
+}
+
+function v68CollectRGB(raw, W, H, region, excludeInk=false) {
+  const out={r:[],g:[],b:[],luma:[],rg:[],gb:[],rb:[]};
+  if (!region) return out;
+  const x1=Math.max(0,Math.min(W-1,region.x1)), y1=Math.max(0,Math.min(H-1,region.y1));
+  const x2=Math.max(x1+1,Math.min(W,region.x2)), y2=Math.max(y1+1,Math.min(H,region.y2));
+  for(let y=y1;y<y2;y++) for(let x=x1;x<x2;x++) {
+    const i=(y*W+x)*3, r=raw[i],g=raw[i+1],b=raw[i+2];
+    const l=.2126*r+.7152*g+.0722*b;
+    if(excludeInk && l<80) continue;
+    out.r.push(r); out.g.push(g); out.b.push(b); out.luma.push(l);
+    out.rg.push(r-g); out.gb.push(g-b); out.rb.push(r-b);
+  }
+  return out;
+}
+
+function v68RingRegions(region, W, H) {
+  const w=Math.max(4,region.x2-region.x1), h=Math.max(4,region.y2-region.y1);
+  const pad=Math.max(3,Math.round(Math.min(w,h)*0.65));
+  const left={x1:Math.max(0,region.x1-pad),y1:region.y1,x2:region.x1,y2:region.y2};
+  const right={x1:region.x2,y1:region.y1,x2:Math.min(W,region.x2+pad),y2:region.y2};
+  const top={x1:region.x1,y1:Math.max(0,region.y1-pad),x2:region.x2,y2:region.y1};
+  const bottom={x1:region.x1,y1:region.y2,x2:region.x2,y2:Math.min(H,region.y2+pad)};
+  return [left,right,top,bottom].filter(r=>r.x2-r.x1>=2 && r.y2-r.y1>=2);
+}
+
+function v68Histogram(values,bins=16) {
+  const h=new Array(bins).fill(0); if(!values.length) return h;
+  for(const v of values) h[Math.max(0,Math.min(bins-1,Math.floor((Number(v)||0)/256*bins)))]++;
+  const n=values.length; return h.map(x=>x/n);
+}
+
+function v68JSD(a,b) {
+  const eps=1e-9; let js=0;
+  for(let i=0;i<Math.min(a.length,b.length);i++) {
+    const x=a[i],y=b[i],m=(x+y)/2;
+    js += .5*(x?x*Math.log((x+eps)/(m+eps)):0) + .5*(y?y*Math.log((y+eps)/(m+eps)):0);
+  }
+  return js/Math.log(2);
+}
+
+function v68ChannelFeatures(raw,W,H,region) {
+  const c=v68CollectRGB(raw,W,H,region,true);
+  const sr=v68Stats(c.r), sg=v68Stats(c.g), sb=v68Stats(c.b), sl=v68Stats(c.luma);
+  const srg=v68Stats(c.rg), sgb=v68Stats(c.gb), srb=v68Stats(c.rb);
+  return {
+    sampleCount:c.r.length,
+    rgb:{mean:[sr.mean,sg.mean,sb.mean].map(x=>Number(x.toFixed(3))),std:[sr.std,sg.std,sb.std].map(x=>Number(x.toFixed(3)))},
+    luma:{mean:Number(sl.mean.toFixed(3)),std:Number(sl.std.toFixed(3)),p10:Number(sl.p10.toFixed(3)),p90:Number(sl.p90.toFixed(3))},
+    chroma:{rgMean:Number(srg.mean.toFixed(3)),gbMean:Number(sgb.mean.toFixed(3)),rbMean:Number(srb.mean.toFixed(3)),rgStd:Number(srg.std.toFixed(3)),gbStd:Number(sgb.std.toFixed(3)),rbStd:Number(srb.std.toFixed(3))},
+    histogram:{r:v68Histogram(c.r),g:v68Histogram(c.g),b:v68Histogram(c.b)}
+  };
+}
+
+function v68ChannelAnomaly(a,b) {
+  if(!a?.sampleCount || !b?.sampleCount) return 0;
+  const meanDiff = ([0,1,2].map(i=>Math.abs(a.rgb.mean[i]-b.rgb.mean[i])/255).reduce((x,y)=>x+y,0)/3);
+  const stdDiff = ([0,1,2].map(i=>Math.abs(a.rgb.std[i]-b.rgb.std[i])/128).reduce((x,y)=>x+y,0)/3);
+  const chromaDiff = [Math.abs(a.chroma.rgMean-b.chroma.rgMean)/128,Math.abs(a.chroma.gbMean-b.chroma.gbMean)/128,Math.abs(a.chroma.rbMean-b.chroma.rbMean)/128].reduce((x,y)=>x+y,0)/3;
+  const hist=(v68JSD(a.histogram.r,b.histogram.r)+v68JSD(a.histogram.g,b.histogram.g)+v68JSD(a.histogram.b,b.histogram.b))/3;
+  return v68Clamp(meanDiff*220 + stdDiff*180 + chromaDiff*220 + hist*180);
+}
+
+function v68JPEGGrid(raw, W, H, originalEncodedBuffer=null, roi=null, controls=[]) {
+  if(!originalEncodedBuffer) return {available:false,score:0};
+  return {available:true, score:0, roiBoundaryResidual:0, controlBoundaryResidual:0, boundaryDelta:0, periodicity:0};
+}
+
+async function v68JPEGGridAnalysis(encodedBuffer, W=512, H=512, roi=null, controls=[]) {
+  try {
+    const normalized=await sharp(encodedBuffer).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().raw().toBuffer();
+    const recompressed=await sharp(normalized,{raw:{width:W,height:H,channels:3}}).jpeg({quality:90,chromaSubsampling:'4:4:4'}).toBuffer();
+    const reread=await sharp(recompressed).removeAlpha().raw().toBuffer();
+    const residual=new Float32Array(W*H);
+    for(let y=0;y<H;y++) for(let x=0;x<W;x++) {
+      const i=(y*W+x)*3;
+      residual[y*W+x]=(Math.abs(normalized[i]-reread[i])+Math.abs(normalized[i+1]-reread[i+1])+Math.abs(normalized[i+2]-reread[i+2]))/3;
+    }
+    const boundaryMean=(r)=>{
+      let s=0,n=0;
+      for(let y=r.y1;y<r.y2;y++) for(let x=r.x1;x<r.x2;x++) if((x%8===0)||(y%8===0)){s+=residual[y*W+x];n++;}
+      return n?s/n:0;
+    };
+    const interiorMean=(r)=>{
+      let s=0,n=0;
+      for(let y=r.y1;y<r.y2;y++) for(let x=r.x1;x<r.x2;x++) if((x%8!==0)&&(y%8!==0)){s+=residual[y*W+x];n++;}
+      return n?s/n:0;
+    };
+    const roiB=roi?boundaryMean(roi):0, roiI=roi?interiorMean(roi):0;
+    const ctrl=controls.map(r=>({b:boundaryMean(r),i:interiorMean(r)})).filter(x=>x.b+x.i>0);
+    const cb=ctrl.length?ctrl.reduce((s,x)=>s+x.b,0)/ctrl.length:0;
+    const ci=ctrl.length?ctrl.reduce((s,x)=>s+x.i,0)/ctrl.length:0;
+    const ratio=(roiB/Math.max(.001,roiI))/(Math.max(.001,cb/Math.max(.001,ci)));
+    let periodic=0, periodicN=0;
+    if(roi){
+      for(let y=roi.y1;y<roi.y2;y++) for(let x=roi.x1;x+8<roi.x2;x++){periodic+=Math.abs(residual[y*W+x]-residual[y*W+x+8]);periodicN++;}
+    }
+    const periodicity=periodicN?Math.max(0,1-(periodic/periodicN)/20):0;
+    const delta=Math.max(0,ratio-1);
+    const score=v68Clamp(delta*55+periodicity*25);
+    return {available:true,score:Math.round(score),roiBoundaryResidual:Number(roiB.toFixed(3)),roiInteriorResidual:Number(roiI.toFixed(3)),controlBoundaryResidual:Number(cb.toFixed(3)),controlInteriorResidual:Number(ci.toFixed(3)),boundaryRatio:Number(ratio.toFixed(3)),periodicity:Number(periodicity.toFixed(3)),quality:90,grid:'8x8'};
+  } catch(error){ return {available:false,score:0,error:error?.message||String(error)}; }
+}
+
+async function runV68Forensics(targetPath, amountForensics=null, bank=null, referencePaths=[]) {
+  if(!targetPath) return null;
+  try {
+    const stat=await fs.stat(targetPath);
+    const cacheKey=`v68:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}`;
+    const cached=advancedForensicsCache.get(cacheKey); if(cached) return JSON.parse(JSON.stringify(cached));
+    const encoded=await fs.readFile(targetPath);
+    const meta=await sharp(encoded).metadata();
+    const sourceW=Number(meta.width)||0, sourceH=Number(meta.height)||0;
+    const W=512,H=512;
+    const rgbRaw=await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().raw().toBuffer();
+    let amountRoi=v68RegionTo512(amountForensics?.region,sourceW,sourceH,W,H);
+    if(!amountRoi && amountForensics?.referenceGuided && amountForensics?.referenceAmountPositionScore!=null){
+      // Fallback anchor is obtained below from the trusted bank reference.
+      try {
+        const anchor=await getReferenceAmountAnchor(bank);
+        if(anchor) amountRoi={x1:Math.round(anchor.xNorm*W),y1:Math.round(anchor.yNorm*H),x2:Math.round((anchor.xNorm+anchor.widthNorm)*W),y2:Math.round((anchor.yNorm+anchor.heightNorm)*H)};
+      } catch {}
+    }
+    const full={x1:0,y1:0,x2:W,y2:H};
+    const controls=amountRoi?v68RingRegions(amountRoi,W,H):[{x1:0,y1:0,x2:W,y2:Math.floor(H/4)},{x1:0,y1:Math.floor(H*3/4),x2:W,y2:H}];
+    const roiFeatures=amountRoi?v68ChannelFeatures(rgbRaw,W,H,amountRoi):v68ChannelFeatures(rgbRaw,W,H,full);
+    const controlFeatures=controls.map(r=>v68ChannelFeatures(rgbRaw,W,H,r)).filter(x=>x.sampleCount>20);
+    const controlAvg=controlFeatures.length?{
+      sampleCount:controlFeatures.reduce((s,x)=>s+x.sampleCount,0),
+      rgb:{mean:[0,1,2].map(i=>controlFeatures.reduce((s,x)=>s+x.rgb.mean[i],0)/controlFeatures.length),std:[0,1,2].map(i=>controlFeatures.reduce((s,x)=>s+x.rgb.std[i],0)/controlFeatures.length)},
+      luma:{mean:controlFeatures.reduce((s,x)=>s+x.luma.mean,0)/controlFeatures.length,std:controlFeatures.reduce((s,x)=>s+x.luma.std,0)/controlFeatures.length},
+      chroma:{rgMean:controlFeatures.reduce((s,x)=>s+x.chroma.rgMean,0)/controlFeatures.length,gbMean:controlFeatures.reduce((s,x)=>s+x.chroma.gbMean,0)/controlFeatures.length,rbMean:controlFeatures.reduce((s,x)=>s+x.chroma.rbMean,0)/controlFeatures.length,rgStd:0,gbStd:0,rbStd:0},
+      histogram:{r:[...new Array(16)].map((_,i)=>controlFeatures.reduce((s,x)=>s+x.histogram.r[i],0)/controlFeatures.length),g:[...new Array(16)].map((_,i)=>controlFeatures.reduce((s,x)=>s+x.histogram.g[i],0)/controlFeatures.length),b:[...new Array(16)].map((_,i)=>controlFeatures.reduce((s,x)=>s+x.histogram.b[i],0)/controlFeatures.length)}
+    }:roiFeatures;
+    const channelScore=amountRoi?v68ChannelAnomaly(roiFeatures,controlAvg):0;
+    const jpegGrid=await v68JPEGGridAnalysis(encoded,W,H,amountRoi,controls);
+
+    let referenceTone=null;
+    if(amountRoi && referencePaths?.length){
+      try {
+        const anchor=await getReferenceAmountAnchor(bank);
+        const refPath=referencePaths[0];
+        const rb=await fs.readFile(refPath);
+        const rm=await sharp(rb).metadata();
+        if(anchor && rm.width && rm.height){
+          const rr={x1:Math.round(anchor.xNorm*W),y1:Math.round(anchor.yNorm*H),x2:Math.round((anchor.xNorm+anchor.widthNorm)*W),y2:Math.round((anchor.yNorm+anchor.heightNorm)*H)};
+          const refRaw=await sharp(rb).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().raw().toBuffer();
+          const tf=v68ChannelFeatures(rgbRaw,W,H,amountRoi), rf=v68ChannelFeatures(refRaw,W,H,rr);
+          const lumaDelta=Math.abs(tf.luma.mean-rf.luma.mean)/255;
+          const chromaDelta=(Math.abs(tf.chroma.rgMean-rf.chroma.rgMean)+Math.abs(tf.chroma.gbMean-rf.chroma.gbMean))/256;
+          referenceTone={available:true,lumaDelta:Number(lumaDelta.toFixed(4)),chromaDelta:Number(chromaDelta.toFixed(4)),score:Math.round(v68Clamp(lumaDelta*120+chromaDelta*100)),referenceFile:path.basename(refPath)};
+        }
+      } catch(error){ referenceTone={available:false,error:error?.message||String(error)}; }
+    }
+    const toneLocal=amountRoi?Math.abs(roiFeatures.luma.mean-controlAvg.luma.mean)/255:0;
+    const localToneScore=v68Clamp(toneLocal*180);
+    const composite=v68Clamp(channelScore*.35+jpegGrid.score*.30+localToneScore*.20+(referenceTone?.score||0)*.15);
+    const out={available:true,engine:'v68-rgb-cfa-jpeg-grid-amount-tone-forensics',amountRegion:amountRoi,metrics:{rgbCfa:{score:Math.round(channelScore),roi:roiFeatures,control:controlAvg},jpegGrid,amountReferenceTone:{localToneScore:Math.round(localToneScore),reference:referenceTone}},score:Math.round(composite),severity:composite>=70?'strong':composite>=40?'moderate':composite>=18?'low':'none',evidence:composite>=40?'Tutar bölgesinde kanal/chroma, JPEG 8x8 residual ve lokal ton sinyallerinden oluşan birleşik bir anomali bulundu. Tek başına sahtecilik hükmü değildir.':'Yeni RGB/CFA-like, JPEG Grid ve Amount Reference Tone sinyalleri güçlü bir lokal anomali üretmedi.'};
+    advancedForensicsCache.set(cacheKey,out); return JSON.parse(JSON.stringify(out));
+  } catch(error){
+    console.warn('V68 ADVANCED FORENSICS HATASI:',error?.message||error);
+    return {available:false,engine:'v68-rgb-cfa-jpeg-grid-amount-tone-forensics',score:0,severity:'unknown',error:error?.message||String(error)};
   }
 }
 
@@ -13481,6 +13684,7 @@ let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
 let pixelForensics = null;
+let advancedForensics = null;
 let openSourceForensics = null;
 let fontForensics = null;
 let azureLayout = null;
@@ -14349,6 +14553,22 @@ if ((type === "image" || type === "pdf") && bank && reference) {
     console.log("PIXEL FORENSICS:", JSON.stringify(pixelForensics));
   } catch (error) {
     console.warn("PIXEL FORENSICS HATASI:", error?.message || error);
+  }
+}
+
+// =====================================================
+// V68 — RGB / CFA-LIKE / JPEG GRID / AMOUNT REFERENCE TONE
+// =====================================================
+if ((type === "image" || type === "pdf") && bank && reference) {
+  try {
+    const visualReferencePath = getVisualReferencePath(reference);
+    const trustedReferencePaths = Array.isArray(visualReferencePath)
+      ? visualReferencePath.filter(Boolean)
+      : (visualReferencePath ? [visualReferencePath] : []);
+    advancedForensics = await runV68Forensics(forensicTargetPath, amountForensics, bank, trustedReferencePaths);
+    console.log("V68 ADVANCED FORENSICS:", JSON.stringify(advancedForensics));
+  } catch (error) {
+    console.warn("V68 ADVANCED FORENSICS HATASI:", error?.message || error);
   }
 }
 
@@ -15594,6 +15814,10 @@ if (openSourceForensics) {
 
 if (pixelForensics) {
   result.pixelForensics = pixelForensics;
+}
+
+if (advancedForensics) {
+  result.advancedForensics = advancedForensics;
 }
 
 if (amountForensics) {
@@ -17808,6 +18032,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   referenceTemplateAnalysis,
   referenceForensics,
   pixelForensics,
+  advancedForensics,
   openSourceForensics,
   azureLayout,
   azureReferenceGeometry,
@@ -17822,6 +18047,16 @@ if (openSourceForensics?.strongCorroboration) {
 }
 
 console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
+if (advancedForensics?.available) {
+  console.log("V68 RGB/CFA/JPEG-GRID/AMOUNT-TONE ACTIVE:", JSON.stringify({
+    score: advancedForensics.score,
+    severity: advancedForensics.severity,
+    rgbCfaScore: advancedForensics.metrics?.rgbCfa?.score || 0,
+    jpegGridScore: advancedForensics.metrics?.jpegGrid?.score || 0,
+    amountToneScore: advancedForensics.metrics?.amountReferenceTone?.localToneScore || 0,
+    referenceToneScore: advancedForensics.metrics?.amountReferenceTone?.reference?.score || 0
+  }));
+}
 
 // Risk motorunu amount forensics değişikliğinden sonra tekrar hesapla.
 const deterministicRiskAfterForensics =
