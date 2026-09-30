@@ -12507,11 +12507,8 @@ async function runFieldTamperingForensics({
       isCritical && (
         elaSignal ||
         internalSignal ||
-        // V14.8: amount V3/V9 raster anomalies are candidate-only. They are
-        // deliberately excluded from MEDIUM by themselves because a known
-        // original Enpara receipt can produce the same localized raster signal.
-        // For amount, require an independent numeric-glyph + local-contrast
-        // corroboration before surfacing a field-level caution.
+        // V14.8: amount V3/V9 raster anomalies are candidate-only.
+        // They must not create a field finding by themselves.
         (field === 'amount' && documentNumericGlyphSignal && localJpegContrastSignal) ||
         (field !== 'amount' && amountV3LocalizedSignal)
       )
@@ -12774,14 +12771,6 @@ async function runFieldTamperingForensics({
       );
 
       if (fallbackConvergentSignal) {
-        // V14.8 V9 CANDIDATE-ONLY GATE:
-        // A localized V3/V9 raster anomaly is NOT a fraud finding by itself.
-        // We observed the same V9 signal on a known-original Enpara receipt.
-        // Therefore V9 remains a candidate detector/diagnostic only; it must
-        // never create a MEDIUM finding or confidence score on its own.
-        // Actual fraud promotion belongs to independent evidence (preferably
-        // exact-original-vs-target paint-over residual analysis).
-        //
         // V13.1 AMOUNT STRONG GATE:
         // Amount V3/V9 are intentionally sensitive detectors, but they are not
         // sufficient by themselves for a STRONG field-tampering finding.
@@ -12800,10 +12789,9 @@ async function runFieldTamperingForensics({
         const amountFormatMismatch = Boolean(
           amountForensics?.amountFormatComparison?.mismatch
         );
+        // V14.8: V9/V3 localized raster is candidate-only.
+        // It cannot create a MEDIUM finding on its own.
         const fallbackStrong = Boolean(
-          // V14.8: V9 localized raster evidence is candidate-only and cannot
-          // promote an amount to STRONG. Keep only an independent corroborating
-          // family here; exact-pair paint-over evidence is handled separately.
           (
             fallbackGlyph?.strong &&
             fallbackLocalJpegSignal
@@ -12834,20 +12822,19 @@ async function runFieldTamperingForensics({
             amountFormatMismatch,
             amountV3LocalizedSignal: true,
             localJpegContrastSignal: fallbackLocalJpegSignal,
-            v9LocalizedRasterSignal: v9LocalizedRasterSignal,
-            v9JpegAwareLocalizedSignal: v9JpegAwareLocalizedSignal,
-            v9CompressionDominated: v9CompressionDominated,
+            v9LocalizedRasterSignal,
+            v9JpegAwareLocalizedSignal,
+            v9CompressionDominated,
             v9StrongFeatureCount,
             source: 'amount-forensics-v9-local-edit-jpeg-aware',
-          candidateOnly: !fallbackStrong,
           },
-        };
-        if (fallbackStrong) findings.push(fallbackFinding);
+        } : null;
+        if (fallbackStrong && fallbackFinding) findings.push(fallbackFinding);
         fieldDiagnostics.push({
           field: 'amount',
           label: 'Tutar',
           targetValue: fallbackText,
-          signalCount: 2,
+          signalCount: fallbackStrong ? 2 : 1,
           signals: fallbackFinding?.signals || {
             documentNumericGlyphSignal: Boolean(fallbackGlyph?.signal),
             documentNumericGlyphStrong: Boolean(fallbackGlyph?.strong),
@@ -15459,94 +15446,188 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
 
 
 // =====================================================
-// V14.7 V3 resolver: exact original remains explicit/configured only.
+// V14.7 — EXACT ORIGINAL PAIR RESIDUAL ENGINE (DIAGNOSTIC ONLY)
+// =====================================================
 async function resolveExactOriginalPathV147(explicitOriginalPath = null) {
-  const candidates = [explicitOriginalPath, process.env.VERIFYDOC_EXACT_ORIGINAL_PATH]
-    .filter(Boolean).map(String);
-  for (const candidate of candidates) {
-    try { const st = await fs.stat(candidate); if (st.isFile()) return candidate; } catch {}
-  }
+  const candidates=[explicitOriginalPath,process.env.VERIFYDOC_EXACT_ORIGINAL_PATH].filter(Boolean).map(String);
+  for(const candidate of candidates){try{const st=await fs.stat(candidate);if(st.isFile())return candidate;}catch{}}
   return null;
 }
+function grayV147(data,i){return .2126*data[i]+.7152*data[i+1]+.0722*data[i+2];}
+async function loadRgbV147(filePath,width,height){const out=await sharp(filePath).resize(width,height,{fit:"fill",kernel:sharp.kernel.lanczos3}).removeAlpha().raw().toBuffer({resolveWithObject:true});return {data:out.data,width:out.info.width,height:out.info.height};}
+function translationScoreV147(target,original,width,height,dx,dy,step=4){const x1=Math.max(0,dx),y1=Math.max(0,dy),x2=Math.min(width,width+dx),y2=Math.min(height,height+dy);if(x2-x1<200||y2-y1<150)return-Infinity;let st=0,so=0,stt=0,soo=0,sto=0,n=0;for(let y=y1;y<y2;y+=step)for(let x=x1;x<x2;x+=step){const ti=(y*width+x)*3,oi=((y-dy)*width+(x-dx))*3,tv=grayV147(target,ti),ov=grayV147(original,oi);st+=tv;so+=ov;stt+=tv*tv;soo+=ov*ov;sto+=tv*ov;n++;}if(n<1000)return-Infinity;const mt=st/n,mo=so/n,c=sto/n-mt*mo,vt=Math.max(1e-9,stt/n-mt*mt),vo=Math.max(1e-9,soo/n-mo*mo);return c/Math.sqrt(vt*vo);}
+function findTranslationV147(target,original,width,height){let best={score:-Infinity,dx:0,dy:0};for(let dy=-20;dy<=20;dy++)for(let dx=-20;dx<=20;dx++){const score=translationScoreV147(target,original,width,height,dx,dy,4);if(score>best.score)best={score,dx,dy};}return best;}
+function annulusResidualV147(target,original,width,height,box,inner,outer,dx,dy){const x1=Math.max(0,Math.floor(box.x1-outer)),y1=Math.max(0,Math.floor(box.y1-outer)),x2=Math.min(width,Math.ceil(box.x2+outer)),y2=Math.min(height,Math.ceil(box.y2+outer));let n=0,sumL=0,sumC=0;for(let y=y1;y<y2;y++)for(let x=x1;x<x2;x++){const d=Math.min(Math.abs(x-box.x1),Math.abs(x-box.x2),Math.abs(y-box.y1),Math.abs(y-box.y2));if(d<inner||d>=outer)continue;const ox=x-dx,oy=y-dy;if(ox<0||oy<0||ox>=width||oy>=height)continue;const ti=(y*width+x)*3,oi=(oy*width+ox)*3;sumL+=Math.abs(grayV147(target,ti)-grayV147(original,oi));sumC+=(Math.abs(target[ti]-original[oi])+Math.abs(target[ti+1]-original[oi+1])+Math.abs(target[ti+2]-original[oi+2]))/3;n++;}return n?{samples:n,lumaResidual:sumL/n,colorResidual:sumC/n}:null;}
+async function runPaintOverExactPairResidualV147({targetPath,originalPath,targetOCR}) {
+  const base = {
+    available:false,
+    engine:"paint-over-exact-pair-residual-v14.7",
+    diagnosticOnly:true,
+    riskContribution:0,
+    calibrationStatus:"exact-pair-diagnostic-only"
+  };
 
-// VERIFYDOC V14.7 V3 — Exact Original Pair Residual
-// Diagnostic-only integration module.
-// IMPORTANT: riskContribution stays 0 until a larger clean/edited calibration set validates thresholds.
-
-function medianV147V3(a){const x=a.filter(Number.isFinite).sort((p,q)=>p-q);if(!x.length)return 0;const m=Math.floor(x.length/2);return x.length%2?x[m]:(x[m-1]+x[m])/2;}
-function madV147V3(a,m=medianV147V3(a)){return medianV147V3(a.filter(Number.isFinite).map(v=>Math.abs(v-m)));}
-function robustZV147V3(v,m,d){return d>1e-6?0.67448975*(v-m)/d:(Math.abs(v-m)<1e-6?0:(v>m?99:-99));}
-function grayV147V3(data,i){return .2126*data[i]+.7152*data[i+1]+.0722*data[i+2];}
-function rectV147V3(r,w,h){const x1=Math.max(0,Math.floor(r.x1)),y1=Math.max(0,Math.floor(r.y1)),x2=Math.min(w,Math.ceil(r.x2)),y2=Math.min(h,Math.ceil(r.y2));return x2>x1&&y2>y1?{x1,y1,x2,y2}:null;}
-function normalizeRegionV147V3(r,w,h){
-  const q=r?.r||r?.box||r;
-  if(!q)return null;
-  if(Number.isFinite(q.x1)&&Number.isFinite(q.y1)&&Number.isFinite(q.x2)&&Number.isFinite(q.y2))return rectV147V3(q,w,h);
-  if(Number.isFinite(q.x)&&Number.isFinite(q.y)&&Number.isFinite(q.width)&&Number.isFinite(q.height))return rectV147V3({x1:q.x,y1:q.y,x2:q.x+q.width,y2:q.y+q.height},w,h);
-  return null;
-}
-function annulusV147V3(target,original,w,h,b,inner,outer,dx,dy){
-  const x1=Math.max(0,Math.floor(b.x1-outer)),y1=Math.max(0,Math.floor(b.y1-outer)),x2=Math.min(w,Math.ceil(b.x2+outer)),y2=Math.min(h,Math.ceil(b.y2+outer));
-  let n=0,sum=0,gt10=0,gt20=0;
-  for(let y=y1;y<y2;y++)for(let x=x1;x<x2;x++){
-    const d=Math.min(Math.abs(x-b.x1),Math.abs(x-b.x2),Math.abs(y-b.y1),Math.abs(y-b.y2));if(d<inner||d>=outer)continue;
-    const ox=x-dx,oy=y-dy;if(ox<0||oy<0||ox>=w||oy>=h)continue;
-    const ti=(y*w+x)*3,oi=(oy*w+ox)*3;
-    const v=Math.abs(grayV147V3(target,ti)-grayV147V3(original,oi));
-    n++;sum+=v;if(v>10)gt10++;if(v>20)gt20++;
+  if (!targetPath || !originalPath || !targetOCR?.success) {
+    return {...base,status:"unavailable",reason:"exact original path or OCR unavailable"};
   }
-  return {samples:n,mean:n?sum/n:0,gt10:n?gt10/n:0,gt20:n?gt20/n:0};
-}
-function boxResidualV147V3(target,original,w,h,b,dx,dy){
-  let n=0,sum=0,sum2=0,gt5=0,gt10=0,gt20=0;
-  for(let y=b.y1;y<b.y2;y++)for(let x=b.x1;x<b.x2;x++){
-    const ox=x-dx,oy=y-dy;if(ox<0||oy<0||ox>=w||oy>=h)continue;
-    const ti=(y*w+x)*3,oi=(oy*w+ox)*3;
-    const v=Math.abs(grayV147V3(target,ti)-grayV147V3(original,oi));
-    n++;sum+=v;sum2+=v*v;if(v>5)gt5++;if(v>10)gt10++;if(v>20)gt20++;
+  if (path.resolve(targetPath) === path.resolve(originalPath)) {
+    return {...base,status:"unavailable",reason:"target and original paths are identical"};
   }
-  const mean=n?sum/n:0;
-  return {samples:n,mean,variance:Math.max(0,n?sum2/n-mean*mean:0),gt5:n?gt5/n:0,gt10:n?gt10/n:0,gt20:n?gt20/n:0};
-}
-function translationScoreV147V3(target,original,w,h,dx,dy,step=4){
-  const x1=Math.max(0,dx),y1=Math.max(0,dy),x2=Math.min(w,w+dx),y2=Math.min(h,h+dy);if(x2-x1<300||y2-y1<200)return-Infinity;
-  let st=0,so=0,stt=0,soo=0,sto=0,n=0;
-  for(let y=y1;y<y2;y+=step)for(let x=x1;x<x2;x+=step){const ti=(y*w+x)*3,oi=((y-dy)*w+(x-dx))*3,t=grayV147V3(target,ti),o=grayV147V3(original,oi);st+=t;so+=o;stt+=t*t;soo+=o*o;sto+=t*o;n++;}
-  const mt=st/n,mo=so/n,vt=Math.max(1e-9,stt/n-mt*mt),vo=Math.max(1e-9,soo/n-mo*mo),c=sto/n-mt*mo;return c/Math.sqrt(vt*vo);
-}
-function findTranslationV147V3(target,original,w,h){let best={dx:0,dy:0,score:-Infinity};for(let dy=-20;dy<=20;dy++)for(let dx=-20;dx<=20;dx++){const s=translationScoreV147V3(target,original,w,h,dx,dy);if(s>best.score)best={dx,dy,score:s};}return best;}
 
-async function runPaintOverExactPairResidualV147({targetPath,originalPath,targetOCR}){
-  const base={available:false,engine:'paint-over-exact-pair-residual-v14.7-v3',diagnosticOnly:true,riskContribution:0,calibrationStatus:'single-known-edited-pair-diagnostic'};
-  if(!targetPath||!originalPath||!targetOCR?.success)return {...base,status:'unavailable',reason:'exact original path or OCR unavailable'};
-  if(path.resolve(targetPath)===path.resolve(originalPath))return {...base,status:'unavailable',reason:'target and original paths are identical'};
-  try{
-    const tm=await sharp(targetPath).metadata();const width=Number(tm.width),height=Number(tm.height);if(!width||!height)return {...base,status:'error',error:'target dimensions unavailable'};
-    const tr=await sharp(targetPath).removeAlpha().raw().toBuffer({resolveWithObject:true});
-    const or=await sharp(originalPath).resize(width,height,{fit:'fill',kernel:sharp.kernel.lanczos3}).removeAlpha().raw().toBuffer({resolveWithObject:true});
-    const target=tr.data,original=or.data,alignment=findTranslationV147V3(target,original,width,height);
-    if(!Number.isFinite(alignment.score)||alignment.score<.90)return {...base,available:true,status:'alignment-failed',alignment};
-    const regions=Array.isArray(targetOCR.regions)?targetOCR.regions:[];
-    const candidates=regions.map((r,i)=>({regionIndex:i,text:String(r?.text||r?.value||'').trim(),box:normalizeRegionV147V3(r,width,height)})).filter(o=>o.text&&o.box)
-      .map(o=>({...o,width:o.box.x2-o.box.x1,height:o.box.y2-o.box.y1,area:(o.box.x2-o.box.x1)*(o.box.y2-o.box.y1)}))
-      .filter(o=>o.width>=8&&o.height>=6&&o.width<=width*.75&&o.height<=height*.25);
-    if(candidates.length<4)return {...base,available:true,status:'insufficient-controls',alignment,regionCount:candidates.length};
-    const observations=[];
-    for(const targetRegion of candidates){
-      const numeric=/\d/.test(targetRegion.text);const peers=candidates.filter(p=>p!==targetRegion&&/\d/.test(p.text)===numeric&&Math.abs(Math.log((p.area+1)/(targetRegion.area+1)))<.9);if(peers.length<2)continue;
-      const inner=boxResidualV147V3(target,original,width,height,targetRegion.box,alignment.dx,alignment.dy);
-      const peerInner=peers.map(p=>boxResidualV147V3(target,original,width,height,p.box,alignment.dx,alignment.dy).mean);const im=medianV147V3(peerInner),id=madV147V3(peerInner,im);
-      const rings={};
-      for(const [name,a,b] of [['1-2px',1,2],['2-4px',2,4],['4-7px',4,7]]){const value=annulusV147V3(target,original,width,height,targetRegion.box,a,b,alignment.dx,alignment.dy);const cv=peers.map(p=>annulusV147V3(target,original,width,height,p.box,a,b,alignment.dx,alignment.dy).mean);const cm=medianV147V3(cv),cd=madV147V3(cv,cm);rings[name]={value:value.mean,controlMedian:cm,controlMAD:cd,robustZ:robustZV147V3(value.mean,cm,cd),ratio:cm>0?value.mean/cm:null,gt20:value.gt20};}
-      observations.push({regionIndex:targetRegion.regionIndex,text:targetRegion.text,targetBox:targetRegion.box,peerCount:peers.length,inner:{...inner,controlMedian:im,controlMAD:id,robustZ:robustZV147V3(inner.mean,im,id),ratio:im>0?inner.mean/im:null},rings});
+  try {
+    const meta = await sharp(targetPath).metadata();
+    const width = Number(meta.width), height = Number(meta.height);
+    if (!width || !height) return {...base,status:"error",error:"target dimensions unavailable"};
+
+    const tr = await sharp(targetPath).removeAlpha().raw().toBuffer({resolveWithObject:true});
+    const or = await loadRgbV147(originalPath,width,height);
+    const target = tr.data, original = or.data;
+    const alignment = findTranslationV147(target,original,width,height);
+
+    if (!Number.isFinite(alignment.score) || alignment.score < .90) {
+      return {...base,available:true,status:"alignment-failed",alignment};
     }
-    observations.sort((a,b)=>Math.abs(b.inner.robustZ)-Math.abs(a.inner.robustZ));
-    const fieldHits=observations.filter(o=>o.inner.mean>15&&Math.abs(o.inner.robustZ)>=5);
-    const amountLike=observations.filter(o=>/\d/.test(o.text)&&/(tutar|eft|[23][.,]000)/i.test(o.text));
-    return {...base,available:true,status:'diagnostic',exactPair:true,imageDimensions:{width,height},alignment:{method:'resize-original-to-target + translation-grid',dx:alignment.dx,dy:alignment.dy,correlation:Number(alignment.score.toFixed(6))},ringWidthsPx:['1-2','2-4','4-7'],controlMethod:'same-image OCR peers matched by numeric/non-numeric class and box area',candidateCount:candidates.length,observationCount:observations.length,topObservations:observations.slice(0,12),fieldHits:fieldHits.map(o=>({text:o.text,meanResidual:o.inner.mean,robustZ:o.inner.robustZ,ratio:o.inner.ratio})),corroboration:{amountLikeRegionCount:amountLike.length,twoFieldCorroboration:amountLike.length>=2},note:'Diagnostic only. Exact-pair residual evidence is not converted to risk until calibrated across multiple clean/edited pairs.'};
-  }catch(error){return {...base,status:'error',error:error?.message||String(error)};}
-}
 
+    const regions = Array.isArray(targetOCR.regions) ? targetOCR.regions : [];
+    const candidates = regions
+      .map((r,i)=>({
+        regionIndex:i,
+        text:String(r?.text || r?.value || "").trim(),
+        box:rectV146(r?.r || r,width,height)
+      }))
+      .filter(o=>o.text && o.box)
+      .map(o=>({...o,
+        width:o.box.x2-o.box.x1,
+        height:o.box.y2-o.box.y1,
+        area:(o.box.x2-o.box.x1)*(o.box.y2-o.box.y1)
+      }))
+      .filter(o=>o.width>=8 && o.height>=6 && o.width<=width*.75 && o.height<=height*.25);
+
+    if (candidates.length < 4) {
+      return {...base,available:true,status:"insufficient-controls",alignment,regionCount:candidates.length};
+    }
+
+    const isNumeric = t => /[0-9]/.test(t);
+    const observations = [];
+
+    for (const targetRegion of candidates) {
+      const numeric = isNumeric(targetRegion.text);
+      const peers = candidates.filter(p =>
+        p !== targetRegion &&
+        Math.abs(Math.log((p.area+1)/(targetRegion.area+1))) < 1 &&
+        isNumeric(p.text) === numeric
+      );
+      if (peers.length < 3) continue;
+
+      const rings = {};
+      for (const [ring,inner,outer] of [["1-2px",1,2],["2-4px",2,4],["4-7px",4,7]]) {
+        const value = annulusResidualV147(target,original,width,height,targetRegion.box,inner,outer,alignment.dx,alignment.dy);
+        if (!value) continue;
+        const pv = peers
+          .map(p=>annulusResidualV147(target,original,width,height,p.box,inner,outer,alignment.dx,alignment.dy))
+          .filter(Boolean);
+        const metrics = {};
+
+        for (const key of ["lumaResidual","colorResidual"]) {
+          const vals = pv.map(v=>v[key]).filter(Number.isFinite);
+          const med = medianV146(vals), mad = madV146(vals,med), val = value[key];
+          metrics[key] = {
+            value:val,
+            controlMedian:med,
+            mad,
+            ratio:med>0 ? val/med : null,
+            robustZ:robustZV146(val,med,mad)
+          };
+        }
+
+        const z = Object.values(metrics).map(x=>Math.abs(x.robustZ)).filter(Number.isFinite);
+        const meanAbsRobustZ = z.length ? z.reduce((a,b)=>a+b,0)/z.length : 0;
+        const strongMetricCount = Object.values(metrics).filter(x =>
+          Number.isFinite(x.robustZ) && Math.abs(x.robustZ) >= 2.5 &&
+          Number.isFinite(x.ratio) && x.ratio >= 2
+        ).length;
+
+        rings[ring] = {
+          samples:value.samples,
+          metrics,
+          meanAbsRobustZ,
+          strongMetricCount
+        };
+      }
+
+      const ringEntries = Object.values(rings);
+      const strongRingCount = ringEntries.filter(r =>
+        r.meanAbsRobustZ >= 2.5 && r.strongMetricCount >= 1
+      ).length;
+      const veryStrongRingCount = ringEntries.filter(r =>
+        r.meanAbsRobustZ >= 3.5 && r.strongMetricCount >= 1
+      ).length;
+      const rv = ringEntries.map(r=>r.meanAbsRobustZ).filter(Number.isFinite);
+      const index = rv.length ? rv.reduce((a,b)=>a+b,0)/rv.length : 0;
+
+      observations.push({
+        regionIndex:targetRegion.regionIndex,
+        text:targetRegion.text,
+        targetBox:targetRegion.box,
+        peerCount:peers.length,
+        paintOverResidualIndex:Number(index.toFixed(3)),
+        strongRingCount,
+        veryStrongRingCount,
+        rings
+      });
+    }
+
+    observations.sort((a,b)=>b.paintOverResidualIndex-a.paintOverResidualIndex);
+
+    // Controlled exact-pair promotion:
+    // - strong geometric alignment
+    // - at least one region with 2+ strong rings, OR 1 very-strong ring + another strong ring
+    // - never use amount-format, OCR text differences, reference typography or JPEG alone
+    const alignedForPromotion = alignment.score >= .95;
+    const strongRegions = observations.filter(o => o.strongRingCount >= 2);
+    const corroboratedRegions = observations.filter(o => o.strongRingCount >= 1 && o.veryStrongRingCount >= 1);
+    const promoted = alignedForPromotion && (strongRegions.length >= 1 || corroboratedRegions.length >= 1);
+
+    // Bounded contribution: exact-pair evidence is intentionally modest until a larger
+    // clean/edited calibration set validates thresholds. It can only add, never subtract.
+    let riskContribution = 0;
+    let evidenceLevel = "none";
+    if (promoted) {
+      const strongest = observations[0] || null;
+      if ((strongest?.strongRingCount || 0) >= 2 && (strongest?.paintOverResidualIndex || 0) >= 2.5) {
+        riskContribution = 12;
+        evidenceLevel = "strong-local-edit";
+      } else {
+        riskContribution = 7;
+        evidenceLevel = "medium-local-edit";
+      }
+    }
+
+    return {
+      ...base,
+      available:true,
+      status:promoted ? "promoted-diagnostic" : "diagnostic",
+      exactPair:true,
+      diagnosticOnly:!promoted,
+      riskContribution,
+      evidenceLevel,
+      calibrationStatus:"bounded-exact-pair-promotion-v1",
+      targetPath:path.basename(targetPath),
+      originalPath:path.basename(originalPath),
+      imageDimensions:{width,height},
+      alignment:{method:"resize-original-to-target + translation-grid",dx:alignment.dx,dy:alignment.dy,correlation:Number(alignment.score.toFixed(6))},
+      ringWidthsPx:["1-2","2-4","4-7"],
+      controlMethod:"same-image OCR peers matched by box area and numeric/non-numeric class",
+      candidateCount:candidates.length,
+      observationCount:observations.length,
+      promotion:{alignedForPromotion,strongRegionCount:strongRegions.length,corroboratedRegionCount:corroboratedRegions.length},
+      topObservations:observations.slice(0,12),
+      note:"Exact original ile hedef arasındaki lokal piksel residualı ölçülür. Promotion yalnızca güçlü hizalama ve çoklu ring residual koşullarında yapılır; tutar formatı, OCR metin farkı, referans tipografisi veya JPEG tek başına kanıt değildir. Eşikler geniş kalibrasyon seti ile doğrulanana kadar risk katkısı sınırlıdır."
+    };
+  } catch(error) {
+    return {...base,available:false,status:"error",error:error?.message||String(error)};
+  }
+}
 
 // =====================================================
 // V14.6 — PAINT-OVER RESIDUAL INDEX V1 (DIAGNOSTIC ONLY)
