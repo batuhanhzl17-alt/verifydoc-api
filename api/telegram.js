@@ -1473,6 +1473,10 @@ async function analyzeFile({
 
 expectedDetails,
 
+ exactOriginalBuffer = null,
+ exactOriginalFileName = null,
+ exactOriginalMimeType = null,
+
 }) {
 
  console.log(
@@ -1748,6 +1752,56 @@ expectedDetails,
  blob,
  fileName
  );
+
+ // ===================================================
+ // V14.7 EXACT ORIGINAL
+ // ===================================================
+
+ if (exactOriginalBuffer?.length) {
+
+ const exactOriginalBlob =
+ new Blob(
+ [exactOriginalBuffer],
+ {
+ type:
+ exactOriginalMimeType ||
+ "application/octet-stream",
+ }
+ );
+
+ form.append(
+ "exactOriginal",
+ exactOriginalBlob,
+ exactOriginalFileName ||
+ "exact-original"
+ );
+
+ console.log(
+ "V14.7 EXACT ORIGINAL REQUEST:",
+ JSON.stringify({
+ available: true,
+ field: "exactOriginal",
+ fileName:
+ exactOriginalFileName || "exact-original",
+ mimeType:
+ exactOriginalMimeType || "application/octet-stream",
+ size:
+ exactOriginalBuffer.length,
+ })
+ );
+
+ } else {
+
+ console.log(
+ "V14.7 EXACT ORIGINAL REQUEST:",
+ JSON.stringify({
+ available: false,
+ field: null,
+ reason: "exactOriginalBuffer verilmedi",
+ })
+ );
+
+ }
 
 
  // ===================================================
@@ -2711,6 +2765,67 @@ Analiz ediliyor...`;
 
 
  // =================================================
+ // V14.7 EXACT ORIGINAL
+ // =================================================
+
+ let exactOriginal = null;
+
+ const exactOriginalMessage =
+ originalMessage?.reply_to_message || null;
+
+ const exactOriginalInfo =
+ extractFileFromMessage(
+ exactOriginalMessage
+ );
+
+ if (exactOriginalInfo?.fileId) {
+
+ try {
+
+ exactOriginal =
+ await downloadTelegramFile(
+ exactOriginalInfo.fileId
+ );
+
+ console.log(
+ "V14.7 EXACT ORIGINAL TELEGRAM:",
+ JSON.stringify({
+ available: true,
+ sourceMessageId:
+ exactOriginalMessage?.message_id || null,
+ fileName:
+ exactOriginalInfo.fileName || null,
+ mimeType:
+ exactOriginalInfo.mimeType || null,
+ size:
+ exactOriginal?.buffer?.length || 0,
+ })
+ );
+
+ } catch (exactOriginalError) {
+
+ console.error(
+ "V14.7 EXACT ORIGINAL TELEGRAM ERROR:",
+ exactOriginalError
+ );
+
+ }
+
+ } else {
+
+ console.log(
+ "V14.7 EXACT ORIGINAL TELEGRAM:",
+ JSON.stringify({
+ available: false,
+ reason:
+ "Hedef belge bir orijinal belge mesajına reply değil",
+ })
+ );
+
+ }
+
+
+ // =================================================
  // VERIFYDOC
  // =================================================
 
@@ -2739,6 +2854,15 @@ Analiz ediliyor...`;
  statementMode,
 
  expectedDetails,
+
+ exactOriginalBuffer:
+ exactOriginal?.buffer || null,
+
+ exactOriginalFileName:
+ exactOriginalInfo?.fileName || null,
+
+ exactOriginalMimeType:
+ exactOriginalInfo?.mimeType || null,
 
  });
 
