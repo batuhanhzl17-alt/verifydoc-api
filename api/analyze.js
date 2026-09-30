@@ -652,125 +652,6 @@ function normalizeOCRAmountLiteral(value) {
   return sign + raw.replace(/[.,]/g, "");
 }
 
-
-// V10 AMOUNT FORMAT FORENSICS:
-// Keep the visible formatting of a monetary value separate from numeric-value
-// normalization. `10.000,00` and `10000,00` are numerically equal but visually
-// different. That difference is useful forensic evidence and must not be erased.
-function buildAmountFormatSignature(value) {
-  const raw = String(value ?? '').trim();
-  if (!raw) return null;
-
-  const compact = raw.replace(/\u00a0/g, ' ');
-  const numberMatch = compact.match(/[+-]?\d[\d.,\s]*/);
-  if (!numberMatch) return null;
-  const numberLiteral = numberMatch[0].trim();
-  const unsigned = numberLiteral.replace(/^[+-]/, '');
-  const sign = /^[+-]/.test(numberLiteral) ? numberLiteral[0] : '';
-
-  const commaCount = (unsigned.match(/,/g) || []).length;
-  const dotCount = (unsigned.match(/\./g) || []).length;
-  const commaPositions = [...unsigned].map((c,i)=>c===','?i:-1).filter(i=>i>=0);
-  const dotPositions = [...unsigned].map((c,i)=>c==='.'?i:-1).filter(i=>i>=0);
-  const lastComma = unsigned.lastIndexOf(',');
-  const lastDot = unsigned.lastIndexOf('.');
-  const lastSep = Math.max(lastComma, lastDot);
-  const digitsAfter = lastSep >= 0 ? unsigned.length-lastSep-1 : 0;
-  const decimalSeparator = (lastSep >= 0 && digitsAfter >= 1 && digitsAfter <= 2)
-    ? unsigned[lastSep]
-    : null;
-  const decimalDigits = decimalSeparator ? digitsAfter : 0;
-  const integerPart = decimalSeparator ? unsigned.slice(0,lastSep) : unsigned;
-  const integerDigits = integerPart.replace(/[.,\s]/g,'').length;
-  const groups = integerPart.split(/[.,\s]/).filter(Boolean);
-  const thousandsSeparator = groups.length > 1
-    ? (integerPart.match(/[.,\s]+/g)?.[0]?.[0] || null)
-    : null;
-
-  const currencyMatch = compact.match(/(₺|TL|TRY|EUR|USD|GBP|€|\$|£)/i);
-  const currency = currencyMatch ? currencyMatch[1].toUpperCase() : null;
-  const currencyIndex = currencyMatch ? currencyMatch.index : -1;
-  const numberIndex = numberMatch.index ?? compact.indexOf(numberLiteral);
-  const currencyPosition = currencyMatch
-    ? (currencyIndex < numberIndex ? 'prefix' : 'suffix')
-    : 'none';
-  const beforeNumber = numberIndex > 0 ? compact.slice(0, numberIndex) : '';
-  const afterNumber = compact.slice(numberIndex + numberLiteral.length);
-  const superscriptChars = [...compact].filter(c => /[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁽⁾]/.test(c));
-
-  // A stable, value-independent pattern. Numeric digits are replaced so this
-  // can safely be retained with the reference template metadata.
-  const normalizedPattern = numberLiteral
-    .replace(/[0-9]/g, '#')
-    .replace(/\s+/g,' ')
-    .trim();
-
-  return {
-    rawPattern: normalizedPattern,
-    sign: sign || null,
-    thousandsSeparator,
-    decimalSeparator,
-    decimalDigits,
-    integerDigits,
-    integerGroupCount: Math.max(1, groups.length),
-    hasThousandsSeparator: groups.length > 1,
-    hasCurrency: Boolean(currency),
-    currency,
-    currencyPosition,
-    spaceBeforeCurrency: currencyPosition === 'suffix' ? /\s$/.test(beforeNumber + numberLiteral) : false,
-    spaceAfterCurrency: currencyPosition === 'prefix' ? /\s/.test(afterNumber) : false,
-    superscriptChars,
-    hasSuperscript: superscriptChars.length > 0,
-    literalLength: raw.length,
-  };
-}
-
-function compareAmountFormatSignatures(targetSignature, referenceSignatures) {
-  const refs = (Array.isArray(referenceSignatures) ? referenceSignatures : [referenceSignatures])
-    .filter(Boolean);
-  if (!targetSignature || !refs.length) {
-    return { available:false, mismatch:false, score:0, confidence:0, reasons:[] };
-  }
-
-  const compareOne = (ref) => {
-    const reasons=[];
-    if (targetSignature.decimalSeparator !== ref.decimalSeparator) reasons.push('ondalık ayırıcı farklı');
-    if (Boolean(targetSignature.hasThousandsSeparator) !== Boolean(ref.hasThousandsSeparator)) reasons.push('binlik ayırıcı kullanımı farklı');
-    else if (targetSignature.hasThousandsSeparator && targetSignature.thousandsSeparator !== ref.thousandsSeparator) reasons.push('binlik ayırıcı farklı');
-    if (targetSignature.decimalDigits !== ref.decimalDigits) reasons.push('ondalık basamak sayısı farklı');
-    if (targetSignature.currency !== ref.currency) reasons.push('para birimi gösterimi farklı');
-    if (targetSignature.currencyPosition !== ref.currencyPosition) reasons.push('para biriminin konumu farklı');
-    if (Boolean(targetSignature.hasSuperscript) !== Boolean(ref.hasSuperscript)) reasons.push('üst simge karakter kullanımı farklı');
-    if (targetSignature.rawPattern !== ref.rawPattern) reasons.push('tutarın görünür yazım biçimi farklı');
-    const mismatchCount = reasons.length;
-    return { mismatchCount, reasons };
-  };
-
-  const comparisons = refs.map(compareOne);
-  comparisons.sort((a,b)=>b.mismatchCount-a.mismatchCount);
-  const worst = comparisons[0];
-  const mismatchVotes = comparisons.filter(x=>x.mismatchCount>0).length;
-  const matchingVotes = comparisons.length - mismatchVotes;
-  const consensusMismatch = mismatchVotes >= Math.max(1, Math.ceil(comparisons.length * 0.5));
-  const score = consensusMismatch
-    ? Math.min(70, 28 + worst.mismatchCount * 9 + (mismatchVotes >= 2 ? 10 : 0))
-    : Math.min(25, worst.mismatchCount * 8);
-
-  return {
-    available:true,
-    mismatch: consensusMismatch,
-    score,
-    confidence: Math.min(99, 72 + (mismatchVotes >= 2 ? 12 : 0) + (comparisons.length >= 2 ? 6 : 0)),
-    target: targetSignature,
-    referenceCount: refs.length,
-    mismatchVotes,
-    matchingVotes,
-    consensusMismatch,
-    reasons:[...new Set(worst.reasons)],
-    comparisons,
-  };
-}
-
 // V56: PaddleOCR sometimes produces mixed thousands/decimal separators such as
 // "1.004.19" or "1,004.19".  These are OCR formatting artifacts, not amount
 // mismatches. Normalize only the numeric literal while preserving the actual
@@ -1066,10 +947,7 @@ async function getAzureReferenceLayouts(bank, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return [];
 
-  const selectedReferenceForCache = Array.isArray(selectedReferencePath)
-    ? selectedReferencePath.find(Boolean)
-    : selectedReferencePath;
-  const selectedKey = selectedReferenceForCache ? path.resolve(selectedReferenceForCache) : "ALL";
+  const selectedKey = selectedReferencePath ? path.resolve(selectedReferencePath) : "ALL";
   const cacheKey = `azure-reference-layout:v2:${normalizedBank}:${selectedKey}`;
   if (azureReferenceLayoutCache.has(cacheKey)) {
     return azureReferenceLayoutCache.get(cacheKey);
@@ -2815,7 +2693,6 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   const layoutScore = Number(forensic?.layoutForensics?.score);
   const ocrConfidence = Number(forensic?.paddleImageOCR?.confidence);
   const amount = forensic?.amountForensics || null;
-  const fieldTampering = forensic?.fieldTamperingForensics || null;
   const doc = result?.documentData || {};
   const template = forensic?.referenceTemplateAnalysis || null;
 
@@ -2860,15 +2737,6 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     );
   }
 
-  // V10: amount formatting is retained as an independent, low-to-medium
-  // financial/document signal. It must never be treated as proof of fraud by
-  // itself, but a high-confidence mismatch in decimal/thousands separators or
-  // currency placement is too important to disappear after numeric normalization.
-  const amountFormatComparison = forensic?.referenceTemplateAnalysis?.amountFormatComparison || null;
-  if (amountFormatComparison?.available === true && amountFormatComparison.mismatch === true) {
-    financialDataRisk = Math.max(financialDataRisk, Math.min(45, Number(amountFormatComparison.score) || 25));
-  }
-
   // Validate any visible IBAN deterministically. This does not prove that an
   // IBAN belongs to the named recipient; it only detects checksum/format errors.
   const ibanCandidates = [doc.recipientIban, doc.iban].filter(Boolean);
@@ -2910,27 +2778,6 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   }
   if (Number.isFinite(pixelScore)) {
     editingRisk = Math.max(editingRisk, Math.min(55, Math.round(pixelScore * 0.55)));
-  }
-
-  // FIELD TAMPERING V1: promote only strong multi-signal local field evidence.
-  // Medium findings remain diagnostic and do not move the final risk by themselves.
-  if (fieldTampering?.available === true) {
-    if (fieldTampering.severity === 'strong' && Number(fieldTampering.strongFindingCount) > 0) {
-      editingRisk = Math.max(editingRisk, 78);
-    } else if (fieldTampering.severity === 'medium' && Number(fieldTampering.mediumFindingCount) > 0) {
-      editingRisk = Math.max(editingRisk, 35);
-    }
-
-    // Only an amount-field tampering finding feeds financialDataRisk. Other
-    // fields (IBAN/date/name/layout) belong to editingRisk and must not be
-    // mislabeled as a financial arithmetic inconsistency.
-    const amountTamperFindings = (Array.isArray(fieldTampering.findings) ? fieldTampering.findings : [])
-      .filter(x => String(x?.field || '').toLowerCase() === 'amount' &&
-        (String(x?.severity || '') === 'strong' || String(x?.severity || '') === 'medium'));
-    if (amountTamperFindings.length) {
-      const hasStrongAmountTamper = amountTamperFindings.some(x => String(x?.severity || '') === 'strong');
-      financialDataRisk = Math.max(financialDataRisk, hasStrongAmountTamper ? 60 : 35);
-    }
   }
   // If the reference engine has a high-confidence semantic local-gap anomaly,
   // make it visible in the editing category even when the other visual signals
@@ -4949,11 +4796,7 @@ async function getReferenceAmountAnchor(bank) {
   const cacheKey = `amount-anchor:v16:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
-  // V11: Accept both Turkish and US-style grouping without relying on a
-  // substring match (e.g. `2,000.00` must be recognized as one amount, not
-  // accidentally as `000.00`). This is used only to locate the reference
-  // amount; the exact visible format is preserved separately by the signature.
-  const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?(?:(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?)|(?:\d+(?:[.,]\d{1,2})?))\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
+  const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
   const primaryLabelRe = /(?:giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|giden\s*tutar|\btutar\b)/i;
   const negativeLabelRe = /(?:sorgu|sorgulama|işlem\s*no|islem\s*no|fiş|fis|referans|iban|hesap\s*no|müşteri|musteri|masraf|komisyon|ücret|ucret)/i;
 
@@ -5047,9 +4890,6 @@ async function getReferenceAmountAnchor(bank) {
           widthNorm: Math.max(0.001, (r.x2-r.x1) / width),
           heightNorm: Math.max(0.001, (r.y2-r.y1) / height),
           referenceFile: path.basename(referencePath),
-          // SECURITY: retain only the value-independent formatting signature,
-          // never the dynamic reference amount itself.
-          valueFormatSignature: buildAmountFormatSignature(best.candidate.text),
         });
       } catch (error) {
         console.warn('REFERENCE AMOUNT ANCHOR DOSYA HATASI:', path.basename(referencePath), error?.message || error);
@@ -5062,25 +4902,6 @@ async function getReferenceAmountAnchor(bank) {
       return null;
     }
 
-    const formatSignatureKey = (sig) => sig ? JSON.stringify({
-      rawPattern: sig.rawPattern,
-      thousandsSeparator: sig.thousandsSeparator,
-      decimalSeparator: sig.decimalSeparator,
-      decimalDigits: sig.decimalDigits,
-      integerGroupCount: sig.integerGroupCount,
-      hasThousandsSeparator: sig.hasThousandsSeparator,
-      currency: sig.currency,
-      currencyPosition: sig.currencyPosition,
-      hasSuperscript: sig.hasSuperscript,
-    }) : null;
-    const formatSignatures = [];
-    for (const entry of entries) {
-      const sig = entry.valueFormatSignature;
-      const key = formatSignatureKey(sig);
-      if (!sig || !key || formatSignatures.some(x => formatSignatureKey(x) === key)) continue;
-      formatSignatures.push(sig);
-    }
-
     const anchor = {
       bank: normalizedBank,
       pageNumber: 1,
@@ -5089,8 +4910,6 @@ async function getReferenceAmountAnchor(bank) {
       widthNorm: median(entries.map(x => x.widthNorm)),
       heightNorm: median(entries.map(x => x.heightNorm)),
       referenceCount: entries.length,
-      formatSignatures,
-      formatSignatureCount: formatSignatures.length,
       spread: {
         x: Math.max(...entries.map(x => x.xNorm)) - Math.min(...entries.map(x => x.xNorm)),
         y: Math.max(...entries.map(x => x.yNorm)) - Math.min(...entries.map(x => x.yNorm)),
@@ -5104,11 +4923,7 @@ async function getReferenceAmountAnchor(bank) {
       bank: anchor.bank, pageNumber: anchor.pageNumber,
       xNorm: anchor.xNorm, yNorm: anchor.yNorm,
       widthNorm: anchor.widthNorm, heightNorm: anchor.heightNorm,
-      referenceCount: anchor.referenceCount,
-      formatSignatureCount: anchor.formatSignatureCount,
-      formatSignatures: anchor.formatSignatures,
-      spread: anchor.spread,
-      source: anchor.source
+      referenceCount: anchor.referenceCount, spread: anchor.spread, source: anchor.source
     }));
     return anchor;
   } catch (error) {
@@ -8409,7 +8224,6 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
             labelKey: rule.key,
             labelPresent: true,
             templateRole: classifyReferenceTemplateRole(rule.key, label.text),
-            valueFormatSignature: rule.key === 'amount' ? buildAmountFormatSignature(value.text) : null,
             style: { source: 'reference-image-ocr', fontNames: [], avgFontHeight: Math.max(1, r.y2 - r.y1), avgCharWidth: 0, itemCount: 1 },
             referenceFile: path.basename(referencePath),
           };
@@ -8486,9 +8300,6 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         labelPresent: Boolean(labelItem),
         valueTextLength: chars,
         templateRole: classifyReferenceTemplateRole(rule.key, row.text),
-        valueFormatSignature: rule.key === 'amount'
-          ? buildAmountFormatSignature(valueItems.map(x => String(x.str || '')).join(''))
-          : null,
         style: { source:'pdf-text-metadata', fontNames, avgFontHeight, avgCharWidth, itemCount:valueItems.length },
         referenceFile: path.basename(referencePath),
       };
@@ -8553,7 +8364,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         const width = Number(rendered?.width) || 0;
         const height = Number(rendered?.height) || 0;
 
-        function addRasterField(key, labelRegion, valueRegion, labelText, valueText = '') {
+        function addRasterField(key, labelRegion, valueRegion, labelText) {
           if (!width || !height || !valueRegion) return;
           const r = valueRegion;
           const box = {
@@ -8565,9 +8376,6 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
             labelKey: key,
             labelPresent: true,
             templateRole: classifyReferenceTemplateRole(key, labelText),
-            valueFormatSignature: key === 'amount'
-              ? buildAmountFormatSignature(String(valueText || ''))
-              : null,
             style: { source:'reference-raster-ocr', fontNames:[], avgFontHeight:Math.max(1,r.y2-r.y1), avgCharWidth:0, itemCount:1 },
             referenceFile: path.basename(referencePath),
           };
@@ -8610,18 +8418,9 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
           }
           if (!value) continue;
 
-          if (rule.key === 'amount') {
-            console.log('REFERENCE PDF RASTER AMOUNT FORMAT V12:', JSON.stringify({
-              bank: normalizedBank,
-              referenceFile: path.basename(referencePath),
-              text: String(value.text || ''),
-              formatSignature: buildAmountFormatSignature(String(value.text || '')),
-            }));
-          }
-
           // Primary amount fields must contain a numeric/currency value.
           if (rule.key === 'amount' && !/(?:\d|TL|TRY|₺|EUR|USD|GBP)/i.test(String(value.text || ''))) continue;
-          addRasterField(rule.key, lr, value.region, label.text, value.text);
+          addRasterField(rule.key, lr, value.region, label.text);
         }
       }
     } catch (error) {
@@ -8706,93 +8505,6 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
       }
       if (!usableEntries.length) continue;
       fields[field] = aggregateReferenceField(usableEntries);
-    }
-
-    // V11 AMOUNT FORMAT BRIDGE:
-    // The V16 trusted Telegram raster anchor already knows where the primary
-    // amount lives, but some Enpara references expose the label/value as one
-    // OCR region (or only through the raster anchor), so the generic template
-    // field extractor can legitimately end up with no `amount` field.
-    // Bridge the two pipelines here: use only the anchor geometry + the
-    // value-independent format signature. Never retain the actual reference
-    // amount text.
-    try {
-      const amountAnchor = await getReferenceAmountAnchor(normalizedBank);
-      const anchorFormats = Array.isArray(amountAnchor?.formatSignatures)
-        ? amountAnchor.formatSignatures.filter(Boolean)
-        : [];
-
-      if (amountAnchor && anchorFormats.length) {
-        if (!fields.amount) {
-          const anchorVariants = anchorFormats.map(sig => ({
-            xNorm: amountAnchor.xNorm,
-            yNorm: amountAnchor.yNorm,
-            widthNorm: amountAnchor.widthNorm,
-            heightNorm: amountAnchor.heightNorm,
-            pageNumber: amountAnchor.pageNumber || 1,
-            labelKey: 'amount',
-            labelPresent: true,
-            templateRole: 'primaryAmount',
-            valueFormatSignature: sig,
-            style: {
-              source: 'trusted-telegram-raster-amount-anchor-v16',
-              fontNames: [],
-              avgFontHeight: 0,
-              avgCharWidth: 0,
-              itemCount: 1,
-            },
-            referenceFile: 'trusted-amount-anchor-ensemble',
-          }));
-          fields.amount = {
-            ...anchorVariants[0],
-            referenceCount: amountAnchor.referenceCount || 1,
-            variants: anchorVariants,
-            spread: amountAnchor.spread || null,
-            valueFormatSignature: anchorVariants[0]?.valueFormatSignature || null,
-            amountFormatSource: 'trusted-telegram-raster-amount-anchor-v16',
-          };
-          console.log('REFERENCE TEMPLATE AMOUNT V11: ANCHOR FORMAT BRIDGE', JSON.stringify({
-            bank: normalizedBank,
-            referenceCount: amountAnchor.referenceCount || 0,
-            formatSignatureCount: anchorFormats.length,
-            formatSignatures: anchorFormats,
-          }));
-        } else {
-          // Generic template extraction found an amount field. If its format
-          // signature is missing, enrich it from the trusted anchor instead of
-          // replacing the geometry/content classification.
-          const currentFormats = [
-            fields.amount?.valueFormatSignature,
-            ...(Array.isArray(fields.amount?.variants)
-              ? fields.amount.variants.map(v => v?.valueFormatSignature)
-              : [])
-          ].filter(Boolean);
-
-          if (!currentFormats.length) {
-            fields.amount.valueFormatSignature = anchorFormats[0] || null;
-            fields.amount.amountFormatSource = 'trusted-telegram-raster-amount-anchor-v16';
-            if (Array.isArray(fields.amount.variants) && fields.amount.variants.length) {
-              fields.amount.variants = fields.amount.variants.map((v, i) => ({
-                ...v,
-                valueFormatSignature: anchorFormats[i] || anchorFormats[0] || null,
-              }));
-            }
-            console.log('REFERENCE TEMPLATE AMOUNT V11: FORMAT ENRICHED FROM ANCHOR', JSON.stringify({
-              bank: normalizedBank,
-              formatSignatureCount: anchorFormats.length,
-              formatSignatures: anchorFormats,
-            }));
-          }
-        }
-      } else {
-        console.log('REFERENCE TEMPLATE AMOUNT V11: ANCHOR FORMAT UNAVAILABLE', JSON.stringify({
-          bank: normalizedBank,
-          anchorAvailable: Boolean(amountAnchor),
-          formatSignatureCount: anchorFormats.length,
-        }));
-      }
-    } catch (error) {
-      console.warn('REFERENCE TEMPLATE AMOUNT V11 ANCHOR BRIDGE HATASI:', error?.message || error);
     }
 
     // SECURITY BOUNDARY: extracted reference PDF text is used only while
@@ -9084,10 +8796,6 @@ function sanitizeReferenceTemplateForOutput(analysis) {
       } : undefined,
       referenceCount: f.reference.referenceCount,
       spread: f.reference.spread,
-      valueFormatSignature: f.field === 'amount' ? f.reference.valueFormatSignature : undefined,
-      variants: f.field === 'amount' && Array.isArray(f.reference.variants)
-        ? f.reference.variants.map(v => ({ valueFormatSignature: v?.valueFormatSignature || null }))
-        : undefined,
     } : undefined,
     target: f.target ? {
       xNorm: f.target.xNorm,
@@ -9118,7 +8826,6 @@ function sanitizeReferenceTemplateForOutput(analysis) {
     weakPlacementCount: analysis.weakPlacementCount,
     strongStyleCount: analysis.strongStyleCount,
     styleComparisonNote: analysis.styleComparisonNote,
-    amountFormatComparison: analysis.amountFormatComparison || null,
     fields: safeFields,
     evidence: analysis.evidence,
   };
@@ -9221,7 +8928,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
     matches.push({
       field,
       status:"matched",
-      reference:{xNorm:nearestRef.xNorm,yNorm:nearestRef.yNorm,widthNorm:nearestRef.widthNorm,heightNorm:nearestRef.heightNorm,pageNumber:nearestRef.pageNumber,style:nearestRef.style,referenceFile:nearestRef.referenceFile,referenceCount:ref.referenceCount,spread:ref.spread,valueFormatSignature: field === 'amount' ? ref.valueFormatSignature : null,variants: field === 'amount' ? (ref.variants || []) : undefined},
+      reference:{xNorm:nearestRef.xNorm,yNorm:nearestRef.yNorm,widthNorm:nearestRef.widthNorm,heightNorm:nearestRef.heightNorm,pageNumber:nearestRef.pageNumber,style:nearestRef.style,referenceFile:nearestRef.referenceFile,referenceCount:ref.referenceCount,spread:ref.spread},
       target:{...target,pageIndex:Number(best.item.pageIndex)||0,text:targetText,ocrScore:Number(best.item.score)||0},
       matchScore:Math.max(0,Math.round(best.score)),
       geometryScore,
@@ -9231,29 +8938,6 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
 
   const matched = matches.filter(x=>x.status==="matched");
   const missing = matches.filter(x=>x.status==="missing");
-
-  const amountMatch = matched.find(x => x.field === 'amount');
-  const referenceAmountFormats = amountMatch?.reference
-    ? [amountMatch.reference.valueFormatSignature, ...(Array.isArray(amountMatch.reference.variants)
-        ? amountMatch.reference.variants.map(v => v?.valueFormatSignature)
-        : [])].filter(Boolean)
-    : [];
-  const targetAmountText = amountMatch?.target?.text || null;
-  const amountFormatComparison = targetAmountText && referenceAmountFormats.length
-    ? compareAmountFormatSignatures(buildAmountFormatSignature(targetAmountText), referenceAmountFormats)
-    : { available:false, mismatch:false, score:0, confidence:0, reasons:[] };
-
-  console.log('AMOUNT FORMAT FORENSICS V11 DETAIL:', JSON.stringify({
-    available: Boolean(amountFormatComparison.available),
-    mismatch: Boolean(amountFormatComparison.mismatch),
-    score: Number(amountFormatComparison.score || 0),
-    confidence: Number(amountFormatComparison.confidence || 0),
-    reasons: amountFormatComparison.reasons || [],
-    targetAmountFormat: targetAmountText ? buildAmountFormatSignature(targetAmountText) : null,
-    referenceFormatCount: referenceAmountFormats.length,
-    referenceFormatSource: amountMatch?.reference?.amountFormatSource || null,
-  }));
-
   const strongGeometry = matched.filter(x=>x.geometryScore>=60);
   const weakPlacement = matched.filter(x=>x.geometryScore>=35);
 
@@ -9269,7 +8953,6 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
     weakPlacementCount:weakPlacement.length,
     strongStyleCount:0,
     styleComparisonNote:"JPG'de PDF font adı birebir ölçülemez; PDF font metadata'sı referans profiline, gerçek piksel yoğunluğu ise JPG tarafına ayrı sinyal olarak kaydedilir.",
-    amountFormatComparison,
     fields:matches,
     evidence: strongGeometry.length || missing.length
       ? `Referans şablonuyla ${matched.length} alan eşleştirildi; ${strongGeometry.length} alanda belirgin geometri farkı, ${missing.length} alanda beklenen alan bulunamadı.`
@@ -11464,1491 +11147,6 @@ console.log("AMOUNT FORENSICS STRONG CACHED:", fileFingerprint);
 }
 
 return finalForensics;
-}
-
-
-// =====================================================
-// V14.3 — TARGET-ONLY PAINT-OVER / BACKGROUND CONTINUITY FORENSICS
-// =====================================================
-// Amaç: OCR karakterinin kendisini "farklı" bulmak yerine, yazının hemen
-// çevresindeki arka planın doğal devamlılığında lokal bir kırılma olup
-// olmadığını ölçmek. Bu katman özellikle şu manipülasyon zincirini hedefler:
-//     eski yazıyı boya/erase -> arka planı yeniden oluştur -> yeni yazıyı yaz
-//
-// ÖNEMLİ V14.3 KURALI:
-//   - Referans farkı ana kanıt değildir.
-//   - amount/font/format farkı ana kanıt değildir.
-//   - maxInk/maxStroke/maxEdge/anomalyRatio tek başına alarm değildir.
-//   - İlk sürüm SADECE diagnostiktir; risk skorunu değiştirmez.
-//
-// Ölçülen şeyler:
-//   1) yazı çevresi yakın ring ile dış ring arasındaki luma kırılması
-//   2) texture/variance kırılması
-//   3) yazı dışındaki lokal edge yoğunluğu
-//   4) yatay+dikey sınırların aynı bölgede toplanması (patch footprint)
-//   5) yakın komşu OCR bölgelerinde aynı tip lokal izlerin tekrarı
-//
-async function runPaintOverBackgroundContinuityV143({
-  targetPath,
-  targetOCR,
-  bank = null,
-  referencePaths = [],
-}) {
-  if (!targetPath || !targetOCR?.success || !Array.isArray(targetOCR?.regions) || !targetOCR.regions.length) {
-    return null;
-  }
-
-  try {
-    const targetBuffer = await fs.readFile(targetPath);
-    const meta = await sharp(targetBuffer).metadata();
-    const imageW = Number(meta.width) || 0;
-    const imageH = Number(meta.height) || 0;
-    if (imageW < 200 || imageH < 200) return null;
-
-    const { data, info } = await sharp(targetBuffer)
-      .grayscale()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-
-    const W = info.width;
-    const H = info.height;
-    const pix = (x, y) => data[y * W + x];
-
-    const clampBox = (r, margin = 0) => {
-      const x1 = Math.max(0, Math.floor(Number(r?.x1) - margin));
-      const y1 = Math.max(0, Math.floor(Number(r?.y1) - margin));
-      const x2 = Math.min(W - 1, Math.ceil(Number(r?.x2) + margin));
-      const y2 = Math.min(H - 1, Math.ceil(Number(r?.y2) + margin));
-      return { x1, y1, x2, y2, width: x2 - x1 + 1, height: y2 - y1 + 1 };
-    };
-
-    const regionCenter = (r) => ({
-      x: (Number(r?.x1 || 0) + Number(r?.x2 || 0)) / 2,
-      y: (Number(r?.y1 || 0) + Number(r?.y2 || 0)) / 2,
-    });
-
-    const stats = (values) => {
-      if (!values.length) return { mean: 0, variance: 0, sd: 0 };
-      let sum = 0;
-      for (const v of values) sum += v;
-      const mean = sum / values.length;
-      let ss = 0;
-      for (const v of values) ss += (v - mean) ** 2;
-      const variance = ss / values.length;
-      return { mean, variance, sd: Math.sqrt(variance) };
-    };
-
-    const localGradient = (x, y) => {
-      if (x <= 0 || y <= 0 || x >= W - 1 || y >= H - 1) return 0;
-      return Math.abs(pix(x + 1, y) - pix(x - 1, y)) +
-             Math.abs(pix(x, y + 1) - pix(x, y - 1));
-    };
-
-    const observations = [];
-    const usableRegions = targetOCR.regions
-      .map((r, index) => ({ r, index, text: String(r?.text || '').trim() }))
-      .filter(x => x.text.length >= 2)
-      .filter(x => Number(x.r?.x2) > Number(x.r?.x1) && Number(x.r?.y2) > Number(x.r?.y1));
-
-    for (const item of usableRegions.slice(0, 80)) {
-      const r = item.r;
-      const rawBox = clampBox(r, 0);
-      const boxW = rawBox.width;
-      const boxH = rawBox.height;
-      if (boxW < 8 || boxH < 5 || boxW > W * 0.75 || boxH > H * 0.18) continue;
-
-      // OCR box'un çevresinde yeterli bağlam bırak. Çok küçük bölgelerde
-      // 12 px, büyük bölgelerde kutunun yüksekliğine göre adaptif margin.
-      const margin = Math.max(8, Math.min(18, Math.round(Math.min(boxW, boxH) * 0.7)));
-      const outer = clampBox(r, margin);
-
-      // Yazı maskesi: OCR kutusundaki yerel luma dağılımına göre adaptif.
-      const sample = [];
-      for (let y = rawBox.y1; y <= rawBox.y2; y++) {
-        for (let x = rawBox.x1; x <= rawBox.x2; x++) sample.push(pix(x, y));
-      }
-      const wholeStats = stats(sample);
-      const inkThreshold = Math.max(85, Math.min(205, wholeStats.mean - Math.max(18, wholeStats.sd * 0.55)));
-
-      const ink = new Uint8Array(boxW * boxH);
-      let inkCount = 0;
-      let inkMinX = boxW, inkMinY = boxH, inkMaxX = -1, inkMaxY = -1;
-      for (let yy = 0; yy < boxH; yy++) {
-        for (let xx = 0; xx < boxW; xx++) {
-          const v = pix(rawBox.x1 + xx, rawBox.y1 + yy);
-          if (v < inkThreshold) {
-            ink[yy * boxW + xx] = 1;
-            inkCount++;
-            if (xx < inkMinX) inkMinX = xx;
-            if (xx > inkMaxX) inkMaxX = xx;
-            if (yy < inkMinY) inkMinY = yy;
-            if (yy > inkMaxY) inkMaxY = yy;
-          }
-        }
-      }
-      if (inkCount < Math.max(3, Math.round(boxW * boxH * 0.005))) continue;
-
-      // OCR kutusunun kenarları bazen metnin gerçek sınırı değildir. Maskenin
-      // bbox'u üzerinden yakın/dış arka plan ring'lerini oluştur.
-      const pad = 3;
-      const ix1 = Math.max(0, inkMinX - pad);
-      const iy1 = Math.max(0, inkMinY - pad);
-      const ix2 = Math.min(boxW - 1, inkMaxX + pad);
-      const iy2 = Math.min(boxH - 1, inkMaxY + pad);
-
-      const near = [];
-      const far = [];
-      const nearGrad = [];
-      const farGrad = [];
-      const side = { top: [], bottom: [], left: [], right: [] };
-
-      for (let y = outer.y1; y <= outer.y2; y++) {
-        for (let x = outer.x1; x <= outer.x2; x++) {
-          const insideRaw = x >= rawBox.x1 && x <= rawBox.x2 && y >= rawBox.y1 && y <= rawBox.y2;
-          const rx = x - rawBox.x1;
-          const ry = y - rawBox.y1;
-          const insideInk = insideRaw && rx >= 0 && ry >= 0 && rx < boxW && ry < boxH && ink[ry * boxW + rx] === 1;
-          if (insideInk) continue;
-
-          const dx = Math.max(ix1 - rx, 0, rx - ix2);
-          const dy = Math.max(iy1 - ry, 0, ry - iy2);
-          const d = Math.max(dx, dy);
-          const v = pix(x, y);
-          const g = localGradient(x, y);
-
-          if (d >= 1 && d <= 4) {
-            near.push(v);
-            nearGrad.push(g);
-            if (ry < iy1) side.top.push(v);
-            if (ry > iy2) side.bottom.push(v);
-            if (rx < ix1) side.left.push(v);
-            if (rx > ix2) side.right.push(v);
-          } else if (d >= 7 && d <= Math.max(9, margin)) {
-            far.push(v);
-            farGrad.push(g);
-          }
-        }
-      }
-
-      if (near.length < 8 || far.length < 12) continue;
-
-      const ns = stats(near);
-      const fs = stats(far);
-      const ng = stats(nearGrad);
-      const fg = stats(farGrad);
-      const lumaBreak = Math.abs(ns.mean - fs.mean);
-      const textureRatio = (ns.sd + 1) / (fs.sd + 1);
-      const edgeRatio = (ng.mean + 1) / (fg.mean + 1);
-
-      const sideStats = Object.fromEntries(Object.entries(side).map(([k, vals]) => [k, stats(vals)]));
-      const sideMeans = Object.values(sideStats).map(x => x.mean).filter(Number.isFinite);
-      const sideMeanSpread = sideMeans.length >= 2 ? Math.max(...sideMeans) - Math.min(...sideMeans) : 0;
-      const populatedSides = Object.values(side).filter(v => v.length >= 2).length;
-
-      // Patch footprint: metin dışındaki bölgede hem yatay hem dikey yönde
-      // güçlü gradyan kümelenmesi varsa, doğal harf kenarından ziyade arka
-      // plan üzerinde bir kutu/halo sınırı olma ihtimali artar.
-      const gx = [];
-      const gy = [];
-      const bgX1 = Math.max(outer.x1 + 1, rawBox.x1 - margin);
-      const bgX2 = Math.min(outer.x2 - 1, rawBox.x2 + margin);
-      const bgY1 = Math.max(outer.y1 + 1, rawBox.y1 - margin);
-      const bgY2 = Math.min(outer.y2 - 1, rawBox.y2 + margin);
-      for (let y = bgY1; y <= bgY2; y++) {
-        for (let x = bgX1; x <= bgX2; x++) {
-          const inText = x >= rawBox.x1 && x <= rawBox.x2 && y >= rawBox.y1 && y <= rawBox.y2;
-          if (inText) continue;
-          gx.push(Math.abs(pix(x, y) - pix(x - 1, y)));
-          gy.push(Math.abs(pix(x, y) - pix(x, y - 1)));
-        }
-      }
-      const gxStats = stats(gx);
-      const gyStats = stats(gy);
-      const footprintAxisSupport =
-        Number(gxStats.mean > 2.2) + Number(gyStats.mean > 2.2);
-
-      const signals = {
-        backgroundLumaBreak: lumaBreak >= 7.5,
-        backgroundTextureBreak: textureRatio >= 1.35 || textureRatio <= 0.72,
-        backgroundEdgeBreak: edgeRatio >= 1.45,
-        rectangularFootprint: footprintAxisSupport >= 2,
-        multiSideSupport: populatedSides >= 3 && sideMeanSpread >= 5,
-      };
-      const signalCount = Object.values(signals).filter(Boolean).length;
-
-      // V14.3: tek bir özellikte alarm verme. Paint-over adayı için en az
-      // üç bağımsız arka plan davranışı ve iki farklı mekanizma gerekir.
-      const backgroundEvidence =
-        signalCount >= 3 &&
-        (signals.backgroundLumaBreak || signals.backgroundTextureBreak) &&
-        (signals.backgroundEdgeBreak || signals.rectangularFootprint || signals.multiSideSupport);
-
-      if (!backgroundEvidence) continue;
-
-      const score = Math.min(100,
-        signalCount * 16 +
-        (signals.rectangularFootprint ? 16 : 0) +
-        (signals.multiSideSupport ? 10 : 0) +
-        Math.min(14, Math.round(lumaBreak))
-      );
-
-      observations.push({
-        regionIndex: item.index,
-        field: rfLabelPart(r)?.text || 'unknown',
-        text: item.text,
-        targetBox: rawBox,
-        lumaBreak: Number(lumaBreak.toFixed(2)),
-        textureRatio: Number(textureRatio.toFixed(3)),
-        edgeRatio: Number(edgeRatio.toFixed(3)),
-        sideMeanSpread: Number(sideMeanSpread.toFixed(2)),
-        footprintAxisSupport,
-        populatedSides,
-        signals,
-        signalCount,
-        score,
-      });
-    }
-
-    // Komşu bölgelerde aynı tip arka plan izi tekrarlanıyorsa tekil false
-    // positive ihtimalini azalt. Bu yalnızca tanısal bir fusion'dır.
-    for (const a of observations) {
-      let neighbors = 0;
-      for (const b of observations) {
-        if (a === b) continue;
-        const ac = regionCenter(a.targetBox);
-        const bc = regionCenter(b.targetBox);
-        const dx = Math.abs(ac.x - bc.x);
-        const dy = Math.abs(ac.y - bc.y);
-        const nearEnough = dx <= Math.max(a.targetBox.width, b.targetBox.width) * 1.8 &&
-                           dy <= Math.max(a.targetBox.height, b.targetBox.height) * 1.8;
-        if (nearEnough) neighbors++;
-      }
-      a.nearbyCandidateCount = neighbors;
-      if (neighbors >= 1) a.score = Math.min(100, a.score + 12);
-    }
-
-    observations.sort((a,b) => Number(b.score) - Number(a.score));
-    const strong = observations.filter(x => Number(x.score) >= 72 && Number(x.signalCount) >= 3);
-    const medium = observations.filter(x => Number(x.score) >= 55);
-    const neighboringStrongPairs = strong.some(a => Number(a.nearbyCandidateCount || 0) >= 1);
-
-    const severity = neighboringStrongPairs
-      ? 'strong-candidate'
-      : strong.length
-        ? 'medium-candidate'
-        : medium.length
-          ? 'weak-candidate'
-          : 'none';
-
-    return {
-      available: true,
-      engine: 'paint-over-background-continuity-v14.3',
-      bank: bank || null,
-      targetOnly: true,
-      referenceUsedAsPrimaryEvidence: false,
-      referenceCorroborationAvailable: Array.isArray(referencePaths) && referencePaths.length > 0,
-      candidateCount: observations.length,
-      strongCandidateCount: strong.length,
-      mediumCandidateCount: medium.length,
-      neighboringStrongPairs: neighboringStrongPairs ? 1 : 0,
-      signal: Boolean(strong.length),
-      severity,
-      score: strong.length ? Math.max(...strong.map(x => Number(x.score) || 0)) : (medium.length ? Math.max(...medium.map(x => Number(x.score) || 0)) : 0),
-      observations: observations.slice(0, 12),
-      evidence: observations.length
-        ? 'Hedef görüntü içinde yazı çevresi arka planında lokal luma/texture/edge/footprint sürekliliği adayları bulundu. Bu V14.3 ilk sürümünde risk skoruna otomatik katkı yoktur.'
-        : 'Hedef görüntü içinde çoklu bağımsız arka plan sürekliliği sinyali veren paint-over adayı bulunmadı.',
-    };
-  } catch (error) {
-    return {
-      available: false,
-      engine: 'paint-over-background-continuity-v14.3',
-      targetOnly: true,
-      error: error?.message || String(error),
-    };
-  }
-}
-
-// =====================================================
-// FIELD TAMPERING FORENSICS V1 — GENERIC FIELD-LEVEL EDIT DETECTOR
-// =====================================================
-// Amaç: Referans motorunun "aynı alanın değeri farklı olabilir" kuralını
-// bozmadan, hedef dekontun kendi içindeki lokal düzenleme izlerini aramak.
-// Özellikle TUTAR / TARİH / SAAT / IBAN / işlem numaraları gibi kritik
-// alanlarda silme + yeniden yazma girişimleri için çalışır.
-//
-// Bu katman içerik eşitliği istemez. Bir tutarın 2.000 -> 10.000 olması
-// normal bir işlem değişikliği olabilir; bu nedenle yalnızca sayı farkına
-// göre alarm üretmez. Alarm için lokal raster / stil / yeniden-kodlama /
-// karakter tutarlılığı sinyallerinin birleşmesi gerekir.
-//
-// ÖNEMLİ: Kusursuz, iz bırakmadan yapılan piksel değişikliğinin tek görselden
-// kesin olarak tespit edilmesi mümkün değildir. Bu motor mevcut görselde
-// ölçülebilir iz varsa yakalamaya çalışır ve sonucu kanıt olarak sunar.
-
-async function runFieldTamperingForensics({
-  targetPath,
-  targetOCR,
-  bank = null,
-  referencePaths = [],
-  fileFingerprint = null,
-  amountForensics = null,
-}) {
-  if (!targetPath || !targetOCR?.success || !Array.isArray(targetOCR?.regions) || !targetOCR.regions.length) {
-    return null;
-  }
-
-  const criticalFields = new Set([
-    'amount','date','time','iban','senderName','recipientName',
-    'transactionNo','accountNo','taxNo','description','branch',
-    'senderAddress','recipientAddress','address'
-  ]);
-
-  const genericCriticalPattern = /(sorgu|referans|fiş|fis|ettn|dok[üu]man|işlem\s*yeri|islem\s*yeri|banka|şube|sube)/i;
-
-  const normalizeKey = (v) => String(v || '').trim();
-  const regionCenter = (r) => ({
-    x: ((Number(r?.x1) || 0) + (Number(r?.x2) || 0)) / 2,
-    y: ((Number(r?.y1) || 0) + (Number(r?.y2) || 0)) / 2,
-  });
-
-  const safeLoadImage = async (filePath) => {
-    try {
-      const ext = path.extname(String(filePath || '')).toLowerCase();
-      if (ext === '.pdf') {
-        const raw = await fs.readFile(filePath);
-        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
-        const rendered = await renderPdfPagePng(pdf, 1, 1.8);
-        return rendered?.buffer || null;
-      }
-      return await fs.readFile(filePath);
-    } catch {
-      return null;
-    }
-  };
-
-  const targetBuffer = await safeLoadImage(targetPath);
-  if (!targetBuffer) return null;
-  const targetMeta = await sharp(targetBuffer).metadata();
-  const targetSize = { width: Number(targetMeta.width) || 0, height: Number(targetMeta.height) || 0 };
-  if (targetSize.width < 100 || targetSize.height < 100) return null;
-
-  const targetRegions = rfPrepareRegions(targetOCR);
-
-  // GLOBAL JPEG/RASTER BASELINE V1:
-  // Build a document-wide baseline from ordinary OCR text regions in the SAME
-  // target image. This is deliberately target-only: no reference value is
-  // assumed. Its purpose is to answer: "Is this local field more anomalous
-  // than the rest of this JPG?" This helps separate global JPEG/Telegram/
-  // resize/render effects from a localized erase+rewrite event.
-  async function buildGlobalJpegRasterBaseline(buffer, regions, imageSize) {
-    try {
-      // V4: Do NOT reject every OCR region containing digits. Bank receipts
-      // naturally contain dates, times, IDs and numeric labels, and PaddleOCR
-      // often groups a label + value into one region. The previous V3 filter
-      // therefore discarded too many usable samples and produced
-      // `available:false` on real receipts. We build the baseline from a
-      // broader set of ordinary OCR text regions and later compare the target
-      // field against the robust median/MAD of the whole document.
-      let candidates = (Array.isArray(regions) ? regions : [])
-        .filter(r => {
-          const w = Math.abs((Number(r?.x2) || 0) - (Number(r?.x1) || 0));
-          const h = Math.abs((Number(r?.y2) || 0) - (Number(r?.y1) || 0));
-          const text = String(r?.text || '').trim();
-          const upper = text.toUpperCase();
-          const looksLikeWholePage = w > imageSize.width * .75 || h > imageSize.height * .18;
-          const looksLikePureImageArtifact = !text || /^(?:[|_\-\.=]{3,})$/.test(text);
-          const isHugeIBAN = /\bTR\d{18,28}\b/i.test(text);
-          const isHugeURL = /https?:\/\//i.test(text);
-          return Boolean(
-            text &&
-            !looksLikeWholePage &&
-            !looksLikePureImageArtifact &&
-            !isHugeIBAN &&
-            !isHugeURL &&
-            w >= 8 && h >= 5 &&
-            w <= imageSize.width * .65 &&
-            h <= imageSize.height * .12 &&
-            upper.length <= 180
-          );
-        })
-        .slice(0, 48);
-
-      // V5: OCR-only sampling can still produce too few usable regions on
-      // bank layouts where PaddleOCR returns merged or irregular boxes.
-      // Add document-grid patches so the JPEG/raster baseline is genuinely
-      // document-wide and does not depend on semantic OCR coverage.
-      if (candidates.length < 12) {
-        const cols = 4;
-        const rows = 6;
-        const patchW = Math.max(48, Math.round(imageSize.width * 0.14));
-        const patchH = Math.max(28, Math.round(imageSize.height * 0.065));
-        const usableW = Math.max(1, imageSize.width - patchW);
-        const usableH = Math.max(1, imageSize.height - patchH);
-        const gridCandidates = [];
-        for (let gy = 0; gy < rows; gy++) {
-          for (let gx = 0; gx < cols; gx++) {
-            const x1 = Math.round((gx / Math.max(1, cols - 1)) * usableW);
-            const y1 = Math.round((gy / Math.max(1, rows - 1)) * usableH);
-            gridCandidates.push({
-              x1, y1,
-              x2: Math.min(imageSize.width, x1 + patchW),
-              y2: Math.min(imageSize.height, y1 + patchH),
-              text: '__GLOBAL_GRID_SAMPLE__',
-              _globalGridSample: true,
-            });
-          }
-        }
-        candidates = candidates.concat(gridCandidates).slice(0, 24);
-      }
-
-      const samples = [];
-      const elaSamples = [];
-      // Recompress once; repeated full-image JPEG recompression would be both
-      // expensive and more noisy.
-      const recompressed = await sharp(buffer)
-        .jpeg({ quality: 88, chromaSubsampling: '4:4:4' })
-        .toBuffer();
-
-      for (const r of candidates) {
-        const region = {
-          x1: Math.max(0, Number(r.x1) || 0),
-          y1: Math.max(0, Number(r.y1) || 0),
-          x2: Math.min(imageSize.width, Number(r.x2) || 0),
-          y2: Math.min(imageSize.height, Number(r.y2) || 0),
-        };
-        const metrics = await rfRasterMetrics(buffer, region, imageSize);
-        if (!metrics) continue;
-
-        let elaMean = null;
-        try {
-          const x = Math.max(0, Math.floor(region.x1));
-          const y = Math.max(0, Math.floor(region.y1));
-          const w = Math.max(4, Math.min(imageSize.width - x, Math.ceil(region.x2 - region.x1)));
-          const h = Math.max(4, Math.min(imageSize.height - y, Math.ceil(region.y2 - region.y1)));
-          const read = async (src) => sharp(src)
-            .extract({ left: x, top: y, width: w, height: h })
-            .resize({ width: 96, height: 40, fit: 'fill' })
-            .grayscale().raw().toBuffer();
-          const [a,b] = await Promise.all([read(buffer), read(recompressed)]);
-          let sum = 0;
-          for (let i=0;i<a.length;i++) sum += Math.abs(Number(a[i])-Number(b[i]));
-          elaMean = sum / Math.max(1,a.length);
-        } catch {}
-
-        samples.push(metrics);
-        if (Number.isFinite(elaMean)) elaSamples.push(elaMean);
-      }
-
-      if (samples.length < 4) return null;
-      const med = (key) => rfMedian(samples.map(x => Number(x?.[key])).filter(Number.isFinite));
-      const baseline = {
-        sampleCount: samples.length,
-        ocrSampleCount: candidates.filter(x => !x._globalGridSample).length,
-        gridSampleCount: candidates.filter(x => x._globalGridSample).length,
-        medianMeanLuma: med('meanLuma'),
-        medianLumaStd: med('lumaStd'),
-        medianDarkRatio: med('darkRatio'),
-        medianEdgeRatio: med('edgeRatio'),
-        medianRowVariance: med('rowVariance'),
-        medianColVariance: med('colVariance'),
-        elaMedian: rfMedian(elaSamples.filter(Number.isFinite)),
-        elaMad: null,
-      };
-      if (Number.isFinite(baseline.elaMedian)) {
-        const deviations = elaSamples.map(v => Math.abs(v-baseline.elaMedian)).filter(Number.isFinite);
-        baseline.elaMad = rfMedian(deviations);
-      }
-
-      const rasterDistance = (m) => {
-        if (!m) return null;
-        const parts = [
-          rfSafeRel(m.meanLuma, baseline.medianMeanLuma, 18),
-          rfSafeRel(m.lumaStd, baseline.medianLumaStd, 10),
-          rfSafeRel(m.darkRatio, baseline.medianDarkRatio, .08),
-          rfSafeRel(m.edgeRatio, baseline.medianEdgeRatio, .08),
-          rfSafeRel(m.rowVariance, baseline.medianRowVariance, .012),
-          rfSafeRel(m.colVariance, baseline.medianColVariance, .012),
-        ].filter(Number.isFinite);
-        return parts.length ? parts.reduce((a,b)=>a+b,0)/parts.length : null;
-      };
-
-      const sampleDistances = samples.map(rasterDistance).filter(Number.isFinite);
-      baseline.rasterDistanceMedian = rfMedian(sampleDistances);
-      baseline.rasterDistanceMad = rfMedian(sampleDistances.map(v => Math.abs(v-baseline.rasterDistanceMedian)));
-      baseline.rasterDistances = sampleDistances;
-      baseline._rasterDistance = rasterDistance;
-      return baseline;
-    } catch (error) {
-      console.warn('GLOBAL JPEG/RASTER BASELINE HATASI:', error?.message || error);
-      return null;
-    }
-  }
-
-  const globalJpegRasterBaseline = await buildGlobalJpegRasterBaseline(targetBuffer, targetRegions, targetSize);
-  console.log('GLOBAL JPEG/RASTER BASELINE V2:', JSON.stringify(globalJpegRasterBaseline ? {
-    sampleCount: globalJpegRasterBaseline.sampleCount,
-    ocrSampleCount: globalJpegRasterBaseline.ocrSampleCount,
-    gridSampleCount: globalJpegRasterBaseline.gridSampleCount,
-    medianMeanLuma: Number(globalJpegRasterBaseline.medianMeanLuma?.toFixed?.(3) || 0),
-    medianDarkRatio: Number(globalJpegRasterBaseline.medianDarkRatio?.toFixed?.(4) || 0),
-    medianEdgeRatio: Number(globalJpegRasterBaseline.medianEdgeRatio?.toFixed?.(4) || 0),
-    elaMedian: Number(globalJpegRasterBaseline.elaMedian?.toFixed?.(3) || 0),
-    elaMad: Number(globalJpegRasterBaseline.elaMad?.toFixed?.(3) || 0),
-    rasterDistanceMedian: Number(globalJpegRasterBaseline.rasterDistanceMedian?.toFixed?.(4) || 0),
-    rasterDistanceMad: Number(globalJpegRasterBaseline.rasterDistanceMad?.toFixed?.(4) || 0),
-  } : { available:false }));
-
-  const isCriticalLabel = (row) => {
-    const rule = referenceFieldRuleForText(row?.text || '');
-    if (rule?.key && criticalFields.has(rule.key)) return rule.key;
-    const raw = String(row?.text || '').trim();
-    const generic = rfGenericFieldKey(rfLabelPart(raw));
-    if (generic && genericCriticalPattern.test(raw)) return generic;
-    return null;
-  };
-
-  const targetLabels = [];
-  for (const row of targetRegions) {
-    const key = isCriticalLabel(row);
-    if (!key) continue;
-    if (!rfLooksLikeLabelRegion(row)) continue;
-    targetLabels.push({ ...row, fieldKey: key });
-  }
-
-  // A clean target-only local edit detector. Recompression residual is useful
-  // because a pasted/repainted ROI often has a different JPEG/raster response
-  // than untouched neighbouring text. It is intentionally normalized against
-  // control regions in the same document so Telegram/JPEG quality alone does
-  // not become a finding.
-  async function localElaProfile(buffer, region, imageSize) {
-    if (!buffer || !region || !imageSize?.width || !imageSize?.height) return null;
-    try {
-      const x = Math.max(0, Math.floor(Number(region.x1)));
-      const y = Math.max(0, Math.floor(Number(region.y1)));
-      const w = Math.max(4, Math.min(imageSize.width - x, Math.ceil(Number(region.x2) - Number(region.x1))));
-      const h = Math.max(4, Math.min(imageSize.height - y, Math.ceil(Number(region.y2) - Number(region.y1))));
-      if (w < 4 || h < 4) return null;
-
-      const recompressed = await sharp(buffer)
-        .jpeg({ quality: 88, chromaSubsampling: '4:4:4' })
-        .toBuffer();
-
-      const read = async (src) => sharp(src)
-        .extract({ left: x, top: y, width: w, height: h })
-        .resize({ width: 180, height: 72, fit: 'fill' })
-        .grayscale()
-        .raw()
-        .toBuffer();
-
-      const [a, b] = await Promise.all([read(buffer), read(recompressed)]);
-      let sum = 0, sum2 = 0;
-      for (let i = 0; i < a.length; i++) {
-        const d = Math.abs(Number(a[i]) - Number(b[i]));
-        sum += d;
-        sum2 += d * d;
-      }
-      const n = Math.max(1, a.length);
-      const mean = sum / n;
-      const variance = Math.max(0, sum2 / n - mean * mean);
-      return { mean, std: Math.sqrt(variance), max: Math.max(...Array.from(a, (v, i) => Math.abs(Number(v) - Number(b[i])))) };
-    } catch {
-      return null;
-    }
-  }
-
-  async function localElaOutlier(buffer, valueRegion) {
-    if (!valueRegion) return null;
-    const x1 = Number(valueRegion.x1), y1 = Number(valueRegion.y1);
-    const x2 = Number(valueRegion.x2), y2 = Number(valueRegion.y2);
-    const w = Math.max(4, x2 - x1), h = Math.max(4, y2 - y1);
-    const candidates = [
-      { x1: x1 - w * 1.25, y1, x2: x1 - w * 0.25, y2: y2 },
-      { x1: x2 + w * 0.25, y1, x2: x2 + w * 1.25, y2 },
-      { x1, y1: y1 - h * 1.5, x2, y2: y1 - h * 0.5 },
-      { x1, y1: y2 + h * 0.5, x2, y2: y2 + h * 1.5 },
-    ].map(r => ({
-      x1: Math.max(0, r.x1), y1: Math.max(0, r.y1),
-      x2: Math.min(targetSize.width, r.x2), y2: Math.min(targetSize.height, r.y2),
-    })).filter(r => r.x2 - r.x1 >= 4 && r.y2 - r.y1 >= 4);
-
-    const targetProfile = await localElaProfile(buffer, valueRegion, targetSize);
-    if (!targetProfile || candidates.length < 2) return null;
-    const controls = [];
-    for (const c of candidates.slice(0, 4)) {
-      const profile = await localElaProfile(buffer, c, targetSize);
-      if (profile) controls.push(profile.mean);
-    }
-    if (controls.length < 2) return null;
-    const baseline = rfMedian(controls);
-    const ratio = targetProfile.mean / Math.max(1, baseline);
-    const excess = Math.max(0, targetProfile.mean - baseline);
-    return {
-      targetMean: Number(targetProfile.mean.toFixed(3)),
-      controlMedian: Number(baseline.toFixed(3)),
-      ratio: Number(ratio.toFixed(3)),
-      excess: Number(excess.toFixed(3)),
-      controls: controls.map(x => Number(x.toFixed(3))),
-      outlier: ratio >= 1.75 && excess >= 2.5,
-    };
-  }
-
-  function metricRatio(a, b, scale) {
-    const x = Number(a), y = Number(b);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
-    return Math.min(1, Math.abs(x - y) / Math.max(scale, 1e-6));
-  }
-
-  function internalStyleResidual(labelMetrics, valueMetrics) {
-    if (!labelMetrics || !valueMetrics) return null;
-    const parts = [
-      metricRatio(valueMetrics.inkRatio, labelMetrics.inkRatio, .08),
-      metricRatio(valueMetrics.inkWidthNorm, labelMetrics.inkWidthNorm, .22),
-      metricRatio(valueMetrics.inkHeightNorm, labelMetrics.inkHeightNorm, .18),
-      metricRatio(valueMetrics.aspect, labelMetrics.aspect, .65),
-      metricRatio(valueMetrics.edgeDensity, labelMetrics.edgeDensity, .08),
-      metricRatio(valueMetrics.textHeightNorm, labelMetrics.textHeightNorm, .16),
-      metricRatio(valueMetrics.rowPeak, labelMetrics.rowPeak, .22),
-    ].filter(Number.isFinite);
-    return parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : null;
-  }
-
-  // Load reference OCR/images only when references are available. The target
-  // local detector remains useful without a reference.
-  const refEntries = [];
-  for (const refPath of (Array.isArray(referencePaths) ? referencePaths : []).slice(0, 5)) {
-    const refBuffer = await safeLoadImage(refPath);
-    if (!refBuffer) continue;
-    const refMeta = await sharp(refBuffer).metadata();
-    const refSize = { width: Number(refMeta.width) || 0, height: Number(refMeta.height) || 0 };
-    if (refSize.width < 100 || refSize.height < 100) continue;
-    const raw = await fs.readFile(refPath);
-    const refId = createHash('sha256').update(raw).digest('hex').slice(0, 16);
-    const cacheKey = `field-tamper-ocr:${normalizeBank(bank)}:${refId}`;
-    let refOCR = paddleOCRCache.get(cacheKey);
-    if (!refOCR?.success) {
-      const tmp = path.join('/tmp', `verifydoc-ft-${normalizeBank(bank) || 'bank'}-${refId}.png`);
-      try {
-        await fs.writeFile(tmp, refBuffer);
-        refOCR = await runPaddleOCR(tmp);
-        if (refOCR?.success) paddleOCRCache.set(cacheKey, refOCR);
-      } finally {
-        try { await fs.unlink(tmp); } catch {}
-      }
-    }
-    if (!refOCR?.success) continue;
-    const refRegions = rfPrepareRegions(refOCR);
-    const refLabels = [];
-    for (const row of refRegions) {
-      const key = isCriticalLabel(row);
-      if (!key || !rfLooksLikeLabelRegion(row)) continue;
-      refLabels.push({ ...row, fieldKey: key });
-    }
-    refEntries.push({ path: refPath, buffer: refBuffer, size: refSize, regions: refRegions, labels: refLabels });
-  }
-
-  // V6: DOCUMENT-WIDE SAME-CHARACTER GLYPH BASELINE
-  // Compare critical numeric fields against the SAME JPG's other numeric
-  // characters. This is intentionally target-only: legitimate value changes
-  // such as 2.000 -> 10.000 are allowed, but a newly rendered/repainted glyph
-  // can still be detected when its shape/fill/height differs from the same
-  // character elsewhere in the document.
-  async function buildNumericGlyphBaseline(excludeRegion) {
-    const profile = new Map();
-    let regionCount = 0;
-    try {
-      const overlaps = (a, b) => {
-        if (!a || !b) return false;
-        const ax1=Number(a.x1)||0, ay1=Number(a.y1)||0, ax2=Number(a.x2)||0, ay2=Number(a.y2)||0;
-        const bx1=Number(b.x1)||0, by1=Number(b.y1)||0, bx2=Number(b.x2)||0, by2=Number(b.y2)||0;
-        const ix=Math.max(0, Math.min(ax2,bx2)-Math.max(ax1,bx1));
-        const iy=Math.max(0, Math.min(ay2,by2)-Math.max(ay1,by1));
-        return ix*iy > 0;
-      };
-      for (const row of targetRegions) {
-        const text=String(row?.text||'').trim();
-        if (!/\d/.test(text) || overlaps(row, excludeRegion)) continue;
-        if (++regionCount > 40) break;
-        const seq=await rfNumericGlyphSequence(targetBuffer, row, targetSize, text);
-        if (!seq?.slots?.length || !seq?.chars?.length) continue;
-        const n=Math.min(seq.slots.length, seq.chars.length);
-        for (let i=0;i<n;i++) {
-          const ch=seq.chars[i];
-          if (!/\d/.test(ch)) continue;
-          const g=seq.slots[i];
-          const item={
-            aspect:Number(g.width)/Math.max(1,Number(g.height)),
-            fill:Number(g.fill),
-            heightNorm:Number(g.height)/Math.max(1,Number(seq.medianH)||1),
-          };
-          if (![item.aspect,item.fill,item.heightNorm].every(Number.isFinite)) continue;
-          if (!profile.has(ch)) profile.set(ch,[]);
-          profile.get(ch).push(item);
-        }
-      }
-      const baseline={};
-      for (const [ch,items] of profile.entries()) {
-        if (items.length < 2) continue;
-        baseline[ch]={
-          count:items.length,
-          aspect:rfMedian(items.map(x=>x.aspect)),
-          fill:rfMedian(items.map(x=>x.fill)),
-          heightNorm:rfMedian(items.map(x=>x.heightNorm)),
-        };
-      }
-      return {baseline, regionCount};
-    } catch(error) {
-      console.warn('DOCUMENT NUMERIC GLYPH BASELINE HATASI:', error?.message || error);
-      return {baseline:{}, regionCount};
-    }
-  }
-
-  async function analyzeAmountAgainstNumericBaseline(amountRegion, amountText) {
-    if (!amountRegion || !/\d/.test(String(amountText||''))) return null;
-    const built=await buildNumericGlyphBaseline(amountRegion);
-    const seq=await rfNumericGlyphSequence(targetBuffer, amountRegion, targetSize, amountText);
-    if (!seq?.slots?.length || !seq?.chars?.length) return null;
-    const n=Math.min(seq.slots.length, seq.chars.length);
-    const perGlyph=[];
-    for(let i=0;i<n;i++) {
-      const ch=seq.chars[i];
-      const base=built.baseline[ch];
-      if(!base || base.count<2) continue;
-      const g=seq.slots[i];
-      const diffs={
-        aspect:rfSafeRel(Number(g.width)/Math.max(1,Number(g.height)),base.aspect,.30),
-        fill:rfSafeRel(Number(g.fill),base.fill,.16),
-        height:rfSafeRel(Number(g.height)/Math.max(1,Number(seq.medianH)||1),base.heightNorm,.18),
-      };
-      const finite=Object.values(diffs).filter(Number.isFinite);
-      const votes=finite.filter(v=>v>=.18).length;
-      const max=finite.length?Math.max(...finite):0;
-      perGlyph.push({index:i,char:ch,baselineCount:base.count,diffs,votes,max});
-    }
-    const outliers=perGlyph.filter(x=>x.votes>=2 && x.max>=.18);
-    const strongOutliers=perGlyph.filter(x=>x.votes>=2 && x.max>=.28);
-    const signal=outliers.length>=1 && outliers.length<=Math.max(2,Math.ceil(perGlyph.length*.40));
-    return {
-      available:perGlyph.length>=2,
-      signal,
-      strong:strongOutliers.length>=1,
-      regionCount:built.regionCount,
-      comparableGlyphCount:perGlyph.length,
-      outlierCount:outliers.length,
-      strongOutlierCount:strongOutliers.length,
-      perGlyph:perGlyph.slice(0,16),
-    };
-  }
-
-  const findings = [];
-  const fieldDiagnostics = [];
-
-  for (const targetLabel of targetLabels) {
-    const field = normalizeKey(targetLabel.fieldKey);
-    const targetValue = rfFindValueRegion(targetRegions, targetLabel, field);
-    if (!targetValue?.region) continue;
-
-    const targetLabelRegion = rfFocusLabelRegion(targetLabel.region, targetLabel.text);
-    const targetValueRegion = rfFocusValueRegion(targetValue.region, targetValue.text, field);
-    if (!targetValueRegion) continue;
-
-    const targetLabelMetrics = await rfRasterMetrics(targetBuffer, targetLabelRegion, targetSize);
-    const targetValueMetrics = await rfRasterMetrics(targetBuffer, targetValueRegion, targetSize);
-    const targetCharacterMetrics = await rfCharacterMetrics(targetBuffer, targetValueRegion, targetSize);
-    const targetEla = await localElaOutlier(targetBuffer, targetValueRegion);
-    const localStyle = internalStyleResidual(targetLabelMetrics, targetValueMetrics);
-
-    let referenceSupport = [];
-    for (const ref of refEntries) {
-      const candidates = ref.labels
-        .filter(x => x.fieldKey === field)
-        .map(x => {
-          const a = regionCenter(targetLabel.region);
-          const b = regionCenter(x.region);
-          const targetNorm = { x: a.x / targetSize.width, y: a.y / targetSize.height };
-          const refNorm = { x: b.x / ref.size.width, y: b.y / ref.size.height };
-          return { row: x, distance: Math.hypot(targetNorm.x - refNorm.x, targetNorm.y - refNorm.y) };
-        })
-        .sort((a, b) => a.distance - b.distance);
-      const refLabel = candidates[0]?.row;
-      if (!refLabel) continue;
-      const refValue = rfFindValueRegion(ref.regions, refLabel, field);
-      if (!refValue?.region) continue;
-      const refLabelRegion = rfFocusLabelRegion(refLabel.region, refLabel.text);
-      const refValueRegion = rfFocusValueRegion(refValue.region, refValue.text, field);
-      const refLabelMetrics = await rfRasterMetrics(ref.buffer, refLabelRegion, ref.size);
-      const refValueMetrics = await rfRasterMetrics(ref.buffer, refValueRegion, ref.size);
-      const refCharacterMetrics = await rfCharacterMetrics(ref.buffer, refValueRegion, ref.size);
-      const targetToRefValueResidual = rfStyleResidual(refValueMetrics, targetValueMetrics);
-      const targetToRefCharacterResidual = rfCharacterMetrics && targetCharacterMetrics && refCharacterMetrics
-        ? rfSafeRel(targetCharacterMetrics.characterWidthToHeight, refCharacterMetrics.characterWidthToHeight, .42) * .25 +
-          rfSafeRel(targetCharacterMetrics.characterFillRatio, refCharacterMetrics.characterFillRatio, .16) * .30 +
-          rfSafeRel(targetCharacterMetrics.characterGapToHeight, refCharacterMetrics.characterGapToHeight, .55) * .25 +
-          rfSafeRel(targetCharacterMetrics.inkAspect, refCharacterMetrics.inkAspect, .55) * .20
-        : null;
-      const referenceInternal = internalStyleResidual(refLabelMetrics, refValueMetrics);
-      const targetInternal = localStyle;
-      const internalDelta = Number.isFinite(targetInternal) && Number.isFinite(referenceInternal)
-        ? Math.abs(targetInternal - referenceInternal)
-        : null;
-
-      referenceSupport.push({
-        reference: path.basename(ref.path),
-        targetValueText: String(targetValue.text || '').trim(),
-        referenceValueText: String(refValue.text || '').trim(),
-        valueStyleResidual: Number.isFinite(targetToRefValueResidual) ? Number(targetToRefValueResidual.toFixed(4)) : null,
-        characterResidual: Number.isFinite(targetToRefCharacterResidual) ? Number(targetToRefCharacterResidual.toFixed(4)) : null,
-        targetInternalStyle: Number.isFinite(targetInternal) ? Number(targetInternal.toFixed(4)) : null,
-        referenceInternalStyle: Number.isFinite(referenceInternal) ? Number(referenceInternal.toFixed(4)) : null,
-        internalStyleDelta: Number.isFinite(internalDelta) ? Number(internalDelta.toFixed(4)) : null,
-      });
-    }
-
-    const refInternalMedian = rfMedian(referenceSupport.map(x => Number(x.internalStyleDelta)).filter(Number.isFinite));
-    const refCharacterMedian = rfMedian(referenceSupport.map(x => Number(x.characterResidual)).filter(Number.isFinite));
-    const refValueStyleMedian = rfMedian(referenceSupport.map(x => Number(x.valueStyleResidual)).filter(Number.isFinite));
-
-    // For the amount field, an unusually high local ELA residual is particularly
-    // useful after a clean-looking erase/rewrite. For other fields it remains
-    // corroborating evidence only.
-    const elaSignal = Boolean(targetEla?.outlier);
-    const internalSignal = Number.isFinite(refInternalMedian) && refInternalMedian >= 0.22;
-    const characterSignal = Number.isFinite(refCharacterMedian) && refCharacterMedian >= 0.24;
-    const valueRasterSignal = Number.isFinite(refValueStyleMedian) && refValueStyleMedian >= 0.48;
-
-    let sameFieldDigitSignal = false;
-    if (field === 'amount' && targetValue.text) {
-      try {
-        const numeric = await rfNumericGlyphSequence(targetBuffer, targetValueRegion, targetSize, targetValue.text);
-        if (numeric?.slots?.length >= 3) {
-          const widths = numeric.slots.map(x => x.width / Math.max(1, x.height));
-          const fills = numeric.slots.map(x => x.fill);
-          const medW = rfMedian(widths), medF = rfMedian(fills);
-          const outlierCount = numeric.slots.filter(x =>
-            Math.abs((x.width / Math.max(1, x.height)) - medW) / Math.max(.05, Math.abs(medW)) > .22 ||
-            Math.abs(x.fill - medF) / Math.max(.05, Math.abs(medF)) > .22
-          ).length;
-          sameFieldDigitSignal = outlierCount >= 1 && outlierCount <= Math.ceil(numeric.slots.length * .30);
-        }
-      } catch {}
-    }
-
-    const numericBaselineAnalysis = field === 'amount' && targetValue.text
-      ? await analyzeAmountAgainstNumericBaseline(targetValueRegion, targetValue.text)
-      : null;
-    const documentNumericGlyphSignal = Boolean(numericBaselineAnalysis?.signal);
-    const documentNumericGlyphStrong = Boolean(numericBaselineAnalysis?.strong);
-
-    // Content-independent signals are preferred. Raw target-vs-reference
-    // character differences are NOT sufficient because legitimate values can
-    // differ (2.000 vs 10.000, one date vs another, different IBAN, etc.).
-    // They remain diagnostics only.
-    // AMOUNT V3 BRIDGE: promote the existing amount micro-raster measurements
-    // into a field-level diagnostic. This is deliberately MEDIUM by itself;
-    // JPG/compression/render differences can also affect these metrics.
-    const amountV3Metrics = field === 'amount' && amountForensics?.metrics
-      ? amountForensics.metrics
-      : null;
-    const amountV3LocalizedSignal = Boolean(
-      amountV3Metrics &&
-      Number(amountV3Metrics.maxFeatureVotes) >= 4 &&
-      Number(amountV3Metrics.localAnomalyRatio) >= 0.15 &&
-      Number(amountV3Metrics.localAnomalyRatio) <= 0.70 &&
-      (
-        Number(amountV3Metrics.maxInkRatioDifference) >= 0.38 ||
-        Number(amountV3Metrics.maxStrokeProxyDifference) >= 0.38 ||
-        Number(amountV3Metrics.maxEdgeDensityDifference) >= 0.38 ||
-        Number(amountV3Metrics.maxDarknessDifference) >= 0.38
-      )
-    );
-
-    // Compare the candidate field against the document-wide SAME-JPG baseline.
-    // If the whole document shows similar raster/ELA deviation, do not treat
-    // the amount's local V3 values as strong evidence by themselves.
-    let globalBaselineDiagnostic = null;
-    let globalJpegLocalizedSignal = false;
-    if (globalJpegRasterBaseline && field === 'amount') {
-      const targetRasterDistance = globalJpegRasterBaseline._rasterDistance(targetValueMetrics);
-      const mad = Math.max(0.01, Number(globalJpegRasterBaseline.rasterDistanceMad) || 0.01);
-      const rasterRobustZ = Number.isFinite(targetRasterDistance)
-        ? (targetRasterDistance - Number(globalJpegRasterBaseline.rasterDistanceMedian || 0)) / mad
-        : null;
-      let elaRobustZ = null;
-      if (Number.isFinite(targetEla?.targetMean) && Number.isFinite(globalJpegRasterBaseline.elaMedian)) {
-        const elaMad = Math.max(0.5, Number(globalJpegRasterBaseline.elaMad) || 0.5);
-        elaRobustZ = (Number(targetEla.targetMean) - Number(globalJpegRasterBaseline.elaMedian)) / elaMad;
-      }
-      globalJpegLocalizedSignal = Boolean(
-        (Number.isFinite(rasterRobustZ) && rasterRobustZ >= 3) ||
-        (Number.isFinite(elaRobustZ) && elaRobustZ >= 3)
-      );
-      globalBaselineDiagnostic = {
-        sampleCount: globalJpegRasterBaseline.sampleCount,
-        targetRasterDistance: Number.isFinite(targetRasterDistance) ? Number(targetRasterDistance.toFixed(4)) : null,
-        rasterBaselineMedian: Number(globalJpegRasterBaseline.rasterDistanceMedian?.toFixed?.(4) || 0),
-        rasterBaselineMad: Number(globalJpegRasterBaseline.rasterDistanceMad?.toFixed?.(4) || 0),
-        rasterRobustZ: Number.isFinite(rasterRobustZ) ? Number(rasterRobustZ.toFixed(2)) : null,
-        targetElaMean: Number.isFinite(targetEla?.targetMean) ? Number(targetEla.targetMean.toFixed(3)) : null,
-        elaBaselineMedian: Number(globalJpegRasterBaseline.elaMedian?.toFixed?.(3) || 0),
-        elaBaselineMad: Number(globalJpegRasterBaseline.elaMad?.toFixed?.(3) || 0),
-        elaRobustZ: Number.isFinite(elaRobustZ) ? Number(elaRobustZ.toFixed(2)) : null,
-        localizedBeyondGlobalJpeg: globalJpegLocalizedSignal,
-      };
-    }
-
-    // V3 local raster evidence is promoted only when the same target image
-    // also shows that the field is unusually different from the document-wide
-    // JPEG/raster baseline. If the whole JPG is noisy, this gate prevents a
-    // global compression/render artifact from becoming a field finding.
-    // V7 AMOUNT JPEG-AWARE LOCAL CONTRAST:
-    // A rewritten amount can have only a modest absolute ELA value. We therefore
-    // compare the amount ROI against immediate same-document neighbours and then
-    // use the document-wide JPEG/raster baseline as a second guard.
-    let localJpegContrastSignal = false;
-    let localJpegContrastDiagnostic = null;
-    if (field === 'amount' && amountV3LocalizedSignal && targetValueRegion) {
-      try {
-        const x1 = Number(targetValueRegion.x1), y1 = Number(targetValueRegion.y1);
-        const x2 = Number(targetValueRegion.x2), y2 = Number(targetValueRegion.y2);
-        const w = Math.max(8, x2 - x1), h = Math.max(8, y2 - y1);
-        const controls = [
-          {x1:x1-w*1.20,y1:y1,x2:x1-w*0.20,y2:y2},
-          {x1:x2+w*0.20,y1:y1,x2:x2+w*1.20,y2:y2},
-          {x1:x1,y1:y1-h*1.20,x2:x2,y2:y1-h*0.20},
-          {x1:x1,y1:y2+h*0.20,x2:x2,y2:y2+h*1.20}
-        ].map(r => ({
-          x1:Math.max(0,r.x1), y1:Math.max(0,r.y1),
-          x2:Math.min(targetSize.width,r.x2), y2:Math.min(targetSize.height,r.y2)
-        })).filter(r => r.x2-r.x1>=8 && r.y2-r.y1>=8);
-
-        const targetRaster = await rfRasterMetrics(targetBuffer,targetValueRegion,targetSize);
-        const controlRaster = [];
-        for (const c of controls.slice(0,4)) {
-          const m = await rfRasterMetrics(targetBuffer,c,targetSize);
-          if (m) controlRaster.push(m);
-        }
-
-        if (targetRaster && controlRaster.length >= 2) {
-          const distanceTo = (m) => {
-            const parts = [
-              rfSafeRel(targetRaster.meanLuma,m.meanLuma,18),
-              rfSafeRel(targetRaster.lumaStd,m.lumaStd,10),
-              rfSafeRel(targetRaster.darkRatio,m.darkRatio,.08),
-              rfSafeRel(targetRaster.edgeRatio,m.edgeRatio,.08),
-              rfSafeRel(targetRaster.rowVariance,m.rowVariance,.012),
-              rfSafeRel(targetRaster.colVariance,m.colVariance,.012)
-            ].filter(Number.isFinite);
-            return parts.length ? parts.reduce((a,b)=>a+b,0)/parts.length : null;
-          };
-          const localDistances = controlRaster.map(distanceTo).filter(Number.isFinite);
-          const localMedian = rfMedian(localDistances);
-          const globalMedian = Number(globalJpegRasterBaseline?.rasterDistanceMedian);
-          const globalMad = Math.max(.01,Number(globalJpegRasterBaseline?.rasterDistanceMad)||.01);
-          const globalFieldDistance = globalJpegRasterBaseline && typeof globalJpegRasterBaseline._rasterDistance === 'function'
-            ? globalJpegRasterBaseline._rasterDistance(targetRaster) : null;
-          const globalRobustZ = Number.isFinite(globalFieldDistance)
-            ? (globalFieldDistance-globalMedian)/globalMad : null;
-          const localVsGlobalRatio = Number.isFinite(localMedian) && Number.isFinite(globalMedian)
-            ? localMedian / Math.max(.05,globalMedian) : null;
-
-          // V3 is required first. Then require a meaningful local contrast.
-          // If the document-wide baseline exists, also require the amount ROI
-          // to be elevated relative to that baseline. This is the JPEG guard.
-          localJpegContrastSignal = Boolean(
-            amountV3LocalizedSignal &&
-            Number.isFinite(localVsGlobalRatio) && localVsGlobalRatio >= 1.45 &&
-            (!Number.isFinite(globalRobustZ) || globalRobustZ >= 1.75)
-          );
-          localJpegContrastDiagnostic = {
-            controlCount: controlRaster.length,
-            localDistances: localDistances.map(v=>Number(v.toFixed(4))),
-            localMedian: Number(localMedian.toFixed(4)),
-            globalMedian: Number.isFinite(globalMedian)?Number(globalMedian.toFixed(4)):null,
-            localVsGlobalRatio: Number.isFinite(localVsGlobalRatio)?Number(localVsGlobalRatio.toFixed(2)):null,
-            globalFieldDistance: Number.isFinite(globalFieldDistance)?Number(globalFieldDistance.toFixed(4)):null,
-            globalRobustZ: Number.isFinite(globalRobustZ)?Number(globalRobustZ.toFixed(2)):null,
-            signal: localJpegContrastSignal
-          };
-        }
-      } catch (error) {
-        console.warn('V7 AMOUNT LOCAL JPEG CONTRAST HATASI:', error?.message || error);
-      }
-    }
-
-    const amountV3GlobalSupported = Boolean(
-      amountV3LocalizedSignal && (
-        globalJpegLocalizedSignal ||
-        localJpegContrastSignal ||
-        !globalBaselineDiagnostic
-      )
-    );
-
-    const contentIndependentStrong =
-      (elaSignal && internalSignal) ||
-      (elaSignal && sameFieldDigitSignal) ||
-      (amountV3GlobalSupported && (elaSignal || internalSignal || sameFieldDigitSignal)) ||
-      (documentNumericGlyphStrong && amountV3GlobalSupported) ||
-      (internalSignal && sameFieldDigitSignal && referenceSupport.length >= 1);
-
-    const signalCount = [
-      elaSignal, internalSignal, characterSignal, valueRasterSignal,
-      sameFieldDigitSignal, amountV3GlobalSupported, documentNumericGlyphSignal
-    ].filter(Boolean).length;
-    const isCritical = field === 'amount' || field === 'date' || field === 'time' || field === 'iban' || field === 'transactionNo';
-
-    // Do not call a field edited from a single weak signal. Critical fields may
-    // surface only when at least two content-independent/local signals agree.
-    // This is deliberately conservative to avoid treating normal dynamic-value
-    // changes as tampering.
-    const strong = Boolean(contentIndependentStrong) && (
-      isCritical || referenceSupport.length >= 1
-    );
-    const medium = !strong && signalCount >= 1 && (
-      isCritical && (
-        elaSignal ||
-        internalSignal ||
-        // V14.8: amount V3/V9 raster anomalies are candidate-only. They are
-        // deliberately excluded from MEDIUM by themselves because a known
-        // original Enpara receipt can produce the same localized raster signal.
-        // For amount, require an independent numeric-glyph + local-contrast
-        // corroboration before surfacing a field-level caution.
-        (field === 'amount' && documentNumericGlyphSignal && localJpegContrastSignal) ||
-        (field !== 'amount' && amountV3LocalizedSignal)
-      )
-    );
-
-    const diagnostic = {
-      field,
-      label: String(targetLabel.text || '').trim(),
-      targetValue: String(targetValue.text || '').trim(),
-      signalCount,
-      signals: {
-        elaSignal,
-        internalSignal,
-        characterSignal,
-        valueRasterSignal,
-        sameFieldDigitSignal,
-        documentNumericGlyphSignal,
-        documentNumericGlyphStrong,
-        amountV3LocalizedSignal,
-        amountV3GlobalSupported,
-        globalJpegLocalizedSignal,
-        localJpegContrastSignal,
-      },
-      localEla: targetEla,
-      referenceSupport,
-      referenceInternalDeltaMedian: Number.isFinite(refInternalMedian) ? Number(refInternalMedian.toFixed(4)) : null,
-      referenceCharacterResidualMedian: Number.isFinite(refCharacterMedian) ? Number(refCharacterMedian.toFixed(4)) : null,
-      referenceValueStyleResidualMedian: Number.isFinite(refValueStyleMedian) ? Number(refValueStyleMedian.toFixed(4)) : null,
-      documentNumericGlyph: numericBaselineAnalysis,
-      amountV3: amountV3Metrics ? {
-        maxFeatureVotes: Number(amountV3Metrics.maxFeatureVotes || 0),
-        maxInkRatioDifference: Number(amountV3Metrics.maxInkRatioDifference || 0),
-        maxStrokeProxyDifference: Number(amountV3Metrics.maxStrokeProxyDifference || 0),
-        maxEdgeDensityDifference: Number(amountV3Metrics.maxEdgeDensityDifference || 0),
-        maxDarknessDifference: Number(amountV3Metrics.maxDarknessDifference || 0),
-        localAnomalyRatio: Number(amountV3Metrics.localAnomalyRatio || 0),
-      } : null,
-      globalJpegBaseline: globalBaselineDiagnostic,
-      localJpegContrast: localJpegContrastDiagnostic,
-      targetBox: { ...targetValueRegion },
-    };
-    if (field === 'amount' && amountForensics?.amountFormatComparison?.mismatch) {
-      diagnostic.signals.amountFormatMismatch = true;
-      diagnostic.amountFormatComparison = amountForensics.amountFormatComparison;
-    }
-    fieldDiagnostics.push(diagnostic);
-
-    if (strong || medium) {
-      const reasons = [];
-      if (elaSignal) reasons.push('lokal yeniden-kodlama/ELA artışı');
-      if (internalSignal) reasons.push('etiket-değer raster ilişkisi referans davranışından ayrılıyor');
-      if (characterSignal) reasons.push('karakter geometrisi referans profilinden ayrılıyor');
-      if (valueRasterSignal) reasons.push('değer bölgesi raster/stroke yapısı belirgin farklı');
-      if (sameFieldDigitSignal) reasons.push('aynı tutar alanında tekil karakter geometrisi aykırılığı');
-      if (documentNumericGlyphSignal) reasons.push('aynı rakamların belge içi karakter profiline göre lokal geometri/dolgu ayrışması');
-      if (amountV3GlobalSupported) reasons.push('tutar alanı global JPG/raster baseline üzerinde lokal anomali gösteriyor');
-      else if (amountV3LocalizedSignal) reasons.push('tutar alanında mikro-raster anomali bulundu ancak global JPG baseline tarafından henüz doğrulanmadı');
-      findings.push({
-        field,
-        title: field === 'amount' ? 'Tutar' : field === 'date' ? 'Tarih' : field === 'time' ? 'Saat' : field === 'iban' ? 'IBAN' : field === 'transactionNo' ? 'İşlem No' : field,
-        severity: strong ? 'strong' : 'medium',
-        confidence: Math.min(98, 68 + signalCount * 9 + (referenceSupport.length >= 2 ? 8 : referenceSupport.length ? 4 : 0)),
-        evidence: `Alan içinde olası sonradan düzenleme izi: ${reasons.join('; ')}.`,
-        targetBox: { ...targetValueRegion },
-        signals: diagnostic.signals,
-      });
-    }
-  }
-
-  // V6 AMOUNT FALLBACK: The amount candidate is already selected by the
-  // dedicated Amount Forensics engine. If semantic label->value pairing did
-  // not expose an `amount` field in the generic loop, do not lose the amount
-  // evidence. Re-run the same-character baseline directly on the selected
-  // amount ROI. This path is only promoted when the existing Amount V3 local
-  // raster signal corroborates it, so a harmless numeric field is not enough.
-  if (amountForensics?.region && !fieldDiagnostics.some(x => x.field === 'amount')) {
-    try {
-      const fallbackRegion = rfFocusValueRegion(amountForensics.region, amountForensics.amountText || amountForensics.selectedAmountText, 'amount');
-      const fallbackText = String(amountForensics.amountText || amountForensics.selectedAmountText || '').trim();
-      const fallbackGlyph = await analyzeAmountAgainstNumericBaseline(fallbackRegion, fallbackText);
-      const fallbackMetrics = amountForensics?.metrics || null;
-      const fallbackV3Signal = Boolean(
-        fallbackMetrics &&
-        Number(fallbackMetrics.maxFeatureVotes) >= 4 &&
-        Number(fallbackMetrics.localAnomalyRatio) >= 0.15 &&
-        Number(fallbackMetrics.localAnomalyRatio) <= 0.70 &&
-        (
-          Number(fallbackMetrics.maxInkRatioDifference) >= 0.38 ||
-          Number(fallbackMetrics.maxStrokeProxyDifference) >= 0.38 ||
-          Number(fallbackMetrics.maxEdgeDensityDifference) >= 0.38 ||
-          Number(fallbackMetrics.maxDarknessDifference) >= 0.38
-        )
-      );
-      // V8 AMOUNT LOCAL-EDIT FALLBACK:
-      // The generic field loop can miss the amount field because semantic
-      // label/value pairing is conservative. The dedicated Amount Forensics
-      // engine, however, already selected the correct amount ROI.
-      //
-      // Important: JPEG/ELA is NOT required to be positive here. We compare
-      // the amount ROI against immediate same-document neighbours and against
-      // the global JPEG baseline. This is specifically designed to distinguish
-      // a local rewrite such as 2.000 -> 10.000 from document-wide JPEG noise.
-      let fallbackLocalJpegSignal = false;
-      let fallbackLocalJpegDiagnostic = null;
-
-      // V13 SCOPE FIX: these values are consumed by the V9/V10 convergence
-      // logic below and must survive outside the inner raster-analysis block.
-      // Initialize them in the surrounding request scope instead of creating
-      // block-local bindings.
-      let fallbackGlobalRobustZ = null;
-      let fallbackLocalVsGlobalRatio = null;
-
-      if (fallbackV3Signal && fallbackRegion) {
-        try {
-          const fx1 = Number(fallbackRegion.x1), fy1 = Number(fallbackRegion.y1);
-          const fx2 = Number(fallbackRegion.x2), fy2 = Number(fallbackRegion.y2);
-          const fw = Math.max(8, fx2 - fx1), fh = Math.max(8, fy2 - fy1);
-          const fallbackControls = [
-            {x1:fx1-fw*1.25,y1:fy1,x2:fx1-fw*0.15,y2:fy2},
-            {x1:fx2+fw*0.15,y1:fy1,x2:fx2+fw*1.25,y2:fy2},
-            {x1:fx1,y1:fy1-fh*1.25,x2:fx2,y2:fy1-fh*0.15},
-            {x1:fx1,y1:fy2+fh*0.15,x2:fx2,y2:fy2+fh*1.25}
-          ].map(r => ({
-            x1:Math.max(0,r.x1), y1:Math.max(0,r.y1),
-            x2:Math.min(targetSize.width,r.x2), y2:Math.min(targetSize.height,r.y2)
-          })).filter(r => r.x2-r.x1>=8 && r.y2-r.y1>=8);
-
-          const fallbackTargetRaster = await rfRasterMetrics(targetBuffer, fallbackRegion, targetSize);
-          const fallbackControlRaster = [];
-          for (const c of fallbackControls.slice(0,4)) {
-            const m = await rfRasterMetrics(targetBuffer, c, targetSize);
-            if (m) fallbackControlRaster.push(m);
-          }
-
-          if (fallbackTargetRaster && fallbackControlRaster.length >= 2) {
-            const fallbackDistanceTo = (m) => {
-              const parts = [
-                rfSafeRel(fallbackTargetRaster.meanLuma,m.meanLuma,18),
-                rfSafeRel(fallbackTargetRaster.lumaStd,m.lumaStd,10),
-                rfSafeRel(fallbackTargetRaster.darkRatio,m.darkRatio,.08),
-                rfSafeRel(fallbackTargetRaster.edgeRatio,m.edgeRatio,.08),
-                rfSafeRel(fallbackTargetRaster.rowVariance,m.rowVariance,.012),
-                rfSafeRel(fallbackTargetRaster.colVariance,m.colVariance,.012)
-              ].filter(Number.isFinite);
-              return parts.length ? parts.reduce((a,b)=>a+b,0)/parts.length : null;
-            };
-
-            const fallbackLocalDistances = fallbackControlRaster
-              .map(fallbackDistanceTo).filter(Number.isFinite);
-            const fallbackLocalMedian = rfMedian(fallbackLocalDistances);
-            const fallbackGlobalMedian = Number(globalJpegRasterBaseline?.rasterDistanceMedian);
-            const fallbackGlobalMad = Math.max(
-              .01,
-              Number(globalJpegRasterBaseline?.rasterDistanceMad) || .01
-            );
-
-            const fallbackGlobalFieldDistance =
-              globalJpegRasterBaseline &&
-              typeof globalJpegRasterBaseline._rasterDistance === 'function'
-                ? globalJpegRasterBaseline._rasterDistance(fallbackTargetRaster)
-                : null;
-
-            fallbackGlobalRobustZ = Number.isFinite(fallbackGlobalFieldDistance)
-              ? (fallbackGlobalFieldDistance-fallbackGlobalMedian)/fallbackGlobalMad
-              : null;
-
-            fallbackLocalVsGlobalRatio =
-              Number.isFinite(fallbackLocalMedian) &&
-              Number.isFinite(fallbackGlobalMedian)
-                ? fallbackLocalMedian / Math.max(.05,fallbackGlobalMedian)
-                : null;
-
-            // V8 uses V3 as the localized trigger and then asks whether the
-            // amount ROI is measurably different from its immediate controls.
-            // The global baseline prevents ordinary JPEG noise from becoming
-            // a finding. ELA is deliberately NOT required.
-            fallbackLocalJpegSignal = Boolean(
-              fallbackV3Signal &&
-              Number.isFinite(fallbackLocalVsGlobalRatio) &&
-              fallbackLocalVsGlobalRatio >= 1.25 &&
-              (
-                !Number.isFinite(fallbackGlobalRobustZ) ||
-                fallbackGlobalRobustZ >= 1.0
-              )
-            );
-
-            fallbackLocalJpegDiagnostic = {
-              controlCount: fallbackControlRaster.length,
-              localDistances: fallbackLocalDistances.map(v=>Number(v.toFixed(4))),
-              localMedian: Number.isFinite(fallbackLocalMedian)
-                ? Number(fallbackLocalMedian.toFixed(4)) : null,
-              globalMedian: Number.isFinite(fallbackGlobalMedian)
-                ? Number(fallbackGlobalMedian.toFixed(4)) : null,
-              globalFieldDistance: Number.isFinite(fallbackGlobalFieldDistance)
-                ? Number(fallbackGlobalFieldDistance.toFixed(4)) : null,
-              localVsGlobalRatio: Number.isFinite(fallbackLocalVsGlobalRatio)
-                ? Number(fallbackLocalVsGlobalRatio.toFixed(2)) : null,
-              globalRobustZ: Number.isFinite(fallbackGlobalRobustZ)
-                ? Number(fallbackGlobalRobustZ.toFixed(2)) : null,
-              signal: fallbackLocalJpegSignal
-            };
-          }
-        } catch (error) {
-          console.warn('V8 AMOUNT LOCAL EDIT CONTRAST HATASI:', error?.message || error);
-        }
-      }
-
-      // V9 AMOUNT CONVERGENCE:
-      // V8 was deliberately conservative: Amount V3 had to be corroborated
-      // by either the numeric-glyph baseline or the local-JPEG contrast test.
-      // That caused a real local rewrite such as 2.000 -> 10.000 to disappear
-      // when the whole JPG had been recompressed and the global JPEG baseline
-      // was not very different from the amount ROI.
-      //
-      // V9 keeps the global JPEG baseline, but uses it as a COMPRESSION VETO,
-      // not as a mandatory positive signal. A localized V3 anomaly can therefore
-      // survive normal document-wide JPEG compression. The V3 signal itself must
-      // still be multi-feature and spatially bounded; we never promote a single
-      // ink/edge metric on its own.
-      const v9Ink = Number(fallbackMetrics?.maxInkRatioDifference || 0);
-      const v9Stroke = Number(fallbackMetrics?.maxStrokeProxyDifference || 0);
-      const v9Edge = Number(fallbackMetrics?.maxEdgeDensityDifference || 0);
-      const v9Darkness = Number(fallbackMetrics?.maxDarknessDifference || 0);
-      const v9AnomalyRatio = Number(fallbackMetrics?.localAnomalyRatio || 0);
-      const v9FeatureVotes = Number(fallbackMetrics?.maxFeatureVotes || 0);
-      const v9StrongFeatureCount = [v9Ink, v9Stroke, v9Edge, v9Darkness]
-        .filter(v => Number.isFinite(v) && v >= 0.42).length;
-
-      const v9LocalizedRasterSignal = Boolean(
-        fallbackV3Signal &&
-        v9FeatureVotes >= 4 &&
-        v9AnomalyRatio >= 0.30 &&
-        v9AnomalyRatio <= 0.70 &&
-        v9StrongFeatureCount >= 2
-      );
-
-      // If the global JPEG baseline itself is extremely abnormal AND the local
-      // ROI is not materially more abnormal than the document background, treat
-      // the V3 result as compression noise. Otherwise preserve the localized
-      // V3 signal. This is the important distinction between document-wide JPG
-      // damage and a small rewritten amount region.
-      const v9CompressionDominated = Boolean(
-        Number.isFinite(fallbackGlobalRobustZ) &&
-        fallbackGlobalRobustZ >= 2.5 &&
-        Number.isFinite(fallbackLocalVsGlobalRatio) &&
-        fallbackLocalVsGlobalRatio < 1.20
-      );
-
-      const v9JpegAwareLocalizedSignal = Boolean(
-        v9LocalizedRasterSignal && !v9CompressionDominated
-      );
-
-      const fallbackConvergentSignal = Boolean(
-        fallbackV3Signal &&
-        (
-          Boolean(fallbackGlyph?.signal) ||
-          fallbackLocalJpegSignal ||
-          v9JpegAwareLocalizedSignal
-        )
-      );
-
-      if (fallbackConvergentSignal) {
-        // V14.8 V9 CANDIDATE-ONLY GATE:
-        // A localized V3/V9 raster anomaly is NOT a fraud finding by itself.
-        // We observed the same V9 signal on a known-original Enpara receipt.
-        // Therefore V9 remains a candidate detector/diagnostic only; it must
-        // never create a MEDIUM finding or confidence score on its own.
-        // Actual fraud promotion belongs to independent evidence (preferably
-        // exact-original-vs-target paint-over residual analysis).
-        //
-        // V13.1 AMOUNT STRONG GATE:
-        // Amount V3/V9 are intentionally sensitive detectors, but they are not
-        // sufficient by themselves for a STRONG field-tampering finding.
-        // A normal original Enpara JPG can legitimately produce a localized
-        // V3/V9 raster outlier because of rendering, resizing or compression.
-        //
-        // STRONG therefore requires a second, independent corroborating family:
-        //   1) strong same-document numeric-glyph evidence PLUS
-        //      local-JPEG contrast, V9 localized raster evidence, OR a real
-        //      reference-format mismatch; OR
-        //   2) very strong local-JPEG evidence with >=5 V3 feature votes; OR
-        //   3) V9 localized raster evidence PLUS a numeric-glyph signal.
-        //
-        // Crucially, V3/V9 alone can remain MEDIUM/diagnostic but cannot promote
-        // an otherwise clean original amount to STRONG.
-        const amountFormatMismatch = Boolean(
-          amountForensics?.amountFormatComparison?.mismatch
-        );
-        const fallbackStrong = Boolean(
-          // V14.8: V9 localized raster evidence is candidate-only and cannot
-          // promote an amount to STRONG. Keep only an independent corroborating
-          // family here; exact-pair paint-over evidence is handled separately.
-          (
-            fallbackGlyph?.strong &&
-            fallbackLocalJpegSignal
-          ) ||
-          (
-            fallbackLocalJpegSignal &&
-            Number(fallbackMetrics?.maxFeatureVotes || 0) >= 5
-          )
-        );
-        const fallbackFinding = fallbackStrong ? {
-          field: 'amount',
-          title: 'Tutar',
-          severity: 'strong',
-          confidence: 91,
-          evidence: `Tutar alanında lokal raster/karakter ayrışması tespit edildi. ${
-            fallbackGlyph?.signal
-              ? `${fallbackGlyph.outlierCount} karakter belge içi karakter profiline göre aykırı. `
-              : ''
-          }Amount Forensics V3 aynı bölgede çoklu mikro-raster anomali gösteriyor${
-            fallbackLocalJpegSignal
-              ? ' ve tutar ROI’si aynı JPG içindeki komşu bölgelerden belirgin şekilde ayrışıyor.'
-              : '.'
-          } JPEG sıkıştırması tek başına bulgu olarak kullanılmadı.`,
-          targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
-          signals: {
-            documentNumericGlyphSignal: Boolean(fallbackGlyph?.signal),
-            documentNumericGlyphStrong: Boolean(fallbackGlyph?.strong),
-            amountFormatMismatch,
-            amountV3LocalizedSignal: true,
-            localJpegContrastSignal: fallbackLocalJpegSignal,
-            v9LocalizedRasterSignal: v9LocalizedRasterSignal,
-            v9JpegAwareLocalizedSignal: v9JpegAwareLocalizedSignal,
-            v9CompressionDominated: v9CompressionDominated,
-            v9StrongFeatureCount,
-            source: 'amount-forensics-v9-local-edit-jpeg-aware',
-          candidateOnly: !fallbackStrong,
-          },
-        };
-        if (fallbackStrong) findings.push(fallbackFinding);
-        fieldDiagnostics.push({
-          field: 'amount',
-          label: 'Tutar',
-          targetValue: fallbackText,
-          signalCount: 2,
-          signals: fallbackFinding?.signals || {
-            documentNumericGlyphSignal: Boolean(fallbackGlyph?.signal),
-            documentNumericGlyphStrong: Boolean(fallbackGlyph?.strong),
-            amountFormatMismatch,
-            amountV3LocalizedSignal: fallbackV3Signal,
-            localJpegContrastSignal: fallbackLocalJpegSignal,
-            v9LocalizedRasterSignal,
-            v9JpegAwareLocalizedSignal,
-            v9CompressionDominated,
-            v9StrongFeatureCount,
-            source: 'amount-forensics-v9-local-edit-jpeg-aware',
-            candidateOnly: true,
-          },
-          documentNumericGlyph: fallbackGlyph,
-          amountV3: fallbackMetrics ? {
-            maxFeatureVotes: Number(fallbackMetrics.maxFeatureVotes || 0),
-            maxInkRatioDifference: Number(fallbackMetrics.maxInkRatioDifference || 0),
-            maxStrokeProxyDifference: Number(fallbackMetrics.maxStrokeProxyDifference || 0),
-            maxEdgeDensityDifference: Number(fallbackMetrics.maxEdgeDensityDifference || 0),
-            maxDarknessDifference: Number(fallbackMetrics.maxDarknessDifference || 0),
-            localAnomalyRatio: Number(fallbackMetrics.localAnomalyRatio || 0),
-          } : null,
-          localJpegContrast: fallbackLocalJpegDiagnostic,
-          targetBox: fallbackRegion ? { ...fallbackRegion } : { ...amountForensics.region },
-        });
-        console.log('V8 AMOUNT DIRECT FALLBACK:', JSON.stringify({
-          amountText: fallbackText,
-          numericGlyphSignal: Boolean(fallbackGlyph?.signal),
-          numericGlyphStrong: Boolean(fallbackGlyph?.strong),
-          outlierCount: Number(fallbackGlyph?.outlierCount || 0),
-          comparableGlyphCount: Number(fallbackGlyph?.comparableGlyphCount || 0),
-          amountV3Signal: fallbackV3Signal,
-          localJpegContrastSignal: fallbackLocalJpegSignal,
-          localJpegContrast: fallbackLocalJpegDiagnostic,
-          convergentSignal: fallbackConvergentSignal,
-          v9LocalizedRasterSignal,
-          v9JpegAwareLocalizedSignal,
-          v9CompressionDominated,
-          v9StrongFeatureCount,
-          v9AnomalyRatio: Number.isFinite(v9AnomalyRatio) ? Number(v9AnomalyRatio.toFixed(3)) : null,
-          candidateOnly: !fallbackStrong,
-          strongGate: {
-            amountFormatMismatch,
-            glyphStrong: Boolean(fallbackGlyph?.strong),
-            glyphSignal: Boolean(fallbackGlyph?.signal),
-            localJpegContrastSignal: fallbackLocalJpegSignal,
-            v9JpegAwareLocalizedSignal,
-            promotedStrong: fallbackStrong,
-          },
-        }));
-      } else {
-        console.log('V9 AMOUNT DIRECT FALLBACK: no-convergent-signal', JSON.stringify({
-          amountText: fallbackText,
-          numericGlyphSignal: Boolean(fallbackGlyph?.signal),
-          amountV3Signal: fallbackV3Signal,
-          localJpegContrastSignal: fallbackLocalJpegSignal,
-          localJpegContrast: fallbackLocalJpegDiagnostic,
-          v9LocalizedRasterSignal,
-          v9JpegAwareLocalizedSignal,
-          v9CompressionDominated,
-          v9StrongFeatureCount,
-          v9AnomalyRatio: Number.isFinite(v9AnomalyRatio) ? Number(v9AnomalyRatio.toFixed(3)) : null,
-          convergentSignal: fallbackConvergentSignal,
-        }));
-      }
-    } catch (error) {
-      console.warn('V6 AMOUNT DIRECT FALLBACK HATASI:', error?.message || error);
-    }
-  }
-  findings.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
-  const strongFindings = findings.filter(x => x.severity === 'strong');
-  const mediumFindings = findings.filter(x => x.severity === 'medium');
-
-  const result = {
-    available: true,
-    engine: 'field-tampering-forensics-v9-local-edit-jpeg-aware',
-    bank: normalizeBank(bank),
-    fileFingerprint: fileFingerprint || null,
-    checkedFieldCount: fieldDiagnostics.length,
-    strongFindingCount: strongFindings.length,
-    mediumFindingCount: mediumFindings.length,
-    findings: findings.slice(0, 12),
-    diagnostics: fieldDiagnostics.slice(0, 40),
-    status: strongFindings.length ? 'warning' : mediumFindings.length ? 'caution' : 'pass',
-    severity: strongFindings.length ? 'strong' : mediumFindings.length ? 'medium' : 'none',
-    evidence: strongFindings.length
-      ? `Alan düzeyinde ${strongFindings.length} güçlü lokal düzenleme sinyali bulundu.`
-      : mediumFindings.length
-        ? `Alan düzeyinde ${mediumFindings.length} orta kuvvette lokal sinyal bulundu; tek başına sahtecilik kanıtı değildir.`
-        : 'Kritik alanlarda çoklu ve lokal düzenleme sinyali bulunmadı.',
-  };
-
-  console.log('FIELD TAMPERING FORENSICS V1:', JSON.stringify({
-    bank: normalizeBank(bank),
-    checkedFieldCount: result.checkedFieldCount,
-    strongFindingCount: result.strongFindingCount,
-    mediumFindingCount: result.mediumFindingCount,
-    findings: result.findings.slice(0, 8).map(x => ({ field: x.field, severity: x.severity, confidence: x.confidence, signals: x.signals })),
-  }));
-
-  return result;
 }
 
 // =====================================================
@@ -15285,10 +13483,6 @@ let negativeSampleForensics = null;
 let pixelForensics = null;
 let openSourceForensics = null;
 let fontForensics = null;
-let fieldTamperingForensics = null;
-let paintOverBackgroundForensicsV143 = null;
-let paintOverResidualIndexV146 = null;
-let paintOverExactPairResidualV147 = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -15420,342 +13614,13 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      (() => {
-        const visualReference = getVisualReferencePath(reference);
-        return Array.isArray(visualReference) ? visualReference[0] : visualReference;
-      })()
+      getVisualReferencePath(reference)
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
   } catch (error) {
     console.warn("REFERENCE FORENSIC ENGINE V26 HATASI:", error?.message || error);
     referenceForensics = null;
-  }
-}
-
-// FIELD TAMPERING FORENSICS: referans karşılaştırmasından ayrı olarak
-// hedef belgenin kritik alanlarında lokal silme/yeniden-yazma izlerini ara.
-// Bu katman kullanıcıya tek başına "sahte" kararı vermez; ölçülebilir çoklu
-// sinyalleri üst risk motoruna kanıt olarak sağlar.
-if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
-  try {
-    const tamperingReferencePaths = getVisualReferencePath(reference);
-    fieldTamperingForensics = await runFieldTamperingForensics({
-      targetPath: forensicTargetPath,
-      targetOCR: paddleImageOCR,
-      bank,
-      referencePaths: Array.isArray(tamperingReferencePaths)
-        ? tamperingReferencePaths
-        : (tamperingReferencePaths ? [tamperingReferencePaths] : []),
-      fileFingerprint,
-      amountForensics,
-    });
-    console.log("FIELD TAMPERING FORENSICS:", JSON.stringify(fieldTamperingForensics));
-  } catch (error) {
-    console.warn("FIELD TAMPERING FORENSICS HATASI:", error?.message || error);
-    fieldTamperingForensics = null;
-  }
-}
-
-
-// =====================================================
-// V14.7 V3 resolver: exact original remains explicit/configured only.
-async function resolveExactOriginalPathV147(explicitOriginalPath = null) {
-  const candidates = [explicitOriginalPath, process.env.VERIFYDOC_EXACT_ORIGINAL_PATH]
-    .filter(Boolean).map(String);
-  for (const candidate of candidates) {
-    try { const st = await fs.stat(candidate); if (st.isFile()) return candidate; } catch {}
-  }
-  return null;
-}
-
-// VERIFYDOC V14.7 V3 — Exact Original Pair Residual
-// Diagnostic-only integration module.
-// IMPORTANT: riskContribution stays 0 until a larger clean/edited calibration set validates thresholds.
-
-function medianV147V3(a){const x=a.filter(Number.isFinite).sort((p,q)=>p-q);if(!x.length)return 0;const m=Math.floor(x.length/2);return x.length%2?x[m]:(x[m-1]+x[m])/2;}
-function madV147V3(a,m=medianV147V3(a)){return medianV147V3(a.filter(Number.isFinite).map(v=>Math.abs(v-m)));}
-function robustZV147V3(v,m,d){return d>1e-6?0.67448975*(v-m)/d:(Math.abs(v-m)<1e-6?0:(v>m?99:-99));}
-function grayV147V3(data,i){return .2126*data[i]+.7152*data[i+1]+.0722*data[i+2];}
-function rectV147V3(r,w,h){const x1=Math.max(0,Math.floor(r.x1)),y1=Math.max(0,Math.floor(r.y1)),x2=Math.min(w,Math.ceil(r.x2)),y2=Math.min(h,Math.ceil(r.y2));return x2>x1&&y2>y1?{x1,y1,x2,y2}:null;}
-function normalizeRegionV147V3(r,w,h){
-  const q=r?.r||r?.box||r;
-  if(!q)return null;
-  if(Number.isFinite(q.x1)&&Number.isFinite(q.y1)&&Number.isFinite(q.x2)&&Number.isFinite(q.y2))return rectV147V3(q,w,h);
-  if(Number.isFinite(q.x)&&Number.isFinite(q.y)&&Number.isFinite(q.width)&&Number.isFinite(q.height))return rectV147V3({x1:q.x,y1:q.y,x2:q.x+q.width,y2:q.y+q.height},w,h);
-  return null;
-}
-function annulusV147V3(target,original,w,h,b,inner,outer,dx,dy){
-  const x1=Math.max(0,Math.floor(b.x1-outer)),y1=Math.max(0,Math.floor(b.y1-outer)),x2=Math.min(w,Math.ceil(b.x2+outer)),y2=Math.min(h,Math.ceil(b.y2+outer));
-  let n=0,sum=0,gt10=0,gt20=0;
-  for(let y=y1;y<y2;y++)for(let x=x1;x<x2;x++){
-    const d=Math.min(Math.abs(x-b.x1),Math.abs(x-b.x2),Math.abs(y-b.y1),Math.abs(y-b.y2));if(d<inner||d>=outer)continue;
-    const ox=x-dx,oy=y-dy;if(ox<0||oy<0||ox>=w||oy>=h)continue;
-    const ti=(y*w+x)*3,oi=(oy*w+ox)*3;
-    const v=Math.abs(grayV147V3(target,ti)-grayV147V3(original,oi));
-    n++;sum+=v;if(v>10)gt10++;if(v>20)gt20++;
-  }
-  return {samples:n,mean:n?sum/n:0,gt10:n?gt10/n:0,gt20:n?gt20/n:0};
-}
-function boxResidualV147V3(target,original,w,h,b,dx,dy){
-  let n=0,sum=0,sum2=0,gt5=0,gt10=0,gt20=0;
-  for(let y=b.y1;y<b.y2;y++)for(let x=b.x1;x<b.x2;x++){
-    const ox=x-dx,oy=y-dy;if(ox<0||oy<0||ox>=w||oy>=h)continue;
-    const ti=(y*w+x)*3,oi=(oy*w+ox)*3;
-    const v=Math.abs(grayV147V3(target,ti)-grayV147V3(original,oi));
-    n++;sum+=v;sum2+=v*v;if(v>5)gt5++;if(v>10)gt10++;if(v>20)gt20++;
-  }
-  const mean=n?sum/n:0;
-  return {samples:n,mean,variance:Math.max(0,n?sum2/n-mean*mean:0),gt5:n?gt5/n:0,gt10:n?gt10/n:0,gt20:n?gt20/n:0};
-}
-function translationScoreV147V3(target,original,w,h,dx,dy,step=4){
-  const x1=Math.max(0,dx),y1=Math.max(0,dy),x2=Math.min(w,w+dx),y2=Math.min(h,h+dy);if(x2-x1<300||y2-y1<200)return-Infinity;
-  let st=0,so=0,stt=0,soo=0,sto=0,n=0;
-  for(let y=y1;y<y2;y+=step)for(let x=x1;x<x2;x+=step){const ti=(y*w+x)*3,oi=((y-dy)*w+(x-dx))*3,t=grayV147V3(target,ti),o=grayV147V3(original,oi);st+=t;so+=o;stt+=t*t;soo+=o*o;sto+=t*o;n++;}
-  const mt=st/n,mo=so/n,vt=Math.max(1e-9,stt/n-mt*mt),vo=Math.max(1e-9,soo/n-mo*mo),c=sto/n-mt*mo;return c/Math.sqrt(vt*vo);
-}
-function findTranslationV147V3(target,original,w,h){let best={dx:0,dy:0,score:-Infinity};for(let dy=-20;dy<=20;dy++)for(let dx=-20;dx<=20;dx++){const s=translationScoreV147V3(target,original,w,h,dx,dy);if(s>best.score)best={dx,dy,score:s};}return best;}
-
-async function runPaintOverExactPairResidualV147({targetPath,originalPath,targetOCR}){
-  const base={available:false,engine:'paint-over-exact-pair-residual-v14.7-v3',diagnosticOnly:true,riskContribution:0,calibrationStatus:'single-known-edited-pair-diagnostic'};
-  if(!targetPath||!originalPath||!targetOCR?.success)return {...base,status:'unavailable',reason:'exact original path or OCR unavailable'};
-  if(path.resolve(targetPath)===path.resolve(originalPath))return {...base,status:'unavailable',reason:'target and original paths are identical'};
-  try{
-    const tm=await sharp(targetPath).metadata();const width=Number(tm.width),height=Number(tm.height);if(!width||!height)return {...base,status:'error',error:'target dimensions unavailable'};
-    const tr=await sharp(targetPath).removeAlpha().raw().toBuffer({resolveWithObject:true});
-    const or=await sharp(originalPath).resize(width,height,{fit:'fill',kernel:sharp.kernel.lanczos3}).removeAlpha().raw().toBuffer({resolveWithObject:true});
-    const target=tr.data,original=or.data,alignment=findTranslationV147V3(target,original,width,height);
-    if(!Number.isFinite(alignment.score)||alignment.score<.90)return {...base,available:true,status:'alignment-failed',alignment};
-    const regions=Array.isArray(targetOCR.regions)?targetOCR.regions:[];
-    const candidates=regions.map((r,i)=>({regionIndex:i,text:String(r?.text||r?.value||'').trim(),box:normalizeRegionV147V3(r,width,height)})).filter(o=>o.text&&o.box)
-      .map(o=>({...o,width:o.box.x2-o.box.x1,height:o.box.y2-o.box.y1,area:(o.box.x2-o.box.x1)*(o.box.y2-o.box.y1)}))
-      .filter(o=>o.width>=8&&o.height>=6&&o.width<=width*.75&&o.height<=height*.25);
-    if(candidates.length<4)return {...base,available:true,status:'insufficient-controls',alignment,regionCount:candidates.length};
-    const observations=[];
-    for(const targetRegion of candidates){
-      const numeric=/\d/.test(targetRegion.text);const peers=candidates.filter(p=>p!==targetRegion&&/\d/.test(p.text)===numeric&&Math.abs(Math.log((p.area+1)/(targetRegion.area+1)))<.9);if(peers.length<2)continue;
-      const inner=boxResidualV147V3(target,original,width,height,targetRegion.box,alignment.dx,alignment.dy);
-      const peerInner=peers.map(p=>boxResidualV147V3(target,original,width,height,p.box,alignment.dx,alignment.dy).mean);const im=medianV147V3(peerInner),id=madV147V3(peerInner,im);
-      const rings={};
-      for(const [name,a,b] of [['1-2px',1,2],['2-4px',2,4],['4-7px',4,7]]){const value=annulusV147V3(target,original,width,height,targetRegion.box,a,b,alignment.dx,alignment.dy);const cv=peers.map(p=>annulusV147V3(target,original,width,height,p.box,a,b,alignment.dx,alignment.dy).mean);const cm=medianV147V3(cv),cd=madV147V3(cv,cm);rings[name]={value:value.mean,controlMedian:cm,controlMAD:cd,robustZ:robustZV147V3(value.mean,cm,cd),ratio:cm>0?value.mean/cm:null,gt20:value.gt20};}
-      observations.push({regionIndex:targetRegion.regionIndex,text:targetRegion.text,targetBox:targetRegion.box,peerCount:peers.length,inner:{...inner,controlMedian:im,controlMAD:id,robustZ:robustZV147V3(inner.mean,im,id),ratio:im>0?inner.mean/im:null},rings});
-    }
-    observations.sort((a,b)=>Math.abs(b.inner.robustZ)-Math.abs(a.inner.robustZ));
-    const fieldHits=observations.filter(o=>o.inner.mean>15&&Math.abs(o.inner.robustZ)>=5);
-    const amountLike=observations.filter(o=>/\d/.test(o.text)&&/(tutar|eft|[23][.,]000)/i.test(o.text));
-    return {...base,available:true,status:'diagnostic',exactPair:true,imageDimensions:{width,height},alignment:{method:'resize-original-to-target + translation-grid',dx:alignment.dx,dy:alignment.dy,correlation:Number(alignment.score.toFixed(6))},ringWidthsPx:['1-2','2-4','4-7'],controlMethod:'same-image OCR peers matched by numeric/non-numeric class and box area',candidateCount:candidates.length,observationCount:observations.length,topObservations:observations.slice(0,12),fieldHits:fieldHits.map(o=>({text:o.text,meanResidual:o.inner.mean,robustZ:o.inner.robustZ,ratio:o.inner.ratio})),corroboration:{amountLikeRegionCount:amountLike.length,twoFieldCorroboration:amountLike.length>=2},note:'Diagnostic only. Exact-pair residual evidence is not converted to risk until calibrated across multiple clean/edited pairs.'};
-  }catch(error){return {...base,status:'error',error:error?.message||String(error)};}
-}
-
-
-// =====================================================
-// V14.6 — PAINT-OVER RESIDUAL INDEX V1 (DIAGNOSTIC ONLY)
-// =====================================================
-// Amaç: OCR kutusunun hemen çevresindeki lokal raster davranışını,
-// aynı görüntüdeki benzer OCR bölgelerinin kontrol dağılımına göre
-// normalize etmek. Referans dekont farkı, amount formatı veya font farkı
-// tek başına sinyal değildir. Bu sürüm ana risk skoruna katkı vermez.
-function medianV146(values) {
-  const a = values.filter(Number.isFinite).sort((x,y)=>x-y);
-  if (!a.length) return null;
-  const m = Math.floor(a.length/2);
-  return a.length % 2 ? a[m] : (a[m-1] + a[m]) / 2;
-}
-
-function madV146(values, med) {
-  const a = values.filter(Number.isFinite).map(v => Math.abs(v-med));
-  return medianV146(a) || 0;
-}
-
-function robustZV146(value, med, mad) {
-  if (!Number.isFinite(value) || !Number.isFinite(med)) return null;
-  const scale = Math.max(1.4826 * (Number(mad) || 0), 0.0001);
-  return (value - med) / scale;
-}
-
-function clampV146(v, lo=0, hi=10) {
-  return Math.max(lo, Math.min(hi, Number.isFinite(v) ? v : 0));
-}
-
-function rectV146(r, width, height) {
-  const x1=Math.max(0,Math.floor(r.x1));
-  const y1=Math.max(0,Math.floor(r.y1));
-  const x2=Math.min(width,Math.ceil(r.x2));
-  const y2=Math.min(height,Math.ceil(r.y2));
-  if (x2<=x1 || y2<=y1) return null;
-  return {x1,y1,x2,y2};
-}
-
-function ringBoundsV146(box, inner, outer, width, height) {
-  const a={x1:box.x1-inner,y1:box.y1-inner,x2:box.x2+inner,y2:box.y2+inner};
-  const b={x1:box.x1-outer,y1:box.y1-outer,x2:box.x2+outer,y2:box.y2+outer};
-  return { inner:rectV146(a,width,height), outer:rectV146(b,width,height) };
-}
-
-function pixelMetricsV146(data, width, height, region) {
-  const r=rectV146(region,width,height);
-  if (!r) return null;
-  let n=0, sumL=0, sumL2=0, sumC=0, sumEdge=0, sumSharp=0;
-  const idx=(x,y)=>(y*width+x)*3;
-  for(let y=r.y1;y<r.y2;y++) for(let x=r.x1;x<r.x2;x++) {
-    const i=idx(x,y), rr=data[i], gg=data[i+1], bb=data[i+2];
-    const l=0.2126*rr+0.7152*gg+0.0722*bb;
-    const c=(Math.abs(rr-gg)+Math.abs(gg-bb)+Math.abs(rr-bb))/3;
-    const ir=idx(Math.min(width-1,x+1),y), id=idx(x,Math.min(height-1,y+1));
-    const lr=0.2126*data[ir]+0.7152*data[ir+1]+0.0722*data[ir+2];
-    const ld=0.2126*data[id]+0.7152*data[id+1]+0.0722*data[id+2];
-    const e=Math.abs(l-lr)+Math.abs(l-ld);
-    sumL+=l; sumL2+=l*l; sumC+=c; sumEdge+=e; n++;
-  }
-  if(!n) return null;
-  const meanL=sumL/n;
-  return {
-    samples:n,
-    luma:meanL,
-    textureVariance:Math.max(0,sumL2/n-meanL*meanL),
-    color:sumC/n,
-    edge:sumEdge/n,
-  };
-}
-
-async function runPaintOverResidualIndexV146({ targetPath, targetOCR }) {
-  const base={
-    available:false,
-    engine:"paint-over-residual-index-v14.6",
-    diagnosticOnly:true,
-    riskContribution:0,
-    calibrationStatus:"same-image-control-only",
-  };
-  if(!targetPath || !targetOCR?.success) return {...base,status:"unavailable",reason:"OCR unavailable"};
-  try {
-    const raw=await sharp(targetPath).resize({fit:"inside",withoutEnlargement:true}).removeAlpha().raw().toBuffer({resolveWithObject:true});
-    const {data,info}=raw;
-    const width=info.width,height=info.height;
-    const regions=Array.isArray(targetOCR.regions)?targetOCR.regions:[];
-    const usable=regions.map((r,i)=>({r,i,text:String(r?.text||r?.value||"").trim()}))
-      .filter(o=>o.text && o.r && Number.isFinite(o.r.x1) && Number.isFinite(o.r.y1) && Number.isFinite(o.r.x2) && Number.isFinite(o.r.y2))
-      .map(o=>({...o,box:rectV146(o.r,width,height)})).filter(o=>o.box);
-    if(usable.length<4) return {...base,available:true,status:"insufficient-controls",regionCount:usable.length};
-
-    const candidates=[];
-    for(const o of usable){
-      const w=o.box.x2-o.box.x1,h=o.box.y2-o.box.y1;
-      if(w<8 || h<6 || w>Math.max(400,width*.75) || h>Math.max(100,height*.25)) continue;
-      const rings={};
-      for(const [name,inner,outer] of [["1-2px",1,2],["2-4px",2,4],["4-7px",4,7]]){
-        const rb=ringBoundsV146(o.box,inner,outer,width,height);
-        if(!rb.inner || !rb.outer) continue;
-        // Outer minus inner: sample only the annulus.
-        const om=pixelMetricsV146(data,width,height,rb.outer);
-        const im=pixelMetricsV146(data,width,height,rb.inner);
-        if(!om || !im) continue;
-        // Approximate annulus by weighted difference; keep positive stable features.
-        const areaOuter=(rb.outer.x2-rb.outer.x1)*(rb.outer.y2-rb.outer.y1);
-        const areaInner=(rb.inner.x2-rb.inner.x1)*(rb.inner.y2-rb.inner.y1);
-        const ann=Math.max(1,areaOuter-areaInner);
-        const scaleO=areaOuter/ann, scaleI=areaInner/ann;
-        rings[name]={
-          luma:Math.abs(om.luma*scaleO-im.luma*scaleI),
-          color:Math.abs(om.color*scaleO-im.color*scaleI),
-          textureVariance:Math.abs(om.textureVariance*scaleO-im.textureVariance*scaleI),
-          edge:Math.abs(om.edge*scaleO-im.edge*scaleI),
-        };
-      }
-      if(Object.keys(rings).length) candidates.push({...o,width:w,height:h,area:w*h,rings});
-    }
-
-    // Build controls from similarly sized OCR regions. Numeric/mixed regions
-    // prefer other numeric/mixed regions, reducing false positives from labels.
-    const isNumeric=t=>/[0-9]/.test(t);
-    const observations=[];
-    for(const target of candidates){
-      const targetNumeric=isNumeric(target.text);
-      const peers=candidates.filter(p=>p!==target && Math.abs(Math.log((p.area+1)/(target.area+1)))<1.0 && isNumeric(p.text)===targetNumeric);
-      if(peers.length<3) continue;
-      const ringScores={};
-      for(const ring of ["1-2px","2-4px","4-7px"]){
-        const metrics={};
-        for(const metric of ["luma","color","textureVariance","edge"]){
-          const vals=peers.map(p=>p.rings?.[ring]?.[metric]).filter(Number.isFinite);
-          const med=medianV146(vals), mad=madV146(vals,med);
-          const value=target.rings?.[ring]?.[metric];
-          metrics[metric]={value,controlMedian:med,mad,robustZ:robustZV146(value,med,mad),ratio:med && med>0 ? value/med : null};
-        }
-        const z=Object.values(metrics).map(x=>Math.abs(x.robustZ)).filter(Number.isFinite);
-        const high=z.filter(v=>v>=2).length;
-        ringScores[ring]={metrics,meanAbsRobustZ:z.length?z.reduce((a,b)=>a+b,0)/z.length:0,highMetricCount:high};
-      }
-      const ringVals=Object.values(ringScores).map(x=>x.meanAbsRobustZ).filter(Number.isFinite);
-      const index=ringVals.length?ringVals.reduce((a,b)=>a+b,0)/ringVals.length:0;
-      observations.push({regionIndex:target.i,text:target.text,targetBox:target.box,peerCount:peers.length,paintOverResidualIndex:Number(index.toFixed(3)),rings:ringScores});
-    }
-
-    observations.sort((a,b)=>b.paintOverResidualIndex-a.paintOverResidualIndex);
-    return {
-      ...base,
-      available:true,
-      status:"diagnostic",
-      imageDimensions:{width,height},
-      controlMethod:"same-image OCR regions; numeric peers matched by box area",
-      ringWidthsPx:["1-2","2-4","4-7"],
-      metrics:["luma","color","textureVariance","edge"],
-      candidateCount:candidates.length,
-      observationCount:observations.length,
-      topObservations:observations.slice(0,12),
-      note:"Bu indeks lokal OCR-ring davranışını aynı görüntüdeki benzer bölgelerle karşılaştırır. Tek başına Photoshop kanıtı değildir ve risk skoruna katkı vermez. Exact-original pair validation gerektiğinde ayrı pixel residual ölçümü kullanılmalıdır."
-    };
-  } catch(error){
-    return {...base,available:false,status:"error",error:error?.message||String(error)};
-  }
-}
-
-// V14.6: aynı-görüntü kontrol normalizasyonlu paint-over residual index.
-// Diagnostic only: exact original olmadığı sürece Photoshop kanıtı değildir.
-if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
-  try {
-    paintOverResidualIndexV146 = await runPaintOverResidualIndexV146({
-      targetPath: forensicTargetPath,
-      targetOCR: paddleImageOCR,
-    });
-    console.log("PAINT-OVER RESIDUAL INDEX V14.6:", JSON.stringify(paintOverResidualIndexV146));
-  } catch (error) {
-    console.warn("PAINT-OVER RESIDUAL INDEX V14.6 HATASI:", error?.message || error);
-    paintOverResidualIndexV146 = null;
-  }
-}
-
-// V14.7: exact-original pair pixel residual.
-if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
-  try {
-    const exactOriginalPathV147 = await resolveExactOriginalPathV147();
-    paintOverExactPairResidualV147 = exactOriginalPathV147
-      ? await runPaintOverExactPairResidualV147({ targetPath: forensicTargetPath, originalPath: exactOriginalPathV147, targetOCR: paddleImageOCR })
-      : { available:false, engine:"paint-over-exact-pair-residual-v14.7", diagnosticOnly:true, riskContribution:0, status:"not-configured", reason:"VERIFYDOC_EXACT_ORIGINAL_PATH not provided" };
-    console.log("PAINT-OVER EXACT PAIR RESIDUAL V14.7:", JSON.stringify(paintOverExactPairResidualV147));
-  } catch (error) {
-    console.warn("PAINT-OVER EXACT PAIR RESIDUAL V14.7 HATASI:", error?.message || error);
-    paintOverExactPairResidualV147 = null;
-  }
-}
-
-// V14.3: hedef-görüntü tabanlı paint-over arka plan sürekliliği.
-// Bu sürüm yalnızca diagnostiktir; referans farklarını ve amount-format
-// farklarını ana kanıt yapmaz ve risk skorunu doğrudan değiştirmez.
-if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
-  try {
-    const paintRefPaths = getVisualReferencePath(reference);
-    paintOverBackgroundForensicsV143 = await runPaintOverBackgroundContinuityV143({
-      targetPath: forensicTargetPath,
-      targetOCR: paddleImageOCR,
-      bank,
-      referencePaths: Array.isArray(paintRefPaths)
-        ? paintRefPaths
-        : (paintRefPaths ? [paintRefPaths] : []),
-    });
-    console.log("PAINT-OVER BACKGROUND FORENSICS V14.3:", JSON.stringify(paintOverBackgroundForensicsV143));
-  } catch (error) {
-    console.warn("PAINT-OVER BACKGROUND FORENSICS V14.3 HATASI:", error?.message || error);
-    paintOverBackgroundForensicsV143 = null;
   }
 }
 
@@ -15812,12 +13677,10 @@ prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
-      const visualReference = getVisualReferencePath(reference);
-      const primaryVisualReference = Array.isArray(visualReference) ? visualReference[0] : visualReference;
       const arg = await runAzureReferenceGeometryComparison(
         al,
         bank,
-        primaryVisualReference
+        getVisualReferencePath(reference)
       );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
@@ -15836,9 +13699,6 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         forensicTargetPath, forensicTargetMime, bank, paddleImageOCR, reference.path
       );
       console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(ta));
-      if (ta?.amountFormatComparison) {
-        console.log("AMOUNT FORMAT FORENSICS V10:", JSON.stringify(ta.amountFormatComparison));
-      }
       return { kind:"template", referenceTemplateAnalysis:ta };
     } catch (error) {
       console.warn("REFERENCE TEMPLATE ANALYSIS HATASI:", error?.message || error);
@@ -15859,18 +13719,6 @@ for (const pr of prepResults) {
   }
 }
 console.log("V63 PREP SURE:", ((Date.now() - prepStartTime) / 1000).toFixed(2), "seconds");
-
-// V10: carry the non-normalized amount-format evidence into the amount
-// forensic object so downstream risk/report/watchlist layers see the same
-// evidence. Numeric normalization remains available separately.
-if (amountForensics && referenceTemplateAnalysis?.amountFormatComparison?.available) {
-  amountForensics.amountFormatComparison = referenceTemplateAnalysis.amountFormatComparison;
-  console.log("AMOUNT FORMAT FORENSICS ATTACHED:", JSON.stringify({
-    mismatch: Boolean(amountForensics.amountFormatComparison.mismatch),
-    score: Number(amountForensics.amountFormatComparison.score || 0),
-    reasons: amountForensics.amountFormatComparison.reasons || []
-  }));
-}
 
 // V56: Duplicate Terra passes V27 and V29 were diagnostic/legacy paths.
 // The V39 focused direct-reference pass below is the sole Terra reference
@@ -16371,15 +14219,11 @@ let referenceLocalCrop = null;
 const localCropStartTime = Date.now();
 if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
   try {
-    const localCropReference = getVisualReferencePath(reference);
-    const localCropReferencePath = Array.isArray(localCropReference)
-      ? localCropReference.find(Boolean)
-      : localCropReference;
     referenceLocalCrop = await runReferenceLocalCropComparator(
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      localCropReferencePath
+      getVisualReferencePath(reference)
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
@@ -16401,10 +14245,6 @@ if (referenceForensics?.available === true && (
   Number(referenceForensics.maxSpacingScore || 0) >= 85 ||
   Number(referenceForensics.suspiciousFieldCount || 0) >= 1
 )) terraGateReasons.push("forensic-strong-signal");
-if (referenceTemplateAnalysis?.amountFormatComparison?.available === true &&
-    referenceTemplateAnalysis.amountFormatComparison.mismatch === true) {
-  terraGateReasons.push("amount-format-mismatch");
-}
 
 // V64 SPEED GATE: Terra is the expensive path (~90-100s in recent runs).
 // A single soft/local signal is not enough to pay that cost.
@@ -16412,9 +14252,7 @@ if (referenceTemplateAnalysis?.amountFormatComparison?.available === true &&
 // two independent pre-Terra signals. This preserves Terra for corroborated
 // cases while skipping the common one-signal false-positive path.
 const hardTerraReasons = terraGateReasons.filter((reason) =>
-  reason === "azure-strong-anomaly" ||
-  reason === "forensic-strong-signal" ||
-  reason === "amount-format-mismatch"
+  reason === "azure-strong-anomaly" || reason === "forensic-strong-signal"
 );
 const softTerraReasons = terraGateReasons.filter((reason) =>
   reason === "template-strong-geometry" || reason === "local-render-outlier"
@@ -16442,13 +14280,10 @@ referenceVisualAdjudication = null;
 // Keep the dedicated visual adjudicator only for the softer two-signal path,
 // where it adds a genuinely independent visual arbitration layer.
 const shouldRunReferenceVisualAdjudicator =
-  (referenceTemplateAnalysis?.amountFormatComparison?.mismatch === true) ||
-  (shouldRunTerra && hardTerraReasons.length === 0 && terraGateReasons.length >= 2);
+  shouldRunTerra && hardTerraReasons.length === 0 && terraGateReasons.length >= 2;
 
 console.log("REFERENCE VISUAL GATE V67:", JSON.stringify({
   shouldRun: shouldRunReferenceVisualAdjudicator,
-  amountFormatMismatch: Boolean(referenceTemplateAnalysis?.amountFormatComparison?.mismatch),
-  amountFormatScore: Number(referenceTemplateAnalysis?.amountFormatComparison?.score || 0),
   reasons: terraGateReasons,
   hardReasons: hardTerraReasons,
   rule: hardTerraReasons.length > 0
@@ -17680,87 +15515,15 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     };
   };
 
-  // V13: amount-format mismatch is a deterministic semantic/reference
-  // finding. It must not disappear merely because pixel/geometry comparators
-  // are quiet. It is content-format evidence, not JPEG/raster evidence.
-  const amountFormatReport = (() => {
-    const cmp = referenceTemplateAnalysis?.amountFormatComparison;
-    if (!cmp?.available || cmp.mismatch !== true) return null;
-    const confidence = Number(cmp.confidence || 0);
-    const score = Number(cmp.score || 0);
-    if (confidence < 80) return null;
-
-    const reasons = Array.isArray(cmp.reasons) ? cmp.reasons.filter(Boolean) : [];
-    const reasonText = reasons.length
-      ? reasons.join(', ')
-      : 'Tutarın görünür sayı biçimi referans formatından farklı.';
-
-    return {
-      engine: 'amount-format-forensics-v13',
-      findings: [{
-        title: 'İşlem tutarı formatı',
-        detail: `İşlem tutarının sayı yazım biçimi referans dekonttan farklı: ${reasonText}. Bu bulgu piksel/JPEG sıkıştırma farkına değil, OCR ile doğrulanan tutar yazım biçimine dayanır.`,
-        kind: 'amount-format-mismatch',
-        priority: 0,
-        evidenceField: 'amount',
-        targetBox: amountForensics?.region || null,
-        score,
-        confidence,
-      }]
-    };
-  })();
-
   const humanForensicReport = mergeReferenceReports([
     deterministicReport,
     detailedDeterministicReport,
-    aiReport,
-    amountFormatReport
+    aiReport
   ]);
   if (humanForensicReport) {
     result.referenceForensicReport = humanForensicReport;
     result.summary = [result.summary, humanForensicReport.userText].filter(Boolean).join("\n\n");
     console.log("HUMAN READABLE FORENSIC REPORT V64:", JSON.stringify(humanForensicReport));
-
-    // FIELD TAMPERING: strong evidence is promoted directly. Medium critical-field
-    // findings are also surfaced with cautious wording so the user can see that
-    // a local anomaly exists without treating it as a definitive fake verdict.
-    if (fieldTamperingForensics?.available === true &&
-        (Number(fieldTamperingForensics.strongFindingCount) > 0 || Number(fieldTamperingForensics.mediumFindingCount) > 0)) {
-      const existing = Array.isArray(result.referenceForensicReport.findings)
-        ? result.referenceForensicReport.findings.slice()
-        : [];
-      const tamperRows = (fieldTamperingForensics.findings || [])
-        .filter(x => String(x?.severity || '') === 'strong' || String(x?.severity || '') === 'medium')
-        .slice(0, 4)
-        .map(x => {
-          const isStrong = String(x?.severity || '') === 'strong';
-          return {
-            title: String(x.title || x.field || 'Alan'),
-            detail: isStrong
-              ? String(x.evidence || 'Alan içinde çoklu lokal düzenleme sinyali tespit edildi.')
-              : `${String(x.evidence || 'Alan içinde lokal görsel anomali tespit edildi.')} Bu bulgu tek başına sahtecilik kanıtı değildir; JPG/sıkıştırma/render etkisi de mümkün olabilir.`,
-            kind: 'field-tampering',
-            priority: isStrong ? 0 : 1,
-            evidenceField: String(x.field || ''),
-            targetBox: x.targetBox || null,
-          };
-        });
-      const merged = [...tamperRows, ...existing]
-        .filter((row, index, arr) => index === arr.findIndex(x => String(x.title) === String(row.title) && String(x.detail) === String(row.detail)))
-        .sort((a,b) => Number(a.priority || 9) - Number(b.priority || 9))
-        .slice(0, 8);
-      result.referenceForensicReport.findings = merged;
-      result.referenceForensicReport.differenceCount = merged.length;
-      result.referenceForensicReport.strongDifferenceCount = merged.filter(x => Number(x.priority || 9) <= 1).length;
-      result.referenceForensicReport.status = merged.length ? 'differences-found' : result.referenceForensicReport.status;
-      result.referenceForensicReport.userText = [
-        '🔎 REFERANS / LOKAL FORENSIC KARŞILAŞTIRMASI', '',
-        '🔴 BULGULAR',
-        ...merged.map(x => `• ${x.title}: ${x.detail}`)
-      ].join('\n');
-      result.summary = [result.summary, result.referenceForensicReport.userText].filter(Boolean).join("\n\n");
-      console.log('FIELD TAMPERING PROMOTED TO USER REPORT:', JSON.stringify(tamperRows));
-    }
 
     try {
       const annotatedReferenceDifference = await buildAnnotatedReferenceDifferenceImage({
@@ -17833,20 +15596,6 @@ if (pixelForensics) {
   result.pixelForensics = pixelForensics;
 }
 
-if (fieldTamperingForensics) {
-  result.fieldTamperingForensics = fieldTamperingForensics;
-}
-
-if (paintOverBackgroundForensicsV143) {
-  result.paintOverBackgroundForensicsV143 = paintOverBackgroundForensicsV143;
-}
-if (paintOverResidualIndexV146) {
-  result.paintOverResidualIndexV146 = paintOverResidualIndexV146;
-}
-if (paintOverExactPairResidualV147) {
-  result.paintOverExactPairResidualV147 = paintOverExactPairResidualV147;
-}
-
 if (amountForensics) {
   result.amountForensics = amountForensics;
   if (amountForensics.selectedAmountText) {
@@ -17883,13 +15632,9 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
     // profile.referenceFiles intentionally stores only basenames (security boundary).
     // Resolve the real absolute reference path again through the canonical resolver.
     const referencePaths = await getReferenceFiles(bank);
-    const selectedPath = Array.isArray(selectedReferencePath)
-      ? selectedReferencePath.find(Boolean)
-      : selectedReferencePath;
     const referencePath =
-      (selectedPath && referencePaths.includes(selectedPath) ? selectedPath : null) ||
-      referencePaths.find(p => /\.(png|jpe?g|webp)$/i.test(String(p))) ||
-      referencePaths.find(p => /\.(pdf)$/i.test(String(p)));
+      referencePaths.find(p => /\.(pdf)$/i.test(String(p))) ||
+      referencePaths.find(p => /\.(png|jpe?g|webp)$/i.test(String(p)));
     if (!referencePath) return null;
 
     const refExt = path.extname(referencePath).toLowerCase();
@@ -20059,7 +17804,6 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   visualForensics,
   layoutForensics,
   amountForensics,
-  fieldTamperingForensics,
   paddleImageOCR,
   referenceTemplateAnalysis,
   referenceForensics,
@@ -20094,33 +17838,6 @@ Number(deterministicRiskAfterForensics.overallRisk) || 0;
 
 calculatedRisk.categories =
 deterministicRiskAfterForensics.categories;
-
-// V13: a high-confidence amount-format mismatch is a semantic content
-// discrepancy, not a raster artifact. Do not let weighted category averaging
-// dilute it back into LOW RISK. Keep the floor at MODERATE RISK; this is not a
-// standalone "fake" verdict, but it makes the discrepancy visible in the
-// final risk score.
-const finalAmountFormatComparison =
-  referenceTemplateAnalysis?.amountFormatComparison || null;
-if (
-  false &&
-  finalAmountFormatComparison?.available === true &&
-  finalAmountFormatComparison?.mismatch === true &&
-  Number(finalAmountFormatComparison?.confidence || 0) >= 80
-) {
-  calculatedRisk.overallRisk = Math.max(
-    46,
-    Number(calculatedRisk.overallRisk) || 0
-  );
-  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
-  console.log('V13 AMOUNT FORMAT RISK FLOOR DISABLED:', JSON.stringify({
-    applied: true,
-    floor: 46,
-    confidence: Number(finalAmountFormatComparison.confidence || 0),
-    score: Number(finalAmountFormatComparison.score || 0),
-    reasons: finalAmountFormatComparison.reasons || []
-  }));
-}
 
 // A very strong, semantically matched local geometry anomaly is a deterministic
 // forensic finding. Keep the user-facing suspicious threshold aligned with that
@@ -20292,30 +18009,6 @@ informationCheck;
 // =====================================================
 // ANA SKOR
 // =====================================================
-// V14.7 exact-pair evidence may add only a bounded, corroborated contribution.
-// It is inactive unless an exact original is explicitly configured and the
-// alignment + multi-ring residual promotion gate passes.
-const exactPairContribution = Number(
-  paintOverExactPairResidualV147?.riskContribution || 0
-);
-
-if (
-  paintOverExactPairResidualV147?.available &&
-  paintOverExactPairResidualV147?.status === "promoted-diagnostic" &&
-  exactPairContribution > 0
-) {
-  const beforeExactPair = Number(result.overallRisk) || 0;
-  result.overallRisk = Math.min(100, beforeExactPair + Math.min(12, exactPairContribution));
-  result.exactPairRiskContribution = Math.min(12, exactPairContribution);
-  result.exactPairEvidenceLevel = paintOverExactPairResidualV147.evidenceLevel || "medium-local-edit";
-  result.exactPairRiskNote = "Exact-original pair local residual evidence; bounded contribution, not based on OCR text/amount format/reference differences.";
-  console.log("V14.7 EXACT PAIR RISK CONTRIBUTION:", JSON.stringify({
-    before: beforeExactPair,
-    contribution: result.exactPairRiskContribution,
-    after: result.overallRisk,
-    evidenceLevel: result.exactPairEvidenceLevel
-  }));
-}
 
 const finalScore =
 Number(
@@ -20361,7 +18054,7 @@ console.log(
 "FINAL SCORE:",
 finalScore
 );
-console.log("FINAL RISK SOURCE: deterministic checks + bounded V14.7 exact-pair contribution when explicitly configured; V14.3 remains diagnostic; amount-format floor disabled");
+console.log("FINAL RISK SOURCE: deterministic checks only; amountAnalysis direct floor disabled");
 
 
 console.log(
