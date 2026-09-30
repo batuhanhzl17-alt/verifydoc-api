@@ -1818,7 +1818,7 @@ async function runNegativeSampleComparison({ targetPath, negativeSamples = [], b
   const targetImage = `data:image/jpeg;base64,${targetJpeg.toString("base64")}`;
   const results = [];
 
-  for (const sample of negativeSamples.slice(0, 3)) {
+  for (const sample of negativeSamples.slice(0, 6)) {
     try {
       const sampleBuffer = await loadImage(sample.path);
       if (!sampleBuffer) continue;
