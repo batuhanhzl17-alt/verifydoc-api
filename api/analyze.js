@@ -12507,8 +12507,13 @@ async function runFieldTamperingForensics({
       isCritical && (
         elaSignal ||
         internalSignal ||
-        amountV3LocalizedSignal ||
-        (field === 'amount' && documentNumericGlyphSignal && (amountV3LocalizedSignal || globalJpegLocalizedSignal))
+        // V14.8: amount V3/V9 raster anomalies are candidate-only. They are
+        // deliberately excluded from MEDIUM by themselves because a known
+        // original Enpara receipt can produce the same localized raster signal.
+        // For amount, require an independent numeric-glyph + local-contrast
+        // corroboration before surfacing a field-level caution.
+        (field === 'amount' && documentNumericGlyphSignal && localJpegContrastSignal) ||
+        (field !== 'amount' && amountV3LocalizedSignal)
       )
     );
 
@@ -12769,6 +12774,14 @@ async function runFieldTamperingForensics({
       );
 
       if (fallbackConvergentSignal) {
+        // V14.8 V9 CANDIDATE-ONLY GATE:
+        // A localized V3/V9 raster anomaly is NOT a fraud finding by itself.
+        // We observed the same V9 signal on a known-original Enpara receipt.
+        // Therefore V9 remains a candidate detector/diagnostic only; it must
+        // never create a MEDIUM finding or confidence score on its own.
+        // Actual fraud promotion belongs to independent evidence (preferably
+        // exact-original-vs-target paint-over residual analysis).
+        //
         // V13.1 AMOUNT STRONG GATE:
         // Amount V3/V9 are intentionally sensitive detectors, but they are not
         // sufficient by themselves for a STRONG field-tampering finding.
@@ -12788,30 +12801,23 @@ async function runFieldTamperingForensics({
           amountForensics?.amountFormatComparison?.mismatch
         );
         const fallbackStrong = Boolean(
+          // V14.8: V9 localized raster evidence is candidate-only and cannot
+          // promote an amount to STRONG. Keep only an independent corroborating
+          // family here; exact-pair paint-over evidence is handled separately.
           (
             fallbackGlyph?.strong &&
-            (
-              fallbackLocalJpegSignal ||
-              v9JpegAwareLocalizedSignal ||
-              amountFormatMismatch
-            )
+            fallbackLocalJpegSignal
           ) ||
           (
             fallbackLocalJpegSignal &&
             Number(fallbackMetrics?.maxFeatureVotes || 0) >= 5
-          ) ||
-          (
-            v9JpegAwareLocalizedSignal &&
-            Boolean(fallbackGlyph?.signal) &&
-            v9StrongFeatureCount >= 3 &&
-            v9AnomalyRatio >= 0.38
           )
         );
-        const fallbackFinding = {
+        const fallbackFinding = fallbackStrong ? {
           field: 'amount',
           title: 'Tutar',
-          severity: fallbackStrong ? 'strong' : 'medium',
-          confidence: fallbackStrong ? 91 : 84,
+          severity: 'strong',
+          confidence: 91,
           evidence: `Tutar alanında lokal raster/karakter ayrışması tespit edildi. ${
             fallbackGlyph?.signal
               ? `${fallbackGlyph.outlierCount} karakter belge içi karakter profiline göre aykırı. `
@@ -12833,15 +12839,28 @@ async function runFieldTamperingForensics({
             v9CompressionDominated: v9CompressionDominated,
             v9StrongFeatureCount,
             source: 'amount-forensics-v9-local-edit-jpeg-aware',
+          candidateOnly: !fallbackStrong,
           },
         };
-        findings.push(fallbackFinding);
+        if (fallbackStrong) findings.push(fallbackFinding);
         fieldDiagnostics.push({
           field: 'amount',
           label: 'Tutar',
           targetValue: fallbackText,
           signalCount: 2,
-          signals: fallbackFinding.signals,
+          signals: fallbackFinding?.signals || {
+            documentNumericGlyphSignal: Boolean(fallbackGlyph?.signal),
+            documentNumericGlyphStrong: Boolean(fallbackGlyph?.strong),
+            amountFormatMismatch,
+            amountV3LocalizedSignal: fallbackV3Signal,
+            localJpegContrastSignal: fallbackLocalJpegSignal,
+            v9LocalizedRasterSignal,
+            v9JpegAwareLocalizedSignal,
+            v9CompressionDominated,
+            v9StrongFeatureCount,
+            source: 'amount-forensics-v9-local-edit-jpeg-aware',
+            candidateOnly: true,
+          },
           documentNumericGlyph: fallbackGlyph,
           amountV3: fallbackMetrics ? {
             maxFeatureVotes: Number(fallbackMetrics.maxFeatureVotes || 0),
@@ -12869,6 +12888,7 @@ async function runFieldTamperingForensics({
           v9CompressionDominated,
           v9StrongFeatureCount,
           v9AnomalyRatio: Number.isFinite(v9AnomalyRatio) ? Number(v9AnomalyRatio.toFixed(3)) : null,
+          candidateOnly: !fallbackStrong,
           strongGate: {
             amountFormatMismatch,
             glyphStrong: Boolean(fallbackGlyph?.strong),
