@@ -1901,6 +1901,12 @@ const NEGATIVE_SAMPLE_MAP = {
   yapikredi: ["yapikredi/sahte-1.jpg"],
   garanti: ["garanti/sahte-hesap-ozeti-1.pdf"],
   isbankasi: ["isbankasi/sahte-hesap-ozeti-1.pdf"],
+  enpara: [
+    "enpara/fake.3000.jpg",
+    "enpara/fake.8000.jpg",
+    "enpara/fake.iban.jpg",
+    "enpara/fake.iban2.jpg",
+  ],
 };
 
 async function loadNegativeSampleFiles(bank) {
@@ -1940,7 +1946,7 @@ async function runNegativeSampleComparison({ targetPath, negativeSamples = [], b
   const targetImage = `data:image/jpeg;base64,${targetJpeg.toString("base64")}`;
   const results = [];
 
-  for (const sample of negativeSamples.slice(0, 3)) {
+  for (const sample of negativeSamples.slice(0, 6)) {
     try {
       const sampleBuffer = await loadImage(sample.path);
       if (!sampleBuffer) continue;
