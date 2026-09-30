@@ -15268,6 +15268,7 @@ let fontForensics = null;
 let fieldTamperingForensics = null;
 let paintOverBackgroundForensicsV143 = null;
 let paintOverResidualIndexV146 = null;
+let paintOverExactPairResidualV147 = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -15436,6 +15437,21 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
   }
 }
 
+
+// =====================================================
+// V14.7 — EXACT ORIGINAL PAIR RESIDUAL ENGINE (DIAGNOSTIC ONLY)
+// =====================================================
+async function resolveExactOriginalPathV147(explicitOriginalPath = null) {
+  const candidates=[explicitOriginalPath,process.env.VERIFYDOC_EXACT_ORIGINAL_PATH].filter(Boolean).map(String);
+  for(const candidate of candidates){try{const st=await fs.stat(candidate);if(st.isFile())return candidate;}catch{}}
+  return null;
+}
+function grayV147(data,i){return .2126*data[i]+.7152*data[i+1]+.0722*data[i+2];}
+async function loadRgbV147(filePath,width,height){const out=await sharp(filePath).resize(width,height,{fit:"fill",kernel:sharp.kernel.lanczos3}).removeAlpha().raw().toBuffer({resolveWithObject:true});return {data:out.data,width:out.info.width,height:out.info.height};}
+function translationScoreV147(target,original,width,height,dx,dy,step=4){const x1=Math.max(0,dx),y1=Math.max(0,dy),x2=Math.min(width,width+dx),y2=Math.min(height,height+dy);if(x2-x1<200||y2-y1<150)return-Infinity;let st=0,so=0,stt=0,soo=0,sto=0,n=0;for(let y=y1;y<y2;y+=step)for(let x=x1;x<x2;x+=step){const ti=(y*width+x)*3,oi=((y-dy)*width+(x-dx))*3,tv=grayV147(target,ti),ov=grayV147(original,oi);st+=tv;so+=ov;stt+=tv*tv;soo+=ov*ov;sto+=tv*ov;n++;}if(n<1000)return-Infinity;const mt=st/n,mo=so/n,c=sto/n-mt*mo,vt=Math.max(1e-9,stt/n-mt*mt),vo=Math.max(1e-9,soo/n-mo*mo);return c/Math.sqrt(vt*vo);}
+function findTranslationV147(target,original,width,height){let best={score:-Infinity,dx:0,dy:0};for(let dy=-20;dy<=20;dy++)for(let dx=-20;dx<=20;dx++){const score=translationScoreV147(target,original,width,height,dx,dy,4);if(score>best.score)best={score,dx,dy};}return best;}
+function annulusResidualV147(target,original,width,height,box,inner,outer,dx,dy){const x1=Math.max(0,Math.floor(box.x1-outer)),y1=Math.max(0,Math.floor(box.y1-outer)),x2=Math.min(width,Math.ceil(box.x2+outer)),y2=Math.min(height,Math.ceil(box.y2+outer));let n=0,sumL=0,sumC=0;for(let y=y1;y<y2;y++)for(let x=x1;x<x2;x++){const d=Math.min(Math.abs(x-box.x1),Math.abs(x-box.x2),Math.abs(y-box.y1),Math.abs(y-box.y2));if(d<inner||d>=outer)continue;const ox=x-dx,oy=y-dy;if(ox<0||oy<0||ox>=width||oy>=height)continue;const ti=(y*width+x)*3,oi=(oy*width+ox)*3;sumL+=Math.abs(grayV147(target,ti)-grayV147(original,oi));sumC+=(Math.abs(target[ti]-original[oi])+Math.abs(target[ti+1]-original[oi+1])+Math.abs(target[ti+2]-original[oi+2]))/3;n++;}return n?{samples:n,lumaResidual:sumL/n,colorResidual:sumC/n}:null;}
+async function runPaintOverExactPairResidualV147({targetPath,originalPath,targetOCR}){const base={available:false,engine:"paint-over-exact-pair-residual-v14.7",diagnosticOnly:true,riskContribution:0,calibrationStatus:"exact-pair-diagnostic-only"};if(!targetPath||!originalPath||!targetOCR?.success)return{...base,status:"unavailable",reason:"exact original path or OCR unavailable"};if(path.resolve(targetPath)===path.resolve(originalPath))return{...base,status:"unavailable",reason:"target and original paths are identical"};try{const meta=await sharp(targetPath).metadata(),width=Number(meta.width),height=Number(meta.height);if(!width||!height)return{...base,status:"error",error:"target dimensions unavailable"};const tr=await sharp(targetPath).removeAlpha().raw().toBuffer({resolveWithObject:true}),or=await loadRgbV147(originalPath,width,height),target=tr.data,original=or.data,alignment=findTranslationV147(target,original,width,height);if(!Number.isFinite(alignment.score)||alignment.score<.90)return{...base,available:true,status:"alignment-failed",alignment};const regions=Array.isArray(targetOCR.regions)?targetOCR.regions:[],candidates=regions.map((r,i)=>({regionIndex:i,text:String(r?.text||r?.value||"").trim(),box:rectV146(r?.r||r,width,height)})).filter(o=>o.text&&o.box).map(o=>({...o,width:o.box.x2-o.box.x1,height:o.box.y2-o.box.y1,area:(o.box.x2-o.box.x1)*(o.box.y2-o.box.y1)})).filter(o=>o.width>=8&&o.height>=6&&o.width<=width*.75&&o.height<=height*.25);if(candidates.length<4)return{...base,available:true,status:"insufficient-controls",alignment,regionCount:candidates.length};const isNumeric=t=>/[0-9]/.test(t),observations=[];for(const targetRegion of candidates){const numeric=isNumeric(targetRegion.text),peers=candidates.filter(p=>p!==targetRegion&&Math.abs(Math.log((p.area+1)/(targetRegion.area+1)))<1&&isNumeric(p.text)===numeric);if(peers.length<3)continue;const rings={};for(const[ring,inner,outer] of [["1-2px",1,2],["2-4px",2,4],["4-7px",4,7]]){const value=annulusResidualV147(target,original,width,height,targetRegion.box,inner,outer,alignment.dx,alignment.dy);if(!value)continue;const pv=peers.map(p=>annulusResidualV147(target,original,width,height,p.box,inner,outer,alignment.dx,alignment.dy)).filter(Boolean),metrics={};for(const key of ["lumaResidual","colorResidual"]){const vals=pv.map(v=>v[key]).filter(Number.isFinite),med=medianV146(vals),mad=madV146(vals,med),val=value[key];metrics[key]={value:val,controlMedian:med,mad,ratio:med>0?val/med:null,robustZ:robustZV146(val,med,mad)};}const z=Object.values(metrics).map(x=>Math.abs(x.robustZ)).filter(Number.isFinite);rings[ring]={samples:value.samples,metrics,meanAbsRobustZ:z.length?z.reduce((a,b)=>a+b,0)/z.length:0};}const rv=Object.values(rings).map(r=>r.meanAbsRobustZ).filter(Number.isFinite);observations.push({regionIndex:targetRegion.regionIndex,text:targetRegion.text,targetBox:targetRegion.box,peerCount:peers.length,rings,exactPairResidualIndex:rv.length?Number((rv.reduce((a,b)=>a+b,0)/rv.length).toFixed(3)):0});}observations.sort((a,b)=>b.exactPairResidualIndex-a.exactPairResidualIndex);return{...base,available:true,status:"diagnostic",exactPair:true,targetPath:path.basename(targetPath),originalPath:path.basename(originalPath),imageDimensions:{width,height},alignment:{method:"resize-original-to-target + translation-grid",dx:alignment.dx,dy:alignment.dy,correlation:Number(alignment.score.toFixed(6))},ringWidthsPx:["1-2","2-4","4-7"],controlMethod:"same-image OCR peers matched by box area and numeric/non-numeric class",candidateCount:candidates.length,observationCount:observations.length,topObservations:observations.slice(0,12),note:"Gerçek orijinal ile hedef arasındaki lokal piksel residualını ölçer; kalibrasyon olmadan tek başına Photoshop kanıtı veya risk skoru değildir."};}catch(error){return{...base,available:false,status:"error",error:error?.message||String(error)};}}
 
 // =====================================================
 // V14.6 — PAINT-OVER RESIDUAL INDEX V1 (DIAGNOSTIC ONLY)
@@ -15613,210 +15629,17 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
   }
 }
 
-
-// =====================================================
-// V14.7 — EXACT ORIGINAL PAIR RESIDUAL V1
-// =====================================================
-// Amaç: Aynı dekontun güvenilir/orijinal rasterı mevcut olduğunda,
-// hedef görüntüyü orijinale affine hizalayıp OCR kutusunun DIŞINDAKİ
-// 1-2 / 2-4 / 4-7 px halkalarda gerçek piksel residual ölçmek.
-// Bu katman font/format/reference-template farkını kanıt olarak kullanmaz.
-// Otomatik risk katkısı şimdilik 0'dır; calibration tamamlanmadan gate değildir.
-let paintOverExactPairV147 = null;
-
-function medianV147(values) {
-  const a = values.filter(Number.isFinite).sort((x,y)=>x-y);
-  if (!a.length) return null;
-  const m = Math.floor(a.length/2);
-  return a.length % 2 ? a[m] : (a[m-1] + a[m]) / 2;
-}
-
-function madV147(values, med) {
-  if (!Number.isFinite(med)) return null;
-  return medianV147(values.map(v=>Math.abs(v-med)).filter(Number.isFinite)) || 0;
-}
-
-function rectV147(r,w,h){
-  const x1=Math.max(0,Math.floor(r.x1)), y1=Math.max(0,Math.floor(r.y1));
-  const x2=Math.min(w,Math.ceil(r.x2)), y2=Math.min(h,Math.ceil(r.y2));
-  return x2>x1&&y2>y1?{x1,y1,x2,y2}:null;
-}
-
-function ringPixelsV147(box, inner, outer, w, h){
-  const x1=Math.max(0,Math.floor(box.x1-outer)), y1=Math.max(0,Math.floor(box.y1-outer));
-  const x2=Math.min(w,Math.ceil(box.x2+outer)), y2=Math.min(h,Math.ceil(box.y2+outer));
-  const out=[];
-  for(let y=y1;y<y2;y++) for(let x=x1;x<x2;x++){
-    const dx=x<box.x1?box.x1-x:(x>=box.x2?x-box.x2:0);
-    const dy=y<box.y1?box.y1-y:(y>=box.y2?y-box.y2:0);
-    const d=Math.max(dx,dy);
-    if(d>=inner && d<outer) out.push([x,y]);
-  }
-  return out;
-}
-
-function lumaV147(r,g,b){return 0.2126*r+0.7152*g+0.0722*b;}
-
-function sampleBilinearRGBV147(data,w,h,x,y){
-  if(x<0||y<0||x>w-1||y>h-1)return null;
-  const x0=Math.floor(x), y0=Math.floor(y), x1=Math.min(w-1,x0+1), y1=Math.min(h-1,y0+1);
-  const fx=x-x0, fy=y-y0;
-  const at=(xx,yy)=>{const i=(yy*w+xx)*3;return [data[i],data[i+1],data[i+2]];};
-  const p00=at(x0,y0),p10=at(x1,y0),p01=at(x0,y1),p11=at(x1,y1);
-  return [0,1,2].map(k=>{
-    const a=p00[k]*(1-fx)+p10[k]*fx;
-    const b=p01[k]*(1-fx)+p11[k]*fx;
-    return a*(1-fy)+b*fy;
-  });
-}
-
-function fitAffineV147(pairs){
-  // Least-squares affine: tx=ax+by+c, ty=dx+ey+f.
-  if(!Array.isArray(pairs)||pairs.length<3)return null;
-  const solve=(axis)=>{
-    let A=[[0,0,0],[0,0,0],[0,0,0]], B=[0,0,0];
-    for(const p of pairs){const x=p.ox,y=p.oy,t=p[axis];const v=[x,y,1];for(let i=0;i<3;i++){for(let j=0;j<3;j++)A[i][j]+=v[i]*v[j];B[i]+=v[i]*t;}}
-    for(let i=0;i<3;i++){let piv=i;for(let r=i+1;r<3;r++)if(Math.abs(A[r][i])>Math.abs(A[piv][i]))piv=r;if(Math.abs(A[piv][i])<1e-9)return null;[A[i],A[piv]]=[A[piv],A[i]];[B[i],B[piv]]=[B[piv],B[i]];const q=A[i][i];for(let j=i;j<3;j++)A[i][j]/=q;B[i]/=q;for(let r=0;r<3;r++){if(r===i)continue;const f=A[r][i];for(let j=i;j<3;j++)A[r][j]-=f*A[i][j];B[r]-=f*B[i];}}
-    return B;
-  };
-  const ax=solve('tx'), ay=solve('ty');
-  return ax&&ay?{a:ax[0],b:ax[1],c:ax[2],d:ay[0],e:ay[1],f:ay[2]}:null;
-}
-
-function applyAffineV147(T,x,y){return{x:T.a*x+T.b*y+T.c,y:T.d*x+T.e*y+T.f};}
-
-function affineResidualErrorV147(T,pairs){
-  if(!T||!pairs?.length)return null;
-  const ds=pairs.map(p=>{const q=applyAffineV147(T,p.ox,p.oy);return Math.hypot(q.x-p.tx,q.y-p.ty);});
-  return {median:medianV147(ds),p95:ds.sort((a,b)=>a-b)[Math.min(ds.length-1,Math.floor(ds.length*.95))],count:ds.length};
-}
-
-function normalizedTextV147(s){return String(s||'').toLowerCase().replace(/[^a-z0-9çğıöşüİı]+/gi,'').trim();}
-function isStaticControlV147(t){
-  const s=normalizedTextV147(t);
-  return s.length>=3 && !/[0-9]{4,}/.test(s) && !/^(3|5|10)[.,]?[0-9]*$/.test(s);
-}
-
-function buildOCRAffinePairsV147(originalOCR,targetOCR,ow,oh,tw,th){
-  const O=(originalOCR?.regions||[]).filter(r=>r?.text&&r?.r&&Number.isFinite(r.r.x1));
-  const T=(targetOCR?.regions||[]).filter(r=>r?.text&&r?.r&&Number.isFinite(r.r.x1));
-  const pairs=[];
-  for(const tr of T){
-    if(!isStaticControlV147(tr.text))continue;
-    const ts=normalizedTextV147(tr.text);
-    if(ts.length<4)continue;
-    let best=null;
-    for(const or of O){
-      if(!isStaticControlV147(or.text))continue;
-      const os=normalizedTextV147(or.text);
-      if(os!==ts)continue;
-      const ocx=(or.r.x1+or.r.x2)/2, ocy=(or.r.y1+or.r.y2)/2;
-      const tcx=(tr.r.x1+tr.r.x2)/2, tcy=(tr.r.y1+tr.r.y2)/2;
-      const areaRatio=((tr.r.x2-tr.r.x1)*(tr.r.y2-tr.r.y1))/Math.max(1,(or.r.x2-or.r.x1)*(or.r.y2-or.r.y1));
-      const score=Math.abs(Math.log(Math.max(0.1,areaRatio)))+0.0005*Math.hypot(tcx-tcx, tcy-tcy);
-      if(!best||score<best.score)best={or,tr,score,ox:ocx,oy:ocy,tx:tcx,ty:tcy};
-    }
-    if(best)pairs.push(best);
-  }
-  // Deduplicate target/original occurrences by nearest geometric consistency.
-  const unique=[]; const usedO=new Set(),usedT=new Set();
-  for(const p of pairs.sort((a,b)=>a.score-b.score)){
-    const oi=O.indexOf(p.or), ti=T.indexOf(p.tr);
-    if(usedO.has(oi)||usedT.has(ti))continue;
-    usedO.add(oi);usedT.add(ti);unique.push(p);
-  }
-  return unique;
-}
-
-function robustResidualSummaryV147(samples){
-  const finite=samples.filter(Number.isFinite);
-  if(!finite.length)return null;
-  const med=medianV147(finite), mad=madV147(finite,med);
-  const p95=[...finite].sort((a,b)=>a-b)[Math.min(finite.length-1,Math.floor(finite.length*.95))];
-  return {median:Number(med.toFixed(3)),mad:Number((mad||0).toFixed(3)),p95:Number(p95.toFixed(3)),count:finite.length};
-}
-
-async function runPaintOverExactPairV147({targetPath,originalPath,targetOCR,originalOCR}){
-  const base={available:false,engine:'paint-over-exact-pair-residual-v14.7',diagnosticOnly:true,riskContribution:0,calibrationStatus:'exact-original-pair'};
-  if(!targetPath||!originalPath)return {...base,status:'unavailable',reason:'exact original path missing'};
-  try{
-    const [tRaw,oRaw]=await Promise.all([
-      sharp(targetPath).removeAlpha().raw().toBuffer({resolveWithObject:true}),
-      sharp(originalPath).removeAlpha().raw().toBuffer({resolveWithObject:true})
-    ]);
-    const tw=tRaw.info.width,th=tRaw.info.height,ow=oRaw.info.width,oh=oRaw.info.height;
-    const pairs=buildOCRAffinePairsV147(originalOCR,targetOCR,ow,oh,tw,th);
-    if(pairs.length<4)return {...base,status:'insufficient-anchors',imageDimensions:{target:{width:tw,height:th},original:{width:ow,height:oh}},anchorCount:pairs.length};
-    const T=fitAffineV147(pairs); if(!T)return {...base,status:'affine-fit-failed',anchorCount:pairs.length};
-    const fit=affineResidualErrorV147(T,pairs);
-    const usable=(targetOCR.regions||[]).map((r,i)=>({r,i,text:String(r.text||'').trim()})).filter(o=>o.text&&o.r&&Number.isFinite(o.r.x1));
-    const targetAmount=usable.find(o=>/[0-9]/.test(o.text)&&/[.,]/.test(o.text)&&o.text.replace(/\D/g,'').length>=3&&((o.r.x1+o.r.x2)/2)>tw*.75);
-    const targets=targetAmount?[targetAmount]:usable.filter(o=>o.r.x1>tw*.55).slice(0,8);
-    const observations=[];
-    const controlBoxes=[];
-    for(const o of usable){if(o===targetAmount)continue; if(isStaticControlV147(o.text))controlBoxes.push(o.r);}
-    for(const target of targets){
-      const box=rectV147(target.r,tw,th); if(!box)continue;
-      const rings={};
-      for(const [name,inner,outer] of [['1-2px',1,2],['2-4px',2,4],['4-7px',4,7]]){
-        const pts=ringPixelsV147(box,inner,outer,tw,th);
-        const residuals=[], lumaResiduals=[], colorResiduals=[];
-        for(const [tx,ty] of pts){
-          let masked=false;
-          for(const cb of controlBoxes){const ex={x1:cb.x1-1,y1:cb.y1-1,x2:cb.x2+1,y2:cb.y2+1};if(tx>=ex.x1&&tx<ex.x2&&ty>=ex.y1&&ty<ex.y2){masked=true;break;}}
-          if(masked)continue;
-          const p=applyAffineV147(T,tx,ty); const rgb=sampleBilinearRGBV147(oRaw.data,ow,oh,p.x,p.y); if(!rgb)continue;
-          const ti=(ty*tw+tx)*3; const tr=tRaw.data[ti],tg=tRaw.data[ti+1],tb=tRaw.data[ti+2];
-          const dr=tr-rgb[0],dg=tg-rgb[1],db=tb-rgb[2];
-          const color=(Math.abs(dr)+Math.abs(dg)+Math.abs(db))/3;
-          const dl=Math.abs(lumaV147(tr,tg,tb)-lumaV147(...rgb));
-          const residual=Math.sqrt((dr*dr+dg*dg+db*db)/3);
-          residuals.push(residual);lumaResiduals.push(dl);colorResiduals.push(color);
-        }
-        rings[name]={rgb:robustResidualSummaryV147(residuals),luma:robustResidualSummaryV147(lumaResiduals),color:robustResidualSummaryV147(colorResiduals)};
-      }
-      observations.push({regionIndex:target.i,text:target.text,targetBox:box,rings});
-    }
-    // Same-image control residuals are measured using the exact same original pair,
-    // so the final comparison is not dominated by global JPEG/scale differences.
-    const controlObs=[];
-    for(const cb0 of controlBoxes.slice(0,12)){
-      const box=rectV147(cb0,tw,th); if(!box)continue;
-      const pts=ringPixelsV147(box,1,2,tw,th);const vals=[];
-      for(const [tx,ty] of pts){const p=applyAffineV147(T,tx,ty);const rgb=sampleBilinearRGBV147(oRaw.data,ow,oh,p.x,p.y);if(!rgb)continue;const i=(ty*tw+tx)*3;vals.push(Math.sqrt(((tRaw.data[i]-rgb[0])**2+(tRaw.data[i+1]-rgb[1])**2+(tRaw.data[i+2]-rgb[2])**2)/3));}
-      if(vals.length)controlObs.push(robustResidualSummaryV147(vals));
-    }
-    const controlMedian=medianV147(controlObs.map(x=>x?.median).filter(Number.isFinite));
-    const target=observations[0];
-    const ratio=target?.rings?.['1-2px']?.rgb?.median!=null&&controlMedian>0?target.rings['1-2px'].rgb.median/controlMedian:null;
-    return {...base,available:true,status:'diagnostic',imageDimensions:{target:{width:tw,height:th},original:{width:ow,height:oh}},anchorCount:pairs.length,affine:T,alignment:fit,controlCount:controlObs.length,controlMedian1to2pxRgb:controlMedian,observations,primaryTargetRatio1to2pxRgb:ratio,note:'Exact-original pair residualidir. OCR kutusu dışındaki halkalarda doğrudan target-vs-original piksel farkı ölçülür; kontrol halkaları aynı eşleşme içinde normalize edilir. Risk skoruna katkı yoktur.'};
-  }catch(error){return {...base,available:false,status:'error',error:error?.message||String(error)};}
-}
-
-// Exact original path is intentionally opt-in. Production can provide it on the
-// reference object or via VERIFYDOC_EXACT_ORIGINAL_PATH. Without it V14.7 remains
-// dormant and cannot manufacture a reference.
-if ((type === 'image' || type === 'pdf') && paddleImageOCR?.success) {
+// V14.7: exact-original pair pixel residual.
+if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
   try {
-    const exactOriginalPath = reference?.exactOriginalPath || process.env.VERIFYDOC_EXACT_ORIGINAL_PATH || null;
-    let exactOriginalExists = false;
-    if (exactOriginalPath) { try { await fs.access(exactOriginalPath); exactOriginalExists = true; } catch {} }
-    if (exactOriginalExists) {
-      const exactOriginalOCR = await runPaddleOCR(exactOriginalPath);
-      paintOverExactPairV147 = await runPaintOverExactPairV147({
-        targetPath: forensicTargetPath,
-        originalPath: exactOriginalPath,
-        targetOCR: paddleImageOCR,
-        originalOCR: exactOriginalOCR,
-      });
-      console.log('PAINT-OVER EXACT PAIR RESIDUAL V14.7:', JSON.stringify(paintOverExactPairV147));
-    } else {
-      paintOverExactPairV147 = {available:false,engine:'paint-over-exact-pair-residual-v14.7',diagnosticOnly:true,riskContribution:0,status:'not-configured',reason:'Exact original path not provided'};
-      console.log('PAINT-OVER EXACT PAIR RESIDUAL V14.7:', JSON.stringify(paintOverExactPairV147));
-    }
-  } catch(error) {
-    console.warn('PAINT-OVER EXACT PAIR RESIDUAL V14.7 HATASI:', error?.message || error);
-    paintOverExactPairV147 = {available:false,engine:'paint-over-exact-pair-residual-v14.7',diagnosticOnly:true,riskContribution:0,status:'error',error:error?.message||String(error)};
+    const exactOriginalPathV147 = await resolveExactOriginalPathV147();
+    paintOverExactPairResidualV147 = exactOriginalPathV147
+      ? await runPaintOverExactPairResidualV147({ targetPath: forensicTargetPath, originalPath: exactOriginalPathV147, targetOCR: paddleImageOCR })
+      : { available:false, engine:"paint-over-exact-pair-residual-v14.7", diagnosticOnly:true, riskContribution:0, status:"not-configured", reason:"VERIFYDOC_EXACT_ORIGINAL_PATH not provided" };
+    console.log("PAINT-OVER EXACT PAIR RESIDUAL V14.7:", JSON.stringify(paintOverExactPairResidualV147));
+  } catch (error) {
+    console.warn("PAINT-OVER EXACT PAIR RESIDUAL V14.7 HATASI:", error?.message || error);
+    paintOverExactPairResidualV147 = null;
   }
 }
 
@@ -17925,8 +17748,8 @@ if (paintOverBackgroundForensicsV143) {
 if (paintOverResidualIndexV146) {
   result.paintOverResidualIndexV146 = paintOverResidualIndexV146;
 }
-if (paintOverExactPairV147) {
-  result.paintOverExactPairV147 = paintOverExactPairV147;
+if (paintOverExactPairResidualV147) {
+  result.paintOverExactPairResidualV147 = paintOverExactPairResidualV147;
 }
 
 if (amountForensics) {
