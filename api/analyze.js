@@ -4832,6 +4832,17 @@ return null;
 }
 
 // =====================================================
+// Exact-pair için ikinci upload alanını bul.
+// Desteklenen multipart alanları: exactOriginal / original / referenceOriginal / originalFile.
+function findUploadedFileByNames(files, names = []) {
+  for (const name of names) {
+    const value = files?.[name];
+    if (!value) continue;
+    return Array.isArray(value) ? value[0] : value;
+  }
+  return null;
+}
+
 // MİKRO KARAKTER / RAKAM TUTARLILIK ANALİZİ
 // =====================================================
 
@@ -12507,10 +12518,8 @@ async function runFieldTamperingForensics({
       isCritical && (
         elaSignal ||
         internalSignal ||
-        // V14.8: amount V3/V9 raster anomalies are candidate-only.
-        // They must not create a field finding by themselves.
-        (field === 'amount' && documentNumericGlyphSignal && localJpegContrastSignal) ||
-        (field !== 'amount' && amountV3LocalizedSignal)
+        amountV3LocalizedSignal ||
+        (field === 'amount' && documentNumericGlyphSignal && (amountV3LocalizedSignal || globalJpegLocalizedSignal))
       )
     );
 
@@ -12789,23 +12798,31 @@ async function runFieldTamperingForensics({
         const amountFormatMismatch = Boolean(
           amountForensics?.amountFormatComparison?.mismatch
         );
-        // V14.8: V9/V3 localized raster is candidate-only.
-        // It cannot create a MEDIUM finding on its own.
         const fallbackStrong = Boolean(
           (
             fallbackGlyph?.strong &&
-            fallbackLocalJpegSignal
+            (
+              fallbackLocalJpegSignal ||
+              v9JpegAwareLocalizedSignal ||
+              amountFormatMismatch
+            )
           ) ||
           (
             fallbackLocalJpegSignal &&
             Number(fallbackMetrics?.maxFeatureVotes || 0) >= 5
+          ) ||
+          (
+            v9JpegAwareLocalizedSignal &&
+            Boolean(fallbackGlyph?.signal) &&
+            v9StrongFeatureCount >= 3 &&
+            v9AnomalyRatio >= 0.38
           )
         );
-        const fallbackFinding = fallbackStrong ? {
+        const fallbackFinding = {
           field: 'amount',
           title: 'Tutar',
-          severity: 'strong',
-          confidence: 91,
+          severity: fallbackStrong ? 'strong' : 'medium',
+          confidence: fallbackStrong ? 91 : 84,
           evidence: `Tutar alanında lokal raster/karakter ayrışması tespit edildi. ${
             fallbackGlyph?.signal
               ? `${fallbackGlyph.outlierCount} karakter belge içi karakter profiline göre aykırı. `
@@ -12822,32 +12839,38 @@ async function runFieldTamperingForensics({
             amountFormatMismatch,
             amountV3LocalizedSignal: true,
             localJpegContrastSignal: fallbackLocalJpegSignal,
-            v9LocalizedRasterSignal,
-            v9JpegAwareLocalizedSignal,
-            v9CompressionDominated,
+            v9LocalizedRasterSignal: v9LocalizedRasterSignal,
+            v9JpegAwareLocalizedSignal: v9JpegAwareLocalizedSignal,
+            v9CompressionDominated: v9CompressionDominated,
             v9StrongFeatureCount,
             source: 'amount-forensics-v9-local-edit-jpeg-aware',
           },
-        } : null;
-        if (fallbackStrong && fallbackFinding) findings.push(fallbackFinding);
+        };
+        // V14.8: V9/V3 localized raster is candidate-only.
+        // Do NOT promote a clean document to MEDIUM merely because the amount
+        // ROI has a localized raster anomaly. Only an independently corroborated
+        // STRONG gate may enter the findings array.
+        if (fallbackStrong) {
+          findings.push(fallbackFinding);
+        } else {
+          console.log('V14.8 AMOUNT RASTER CANDIDATE ONLY:', JSON.stringify({
+            amountText: fallbackText,
+            candidate: true,
+            promotedToFinding: false,
+            reason: 'v9/v3-local-raster-without-independent-corroboration',
+            v9LocalizedRasterSignal,
+            v9JpegAwareLocalizedSignal,
+            v9StrongFeatureCount,
+            v9AnomalyRatio: Number.isFinite(v9AnomalyRatio) ? Number(v9AnomalyRatio.toFixed(3)) : null,
+          }));
+        }
         fieldDiagnostics.push({
           field: 'amount',
           label: 'Tutar',
           targetValue: fallbackText,
           signalCount: fallbackStrong ? 2 : 1,
-          signals: fallbackFinding?.signals || {
-            documentNumericGlyphSignal: Boolean(fallbackGlyph?.signal),
-            documentNumericGlyphStrong: Boolean(fallbackGlyph?.strong),
-            amountFormatMismatch,
-            amountV3LocalizedSignal: fallbackV3Signal,
-            localJpegContrastSignal: fallbackLocalJpegSignal,
-            v9LocalizedRasterSignal,
-            v9JpegAwareLocalizedSignal,
-            v9CompressionDominated,
-            v9StrongFeatureCount,
-            source: 'amount-forensics-v9-local-edit-jpeg-aware',
-            candidateOnly: true,
-          },
+          candidateOnly: !fallbackStrong,
+          signals: fallbackFinding.signals,
           documentNumericGlyph: fallbackGlyph,
           amountV3: fallbackMetrics ? {
             maxFeatureVotes: Number(fallbackMetrics.maxFeatureVotes || 0),
@@ -12875,7 +12898,6 @@ async function runFieldTamperingForensics({
           v9CompressionDominated,
           v9StrongFeatureCount,
           v9AnomalyRatio: Number.isFinite(v9AnomalyRatio) ? Number(v9AnomalyRatio.toFixed(3)) : null,
-          candidateOnly: !fallbackStrong,
           strongGate: {
             amountFormatMismatch,
             glyphStrong: Boolean(fallbackGlyph?.strong),
@@ -14925,6 +14947,18 @@ throw new Error(
 );
 }
 
+// =================================================
+// EXACT ORIGINAL — AYNI REQUEST İÇİN İKİNCİ DOSYA
+// =================================================
+// V14.7 artık originalPath'i doğrudan multipart upload'dan alabilir.
+// Env değişkeni yalnızca geriye dönük fallback olarak kalır.
+const exactOriginalUpload = findUploadedFileByNames(files, [
+  "exactOriginal",
+  "original",
+  "referenceOriginal",
+  "originalFile",
+]);
+
 const rawType =
 first(
 fields?.type
@@ -15808,10 +15842,29 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
 // V14.7: exact-original pair pixel residual.
 if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
   try {
-    const exactOriginalPathV147 = await resolveExactOriginalPathV147();
+    const exactOriginalPathV147 = await resolveExactOriginalPathV147(
+      exactOriginalUpload?.filepath || null
+    );
     paintOverExactPairResidualV147 = exactOriginalPathV147
-      ? await runPaintOverExactPairResidualV147({ targetPath: forensicTargetPath, originalPath: exactOriginalPathV147, targetOCR: paddleImageOCR })
-      : { available:false, engine:"paint-over-exact-pair-residual-v14.7", diagnosticOnly:true, riskContribution:0, status:"not-configured", reason:"VERIFYDOC_EXACT_ORIGINAL_PATH not provided" };
+      ? await runPaintOverExactPairResidualV147({
+          targetPath: forensicTargetPath,
+          originalPath: exactOriginalPathV147,
+          targetOCR: paddleImageOCR
+        })
+      : {
+          available:false,
+          engine:"paint-over-exact-pair-residual-v14.7",
+          diagnosticOnly:true,
+          riskContribution:0,
+          status:"not-configured",
+          reason:"Exact original upload/path not provided",
+          expectedMultipartFields:["exactOriginal","original","referenceOriginal","originalFile"]
+        };
+    console.log("PAINT-OVER EXACT PAIR ORIGINAL SOURCE:", JSON.stringify({
+      source: exactOriginalUpload?.filepath ? "multipart-upload" : (process.env.VERIFYDOC_EXACT_ORIGINAL_PATH ? "environment" : "none"),
+      field: exactOriginalUpload?.filepath ? "exactOriginal/original/referenceOriginal/originalFile" : null,
+      originalFileName: exactOriginalUpload?.originalFilename || null
+    }));
     console.log("PAINT-OVER EXACT PAIR RESIDUAL V14.7:", JSON.stringify(paintOverExactPairResidualV147));
   } catch (error) {
     console.warn("PAINT-OVER EXACT PAIR RESIDUAL V14.7 HATASI:", error?.message || error);
