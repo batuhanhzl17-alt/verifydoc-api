@@ -11468,267 +11468,14 @@ return finalForensics;
 
 
 // =====================================================
-// V14.5 — PAINT-OVER RESIDUAL LAB (DIAGNOSTIC ONLY)
-// =====================================================
-// Measures reference-aligned residuals outside the union of inferred target
-// and reference glyph masks. A bank/layout reference is not an authenticated
-// copy of this exact receipt, so these measurements describe differences only;
-// they cannot establish Photoshop editing. This output never enters risk.
-async function runPaintOverResidualLabV145({ targetPath, targetOCR, referencePaths = [], bank = null }) {
-  const unavailable = reason => ({ available:false, engine:'paint-over-residual-lab-v14.5', diagnosticOnly:true, riskContribution:0, bank:bank||null, reason });
-  if (!targetPath || !targetOCR?.success || !Array.isArray(targetOCR?.regions)) return unavailable('target-or-ocr-unavailable');
-  const refPath=(Array.isArray(referencePaths)?referencePaths:[referencePaths]).find(Boolean);
-  if(!refPath)return unavailable('visual-reference-unavailable');
-  try {
-    const readRaster=async p=>{
-      if(path.extname(String(p)).toLowerCase()==='.pdf'){
-        const raw=await fs.readFile(p),pdf=await pdfjsLib.getDocument({data:new Uint8Array(raw)}).promise;
-        return (await renderPdfPagePng(pdf,1,1.8))?.buffer||null;
-      }
-      return fs.readFile(p);
-    };
-    const [tb,rb]=await Promise.all([readRaster(targetPath),readRaster(refPath)]);
-    if(!tb||!rb)return unavailable('image-read-failed');
-    const [tm,rm]=await Promise.all([sharp(tb).metadata(),sharp(rb).metadata()]);
-    const W=Number(tm.width)||0,H=Number(tm.height)||0;
-    if(W<100||H<100||!rm.width||!rm.height)return unavailable('invalid-image-dimensions');
-    const aspectRatioDelta=Math.abs((rm.width/rm.height)/(W/H)-1);
-    // Keep a mismatched canvas measurable; report the resize explicitly instead
-    // of silently returning no diagnostics. The metric remains diagnostic only.
-    const [td,rd]=await Promise.all([
-      sharp(tb).removeAlpha().toColourspace('srgb').resize(W,H,{fit:'fill'}).raw().toBuffer(),
-      sharp(rb).removeAlpha().toColourspace('srgb').resize(W,H,{fit:'fill'}).raw().toBuffer()
-    ]);
-    const lum=(buf,x,y)=>{const i=(y*W+x)*3;return .2126*buf[i]+.7152*buf[i+1]+.0722*buf[i+2];};
-    const maxShift=Math.min(24,Math.max(4,Math.round(Math.min(W,H)*.012)));
-    let best={dx:0,dy:0,loss:Infinity};
-    for(let dy=-maxShift;dy<=maxShift;dy+=2)for(let dx=-maxShift;dx<=maxShift;dx+=2){
-      let sum=0,n=0;const sy=Math.max(3,Math.floor(H/100)),sx=Math.max(3,Math.floor(W/100));
-      for(let y=maxShift+2;y<H-maxShift-2;y+=sy)for(let x=maxShift+2;x<W-maxShift-2;x+=sx){sum+=Math.abs(lum(td,x,y)-lum(rd,x+dx,y+dy));n++;}
-      if(n&&sum/n<best.loss)best={dx,dy,loss:sum/n};
-    }
-    const refAt=(x,y)=>({x:x+best.dx,y:y+best.dy}),clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
-    const percentile=(a,f)=>{const z=a.slice().sort((x,y)=>x-y);return z[Math.floor((z.length-1)*f)]||0;};
-    const median=a=>{const z=a.filter(Number.isFinite).sort((x,y)=>x-y);return z.length?z[Math.floor(z.length/2)]:0;};
-    const names=['luma','color','textureVariance','edge','sharpness','jpegBlock'];
-    const obs=[];
-    const regions=targetOCR.regions.map((r,index)=>({r:r?.region||r,index,text:String(r?.text||'').trim()})).filter(q=>q.text.length>=2&&Number(q.r?.x2)>Number(q.r?.x1)&&Number(q.r?.y2)>Number(q.r?.y1)).slice(0,100);
-    for(const q of regions){
-      const x1=clamp(Math.floor(Number(q.r.x1)),1,W-2),y1=clamp(Math.floor(Number(q.r.y1)),1,H-2),x2=clamp(Math.ceil(Number(q.r.x2)),1,W-2),y2=clamp(Math.ceil(Number(q.r.y2)),1,H-2);
-      if(x2-x1<5||y2-y1<3||x2-x1>W*.7||y2-y1>H*.15)continue;
-      const tv=[],rv=[];
-      for(let y=y1;y<=y2;y++)for(let x=x1;x<=x2;x++){const p=refAt(x,y);if(p.x>=0&&p.x<W&&p.y>=0&&p.y<H){tv.push(lum(td,x,y));rv.push(lum(rd,p.x,p.y));}}
-      const tth=Math.min(220,percentile(tv,.32)),rth=Math.min(220,percentile(rv,.32)),glyph=[];
-      for(let y=y1;y<=y2;y++)for(let x=x1;x<=x2;x++){const p=refAt(x,y);if(lum(td,x,y)<=tth||(p.x>=0&&p.x<W&&p.y>=0&&p.y<H&&lum(rd,p.x,p.y)<=rth))glyph.push([x,y]);}
-      if(glyph.length<3)continue;
-      const rings=[['1-2px',1,2],['2-4px',3,4],['4-7px',5,7]],rows=[];
-      const ax=Math.max(1,x1-7),ay=Math.max(1,y1-7),bx=Math.min(W-2,x2+7),by=Math.min(H-2,y2+7),roiW=bx-ax+1;
-      const distance=new Uint8Array(roiW*(by-ay+1));distance.fill(255);
-      for(const [gx,gy] of glyph)for(let oy=-7;oy<=7;oy++)for(let ox=-7;ox<=7;ox++){
-        const xx=gx+ox,yy=gy+oy;if(xx<ax||xx>bx||yy<ay||yy>by)continue;
-        const d=Math.max(Math.abs(ox),Math.abs(oy)),di=(yy-ay)*roiW+(xx-ax);if(d<distance[di])distance[di]=d;
-      }
-      for(const [name,lo,hi] of rings){const v=Object.fromEntries(names.map(k=>[k,[]]));
-        for(let y=ay;y<=by;y++)for(let x=ax;x<=bx;x++){
-          const d=distance[(y-ay)*roiW+(x-ax)];if(d<lo||d>hi)continue;
-          const p=refAt(x,y);if(p.x<1||p.y<1||p.x>=W-1||p.y>=H-1)continue;
-          const a=lum(td,x,y),b=lum(rd,p.x,p.y),i=(y*W+x)*3,j=(p.y*W+p.x)*3;
-          v.luma.push(Math.abs(a-b));v.color.push((Math.abs(td[i]-rd[j])+Math.abs(td[i+1]-rd[j+1])+Math.abs(td[i+2]-rd[j+2]))/3);
-          let sa=0,sb=0,qa=0,qb=0;
-          for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){const aa=lum(td,x+ox,y+oy),pp=refAt(x+ox,y+oy),bb=lum(rd,pp.x,pp.y);sa+=aa;sb+=bb;qa+=aa*aa;qb+=bb*bb;}
-          v.textureVariance.push(Math.abs((qa/9-(sa/9)**2)-(qb/9-(sb/9)**2)));
-          const grad=(buf,xx,yy)=>[lum(buf,xx+1,yy)-lum(buf,xx-1,yy),lum(buf,xx,yy+1)-lum(buf,xx,yy-1)];
-          const ga=grad(td,x,y),gb=grad(rd,p.x,p.y),la=4*a-lum(td,x-1,y)-lum(td,x+1,y)-lum(td,x,y-1)-lum(td,x,y+1),lb=4*b-lum(rd,p.x-1,p.y)-lum(rd,p.x+1,p.y)-lum(rd,p.x,p.y-1)-lum(rd,p.x,p.y+1);
-          v.edge.push(Math.abs(Math.hypot(...ga)-Math.hypot(...gb)));v.sharpness.push(Math.abs(Math.abs(la)-Math.abs(lb)));
-          const ea=Math.abs(ga[0])+Math.abs(ga[1]),eb=Math.abs(gb[0])+Math.abs(gb[1]);v.jpegBlock.push(Math.abs(((x%8===0||y%8===0)?ea:0)-((p.x%8===0||p.y%8===0)?eb:0)));
-        }
-        rows.push({ring:name,metrics:Object.fromEntries(names.map(k=>[k,{mean:v[k].length?v[k].reduce((a,b)=>a+b,0)/v[k].length:0,samples:v[k].length}]))});
-      }
-      obs.push({regionIndex:q.index,field:rfLabelPart(q.text)||'unknown',text:q.text,targetBox:{x1,y1,x2,y2},glyphPixels:glyph.length,rings:rows});
-    }
-    const baseline={};for(const ring of ['1-2px','2-4px','4-7px']){baseline[ring]={};for(const metric of names)baseline[ring][metric]=median(obs.map(o=>o.rings.find(r=>r.ring===ring)?.metrics[metric].mean||0).filter(x=>x>0));}
-    for(const o of obs)for(const row of o.rings)for(const metric of names){const m=row.metrics[metric],b=baseline[row.ring][metric];m.documentBaseline=Number(b.toFixed(4));m.normalizedExcess=Number((m.mean/(b+.25)).toFixed(3));}
-    const norm=s=>String(s||'').toLocaleUpperCase('tr-TR').replace(/[^\p{L}\p{N}]/gu,'');
-    const amountValueKey=token=>{
-      const cut=Math.max(token.lastIndexOf(','),token.lastIndexOf('.'));if(cut<0)return null;
-      const integer=token.slice(0,cut).replace(/\D/g,'');const fraction=token.slice(cut+1).replace(/\D/g,'').padEnd(2,'0').slice(0,2);
-      if(!integer||!fraction)return null;return `${integer.replace(/^0+(?=\d)/,'')}.${fraction}`;
-    };
-    const amountGroups=new Map();
-    for(const o of obs){
-      const text=String(o.text||'');const dateLike=/\b(?:tarih|date|saat|time)\b/i.test(text);
-      const matches=[...text.matchAll(/(?<!\d)(?:\d{1,3}(?:[., ]\d{3})+|\d+)[.,]\d{1,2}(?!\d)/g)];
-      for(const m of matches){
-        const token=m[0],context=/(?:tutar|amount|\bTL\b|\bTRY\b|\bEUR\b|\bUSD\b|\bGBP\b|₺)/i.test(text)||norm(text)===norm(token);
-        if(!context||dateLike&&!/tutar|amount/i.test(text))continue;
-        const value=amountValueKey(token);if(!value)continue;
-        if(!amountGroups.has(value))amountGroups.set(value,[]);
-        amountGroups.get(value).push({observation:o,token,textStart:m.index,textEnd:m.index+token.length});
-      }
-    }
-    const duplicateGroups=[];
-    for(const [value,items] of amountGroups){
-      const distinct=[...new Map(items.map(item=>[item.observation.regionIndex,item])).values()];if(distinct.length<2)continue;
-      const metricSupportByRing=Object.fromEntries(['1-2px','2-4px','4-7px'].map(ring=>[ring,Object.fromEntries(names.map(metric=>[metric,Number(median(distinct.map(item=>item.observation.rings.find(r=>r.ring===ring)?.metrics[metric]?.normalizedExcess||0)).toFixed(3))]))]));
-      duplicateGroups.push({kind:'repeated-amount-value',normalizedValue:value,occurrenceCount:items.length,fieldCount:distinct.length,regionIndices:distinct.map(item=>item.observation.regionIndex),occurrences:items.map(item=>({regionIndex:item.observation.regionIndex,token:item.token,text:item.observation.text,textSpan:{start:item.textStart,end:item.textEnd},targetBox:item.observation.targetBox})),metricSupportByRing,measurementScope:'whole OCR region; amount token is not isolated when OCR grouped it with neighboring text'});
-    }
-    return {available:true,engine:'paint-over-residual-lab-v14.5',bank:bank||null,diagnosticOnly:true,riskContribution:0,
-      forensicInterpretation:{status:'indeterminate',referenceScope:'bank-layout-reference-not-verified-as-the-same-receipt',exactOriginalAvailable:false,canProvePhotoshopFromTheseMeasurements:false,reason:'A different transaction or generic bank template cannot serve as a pixel-authentic original. Seamless removal on a flat background may leave no target-only trace; replacement traces require validation against genuine and edited Telegram-transcoded pairs.'},
-      alignment:{method:'reference-resized-to-target-canvas-then-sparse-translation-search',dx:best.dx,dy:best.dy,meanLumaResidual:Number(best.loss.toFixed(3)),targetDimensions:{width:W,height:H},referenceDimensions:{width:Number(rm.width),height:Number(rm.height)},aspectRatioDelta:Number(aspectRatioDelta.toFixed(5)),referenceResizedToTargetCanvas:true,geometryCaution:aspectRatioDelta>.025?'aspect ratio differs by over 2.5%; interpret residuals cautiously':'aspect ratio is close',referencePath:path.basename(refPath)},
-      ringWidthsPx:['1-2','2-4','4-7'],metrics:names,documentBaseline:baseline,duplicateFieldSupport:{groupCount:duplicateGroups.length,groups:duplicateGroups},ocrRegionCount:targetOCR.regions.length,boxedOcrFieldCount:regions.length,fieldCount:obs.length,observations:obs.slice(0,40),
-      note:'Aligned residuals are descriptive because the available reference is not verified as the exact original receipt. Do not interpret them as Photoshop evidence. Diagnostic only; riskContribution is zero.'};
-  }catch(error){return unavailable(error?.message||String(error));}
-}
-
-// =====================================================
-// V15 — SINGLE-IMAGE EDIT TRACE LAB (DIAGNOSTIC ONLY)
-// =====================================================
-// Runtime input is ONE candidate image. No transaction-specific original or
-// generic bank-template pixel comparison is used here. OCR boxes are unwrapped
-// explicitly because PaddleOCR returns coordinates under `region`; controls
-// are selected from similarly sized regions in this same image.
-// This is an exploratory feature logger, not a calibrated Photoshop verdict.
-async function runSingleImageEditTraceLabV15({ targetPath, targetOCR }) {
-  const unavailable = reason => ({
-    available: false,
-    engine: 'single-image-edit-trace-lab-v15',
-    diagnosticOnly: true,
-    riskContribution: 0,
-    inputImages: 1,
-    referenceUsed: false,
-    calibrationStatus: 'uncalibrated',
-    reason,
-  });
-  if (!targetPath || !targetOCR?.success || !Array.isArray(targetOCR?.regions)) {
-    return unavailable('target-image-or-ocr-unavailable');
-  }
-  try {
-    const buffer = await fs.readFile(targetPath);
-    const { data, info } = await sharp(buffer)
-      .removeAlpha()
-      .toColourspace('srgb')
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    const W = Number(info.width) || 0;
-    const H = Number(info.height) || 0;
-    const C = Number(info.channels) || 3;
-    if (W < 100 || H < 100 || C < 3) return unavailable('invalid-raster-dimensions');
-
-    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const regions = targetOCR.regions.map((entry, index) => {
-      const r = entry?.region || entry?.box || entry;
-      const x1 = Number(r?.x1), y1 = Number(r?.y1), x2 = Number(r?.x2), y2 = Number(r?.y2);
-      if (![x1,y1,x2,y2].every(Number.isFinite)) return null;
-      const box = {
-        x1: clamp(Math.floor(Math.min(x1,x2)), 0, W-1),
-        y1: clamp(Math.floor(Math.min(y1,y2)), 0, H-1),
-        x2: clamp(Math.ceil(Math.max(x1,x2)), 0, W-1),
-        y2: clamp(Math.ceil(Math.max(y1,y2)), 0, H-1),
-      };
-      const text = String(entry?.text || '').trim();
-      if (!text || box.x2-box.x1 < 4 || box.y2-box.y1 < 4) return null;
-      const width = box.x2-box.x1+1, height = box.y2-box.y1+1;
-      if (width > W*.75 || height > H*.18) return null;
-      return { index, text, box, width, height, aspect: width/Math.max(1,height), hasDigits: /\d{2,}/.test(text) };
-    }).filter(Boolean).slice(0,120);
-    if (regions.length < 4) return unavailable('too-few-usable-ocr-regions');
-
-    const lumAt = (x,y) => {
-      const i = (y*W+x)*C;
-      return .2126*data[i] + .7152*data[i+1] + .0722*data[i+2];
-    };
-    const featureNames = ['inkRatio','edgeMean','laplacianMean','jpegBoundaryRatio','chromaMean'];
-    const featuresFor = region => {
-      const {x1,y1,x2,y2} = region.box;
-      let count=0,dark=0,edgeSum=0,lapSum=0,chromaSum=0,boundarySum=0,interiorSum=0,boundaryCount=0,interiorCount=0;
-      for(let y=y1;y<=y2;y++) for(let x=x1;x<=x2;x++) {
-        const i=(y*W+x)*C, r=data[i],g=data[i+1],b=data[i+2], l=.2126*r+.7152*g+.0722*b;
-        count++; if(l<190) dark++;
-        chromaSum += Math.max(r,g,b)-Math.min(r,g,b);
-        if(x>0&&y>0&&x<W-1&&y<H-1) {
-          const gx=lumAt(x+1,y)-lumAt(x-1,y), gy=lumAt(x,y+1)-lumAt(x,y-1);
-          const e=(Math.abs(gx)+Math.abs(gy))*.5;
-          const lap=Math.abs(4*l-lumAt(x-1,y)-lumAt(x+1,y)-lumAt(x,y-1)-lumAt(x,y+1));
-          edgeSum+=e; lapSum+=lap;
-          if(x%8===0||y%8===0){boundarySum+=e;boundaryCount++;}else{interiorSum+=e;interiorCount++;}
-        }
-      }
-      const boundaryMean=boundaryCount?boundarySum/boundaryCount:0;
-      const interiorMean=interiorCount?interiorSum/interiorCount:0;
-      return {
-        inkRatio: count?dark/count:0,
-        edgeMean: edgeSum/Math.max(1,count),
-        laplacianMean: lapSum/Math.max(1,count),
-        jpegBoundaryRatio: boundaryMean/(interiorMean+.05),
-        chromaMean: chromaSum/Math.max(1,count),
-      };
-    };
-    const median = values => {
-      const a=values.filter(Number.isFinite).sort((x,y)=>x-y);
-      if(!a.length)return null;
-      const m=Math.floor(a.length/2);
-      return a.length%2?a[m]:(a[m-1]+a[m])/2;
-    };
-    const all = regions.map(r => ({...r, features:featuresFor(r)}));
-    const candidateRows = all.filter(r => r.hasDigits || /tutar|amount|eft|fast|tl|try|iban|tarih|işlem|islem|fiş|fis/i.test(r.text));
-    const observations = candidateRows.slice(0,40).map(row => {
-      const peers = all.filter(peer => peer.index!==row.index &&
-        peer.height >= row.height*.78 && peer.height <= row.height*1.28 &&
-        peer.aspect >= row.aspect*.35 && peer.aspect <= row.aspect*2.85 &&
-        (!row.hasDigits || peer.hasDigits));
-      const control = {};
-      for(const metric of featureNames) {
-        const values=peers.map(p=>p.features[metric]);
-        const med=median(values);
-        const mad=med==null?null:median(values.map(v=>Math.abs(v-med)));
-        const scale=mad==null?null:1.4826*mad;
-        const raw=med==null||!Number.isFinite(scale)||scale<1e-6?null:(row.features[metric]-med)/scale;
-        control[metric]={value:Number(row.features[metric].toFixed(5)),peerMedian:med==null?null:Number(med.toFixed(5)),peerMad:mad==null?null:Number(mad.toFixed(5)),robustZ:raw==null?null:Number(raw.toFixed(3)),peerCount:values.length};
-      }
-      const outlierMetrics=featureNames.filter(k=>Number.isFinite(control[k].robustZ)&&Math.abs(control[k].robustZ)>=3.5);
-      return {
-        regionIndex:row.index,
-        text:row.text.slice(0,120),
-        targetBox:row.box,
-        targetKind:row.hasDigits?'numeric-or-mixed':'critical-label-or-field',
-        matchedPeerCount:peers.length,
-        features:control,
-        exploratoryOutlierMetrics:outlierMetrics,
-        exploratoryOutlierHint:peers.length>=4&&outlierMetrics.length>=2,
-      };
-    });
-    return {
-      available:true,
-      engine:'single-image-edit-trace-lab-v15',
-      diagnosticOnly:true,
-      riskContribution:0,
-      inputImages:1,
-      referenceUsed:false,
-      calibrationStatus:'uncalibrated',
-      imageDimensions:{width:W,height:H},
-      ocrRegionCount:targetOCR.regions.length,
-      usableRegionCount:regions.length,
-      candidateFieldCount:candidateRows.length,
-      controlMethod:'same-image OCR regions with similar box height/aspect; numeric fields use numeric peers',
-      metrics:featureNames,
-      exploratoryHintCount:observations.filter(x=>x.exploratoryOutlierHint).length,
-      observations,
-      interpretation:{status:'diagnostic-only',meaning:'Local statistical outliers are investigation hints, not proof of Photoshop editing.',importantLimit:'A seamless erase on a uniform background may leave no detectable single-image trace. Missing OCR text alone is not treated as an edit signal.'},
-    };
-  } catch(error) {
-    return unavailable(error?.message||String(error));
-  }
-}
-
-// =====================================================
-// V14.4 — TARGET-ONLY PAINT-OVER / BACKGROUND CONTINUITY DIAGNOSTIC
+// V14.3 — TARGET-ONLY PAINT-OVER / BACKGROUND CONTINUITY FORENSICS
 // =====================================================
 // Amaç: OCR karakterinin kendisini "farklı" bulmak yerine, yazının hemen
 // çevresindeki arka planın doğal devamlılığında lokal bir kırılma olup
 // olmadığını ölçmek. Bu katman özellikle şu manipülasyon zincirini hedefler:
 //     eski yazıyı boya/erase -> arka planı yeniden oluştur -> yeni yazıyı yaz
 //
-// ÖNEMLİ V14.4 KURALI:
+// ÖNEMLİ V14.3 KURALI:
 //   - Referans farkı ana kanıt değildir.
 //   - amount/font/format farkı ana kanıt değildir.
 //   - maxInk/maxStroke/maxEdge/anomalyRatio tek başına alarm değildir.
@@ -11920,37 +11667,29 @@ async function runPaintOverBackgroundContinuityV143({
       const footprintAxisSupport =
         Number(gxStats.mean > 2.2) + Number(gyStats.mean > 2.2);
 
-      // V14.4 DIAGNOSTIC CHANGE:
-      // V14.3'ün "3 bağımsız sinyal" kapısı fazla katıydı ve hem sahte hem
-      // orijinalde 0 aday üretti. V14.4 burada risk kararı vermiyor; önce
-      // ham adayları görünür hale getiriyor. Bu nedenle tek bir orta kuvvette
-      // arka-plan kırılması bile diagnostic candidate olarak kaydedilebilir.
-      // Ancak salt harf kenarı/edge davranışı tek başına yeterli değildir.
       const signals = {
-        backgroundLumaBreak: lumaBreak >= 3.2,
-        backgroundTextureBreak: textureRatio >= 1.20 || textureRatio <= 0.82,
-        backgroundEdgeBreak: edgeRatio >= 1.22,
-        rectangularFootprint: footprintAxisSupport >= 1,
-        multiSideSupport: populatedSides >= 3 && sideMeanSpread >= 2.5,
+        backgroundLumaBreak: lumaBreak >= 7.5,
+        backgroundTextureBreak: textureRatio >= 1.35 || textureRatio <= 0.72,
+        backgroundEdgeBreak: edgeRatio >= 1.45,
+        rectangularFootprint: footprintAxisSupport >= 2,
+        multiSideSupport: populatedSides >= 3 && sideMeanSpread >= 5,
       };
       const signalCount = Object.values(signals).filter(Boolean).length;
 
+      // V14.3: tek bir özellikte alarm verme. Paint-over adayı için en az
+      // üç bağımsız arka plan davranışı ve iki farklı mekanizma gerekir.
       const backgroundEvidence =
-        signalCount >= 1 &&
-        (signals.backgroundLumaBreak || signals.backgroundTextureBreak || signals.multiSideSupport) &&
+        signalCount >= 3 &&
+        (signals.backgroundLumaBreak || signals.backgroundTextureBreak) &&
         (signals.backgroundEdgeBreak || signals.rectangularFootprint || signals.multiSideSupport);
 
       if (!backgroundEvidence) continue;
 
-      // Daha sonra V14.5'te kalibre edilecek ham diagnostic score. Bu skor
-      // kesinlikle risk motoruna bağlanmaz; üç testteki dağılımı karşılaştırmak
-      // için loglanır.
       const score = Math.min(100,
-        signalCount * 14 +
-        (signals.rectangularFootprint ? 12 : 0) +
-        (signals.multiSideSupport ? 14 : 0) +
-        Math.min(18, Math.round(lumaBreak * 1.5)) +
-        Math.min(12, Math.round(Math.abs(textureRatio - 1) * 35))
+        signalCount * 16 +
+        (signals.rectangularFootprint ? 16 : 0) +
+        (signals.multiSideSupport ? 10 : 0) +
+        Math.min(14, Math.round(lumaBreak))
       );
 
       observations.push({
@@ -12003,7 +11742,7 @@ async function runPaintOverBackgroundContinuityV143({
 
     return {
       available: true,
-      engine: 'paint-over-background-continuity-v14.4-diagnostic',
+      engine: 'paint-over-background-continuity-v14.3',
       bank: bank || null,
       targetOnly: true,
       referenceUsedAsPrimaryEvidence: false,
@@ -12014,18 +11753,16 @@ async function runPaintOverBackgroundContinuityV143({
       neighboringStrongPairs: neighboringStrongPairs ? 1 : 0,
       signal: Boolean(strong.length),
       severity,
-      diagnosticOnly: true,
-      riskContribution: 0,
       score: strong.length ? Math.max(...strong.map(x => Number(x.score) || 0)) : (medium.length ? Math.max(...medium.map(x => Number(x.score) || 0)) : 0),
       observations: observations.slice(0, 12),
       evidence: observations.length
-        ? 'Hedef görüntü içinde yazı çevresi arka planında lokal luma/texture/edge/footprint sürekliliği adayları bulundu. Bu V14.4 diagnostic sürümünde risk skoruna otomatik katkı yoktur.'
+        ? 'Hedef görüntü içinde yazı çevresi arka planında lokal luma/texture/edge/footprint sürekliliği adayları bulundu. Bu V14.3 ilk sürümünde risk skoruna otomatik katkı yoktur.'
         : 'Hedef görüntü içinde çoklu bağımsız arka plan sürekliliği sinyali veren paint-over adayı bulunmadı.',
     };
   } catch (error) {
     return {
       available: false,
-      engine: 'paint-over-background-continuity-v14.4-diagnostic',
+      engine: 'paint-over-background-continuity-v14.3',
       targetOnly: true,
       error: error?.message || String(error),
     };
@@ -15530,8 +15267,7 @@ let openSourceForensics = null;
 let fontForensics = null;
 let fieldTamperingForensics = null;
 let paintOverBackgroundForensicsV143 = null;
-let paintOverResidualLabV145 = null;
-let singleImageEditTraceLabV15 = null;
+let paintOverResidualIndexV146 = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -15700,15 +15436,189 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
   }
 }
 
+
+// =====================================================
+// V14.6 — PAINT-OVER RESIDUAL INDEX V1 (DIAGNOSTIC ONLY)
+// =====================================================
+// Amaç: OCR kutusunun hemen çevresindeki lokal raster davranışını,
+// aynı görüntüdeki benzer OCR bölgelerinin kontrol dağılımına göre
+// normalize etmek. Referans dekont farkı, amount formatı veya font farkı
+// tek başına sinyal değildir. Bu sürüm ana risk skoruna katkı vermez.
+function medianV146(values) {
+  const a = values.filter(Number.isFinite).sort((x,y)=>x-y);
+  if (!a.length) return null;
+  const m = Math.floor(a.length/2);
+  return a.length % 2 ? a[m] : (a[m-1] + a[m]) / 2;
+}
+
+function madV146(values, med) {
+  const a = values.filter(Number.isFinite).map(v => Math.abs(v-med));
+  return medianV146(a) || 0;
+}
+
+function robustZV146(value, med, mad) {
+  if (!Number.isFinite(value) || !Number.isFinite(med)) return null;
+  const scale = Math.max(1.4826 * (Number(mad) || 0), 0.0001);
+  return (value - med) / scale;
+}
+
+function clampV146(v, lo=0, hi=10) {
+  return Math.max(lo, Math.min(hi, Number.isFinite(v) ? v : 0));
+}
+
+function rectV146(r, width, height) {
+  const x1=Math.max(0,Math.floor(r.x1));
+  const y1=Math.max(0,Math.floor(r.y1));
+  const x2=Math.min(width,Math.ceil(r.x2));
+  const y2=Math.min(height,Math.ceil(r.y2));
+  if (x2<=x1 || y2<=y1) return null;
+  return {x1,y1,x2,y2};
+}
+
+function ringBoundsV146(box, inner, outer, width, height) {
+  const a={x1:box.x1-inner,y1:box.y1-inner,x2:box.x2+inner,y2:box.y2+inner};
+  const b={x1:box.x1-outer,y1:box.y1-outer,x2:box.x2+outer,y2:box.y2+outer};
+  return { inner:rectV146(a,width,height), outer:rectV146(b,width,height) };
+}
+
+function pixelMetricsV146(data, width, height, region) {
+  const r=rectV146(region,width,height);
+  if (!r) return null;
+  let n=0, sumL=0, sumL2=0, sumC=0, sumEdge=0, sumSharp=0;
+  const idx=(x,y)=>(y*width+x)*3;
+  for(let y=r.y1;y<r.y2;y++) for(let x=r.x1;x<r.x2;x++) {
+    const i=idx(x,y), rr=data[i], gg=data[i+1], bb=data[i+2];
+    const l=0.2126*rr+0.7152*gg+0.0722*bb;
+    const c=(Math.abs(rr-gg)+Math.abs(gg-bb)+Math.abs(rr-bb))/3;
+    const ir=idx(Math.min(width-1,x+1),y), id=idx(x,Math.min(height-1,y+1));
+    const lr=0.2126*data[ir]+0.7152*data[ir+1]+0.0722*data[ir+2];
+    const ld=0.2126*data[id]+0.7152*data[id+1]+0.0722*data[id+2];
+    const e=Math.abs(l-lr)+Math.abs(l-ld);
+    sumL+=l; sumL2+=l*l; sumC+=c; sumEdge+=e; n++;
+  }
+  if(!n) return null;
+  const meanL=sumL/n;
+  return {
+    samples:n,
+    luma:meanL,
+    textureVariance:Math.max(0,sumL2/n-meanL*meanL),
+    color:sumC/n,
+    edge:sumEdge/n,
+  };
+}
+
+async function runPaintOverResidualIndexV146({ targetPath, targetOCR }) {
+  const base={
+    available:false,
+    engine:"paint-over-residual-index-v14.6",
+    diagnosticOnly:true,
+    riskContribution:0,
+    calibrationStatus:"same-image-control-only",
+  };
+  if(!targetPath || !targetOCR?.success) return {...base,status:"unavailable",reason:"OCR unavailable"};
+  try {
+    const raw=await sharp(targetPath).resize({fit:"inside",withoutEnlargement:true}).removeAlpha().raw().toBuffer({resolveWithObject:true});
+    const {data,info}=raw;
+    const width=info.width,height=info.height;
+    const regions=Array.isArray(targetOCR.regions)?targetOCR.regions:[];
+    const usable=regions.map((r,i)=>({r,i,text:String(r?.text||r?.value||"").trim()}))
+      .filter(o=>o.text && o.r && Number.isFinite(o.r.x1) && Number.isFinite(o.r.y1) && Number.isFinite(o.r.x2) && Number.isFinite(o.r.y2))
+      .map(o=>({...o,box:rectV146(o.r,width,height)})).filter(o=>o.box);
+    if(usable.length<4) return {...base,available:true,status:"insufficient-controls",regionCount:usable.length};
+
+    const candidates=[];
+    for(const o of usable){
+      const w=o.box.x2-o.box.x1,h=o.box.y2-o.box.y1;
+      if(w<8 || h<6 || w>Math.max(400,width*.75) || h>Math.max(100,height*.25)) continue;
+      const rings={};
+      for(const [name,inner,outer] of [["1-2px",1,2],["2-4px",2,4],["4-7px",4,7]]){
+        const rb=ringBoundsV146(o.box,inner,outer,width,height);
+        if(!rb.inner || !rb.outer) continue;
+        // Outer minus inner: sample only the annulus.
+        const om=pixelMetricsV146(data,width,height,rb.outer);
+        const im=pixelMetricsV146(data,width,height,rb.inner);
+        if(!om || !im) continue;
+        // Approximate annulus by weighted difference; keep positive stable features.
+        const areaOuter=(rb.outer.x2-rb.outer.x1)*(rb.outer.y2-rb.outer.y1);
+        const areaInner=(rb.inner.x2-rb.inner.x1)*(rb.inner.y2-rb.inner.y1);
+        const ann=Math.max(1,areaOuter-areaInner);
+        const scaleO=areaOuter/ann, scaleI=areaInner/ann;
+        rings[name]={
+          luma:Math.abs(om.luma*scaleO-im.luma*scaleI),
+          color:Math.abs(om.color*scaleO-im.color*scaleI),
+          textureVariance:Math.abs(om.textureVariance*scaleO-im.textureVariance*scaleI),
+          edge:Math.abs(om.edge*scaleO-im.edge*scaleI),
+        };
+      }
+      if(Object.keys(rings).length) candidates.push({...o,width:w,height:h,area:w*h,rings});
+    }
+
+    // Build controls from similarly sized OCR regions. Numeric/mixed regions
+    // prefer other numeric/mixed regions, reducing false positives from labels.
+    const isNumeric=t=>/[0-9]/.test(t);
+    const observations=[];
+    for(const target of candidates){
+      const targetNumeric=isNumeric(target.text);
+      const peers=candidates.filter(p=>p!==target && Math.abs(Math.log((p.area+1)/(target.area+1)))<1.0 && isNumeric(p.text)===targetNumeric);
+      if(peers.length<3) continue;
+      const ringScores={};
+      for(const ring of ["1-2px","2-4px","4-7px"]){
+        const metrics={};
+        for(const metric of ["luma","color","textureVariance","edge"]){
+          const vals=peers.map(p=>p.rings?.[ring]?.[metric]).filter(Number.isFinite);
+          const med=medianV146(vals), mad=madV146(vals,med);
+          const value=target.rings?.[ring]?.[metric];
+          metrics[metric]={value,controlMedian:med,mad,robustZ:robustZV146(value,med,mad),ratio:med && med>0 ? value/med : null};
+        }
+        const z=Object.values(metrics).map(x=>Math.abs(x.robustZ)).filter(Number.isFinite);
+        const high=z.filter(v=>v>=2).length;
+        ringScores[ring]={metrics,meanAbsRobustZ:z.length?z.reduce((a,b)=>a+b,0)/z.length:0,highMetricCount:high};
+      }
+      const ringVals=Object.values(ringScores).map(x=>x.meanAbsRobustZ).filter(Number.isFinite);
+      const index=ringVals.length?ringVals.reduce((a,b)=>a+b,0)/ringVals.length:0;
+      observations.push({regionIndex:target.i,text:target.text,targetBox:target.box,peerCount:peers.length,paintOverResidualIndex:Number(index.toFixed(3)),rings:ringScores});
+    }
+
+    observations.sort((a,b)=>b.paintOverResidualIndex-a.paintOverResidualIndex);
+    return {
+      ...base,
+      available:true,
+      status:"diagnostic",
+      imageDimensions:{width,height},
+      controlMethod:"same-image OCR regions; numeric peers matched by box area",
+      ringWidthsPx:["1-2","2-4","4-7"],
+      metrics:["luma","color","textureVariance","edge"],
+      candidateCount:candidates.length,
+      observationCount:observations.length,
+      topObservations:observations.slice(0,12),
+      note:"Bu indeks lokal OCR-ring davranışını aynı görüntüdeki benzer bölgelerle karşılaştırır. Tek başına Photoshop kanıtı değildir ve risk skoruna katkı vermez. Exact-original pair validation gerektiğinde ayrı pixel residual ölçümü kullanılmalıdır."
+    };
+  } catch(error){
+    return {...base,available:false,status:"error",error:error?.message||String(error)};
+  }
+}
+
+// V14.6: aynı-görüntü kontrol normalizasyonlu paint-over residual index.
+// Diagnostic only: exact original olmadığı sürece Photoshop kanıtı değildir.
+if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
+  try {
+    paintOverResidualIndexV146 = await runPaintOverResidualIndexV146({
+      targetPath: forensicTargetPath,
+      targetOCR: paddleImageOCR,
+    });
+    console.log("PAINT-OVER RESIDUAL INDEX V14.6:", JSON.stringify(paintOverResidualIndexV146));
+  } catch (error) {
+    console.warn("PAINT-OVER RESIDUAL INDEX V14.6 HATASI:", error?.message || error);
+    paintOverResidualIndexV146 = null;
+  }
+}
+
 // V14.3: hedef-görüntü tabanlı paint-over arka plan sürekliliği.
 // Bu sürüm yalnızca diagnostiktir; referans farklarını ve amount-format
 // farklarını ana kanıt yapmaz ve risk skorunu doğrudan değiştirmez.
 if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
   try {
     const paintRefPaths = getVisualReferencePath(reference);
-    paintOverResidualLabV145 = await runPaintOverResidualLabV145({ targetPath: forensicTargetPath, targetOCR: paddleImageOCR, bank,
-      referencePaths: Array.isArray(paintRefPaths) ? paintRefPaths : (paintRefPaths ? [paintRefPaths] : []) });
-    console.log("PAINT-OVER RESIDUAL LAB V14.5:", JSON.stringify(paintOverResidualLabV145));
     paintOverBackgroundForensicsV143 = await runPaintOverBackgroundContinuityV143({
       targetPath: forensicTargetPath,
       targetOCR: paddleImageOCR,
@@ -15717,25 +15627,10 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
         ? paintRefPaths
         : (paintRefPaths ? [paintRefPaths] : []),
     });
-    console.log("PAINT-OVER BACKGROUND FORENSICS V14.4:", JSON.stringify(paintOverBackgroundForensicsV143));
+    console.log("PAINT-OVER BACKGROUND FORENSICS V14.3:", JSON.stringify(paintOverBackgroundForensicsV143));
   } catch (error) {
-    console.warn("PAINT-OVER BACKGROUND FORENSICS V14.4 HATASI:", error?.message || error);
+    console.warn("PAINT-OVER BACKGROUND FORENSICS V14.3 HATASI:", error?.message || error);
     paintOverBackgroundForensicsV143 = null;
-  }
-}
-
-// V15: one-image forensic feature lab. It runs on the submitted image only;
-// its exploratory statistics are diagnostic and have no risk contribution.
-if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
-  try {
-    singleImageEditTraceLabV15 = await runSingleImageEditTraceLabV15({
-      targetPath: forensicTargetPath,
-      targetOCR: paddleImageOCR,
-    });
-    console.log("SINGLE-IMAGE EDIT TRACE LAB V15:", JSON.stringify(singleImageEditTraceLabV15));
-  } catch (error) {
-    console.warn("SINGLE-IMAGE EDIT TRACE LAB V15 ERROR:", error?.message || error);
-    singleImageEditTraceLabV15 = null;
   }
 }
 
@@ -17820,8 +17715,9 @@ if (fieldTamperingForensics) {
 if (paintOverBackgroundForensicsV143) {
   result.paintOverBackgroundForensicsV143 = paintOverBackgroundForensicsV143;
 }
-if (paintOverResidualLabV145) result.paintOverResidualLabV145 = paintOverResidualLabV145;
-if (singleImageEditTraceLabV15) result.singleImageEditTraceLabV15 = singleImageEditTraceLabV15;
+if (paintOverResidualIndexV146) {
+  result.paintOverResidualIndexV146 = paintOverResidualIndexV146;
+}
 
 if (amountForensics) {
   result.amountForensics = amountForensics;
