@@ -1901,12 +1901,6 @@ const NEGATIVE_SAMPLE_MAP = {
   yapikredi: ["yapikredi/sahte-1.jpg"],
   garanti: ["garanti/sahte-hesap-ozeti-1.pdf"],
   isbankasi: ["isbankasi/sahte-hesap-ozeti-1.pdf"],
-  enpara: [
-    "enpara/fake.3000.jpg",
-    "enpara/fake.8000.jpg",
-    "enpara/fake.iban.jpg",
-    "enpara/fake.iban2.jpg",
-  ],
 };
 
 async function loadNegativeSampleFiles(bank) {
@@ -1946,7 +1940,7 @@ async function runNegativeSampleComparison({ targetPath, negativeSamples = [], b
   const targetImage = `data:image/jpeg;base64,${targetJpeg.toString("base64")}`;
   const results = [];
 
-  for (const sample of negativeSamples.slice(0, 6)) {
+  for (const sample of negativeSamples.slice(0, 3)) {
     try {
       const sampleBuffer = await loadImage(sample.path);
       if (!sampleBuffer) continue;
@@ -14958,12 +14952,22 @@ throw new Error(
 // =================================================
 // V14.7 artık originalPath'i doğrudan multipart upload'dan alabilir.
 // Env değişkeni yalnızca geriye dönük fallback olarak kalır.
-const exactOriginalUpload = findUploadedFileByNames(files, [
+const exactOriginalFieldNames = [
   "exactOriginal",
   "original",
   "referenceOriginal",
   "originalFile",
-]);
+];
+const exactOriginalUpload = findUploadedFileByNames(files, exactOriginalFieldNames);
+const exactOriginalField = exactOriginalFieldNames.find((name) => Boolean(files?.[name])) || null;
+
+console.log("V14.7 EXACT ORIGINAL INPUT:", JSON.stringify({
+  available: Boolean(exactOriginalUpload?.filepath),
+  field: exactOriginalField,
+  fileName: exactOriginalUpload?.originalFilename || null,
+  mimeType: exactOriginalUpload?.mimetype || null,
+  size: Number(exactOriginalUpload?.size || 0),
+}));
 
 const rawType =
 first(
@@ -15868,7 +15872,7 @@ if ((type === "image" || type === "pdf") && paddleImageOCR?.success) {
         };
     console.log("PAINT-OVER EXACT PAIR ORIGINAL SOURCE:", JSON.stringify({
       source: exactOriginalUpload?.filepath ? "multipart-upload" : (process.env.VERIFYDOC_EXACT_ORIGINAL_PATH ? "environment" : "none"),
-      field: exactOriginalUpload?.filepath ? "exactOriginal/original/referenceOriginal/originalFile" : null,
+      field: exactOriginalField,
       originalFileName: exactOriginalUpload?.originalFilename || null
     }));
     console.log("PAINT-OVER EXACT PAIR RESIDUAL V14.7:", JSON.stringify(paintOverExactPairResidualV147));
