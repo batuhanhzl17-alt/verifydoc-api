@@ -18765,10 +18765,16 @@ const meaningfulPixelReferenceSignal =
   Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 45 &&
   Number(pixelForensics?.score || 0) >= 35;
 
+// V15.2 corroboration intentionally uses the raw V1 local signal here.
+// V2 is the Telegram-calibrated baseline layer; its score may become 0 when
+// the same raw Paint-Over pattern is explained by normal Telegram variation.
+// We therefore do NOT treat V2's calibrated score as the independent
+// corroborator. V1 is only admitted when the Amount Promotion is already
+// eligible and the V1 signal explicitly supports the same amount ROI.
 const paintOverForV152 =
-  result?.paintOverForensicsV2?.available === true
-    ? result.paintOverForensicsV2
-    : (paintOverForensics || result?.paintOverForensics || null);
+  paintOverForensics?.available === true
+    ? paintOverForensics
+    : (result?.paintOverForensics || result?.paintOverForensicsV1 || null);
 const paintOverV152Score = Number(paintOverForV152?.score || 0);
 const paintOverV152Signals = Number(paintOverForV152?.metrics?.supportSignals || 0);
 const paintOverV152AmountSupport = Number(paintOverForV152?.metrics?.amountSupport || 0);
@@ -18783,20 +18789,40 @@ const controlledAmountCorroborated =
   paintOverV152AmountSupport >= 20;
 
 if (controlledAmountCorroborated) {
-  // Reuse the pipeline's existing suspicious threshold. This is a
-  // corroboration floor, not an amount-only risk score.
-  finalRiskScore = Math.max(finalRiskScore, 46);
+  // V15.2: Controlled Promotion is a category-fusion signal, NOT an
+  // arbitrary final-score floor. Amount Forensics already contributes to
+  // financialDataRisk through its own deterministic warning/strong path.
+  // Here we add only the independent same-ROI corroboration to editingRisk.
+  //
+  // 750 regression: amount promotion is false, so this block is skipped.
+  // 1000 regression: amount promotion is true + PaintOver V1 corroborates
+  // the same amount ROI, so editingRisk is raised from 75 -> 85.
   result.categories = {
     ...(result.categories || {}),
-    financialDataRisk: Math.max(Number(result.categories?.financialDataRisk || 0), 85),
+    editingRisk: Math.max(
+      Number(result.categories?.editingRisk || 0),
+      85
+    )
   };
+
+  finalRiskScore = Math.round((
+    Number(result.categories.visualRisk || 0) * RISK_CATEGORY_WEIGHTS.visualRisk +
+    Number(result.categories.textRisk || 0) * RISK_CATEGORY_WEIGHTS.textRisk +
+    Number(result.categories.layoutRisk || 0) * RISK_CATEGORY_WEIGHTS.layoutRisk +
+    Number(result.categories.financialDataRisk || 0) * RISK_CATEGORY_WEIGHTS.financialDataRisk +
+    Number(result.categories.editingRisk || 0) * RISK_CATEGORY_WEIGHTS.editingRisk
+  ) / 100);
+
   console.log("V15.2 CONTROLLED AMOUNT CORROBORATION:", JSON.stringify({
-    appliedFloor: 46,
+    mode: "category-fusion",
     amountScore: __controlledAmountPromotion.score,
     amountSeverity: __controlledAmountPromotion.severity,
     paintOverScore: paintOverV152Score,
     paintOverSignals: paintOverV152Signals,
-    paintOverAmountSupport: paintOverV152AmountSupport
+    paintOverAmountSupport: paintOverV152AmountSupport,
+    financialDataRisk: result.categories.financialDataRisk,
+    editingRisk: result.categories.editingRisk,
+    fusedRisk: finalRiskScore
   }));
 }
 
