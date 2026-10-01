@@ -2785,6 +2785,18 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   if (Number.isFinite(advancedForensicsScore) && forensic?.advancedForensics?.available === true) {
     editingRisk = Math.max(editingRisk, Math.min(70, Math.round(advancedForensicsScore * 0.70)));
   }
+  // Paint-Over V1: promote only multi-signal LOCAL evidence. A single residual,
+  // grayscale channel match, or Telegram/JPEG artifact is never enough.
+  const paintOverScore = Number(forensic?.paintOverForensics?.score);
+  const paintOverSignals = Number(forensic?.paintOverForensics?.metrics?.supportSignals) || 0;
+  const paintOverMultiSignal = forensic?.paintOverForensics?.metrics?.multiSignal === true;
+  if (Number.isFinite(paintOverScore) && forensic?.paintOverForensics?.available === true && paintOverMultiSignal) {
+    const promoted = paintOverSignals >= 3 && paintOverScore >= 75 ? 75
+      : paintOverSignals >= 3 && paintOverScore >= 60 ? 65
+      : paintOverSignals >= 2 && paintOverScore >= 50 ? 55
+      : 0;
+    if (promoted) editingRisk = Math.max(editingRisk, promoted);
+  }
   // If the reference engine has a high-confidence semantic local-gap anomaly,
   // make it visible in the editing category even when the other visual signals
   // are quiet. Require a strong anomaly score and a healthy reference match.
@@ -3986,6 +3998,136 @@ async function v68JPEGGridAnalysis(encodedBuffer, W=512, H=512, roi=null, contro
     const score=v68Clamp(delta*55+periodicity*25);
     return {available:true,score:Math.round(score),roiBoundaryResidual:Number(roiB.toFixed(3)),roiInteriorResidual:Number(roiI.toFixed(3)),controlBoundaryResidual:Number(cb.toFixed(3)),controlInteriorResidual:Number(ci.toFixed(3)),boundaryRatio:Number(ratio.toFixed(3)),periodicity:Number(periodicity.toFixed(3)),quality:90,grid:'8x8'};
   } catch(error){ return {available:false,score:0,error:error?.message||String(error)}; }
+}
+
+
+// =====================================================
+// PAINT-OVER / ERASE-REWRITE FORENSICS V1
+// =====================================================
+// Purpose: detect LOCAL edit traces around a semantically selected field.
+// This is deliberately different from global JPEG/CFA-like anomaly scoring.
+// It looks for aligned local discontinuities in luma/channel residual,
+// edges and texture/noise. Grayscale edits are still detectable because
+// luma/residual/edge/texture signals do not require chroma separation.
+async function runPaintOverForensics(targetPath, amountForensics=null) {
+  const engine = 'paint-over-erase-rewrite-forensics-v1';
+  try {
+    if (!targetPath) return {available:false, engine, score:0, severity:'unknown', reason:'no-target'};
+    const stat = await fs.stat(targetPath);
+    const cacheKey = `paintover-v1:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${JSON.stringify(amountForensics?.region||null)}`;
+    const cached = advancedForensicsCache.get(cacheKey);
+    if (cached?.paintOver) return JSON.parse(JSON.stringify(cached.paintOver));
+
+    const encoded = await fs.readFile(targetPath);
+    const meta = await sharp(encoded).metadata();
+    const sourceW = Number(meta.width)||0, sourceH = Number(meta.height)||0;
+    const W=512,H=512;
+    const base = await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().raw().toBuffer();
+
+    let roi = v68RegionTo512(amountForensics?.region, sourceW, sourceH, W, H);
+    if (!roi && amountForensics?.referenceGuided) {
+      try {
+        const anchor = await getReferenceAmountAnchor(null);
+        if (anchor) roi={x1:Math.round(anchor.xNorm*W),y1:Math.round(anchor.yNorm*H),x2:Math.round((anchor.xNorm+anchor.widthNorm)*W),y2:Math.round((anchor.yNorm+anchor.heightNorm)*H)};
+      } catch {}
+    }
+    if (!roi) return {available:false, engine, score:0, severity:'insufficient-data', reason:'amount-roi-unavailable'};
+
+    roi = {
+      x1:Math.max(1,Math.min(W-3,Math.floor(roi.x1))),
+      y1:Math.max(1,Math.min(H-3,Math.floor(roi.y1))),
+      x2:Math.max(roi.x1+3,Math.min(W-2,Math.ceil(roi.x2))),
+      y2:Math.max(roi.y1+3,Math.min(H-2,Math.ceil(roi.y2)))
+    };
+    const rw=roi.x2-roi.x1, rh=roi.y2-roi.y1;
+    if (rw<6 || rh<4) return {available:false, engine, score:0, severity:'insufficient-data', reason:'roi-too-small', roi};
+
+    const luma = new Float32Array(W*H);
+    const chans=[new Float32Array(W*H),new Float32Array(W*H),new Float32Array(W*H)];
+    for(let i=0,j=0;i<base.length;i+=3,j++){
+      chans[0][j]=base[i]; chans[1][j]=base[i+1]; chans[2][j]=base[i+2];
+      luma[j]=0.299*base[i]+0.587*base[i+1]+0.114*base[i+2];
+    }
+
+    const rectStats=(arr,r)=>{
+      let n=0,sum=0,sum2=0;
+      for(let y=r.y1;y<r.y2;y++) for(let x=r.x1;x<r.x2;x++){const v=arr[y*W+x];sum+=v;sum2+=v*v;n++;}
+      const mean=n?sum/n:0, sd=n?Math.sqrt(Math.max(0,sum2/n-mean*mean)):0;
+      return {n,mean,sd};
+    };
+    const residualStats=(arr,r)=>{
+      let n=0,sum=0,sum2=0;
+      for(let y=Math.max(1,r.y1);y<Math.min(H-1,r.y2);y++) for(let x=Math.max(1,r.x1);x<Math.min(W-1,r.x2);x++){
+        const i=y*W+x;
+        const local=(arr[i-1]+arr[i+1]+arr[i-W]+arr[i+W])*0.25;
+        const v=Math.abs(arr[i]-local); sum+=v; sum2+=v*v; n++;
+      }
+      const mean=n?sum/n:0, sd=n?Math.sqrt(Math.max(0,sum2/n-mean*mean)):0;
+      return {n,mean,sd};
+    };
+    const edgeStats=(arr,r)=>{
+      let n=0,sum=0,sum2=0;
+      for(let y=Math.max(1,r.y1);y<Math.min(H-1,r.y2);y++) for(let x=Math.max(1,r.x1);x<Math.min(W-1,r.x2);x++){
+        const i=y*W+x;
+        const gx=Math.abs(arr[i+1]-arr[i-1]);
+        const gy=Math.abs(arr[i+W]-arr[i-W]);
+        const e=Math.sqrt(gx*gx+gy*gy); sum+=e; sum2+=e*e; n++;
+      }
+      return {n,mean:n?sum/n:0,sd:n?Math.sqrt(Math.max(0,sum2/n-(sum/n)*(sum/n))):0};
+    };
+    const inner={x1:roi.x1+2,y1:roi.y1+2,x2:roi.x2-2,y2:roi.y2-2};
+    const ring={x1:Math.max(1,roi.x1-2),y1:Math.max(1,roi.y1-2),x2:Math.min(W-1,roi.x2+2),y2:Math.min(H-1,roi.y2+2)};
+    const controlRects=[
+      {x1:Math.max(1,roi.x1-rw*2),y1:roi.y1,x2:Math.max(roi.x1+4,roi.x1-rw),y2:roi.y2},
+      {x1:Math.min(W-rw-2,roi.x2+rw),y1:roi.y1,x2:Math.min(W-1,roi.x2+2*rw),y2:roi.y2},
+      {x1:roi.x1,y1:Math.max(1,roi.y1-rh*2),x2:roi.x2,y2:Math.max(roi.y1+3,roi.y1-rh)},
+      {x1:roi.x1,y1:Math.min(H-rh-2,roi.y2+rh),x2:roi.x2,y2:Math.min(H-1,roi.y2+2*rh)}
+    ].filter(r=>r.x2-r.x1>=4 && r.y2-r.y1>=3);
+    const safeAvg=(vals)=>vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:0;
+    const controls=controlRects.map(r=>({
+      luma:rectStats(luma,r), residual:residualStats(luma,r), edge:edgeStats(luma,r),
+      rgb:chans.map(c=>({raw:rectStats(c,r),res:residualStats(c,r)}))
+    })).filter(x=>x.luma.n>8);
+    if(!controls.length) return {available:false,engine,score:0,severity:'insufficient-data',reason:'no-control-regions',roi};
+
+    const cLuma= {mean:safeAvg(controls.map(c=>c.luma.mean)),sd:safeAvg(controls.map(c=>c.luma.sd)),res:safeAvg(controls.map(c=>c.residual.mean)),edge:safeAvg(controls.map(c=>c.edge.mean))};
+    const roiL=rectStats(luma,inner), ringL=rectStats(luma,ring), roiRes=residualStats(luma,inner), ringRes=residualStats(luma,ring), roiEdge=edgeStats(luma,inner), ringEdge=edgeStats(luma,ring);
+    const channelResidual=chans.map(c=>({roi:residualStats(c,inner),ring:residualStats(c,ring),control:safeAvg(controls.map(x=>x.rgb[chans.indexOf(c)].res.mean))}));
+    const residualRatios=channelResidual.map(x=>Math.abs(x.roi.mean-x.control)/Math.max(1,x.control));
+    const channelResidualScore=Math.min(100,Math.round(safeAvg(residualRatios)*900));
+    const lumaResidualRatio=Math.abs(roiRes.mean-cLuma.res)/Math.max(1,cLuma.res);
+    const lumaResidualScore=Math.min(100,Math.round(lumaResidualRatio*900));
+    const edgeRatio=Math.abs(roiEdge.mean-cLuma.edge)/Math.max(1,cLuma.edge);
+    const edgeBoundaryRatio=Math.abs(ringEdge.mean-roiEdge.mean)/Math.max(1,roiEdge.mean);
+    const edgeScore=Math.min(100,Math.round((edgeRatio*500)+(edgeBoundaryRatio*350)));
+    const textureRatio=Math.abs(roiL.sd-cLuma.sd)/Math.max(1,cLuma.sd);
+    const noiseRatio=Math.abs(roiRes.sd-safeAvg(controls.map(c=>c.residual.sd)))/Math.max(1,cLuma.res);
+    const textureScore=Math.min(100,Math.round(textureRatio*500+noiseRatio*500));
+
+    // Channel divergence is corroborating only; grayscale edits can still score via luma/residual/edge/texture.
+    const rgbMeans=chans.map(c=>rectStats(c,inner).mean);
+    const chromaSpread=Math.max(...rgbMeans)-Math.min(...rgbMeans);
+    const channelDivergenceScore=Math.min(100,Math.round(chromaSpread*2));
+
+    const supportSignals=[
+      channelResidualScore>=55,
+      lumaResidualScore>=55,
+      edgeScore>=55,
+      textureScore>=55,
+      channelDivergenceScore>=55
+    ].filter(Boolean).length;
+    const amountSupport = amountForensics?.status==='warning' && Number(amountForensics?.score||0)>=70 ? 25 : amountForensics?.status==='warning' ? 10 : 0;
+    const multiSignal = supportSignals>=3 || (supportSignals>=2 && amountSupport>=20);
+    const rawScore=Math.round(channelResidualScore*.25+lumaResidualScore*.25+edgeScore*.20+textureScore*.20+channelDivergenceScore*.10);
+    const score=Math.min(100, Math.round(rawScore + (multiSignal ? amountSupport : 0)));
+    const severity=score>=75&&multiSignal?'strong':score>=50&&supportSignals>=2?'moderate':score>=25?'low':'none';
+    const out={available:true,engine,version:'V1',roi,metrics:{channelResidualScore,lumaResidualScore,edgeScore,textureScore,channelDivergenceScore,rawScore,supportSignals,amountSupport,multiSignal,channelResidual:channelResidual.map(x=>({roi:x.roi.mean,ring:x.ring.mean,control:x.control}))},comparators:{roiLuma:roiL,ringLuma:ringL,controlLuma:cLuma,roiResidual:roiRes,ringResidual:ringRes,roiEdge:ringEdge,controlEdge:cLuma.edge},score,severity,evidence:multiSignal?'Aynı tutar ROI içinde birden fazla bağımsız lokal residual/edge/texture sinyali birlikte görüldü; bu Paint-Over/Erase-Rewrite için corroborating bir adli sinyaldir, tek başına kesin sahtecilik hükmü değildir.':'Lokal Paint-Over için gereken çoklu bağımsız sinyal eşiği oluşmadı; global JPEG/CFA benzeri anomaliler bu katmanda tek başına kullanılmadı.'};
+    advancedForensicsCache.set(cacheKey,{paintOver:out});
+    return JSON.parse(JSON.stringify(out));
+  } catch(error){
+    console.warn('PAINT-OVER FORENSICS HATASI:',error?.message||error);
+    return {available:false,engine,score:0,severity:'unknown',error:error?.message||String(error)};
+  }
 }
 
 async function runV68Forensics(targetPath, amountForensics=null, bank=null, referencePaths=[]) {
@@ -13685,6 +13827,7 @@ let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
 let pixelForensics = null;
 let advancedForensics = null;
+let paintOverForensics = null;
 let openSourceForensics = null;
 let fontForensics = null;
 let azureLayout = null;
@@ -14567,6 +14710,8 @@ if ((type === "image" || type === "pdf") && bank && reference) {
       : (visualReferencePath ? [visualReferencePath] : []);
     advancedForensics = await runV68Forensics(forensicTargetPath, amountForensics, bank, trustedReferencePaths);
     console.log("V68 ADVANCED FORENSICS:", JSON.stringify(advancedForensics));
+    paintOverForensics = await runPaintOverForensics(forensicTargetPath, amountForensics);
+    console.log("PAINT-OVER FORENSICS V1 ACTIVE:", JSON.stringify(paintOverForensics));
   } catch (error) {
     console.warn("V68 ADVANCED FORENSICS HATASI:", error?.message || error);
   }
@@ -15818,6 +15963,9 @@ if (pixelForensics) {
 
 if (advancedForensics) {
   result.advancedForensics = advancedForensics;
+}
+if (paintOverForensics) {
+  result.paintOverForensics = paintOverForensics;
 }
 
 if (amountForensics) {
@@ -18033,6 +18181,7 @@ result.deterministicRisk = calculateDeterministicForensicRisk(result, {
   referenceForensics,
   pixelForensics,
   advancedForensics,
+  paintOverForensics,
   openSourceForensics,
   azureLayout,
   azureReferenceGeometry,
@@ -18055,6 +18204,18 @@ if (advancedForensics?.available) {
     jpegGridScore: advancedForensics.metrics?.jpegGrid?.score || 0,
     amountToneScore: advancedForensics.metrics?.amountReferenceTone?.localToneScore || 0,
     referenceToneScore: advancedForensics.metrics?.amountReferenceTone?.reference?.score || 0
+  }));
+}
+if (paintOverForensics?.available) {
+  console.log("PAINT-OVER FORENSICS SUMMARY:", JSON.stringify({
+    score: paintOverForensics.score,
+    severity: paintOverForensics.severity,
+    channelResidualScore: paintOverForensics.metrics?.channelResidualScore || 0,
+    lumaResidualScore: paintOverForensics.metrics?.lumaResidualScore || 0,
+    edgeScore: paintOverForensics.metrics?.edgeScore || 0,
+    textureScore: paintOverForensics.metrics?.textureScore || 0,
+    corroboratingSignals: paintOverForensics.metrics?.supportSignals || 0,
+    amountSupport: paintOverForensics.metrics?.amountSupport || 0
   }));
 }
 
