@@ -18765,6 +18765,41 @@ const meaningfulPixelReferenceSignal =
   Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 45 &&
   Number(pixelForensics?.score || 0) >= 35;
 
+const paintOverForV152 =
+  result?.paintOverForensicsV2?.available === true
+    ? result.paintOverForensicsV2
+    : (paintOverForensics || result?.paintOverForensics || null);
+const paintOverV152Score = Number(paintOverForV152?.score || 0);
+const paintOverV152Signals = Number(paintOverForV152?.metrics?.supportSignals || 0);
+const paintOverV152AmountSupport = Number(paintOverForV152?.metrics?.amountSupport || 0);
+
+// V15.2: controlled Amount Forensics promotion becomes deterministic only
+// when an independent Paint-Over signal corroborates the same amount ROI.
+// 750 TL cannot enter this path because its Amount Forensics is pass/score 0.
+const controlledAmountCorroborated =
+  __controlledAmountPromotion.eligible &&
+  paintOverV152Score >= 75 &&
+  paintOverV152Signals >= 3 &&
+  paintOverV152AmountSupport >= 20;
+
+if (controlledAmountCorroborated) {
+  // Reuse the pipeline's existing suspicious threshold. This is a
+  // corroboration floor, not an amount-only risk score.
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  result.categories = {
+    ...(result.categories || {}),
+    financialDataRisk: Math.max(Number(result.categories?.financialDataRisk || 0), 85),
+  };
+  console.log("V15.2 CONTROLLED AMOUNT CORROBORATION:", JSON.stringify({
+    appliedFloor: 46,
+    amountScore: __controlledAmountPromotion.score,
+    amountSeverity: __controlledAmountPromotion.severity,
+    paintOverScore: paintOverV152Score,
+    paintOverSignals: paintOverV152Signals,
+    paintOverAmountSupport: paintOverV152AmountSupport
+  }));
+}
+
 const independentForensicSupportCount = [
   strongAmountSignal,
   strongAzureSignal,
@@ -18805,8 +18840,9 @@ const finalRiskLabel = getRiskLabel(finalRiskScore);
 result.overallRisk = finalRiskScore;
 result.riskLabel = finalRiskLabel;
 
-result.categories =
-finalDeterministicRisk.categories;
+if (!controlledAmountCorroborated) {
+  result.categories = finalDeterministicRisk.categories;
+}
 
 // AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
@@ -18876,7 +18912,9 @@ console.log(
 "FINAL SCORE:",
 finalScore
 );
-console.log("FINAL RISK SOURCE: deterministic checks only; amountAnalysis direct floor disabled");
+console.log("FINAL RISK SOURCE:", controlledAmountCorroborated
+  ? "deterministic checks + V15.2 controlled amount/paint-over corroboration"
+  : "deterministic checks only; amountAnalysis direct floor disabled");
 
 
 console.log(
