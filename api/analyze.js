@@ -308,6 +308,49 @@ async function forensicWatchlistRequest(method, query = "", body = null) {
   }
 }
 
+
+// V14: Amount Forensics kontrollü promotion.
+// Reference anchor yokluğu tek başına güçlü lokal amount bulgusunu silmez.
+// 750 TL gibi pass/low sonuçlar bu kapıdan geçemez.
+function getControlledAmountPromotion(result = {}) {
+  const amount = result?.amountForensics || {};
+  const score = Number(amount.score || 0);
+  const severity = String(amount.severity || "").toLowerCase();
+  const anomalyRatio = Number(amount.localAnomalyRatio ?? amount.anomalyRatio ?? 0);
+  const featureVotes = Number(amount.maxFeatureVotes ?? amount.featureVotes ?? 0);
+
+  const strongSeverity = severity === "strong";
+  const scoreStrong = score >= 80;
+  const anomalyStrong = anomalyRatio >= 0.20;
+  const votesStrong = featureVotes >= 3;
+
+  const detail = String(amount.evidence || "");
+  const strongFeatureEvidence =
+    /ink|stroke|edge|geometry|repeated|character|micro-visual/i.test(detail);
+
+  const eligible =
+    amount.available === true &&
+    strongSeverity &&
+    scoreStrong &&
+    (
+      anomalyStrong ||
+      votesStrong ||
+      strongFeatureEvidence
+    );
+
+  return {
+    eligible,
+    score,
+    severity,
+    anomalyRatio,
+    featureVotes,
+    strongFeatureEvidence,
+    reason: eligible
+      ? "controlled-amount-promotion"
+      : "insufficient-independent-amount-evidence"
+  };
+}
+
 function extractForensicWatchSignal(result = {}) {
   const referenceFindings = Array.isArray(result?.referenceForensicReport?.findings)
     ? result.referenceForensicReport.findings
@@ -317,14 +360,15 @@ function extractForensicWatchSignal(result = {}) {
     result?.referenceForensicReport?.status === "differences-found" &&
     referenceFindings.length > 0;
 
+  const controlledAmountPromotion = getControlledAmountPromotion(result);
   const amountStrong =
     result?.amountForensics?.available === true &&
-    String(result.amountForensics?.severity || "").toLowerCase() === "strong" &&
     (
       result.amountForensics?.referenceGuided === true ||
       /reference-(?:roi|position)|reference-guided|reference-anchor/i.test(
         String(result.amountForensics?.selectionMethod || "")
-      )
+      ) ||
+      controlledAmountPromotion.eligible
     );
 
   // KRİTİK FİNANSAL TUTARSIZLIK:
@@ -4154,31 +4198,38 @@ function clamp100(v) {
   return Math.max(0, Math.min(100, Number.isFinite(Number(v)) ? Number(v) : 0));
 }
 
-async function listPaintOverV2Samples(bank, kind = 'genuine') {
+async function listPaintOverV2Samples(bank, kind = "genuine") {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return [];
 
-  if (kind === 'genuine') {
-    // Reuse the canonical reference loader so V2 follows the same bank/file
-    // selection rules as the rest of VerifyDoc. The references are the
-    // user's existing genuine Telegram-processed samples; do not create or
-    // require a second genuine_telegram directory.
+  // V14: genuine baseline = mevcut trusted references.
+  // Ayrı genuine_telegram klasörü kullanılmaz.
+  if (kind === "genuine") {
     try {
-      const rows = await getReferenceFiles(normalizedBank);
-      const files = (Array.isArray(rows) ? rows : [rows])
-        .map(x => typeof x === 'string' ? x : x?.path)
+      const refs = await getReferenceFiles(normalizedBank);
+      return (Array.isArray(refs) ? refs : [])
         .filter(Boolean)
-        .filter(filePath => /\.(?:jpe?g|png|webp)$/i.test(filePath));
-      return [...new Set(files)].slice(0, 24);
+        .map(String)
+        .filter((file) => /\.(?:jpe?g|png|webp)$/i.test(file));
     } catch (error) {
-      console.warn('PAINT-OVER V2 REFERENCES BASELINE OKUNAMADI:', error?.message || error);
+      console.warn("PAINTOVER V2 GENUINE REFERENCE LOAD HATASI:", error?.message || error);
       return [];
     }
   }
 
-  // Reuse the existing negative-sample registry without duplicating it.
-  const rows = await loadNegativeSampleFiles(normalizedBank);
-  return rows.map(x => x.path).filter(Boolean).slice(0, 12);
+  // Known-fake baseline mevcut negative_samples mekanizmasından gelir.
+  try {
+    const negatives = await loadNegativeSampleFiles(normalizedBank);
+    return (Array.isArray(negatives) ? negatives : [])
+      .filter(Boolean)
+      .map((entry) => typeof entry === "string" ? entry : entry?.path)
+      .filter(Boolean)
+      .map(String)
+      .filter((file) => /\.(?:jpe?g|png|webp)$/i.test(file));
+  } catch (error) {
+    console.warn("PAINTOVER V2 NEGATIVE SAMPLE LOAD HATASI:", error?.message || error);
+    return [];
+  }
 }
 
 async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank = null) {
@@ -18518,6 +18569,11 @@ if (openSourceForensics?.strongCorroboration) {
     corroboratedEditingSignal: true
   };
   console.log("OPEN SOURCE FORENSICS CORROBORATED EDITING SIGNAL: TRUE");
+}
+
+const __controlledAmountPromotion = getControlledAmountPromotion(result);
+if (__controlledAmountPromotion.eligible) {
+  console.log("AMOUNT FORENSICS CONTROLLED PROMOTION:", JSON.stringify(__controlledAmountPromotion));
 }
 
 console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
