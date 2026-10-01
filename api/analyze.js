@@ -4399,8 +4399,14 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       if(v) genuineVectors.push({path:samplePath,vector:v});
     }
 
+    console.log('PAINTOVER V2 GENUINE TELEGRAM BASELINE SAMPLES:', JSON.stringify({
+      bank: normalizeBank(bank),
+      sampleCount: genuineVectors.length,
+      samples: genuineVectors.map(x => ({ file: path.basename(x.path), path: x.path, rawScore: x.vector.rawScore }))
+    }));
     const baselineScores=genuineVectors.map(x=>x.vector.rawScore);
-    const baselineAvailable=baselineScores.length>=3;
+    const baselineAvailable=baselineScores.length>=1;
+    const baselineCalibrationQuality = genuineVectors.length >= 3 ? 'multi-sample' : genuineVectors.length === 2 ? 'two-sample' : genuineVectors.length === 1 ? 'single-sample' : 'unavailable';
     const baselineMedian=robustMedian(baselineScores);
     const baselineMad=robustMad(baselineScores,baselineMedian);
     const baselineP90=baselineScores.length?baselineScores.slice().sort((a,b)=>a-b)[Math.min(baselineScores.length-1,Math.ceil(baselineScores.length*.90)-1)]:0;
@@ -4464,7 +4470,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
         rawScore:target.rawScore,
         supportSignals:target.supportSignals,
         featureScores:{channelResidual:target.features[0],lumaResidual:target.features[1],edge:target.features[2],texture:target.features[3],channelDivergence:target.features[4]},
-        telegramBaseline:{available:baselineAvailable,sampleCount:genuineVectors.length,median:Math.round(baselineMedian),mad:Math.round(baselineMad),p90:Math.round(baselineP90),percentile:Number(baselinePercentile.toFixed(3)),adjustedScore:telegramAdjusted==null?null:Math.round(telegramAdjusted)},
+        telegramBaseline:{available:baselineAvailable,sampleCount:genuineVectors.length,samples:genuineVectors.map(x=>path.basename(x.path)),calibrationQuality:baselineCalibrationQuality,median:Math.round(baselineMedian),mad:Math.round(baselineMad),p90:Math.round(baselineP90),percentile:Number(baselinePercentile.toFixed(3)),adjustedScore:telegramAdjusted==null?null:Math.round(telegramAdjusted)},
         knownFakePattern:{available:negativeVectors.length>0,sampleCount:negativeVectors.length,bestSimilarity:Number(bestNegativeSimilarity.toFixed(4)),score:fakePatternScore==null?null:Math.round(fakePatternScore),matches:negativeSimilarities.slice(0,5)},
         amountForensics:{score:Math.round(amountScore),strong:amountStrong,usedAsFixedSupport:false}
       },
@@ -9688,6 +9694,16 @@ return null;
 if (fileFingerprint && amountForensicsStrongCache.has(fileFingerprint)) {
 const cached = amountForensicsStrongCache.get(fileFingerprint);
 console.log("AMOUNT FORENSICS CACHE HIT:", fileFingerprint);
+try {
+  const cachedAnchor = await getReferenceAmountAnchor(bank);
+  if (cachedAnchor) {
+    cached.referenceGuided = true;
+    cached.referenceAnchorAvailable = true;
+    cached.referenceAnchorSource = cachedAnchor.source || null;
+    cached.referenceAnchorReferenceCount = Number(cachedAnchor.referenceCount || 0);
+    cached.metrics = { ...(cached.metrics || {}), referenceGuided:true, referenceAnchorAvailable:true, referenceAnchorSource:cachedAnchor.source || null, referenceAnchorReferenceCount:Number(cachedAnchor.referenceCount || 0) };
+  }
+} catch {}
 return JSON.parse(JSON.stringify(cached));
 }
 
@@ -11809,7 +11825,10 @@ maxFeatureVotes: maxScore,
 templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
 templatePositionScore: Number(candidate.templateScore || 0),
-referenceGuided: Boolean(referenceAmountField),
+referenceGuided: Boolean(referenceAmountField || referenceAnchor),
+referenceAnchorAvailable: Boolean(referenceAnchor),
+referenceAnchorSource: referenceAnchor?.source || null,
+referenceAnchorReferenceCount: Number(referenceAnchor?.referenceCount || 0),
 referenceGuidedSelection: selectionMethod,
 referenceAmountPositionScore: Number(candidate.referencePositionScore || 0),
 amountLabelScore: Number(candidate.labelEvidence?.score || 0),
@@ -16346,6 +16365,32 @@ if (paintOverForensics) {
 
 if (amountForensics) {
   result.amountForensics = amountForensics;
+  // V15.1: carry the trusted raster reference-anchor state into the final
+  // result so downstream risk logic cannot lose it between stages.
+  try {
+    const finalReferenceAnchor = await getReferenceAmountAnchor(bank);
+    if (finalReferenceAnchor) {
+      result.amountForensics.referenceGuided = true;
+      result.amountForensics.referenceAnchorAvailable = true;
+      result.amountForensics.referenceAnchorSource = finalReferenceAnchor.source || null;
+      result.amountForensics.referenceAnchorReferenceCount = Number(finalReferenceAnchor.referenceCount || 0);
+      result.amountForensics.metrics = {
+        ...(result.amountForensics.metrics || {}),
+        referenceGuided: true,
+        referenceAnchorAvailable: true,
+        referenceAnchorSource: finalReferenceAnchor.source || null,
+        referenceAnchorReferenceCount: Number(finalReferenceAnchor.referenceCount || 0),
+      };
+      console.log('REFERENCE AMOUNT ANCHOR STATE TRANSFERRED V15.1:', JSON.stringify({
+        bank: finalReferenceAnchor.bank,
+        referenceCount: finalReferenceAnchor.referenceCount,
+        source: finalReferenceAnchor.source,
+        referenceGuided: true
+      }));
+    }
+  } catch (error) {
+    console.warn('REFERENCE AMOUNT ANCHOR STATE TRANSFER V15.1 HATASI:', error?.message || error);
+  }
   if (amountForensics.selectedAmountText) {
     console.log("AMOUNT FORENSICS FINAL SELECTION:", JSON.stringify({
       selectedAmountText: amountForensics.selectedAmountText,
