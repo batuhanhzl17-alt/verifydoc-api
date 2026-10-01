@@ -4142,16 +4142,13 @@ async function runPaintOverForensics(targetPath, amountForensics=null) {
 // an observation that must be calibrated against genuine Telegram samples
 // before it is promoted to an editing signal.
 //
-// Directory convention (optional):
-//   genuine_telegram/<bank>/*.jpg|jpeg|png|webp
-// These are expected to be genuine bank documents after Telegram delivery.
-// If no baseline exists, V2 stays neutral rather than inventing a correction.
-//
-// Negative samples are already supported elsewhere by NEGATIVE_SAMPLE_MAP;
-// V2 can use the same known-manipulated files as a second reference class.
+// Genuine Telegram baseline source:
+//   references/  -> trusted genuine samples (already passed through Telegram)
+// Negative Telegram baseline source:
+//   negative_samples/ -> known-fake samples (already passed through Telegram)
+// No separate genuine_telegram directory is required.
 // =====================================================
 const paintOverV2Cache = new Map();
-const PAINTOVER_V2_GENUINE_DIR = path.join(process.cwd(), 'genuine_telegram');
 
 function clamp100(v) {
   return Math.max(0, Math.min(100, Number.isFinite(Number(v)) ? Number(v) : 0));
@@ -4162,14 +4159,19 @@ async function listPaintOverV2Samples(bank, kind = 'genuine') {
   if (!normalizedBank) return [];
 
   if (kind === 'genuine') {
-    const dir = path.join(PAINTOVER_V2_GENUINE_DIR, normalizedBank);
+    // Reuse the canonical reference loader so V2 follows the same bank/file
+    // selection rules as the rest of VerifyDoc. The references are the
+    // user's existing genuine Telegram-processed samples; do not create or
+    // require a second genuine_telegram directory.
     try {
-      const names = await fs.readdir(dir);
-      return names
-        .filter(name => /\.(?:jpe?g|png|webp)$/i.test(name))
-        .slice(0, 24)
-        .map(name => path.join(dir, name));
-    } catch {
+      const rows = await getReferenceFiles(normalizedBank);
+      const files = (Array.isArray(rows) ? rows : [rows])
+        .map(x => typeof x === 'string' ? x : x?.path)
+        .filter(Boolean)
+        .filter(filePath => /\.(?:jpe?g|png|webp)$/i.test(filePath));
+      return [...new Set(files)].slice(0, 24);
+    } catch (error) {
+      console.warn('PAINT-OVER V2 REFERENCES BASELINE OKUNAMADI:', error?.message || error);
       return [];
     }
   }
