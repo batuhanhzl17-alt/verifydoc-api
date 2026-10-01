@@ -2787,9 +2787,13 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   }
   // Paint-Over V1: promote only multi-signal LOCAL evidence. A single residual,
   // grayscale channel match, or Telegram/JPEG artifact is never enough.
-  const paintOverScore = Number(forensic?.paintOverForensics?.score);
-  const paintOverSignals = Number(forensic?.paintOverForensics?.metrics?.supportSignals) || 0;
-  const paintOverMultiSignal = forensic?.paintOverForensics?.metrics?.multiSignal === true;
+  const paintOverV2 = forensic?.paintOverForensicsV2;
+  const paintOverV1 = forensic?.paintOverForensics || forensic?.paintOverForensicsV1;
+  const paintOverScore = Number(paintOverV2?.score ?? paintOverV1?.score);
+  const paintOverSignals = Number(paintOverV2?.metrics?.supportSignals ?? paintOverV1?.metrics?.supportSignals) || 0;
+  const paintOverMultiSignal = paintOverV2?.available === true
+    ? (String(paintOverV2?.severity || '').toLowerCase() === 'strong' || String(paintOverV2?.severity || '').toLowerCase() === 'moderate')
+    : paintOverV1?.metrics?.multiSignal === true;
   if (Number.isFinite(paintOverScore) && forensic?.paintOverForensics?.available === true && paintOverMultiSignal) {
     const promoted = paintOverSignals >= 3 && paintOverScore >= 75 ? 75
       : paintOverSignals >= 3 && paintOverScore >= 60 ? 65
@@ -4126,6 +4130,301 @@ async function runPaintOverForensics(targetPath, amountForensics=null) {
     return JSON.parse(JSON.stringify(out));
   } catch(error){
     console.warn('PAINT-OVER FORENSICS HATASI:',error?.message||error);
+    return {available:false,engine,score:0,severity:'unknown',error:error?.message||String(error)};
+  }
+}
+
+
+// =====================================================
+// PAINT-OVER FORENSICS V2 — TELEGRAM BASELINE CALIBRATION
+// =====================================================
+// V1 intentionally remains untouched. V2 treats the V1/raw local signal as
+// an observation that must be calibrated against genuine Telegram samples
+// before it is promoted to an editing signal.
+//
+// Directory convention (optional):
+//   genuine_telegram/<bank>/*.jpg|jpeg|png|webp
+// These are expected to be genuine bank documents after Telegram delivery.
+// If no baseline exists, V2 stays neutral rather than inventing a correction.
+//
+// Negative samples are already supported elsewhere by NEGATIVE_SAMPLE_MAP;
+// V2 can use the same known-manipulated files as a second reference class.
+// =====================================================
+const paintOverV2Cache = new Map();
+const PAINTOVER_V2_GENUINE_DIR = path.join(process.cwd(), 'genuine_telegram');
+
+function clamp100(v) {
+  return Math.max(0, Math.min(100, Number.isFinite(Number(v)) ? Number(v) : 0));
+}
+
+async function listPaintOverV2Samples(bank, kind = 'genuine') {
+  const normalizedBank = normalizeBank(bank);
+  if (!normalizedBank) return [];
+
+  if (kind === 'genuine') {
+    const dir = path.join(PAINTOVER_V2_GENUINE_DIR, normalizedBank);
+    try {
+      const names = await fs.readdir(dir);
+      return names
+        .filter(name => /\.(?:jpe?g|png|webp)$/i.test(name))
+        .slice(0, 24)
+        .map(name => path.join(dir, name));
+    } catch {
+      return [];
+    }
+  }
+
+  // Reuse the existing negative-sample registry without duplicating it.
+  const rows = await loadNegativeSampleFiles(normalizedBank);
+  return rows.map(x => x.path).filter(Boolean).slice(0, 12);
+}
+
+async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank = null) {
+  if (!targetPath) return null;
+  try {
+    const encoded = await fs.readFile(targetPath);
+    const meta = await sharp(encoded).metadata();
+    const sourceW = Number(meta.width) || 0;
+    const sourceH = Number(meta.height) || 0;
+    const W = 512, H = 512;
+    if (!sourceW || !sourceH) return null;
+
+    const base = await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().raw().toBuffer();
+
+    let roi = v68RegionTo512(amountForensics?.region, sourceW, sourceH, W, H);
+    if (!roi && bank) {
+      try {
+        const anchor = await getReferenceAmountAnchor(bank);
+        if (anchor) {
+          roi = {
+            x1: Math.round(anchor.xNorm * W),
+            y1: Math.round(anchor.yNorm * H),
+            x2: Math.round((anchor.xNorm + anchor.widthNorm) * W),
+            y2: Math.round((anchor.yNorm + anchor.heightNorm) * H),
+          };
+        }
+      } catch {}
+    }
+    if (!roi) return null;
+
+    roi = {
+      x1: Math.max(1, Math.min(W - 3, Math.floor(roi.x1))),
+      y1: Math.max(1, Math.min(H - 3, Math.floor(roi.y1))),
+      x2: Math.max(roi.x1 + 3, Math.min(W - 2, Math.ceil(roi.x2))),
+      y2: Math.max(roi.y1 + 3, Math.min(H - 2, Math.ceil(roi.y2))),
+    };
+    const rw = roi.x2 - roi.x1, rh = roi.y2 - roi.y1;
+    if (rw < 6 || rh < 4) return null;
+
+    const luma = new Float32Array(W * H);
+    const chans = [new Float32Array(W * H), new Float32Array(W * H), new Float32Array(W * H)];
+    for (let i=0,j=0; i<base.length; i+=3,j++) {
+      chans[0][j] = base[i];
+      chans[1][j] = base[i+1];
+      chans[2][j] = base[i+2];
+      luma[j] = 0.299*base[i] + 0.587*base[i+1] + 0.114*base[i+2];
+    }
+
+    const rectStats = (arr, r) => {
+      let n=0,sum=0,sum2=0;
+      for(let y=r.y1;y<r.y2;y++) for(let x=r.x1;x<r.x2;x++) {
+        const v=arr[y*W+x]; sum+=v; sum2+=v*v; n++;
+      }
+      const mean=n?sum/n:0;
+      return {n,mean,sd:n?Math.sqrt(Math.max(0,sum2/n-mean*mean)):0};
+    };
+    const residualStats = (arr,r) => {
+      let n=0,sum=0,sum2=0;
+      for(let y=Math.max(1,r.y1);y<Math.min(H-1,r.y2);y++) for(let x=Math.max(1,r.x1);x<Math.min(W-1,r.x2);x++) {
+        const i=y*W+x;
+        const local=(arr[i-1]+arr[i+1]+arr[i-W]+arr[i+W])*0.25;
+        const v=Math.abs(arr[i]-local); sum+=v; sum2+=v*v; n++;
+      }
+      const mean=n?sum/n:0;
+      return {n,mean,sd:n?Math.sqrt(Math.max(0,sum2/n-mean*mean)):0};
+    };
+    const edgeStats = (arr,r) => {
+      let n=0,sum=0,sum2=0;
+      for(let y=Math.max(1,r.y1);y<Math.min(H-1,r.y2);y++) for(let x=Math.max(1,r.x1);x<Math.min(W-1,r.x2);x++) {
+        const i=y*W+x;
+        const gx=Math.abs(arr[i+1]-arr[i-1]);
+        const gy=Math.abs(arr[i+W]-arr[i-W]);
+        const e=Math.sqrt(gx*gx+gy*gy); sum+=e; sum2+=e*e; n++;
+      }
+      return {n,mean:n?sum/n:0,sd:n?Math.sqrt(Math.max(0,sum2/n-(sum/n)*(sum/n))):0};
+    };
+    const inner={x1:roi.x1+2,y1:roi.y1+2,x2:roi.x2-2,y2:roi.y2-2};
+    const ring={x1:Math.max(1,roi.x1-2),y1:Math.max(1,roi.y1-2),x2:Math.min(W-1,roi.x2+2),y2:Math.min(H-1,roi.y2+2)};
+    const controls=[
+      {x1:Math.max(1,roi.x1-rw*2),y1:roi.y1,x2:Math.max(roi.x1+4,roi.x1-rw),y2:roi.y2},
+      {x1:Math.min(W-rw-2,roi.x2+rw),y1:roi.y1,x2:Math.min(W-1,roi.x2+2*rw),y2:roi.y2},
+      {x1:roi.x1,y1:Math.max(1,roi.y1-rh*2),x2:roi.x2,y2:Math.max(roi.y1+3,roi.y1-rh)},
+      {x1:roi.x1,y1:Math.min(H-rh-2,roi.y2+rh),x2:roi.x2,y2:Math.min(H-1,roi.y2+2*rh)}
+    ].filter(r=>r.x2-r.x1>=4 && r.y2-r.y1>=3);
+    const safeAvg=vals=>vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:0;
+    const controlData=controls.map(r=>({
+      luma:rectStats(luma,r), residual:residualStats(luma,r), edge:edgeStats(luma,r),
+      rgb:chans.map(c=>({res:residualStats(c,r)}))
+    })).filter(x=>x.luma.n>8);
+    if(!controlData.length) return null;
+    const cLuma={
+      sd:safeAvg(controlData.map(c=>c.luma.sd)),
+      res:safeAvg(controlData.map(c=>c.residual.mean)),
+      edge:safeAvg(controlData.map(c=>c.edge.mean))
+    };
+    const roiL=rectStats(luma,inner);
+    const roiRes=residualStats(luma,inner);
+    const roiEdge=edgeStats(luma,inner);
+    const channelResidual=chans.map((c,idx)=>({
+      roi:residualStats(c,inner),
+      control:safeAvg(controlData.map(x=>x.rgb[idx].res.mean))
+    }));
+    const residualRatios=channelResidual.map(x=>Math.abs(x.roi.mean-x.control)/Math.max(1,x.control));
+    const channelResidualScore=Math.min(100,Math.round(safeAvg(residualRatios)*900));
+    const lumaResidualScore=Math.min(100,Math.round((Math.abs(roiRes.mean-cLuma.res)/Math.max(1,cLuma.res))*900));
+    const edgeRatio=Math.abs(roiEdge.mean-cLuma.edge)/Math.max(1,cLuma.edge);
+    const edgeBoundaryRatio=Math.abs(edgeStats(luma,ring).mean-roiEdge.mean)/Math.max(1,roiEdge.mean);
+    const edgeScore=Math.min(100,Math.round(edgeRatio*500+edgeBoundaryRatio*350));
+    const textureRatio=Math.abs(roiL.sd-cLuma.sd)/Math.max(1,cLuma.sd);
+    const noiseRatio=Math.abs(roiRes.sd-safeAvg(controlData.map(c=>c.residual.sd)))/Math.max(1,cLuma.res);
+    const textureScore=Math.min(100,Math.round(textureRatio*500+noiseRatio*500));
+    const rgbMeans=chans.map(c=>rectStats(c,inner).mean);
+    const channelDivergenceScore=Math.min(100,Math.round((Math.max(...rgbMeans)-Math.min(...rgbMeans))*2));
+    const supportSignals=[channelResidualScore>=55,lumaResidualScore>=55,edgeScore>=55,textureScore>=55,channelDivergenceScore>=55].filter(Boolean).length;
+    const rawScore=Math.round(channelResidualScore*.25+lumaResidualScore*.25+edgeScore*.20+textureScore*.20+channelDivergenceScore*.10);
+    return {
+      rawScore,
+      supportSignals,
+      features:[channelResidualScore,lumaResidualScore,edgeScore,textureScore,channelDivergenceScore],
+      roi,
+    };
+  } catch(error) {
+    console.warn('PAINT-OVER V2 VECTOR HATASI:',error?.message||error);
+    return null;
+  }
+}
+
+function robustMedian(values) {
+  const v=values.filter(Number.isFinite).sort((a,b)=>a-b);
+  if(!v.length) return 0;
+  const m=Math.floor(v.length/2);
+  return v.length%2?v[m]:(v[m-1]+v[m])/2;
+}
+function robustMad(values, median) {
+  return robustMedian(values.map(v=>Math.abs(v-median)));
+}
+function percentileRank(value, values) {
+  const v=values.filter(Number.isFinite).sort((a,b)=>a-b);
+  if(!v.length) return 0.5;
+  let n=0; for(const x of v){if(x<=value)n++;else break;}
+  return n/v.length;
+}
+function vectorSimilarity(a,b) {
+  if(!a?.length || !b?.length || a.length!==b.length) return 0;
+  let dot=0,na=0,nb=0;
+  for(let i=0;i<a.length;i++){dot+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];}
+  if(!na||!nb) return 0;
+  return Math.max(0,Math.min(1,dot/(Math.sqrt(na)*Math.sqrt(nb))));
+}
+
+async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=null, negativeSamples=null) {
+  const engine='paint-over-erase-rewrite-forensics-v2-calibrated';
+  try {
+    if(!targetPath) return {available:false,engine,score:0,severity:'unknown',reason:'no-target'};
+    const stat=await fs.stat(targetPath);
+    const cacheKey=`paintover-v2:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${JSON.stringify(amountForensics?.region||null)}`;
+    const cached=paintOverV2Cache.get(cacheKey);
+    if(cached) return JSON.parse(JSON.stringify(cached));
+
+    const target=await extractPaintOverV2Vector(targetPath,amountForensics,bank);
+    if(!target) return {available:false,engine,score:0,severity:'insufficient-data',reason:'target-vector-unavailable'};
+
+    const genuinePaths=await listPaintOverV2Samples(bank,'genuine');
+    const genuineVectors=[];
+    for(const samplePath of genuinePaths){
+      const v=await extractPaintOverV2Vector(samplePath,null,bank);
+      if(v) genuineVectors.push({path:samplePath,vector:v});
+    }
+
+    const baselineScores=genuineVectors.map(x=>x.vector.rawScore);
+    const baselineAvailable=baselineScores.length>=3;
+    const baselineMedian=robustMedian(baselineScores);
+    const baselineMad=robustMad(baselineScores,baselineMedian);
+    const baselineP90=baselineScores.length?baselineScores.slice().sort((a,b)=>a-b)[Math.min(baselineScores.length-1,Math.ceil(baselineScores.length*.90)-1)]:0;
+    const baselinePercentile=baselineScores.length?percentileRank(target.rawScore,baselineScores):0;
+
+    // A genuine Telegram baseline is a subtraction/calibration layer, not a
+    // second risk score. A target at or below the genuine p90 receives no
+    // Telegram-adjusted PaintOver evidence.
+    const telegramAdjusted=baselineAvailable
+      ? clamp100(((target.rawScore-Math.max(baselineP90,baselineMedian+2*baselineMad))/Math.max(1,100-Math.max(baselineP90,baselineMedian+2*baselineMad)))*100)
+      : null;
+
+    const negPaths=Array.isArray(negativeSamples)&&negativeSamples.length
+      ? negativeSamples.map(x=>typeof x==='string'?x:x.path).filter(Boolean).slice(0,12)
+      : await listPaintOverV2Samples(bank,'negative');
+    const negativeVectors=[];
+    for(const samplePath of negPaths){
+      const v=await extractPaintOverV2Vector(samplePath,null,bank);
+      if(v) negativeVectors.push({path:samplePath,vector:v});
+    }
+    const targetFeature=target.features;
+    const negativeSimilarities=negativeVectors.map(x=>({file:path.basename(x.path),similarity:vectorSimilarity(targetFeature,x.vector.features),rawScore:x.vector.rawScore}));
+    negativeSimilarities.sort((a,b)=>b.similarity-a.similarity);
+    const bestNegativeSimilarity=negativeSimilarities[0]?.similarity||0;
+    const fakePatternScore=negativeVectors.length?clamp100((bestNegativeSimilarity-0.82)/0.18*100):null;
+
+    const amountScore=clamp100(Number(amountForensics?.score)||0);
+    const amountStrong=String(amountForensics?.severity||'').toLowerCase()==='strong' || (amountForensics?.status==='warning'&&amountScore>=70);
+    const fakeSupport=fakePatternScore!=null?fakePatternScore:0;
+
+    // Core V2 rule:
+    // 1) raw local signal is first calibrated against genuine Telegram data;
+    // 2) known-fake similarity can corroborate it;
+    // 3) Amount Forensics is corroboration only, never +10/+25 to PaintOver.
+    let calibrated=baselineAvailable?telegramAdjusted:clamp100(target.rawScore);
+    if(fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
+    else if(fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
+
+    // Amount Forensics can lift a borderline calibrated result only when the
+    // image-local signal already survives Telegram calibration. It is not added
+    // as a fixed support score.
+    if(amountStrong && calibrated>=45) calibrated=clamp100(calibrated+Math.min(18,amountScore*.18));
+
+    const strong=calibrated>=75 && (
+      target.supportSignals>=3 ||
+      bestNegativeSimilarity>=0.90 ||
+      (amountStrong && target.supportSignals>=2)
+    );
+    const moderate=calibrated>=50 && (target.supportSignals>=2 || bestNegativeSimilarity>=0.85);
+    const severity=strong?'strong':moderate?'moderate':calibrated>=25?'low':'none';
+
+    const out={
+      available:true,
+      engine,
+      version:'V2',
+      score:Math.round(calibrated),
+      rawScore:target.rawScore,
+      severity,
+      roi:target.roi,
+      metrics:{
+        rawScore:target.rawScore,
+        supportSignals:target.supportSignals,
+        featureScores:{channelResidual:target.features[0],lumaResidual:target.features[1],edge:target.features[2],texture:target.features[3],channelDivergence:target.features[4]},
+        telegramBaseline:{available:baselineAvailable,sampleCount:genuineVectors.length,median:Math.round(baselineMedian),mad:Math.round(baselineMad),p90:Math.round(baselineP90),percentile:Number(baselinePercentile.toFixed(3)),adjustedScore:telegramAdjusted==null?null:Math.round(telegramAdjusted)},
+        knownFakePattern:{available:negativeVectors.length>0,sampleCount:negativeVectors.length,bestSimilarity:Number(bestNegativeSimilarity.toFixed(4)),score:fakePatternScore==null?null:Math.round(fakePatternScore),matches:negativeSimilarities.slice(0,5)},
+        amountForensics:{score:Math.round(amountScore),strong:amountStrong,usedAsFixedSupport:false}
+      },
+      evidence: strong
+        ? 'Telegram baseline kalibrasyonundan sonra lokal Paint-Over sinyali yüksek kaldı ve bağımsız desteklerle güçlendi.'
+        : moderate
+          ? 'Telegram etkisi kalibrasyona dahil edildi; kalan lokal sinyal orta düzeyde ve ek corroborating bulgu gerektiriyor.'
+          : 'Ham Paint-Over sinyalinin önemli bölümü normal Telegram/görüntü varyasyonu ile açıklanabilir veya yeterli bağımsız destek bulunmadı.'
+    };
+    paintOverV2Cache.set(cacheKey,out);
+    return JSON.parse(JSON.stringify(out));
+  } catch(error){
+    console.warn('PAINT-OVER FORENSICS V2 HATASI:',error?.message||error);
     return {available:false,engine,score:0,severity:'unknown',error:error?.message||String(error)};
   }
 }
@@ -13828,6 +14127,7 @@ let negativeSampleForensics = null;
 let pixelForensics = null;
 let advancedForensics = null;
 let paintOverForensics = null;
+let paintOverForensicsV2 = null;
 let openSourceForensics = null;
 let fontForensics = null;
 let azureLayout = null;
@@ -14712,6 +15012,22 @@ if ((type === "image" || type === "pdf") && bank && reference) {
     console.log("V68 ADVANCED FORENSICS:", JSON.stringify(advancedForensics));
     paintOverForensics = await runPaintOverForensics(forensicTargetPath, amountForensics);
     console.log("PAINT-OVER FORENSICS V1 ACTIVE:", JSON.stringify(paintOverForensics));
+
+    // V2 is deliberately additive: V1 remains available for regression comparison.
+    // Known negative samples are passed in so V2 can compare feature patterns
+    // without changing the existing negative-sample adjudicator.
+    let paintOverV2NegativeSamples = [];
+    try {
+      const rows = await loadNegativeSampleFiles(bank);
+      paintOverV2NegativeSamples = rows.map(x => x.path).filter(Boolean);
+    } catch {}
+    paintOverForensicsV2 = await runPaintOverForensicsV2(
+      forensicTargetPath,
+      amountForensics,
+      bank,
+      paintOverV2NegativeSamples
+    );
+    console.log("PAINT-OVER FORENSICS V2 CALIBRATED:", JSON.stringify(paintOverForensicsV2));
   } catch (error) {
     console.warn("V68 ADVANCED FORENSICS HATASI:", error?.message || error);
   }
@@ -15777,6 +16093,13 @@ if (fontForensics) {
     targetActiveFontUsages: fontForensics.targetActiveFontUsages || []
   }));
 }
+if (paintOverForensicsV2) {
+  result.paintOverForensicsV2 = paintOverForensicsV2;
+}
+if (paintOverForensics) {
+  result.paintOverForensicsV1 = paintOverForensics;
+}
+
 if (referenceForensics) {
   result.referenceForensics = referenceForensics;
 
@@ -18137,58 +18460,12 @@ if (
     ].filter(Boolean).join(" ");
     console.log("AMOUNT FORENSICS PROMOTED TO RISK: REFERENCE-GUIDED");
   } else {
-    // V13: Reference anchor yoksa Amount Forensics tamamen yok sayılmaz.
-    // Yalnızca bağımsız mikro-feature kanıtı yeterince güçlüyse kontrollü
-    // bir risk katkısı verilir; bu katkı blacklist/amountConsistency kararını
-    // tek başına yükseltmez ve deterministic motor ayrıca kendi skorlamasını yapar.
-    const amountScore = Number(amountForensics.score || 0);
-    const anomalyRatio = Number(amountForensics.localAnomalyRatio ?? amountForensics.anomalyRatio ?? 0);
-    const featureVotes = Number(amountForensics.maxFeatureVotes || 0);
-    const repeatedCharacterEvidence = Boolean(
-      amountForensics.repeatedCharacterAnalysis?.available === true &&
-      Array.isArray(amountForensics.repeatedCharacterAnalysis?.strongGroups) &&
-      amountForensics.repeatedCharacterAnalysis.strongGroups.length > 0
-    );
-    const strongIndependentAmountEvidence =
-      amountScore >= 80 &&
-      String(amountForensics.severity || '').toLowerCase() === 'strong' &&
-      anomalyRatio >= 0.20 &&
-      featureVotes >= 3 &&
-      (repeatedCharacterEvidence ||
-        Number(amountForensics.maxStrokeProxyDifference || 0) >= 0.50 ||
-        Number(amountForensics.maxInkDifference || 0) >= 0.25 ||
-        Number(amountForensics.maxEdgeDifference || 0) >= 0.30);
-
-    if (strongIndependentAmountEvidence) {
-      result.checks.amountConsistency.status = 'fail';
-      result.checks.amountConsistency.score = Math.max(
-        Number(result.checks.amountConsistency.score) || 0,
-        Math.min(60, amountScore)
-      );
-      result.checks.amountConsistency.evidence = [
-        result.checks.amountConsistency.evidence,
-        amountForensics.evidence,
-        'Reference anchor bulunamadı; ancak bağımsız tutar-mikro-görsel kanıtları kontrollü şekilde risk katkısına alındı.'
-      ].filter(Boolean).join(' ');
-      result.__amountForensicsControlledPromotion = true;
-      console.log('AMOUNT FORENSICS CONTROLLED PROMOTION: NO REFERENCE ANCHOR BUT STRONG INDEPENDENT EVIDENCE', JSON.stringify({
-        selectionMethod: amountForensics.selectionMethod || null,
-        score: amountScore,
-        severity: amountForensics.severity || null,
-        anomalyRatio,
-        featureVotes,
-        repeatedCharacterEvidence
-      }));
-    } else {
-      console.log('AMOUNT FORENSICS NOT PROMOTED TO RISK: INSUFFICIENT INDEPENDENT EVIDENCE', JSON.stringify({
-        selectionMethod: amountForensics.selectionMethod || null,
-        referenceGuided: amountForensics.referenceGuided ?? false,
-        score: amountScore,
-        severity: amountForensics.severity || null,
-        anomalyRatio,
-        featureVotes
-      }));
-    }
+    console.log("AMOUNT FORENSICS NOT PROMOTED TO RISK: NO REFERENCE ANCHOR", JSON.stringify({
+      selectionMethod: amountForensics.selectionMethod || null,
+      referenceGuided: amountForensics.referenceGuided ?? false,
+      score: amountForensics.score || 0,
+      severity: amountForensics.severity || null
+    }));
   }
 }
 
