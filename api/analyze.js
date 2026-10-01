@@ -18765,16 +18765,10 @@ const meaningfulPixelReferenceSignal =
   Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 45 &&
   Number(pixelForensics?.score || 0) >= 35;
 
-// V15.2 corroboration intentionally uses the raw V1 local signal here.
-// V2 is the Telegram-calibrated baseline layer; its score may become 0 when
-// the same raw Paint-Over pattern is explained by normal Telegram variation.
-// We therefore do NOT treat V2's calibrated score as the independent
-// corroborator. V1 is only admitted when the Amount Promotion is already
-// eligible and the V1 signal explicitly supports the same amount ROI.
 const paintOverForV152 =
-  paintOverForensics?.available === true
-    ? paintOverForensics
-    : (result?.paintOverForensics || result?.paintOverForensicsV1 || null);
+  result?.paintOverForensicsV2?.available === true
+    ? result.paintOverForensicsV2
+    : (paintOverForensics || result?.paintOverForensics || null);
 const paintOverV152Score = Number(paintOverForV152?.score || 0);
 const paintOverV152Signals = Number(paintOverForV152?.metrics?.supportSignals || 0);
 const paintOverV152AmountSupport = Number(paintOverForV152?.metrics?.amountSupport || 0);
@@ -18789,40 +18783,97 @@ const controlledAmountCorroborated =
   paintOverV152AmountSupport >= 20;
 
 if (controlledAmountCorroborated) {
-  // V15.2: Controlled Promotion is a category-fusion signal, NOT an
-  // arbitrary final-score floor. Amount Forensics already contributes to
-  // financialDataRisk through its own deterministic warning/strong path.
-  // Here we add only the independent same-ROI corroboration to editingRisk.
-  //
-  // 750 regression: amount promotion is false, so this block is skipped.
-  // 1000 regression: amount promotion is true + PaintOver V1 corroborates
-  // the same amount ROI, so editingRisk is raised from 75 -> 85.
+  // Reuse the pipeline's existing suspicious threshold. This is a
+  // corroboration floor, not an amount-only risk score.
+  finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
-    editingRisk: Math.max(
-      Number(result.categories?.editingRisk || 0),
-      85
-    )
+    financialDataRisk: Math.max(Number(result.categories?.financialDataRisk || 0), 85),
   };
-
-  finalRiskScore = Math.round((
-    Number(result.categories.visualRisk || 0) * RISK_CATEGORY_WEIGHTS.visualRisk +
-    Number(result.categories.textRisk || 0) * RISK_CATEGORY_WEIGHTS.textRisk +
-    Number(result.categories.layoutRisk || 0) * RISK_CATEGORY_WEIGHTS.layoutRisk +
-    Number(result.categories.financialDataRisk || 0) * RISK_CATEGORY_WEIGHTS.financialDataRisk +
-    Number(result.categories.editingRisk || 0) * RISK_CATEGORY_WEIGHTS.editingRisk
-  ) / 100);
-
   console.log("V15.2 CONTROLLED AMOUNT CORROBORATION:", JSON.stringify({
-    mode: "category-fusion",
+    appliedFloor: 46,
     amountScore: __controlledAmountPromotion.score,
     amountSeverity: __controlledAmountPromotion.severity,
     paintOverScore: paintOverV152Score,
     paintOverSignals: paintOverV152Signals,
-    paintOverAmountSupport: paintOverV152AmountSupport,
-    financialDataRisk: result.categories.financialDataRisk,
-    editingRisk: result.categories.editingRisk,
+    paintOverAmountSupport: paintOverV152AmountSupport
+  }));
+}
+
+// =====================================================
+// V15.3: KNOWN-FAKE BASELINE CORROBORATION
+// =====================================================
+// negative_samples yalnızca bilinen sahte örneklerden oluşan ayrı bir
+// pattern/baseline katmanıdır. Tek başına similarity nihai riski yükseltmez.
+// Current upload hiçbir zaman baseline değildir; PaintOver V2 yalnızca
+// references/ ve negative_samples kaynaklarını kullanır.
+const knownFakePatternV153 =
+  result?.paintOverForensicsV2?.metrics?.knownFakePattern || null;
+const knownFakeAvailableV153 =
+  knownFakePatternV153?.available === true &&
+  Number(knownFakePatternV153?.sampleCount || 0) > 0;
+const knownFakeSimilarityV153 = Number(knownFakePatternV153?.bestSimilarity || 0);
+const knownFakeScoreV153 = Number(knownFakePatternV153?.score || 0);
+const strongKnownFakePatternV153 =
+  knownFakeAvailableV153 &&
+  knownFakeSimilarityV153 >= 0.90 &&
+  knownFakeScoreV153 >= 40;
+
+const rawPaintOverV153 =
+  result?.paintOverForensics || paintOverForensics || null;
+const rawPaintOverScoreV153 = Number(rawPaintOverV153?.score || 0);
+const rawPaintOverSignalsV153 = Number(rawPaintOverV153?.metrics?.supportSignals || 0);
+const independentPaintOverV153 =
+  rawPaintOverV153?.available === true &&
+  rawPaintOverScoreV153 >= 75 &&
+  rawPaintOverSignalsV153 >= 3;
+
+const knownFakeIndependentCorroborationV153 =
+  strongKnownFakePatternV153 &&
+  (
+    __controlledAmountPromotion?.eligible === true ||
+    independentPaintOverV153 ||
+    strongAmountSignal ||
+    strongAzureSignal ||
+    meaningfulPixelReferenceSignal
+  );
+
+if (knownFakeIndependentCorroborationV153) {
+  // Similarity tek başına floor oluşturmaz. Mevcut kategori ağırlıkları
+  // üzerinden kontrollü fusion yapılır; böylece yeni bir sabit overallRisk
+  // tabanı eklenmez.
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 85)
+  };
+
+  const knownFakeFusedRisk = calculateOverallRisk(result);
+  finalRiskScore = Math.max(finalRiskScore, Number(knownFakeFusedRisk?.overallRisk || 0));
+  result.categories = {
+    ...(result.categories || {}),
+    ...(knownFakeFusedRisk?.categories || {})
+  };
+
+  console.log("V15.3 KNOWN-FAKE CORROBORATION:", JSON.stringify({
+    mode: "category-fusion",
+    knownFakeSampleCount: Number(knownFakePatternV153?.sampleCount || 0),
+    bestSimilarity: knownFakeSimilarityV153,
+    knownFakeScore: knownFakeScoreV153,
+    independentPaintOver: independentPaintOverV153,
+    controlledAmount: __controlledAmountPromotion?.eligible === true,
+    strongAmountSignal,
+    strongAzureSignal,
+    meaningfulPixelReferenceSignal,
+    editingRisk: result.categories?.editingRisk,
     fusedRisk: finalRiskScore
+  }));
+} else if (knownFakeAvailableV153) {
+  console.log("V15.3 KNOWN-FAKE PATTERN (ADVISORY ONLY):", JSON.stringify({
+    sampleCount: Number(knownFakePatternV153?.sampleCount || 0),
+    bestSimilarity: knownFakeSimilarityV153,
+    score: knownFakeScoreV153,
+    promoted: false,
+    reason: "known-fake similarity alone is not final-risk evidence"
   }));
 }
 
