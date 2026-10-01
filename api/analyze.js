@@ -1827,20 +1827,55 @@ const NEGATIVE_SAMPLE_MAP = {
 
 async function loadNegativeSampleFiles(bank) {
   const normalizedBank = normalizeBank(bank);
-  const names = NEGATIVE_SAMPLE_MAP[normalizedBank] || [];
-  if (!names.length) return [];
+  if (!normalizedBank) return [];
+
+  const negativeRoot = path.join(process.cwd(), "negative_samples");
+  const bankDir = path.join(negativeRoot, normalizedBank);
+  const allowedExt = /\.(?:jpe?g|png|webp|pdf)$/i;
   const out = [];
-  for (const name of names) {
-    const filePath = path.join(process.cwd(), "negative_samples", name);
-    try {
-      const buffer = await fs.readFile(filePath);
-      if (buffer?.length) {
-        out.push({ bank: normalizedBank, fileName: path.basename(filePath), path: filePath, base64: buffer.toString("base64") });
+
+  // V15.3: negative_samples/<bank>/ klasoru canonical kaynaktir.
+  // Boylece yeni bir sahte ornek eklendiginde kod/map degistirmek gerekmez.
+  try {
+    const entries = await fs.readdir(bankDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !allowedExt.test(entry.name)) continue;
+      const filePath = path.join(bankDir, entry.name);
+      try {
+        const buffer = await fs.readFile(filePath);
+        if (buffer?.length) {
+          out.push({
+            bank: normalizedBank,
+            fileName: entry.name,
+            path: filePath,
+            base64: buffer.toString("base64"),
+          });
+        }
+      } catch {
+        console.log("NEGATIVE SAMPLE OKUNAMADI:", filePath);
       }
-    } catch {
-      console.log("NEGATIVE SAMPLE BULUNAMADI:", filePath);
+    }
+  } catch (error) {
+    // Backward compatibility for older deployments that still use the map.
+    const names = NEGATIVE_SAMPLE_MAP[normalizedBank] || [];
+    for (const name of names) {
+      const filePath = path.join(negativeRoot, name);
+      try {
+        const buffer = await fs.readFile(filePath);
+        if (buffer?.length) {
+          out.push({
+            bank: normalizedBank,
+            fileName: path.basename(filePath),
+            path: filePath,
+            base64: buffer.toString("base64"),
+          });
+        }
+      } catch {
+        console.log("NEGATIVE SAMPLE BULUNAMADI:", filePath);
+      }
     }
   }
+
   return out;
 }
 
@@ -4435,15 +4470,13 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
 
     const amountScore=clamp100(Number(amountForensics?.score)||0);
     const amountStrong=String(amountForensics?.severity||'').toLowerCase()==='strong' || (amountForensics?.status==='warning'&&amountScore>=70);
-    const fakeSupport=fakePatternScore!=null?fakePatternScore:0;
 
-    // Core V2 rule:
-    // 1) raw local signal is first calibrated against genuine Telegram data;
-    // 2) known-fake similarity can corroborate it;
-    // 3) Amount Forensics is corroboration only, never +10/+25 to PaintOver.
+    // V15.3: known-fake similarity is metadata/advisory evidence here.
+    // It MUST NOT alter the calibrated PaintOver score by itself. Final-risk
+    // promotion is handled later by the explicit V15.3 corroboration gate.
+    // This keeps genuine Telegram calibration and V15.2 regression behavior
+    // independent from the negative-sample pattern layer.
     let calibrated=baselineAvailable?telegramAdjusted:clamp100(target.rawScore);
-    if(fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
-    else if(fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
 
     // Amount Forensics can lift a borderline calibrated result only when the
     // image-local signal already survives Telegram calibration. It is not added
@@ -4452,10 +4485,9 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
 
     const strong=calibrated>=75 && (
       target.supportSignals>=3 ||
-      bestNegativeSimilarity>=0.90 ||
       (amountStrong && target.supportSignals>=2)
     );
-    const moderate=calibrated>=50 && (target.supportSignals>=2 || bestNegativeSimilarity>=0.85);
+    const moderate=calibrated>=50 && target.supportSignals>=2;
     const severity=strong?'strong':moderate?'moderate':calibrated>=25?'low':'none';
 
     const out={
