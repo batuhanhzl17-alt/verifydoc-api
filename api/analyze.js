@@ -4384,10 +4384,45 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
     const channelDivergenceScore=Math.min(100,Math.round((Math.max(...rgbMeans)-Math.min(...rgbMeans))*2));
     const supportSignals=[channelResidualScore>=55,lumaResidualScore>=55,edgeScore>=55,textureScore>=55,channelDivergenceScore>=55].filter(Boolean).length;
     const rawScore=Math.round(channelResidualScore*.25+lumaResidualScore*.25+edgeScore*.20+textureScore*.20+channelDivergenceScore*.10);
+
+    // V15.3.2: aggregate PaintOver scores are intentionally NOT used as the
+    // known-fake fingerprint. Different manipulated samples can legitimately
+    // produce the same aggregate 100/100/100/100 pattern and rawScore 90.
+    // Build a sample-specific spatial signature from the actual ROI instead.
+    // Each cell records normalized residual/edge/darkness/variance structure.
+    const spatialSignature=[];
+    const GRID_X=8, GRID_Y=4;
+    const ctrlRes=Math.max(1,cLuma.res);
+    const ctrlEdge=Math.max(1,cLuma.edge);
+    const ctrlLuma=Math.max(1,cLuma.sd || roiL.sd || 1);
+    const cellW=rw/GRID_X, cellH=rh/GRID_Y;
+    for(let gy=0;gy<GRID_Y;gy++){
+      for(let gx=0;gx<GRID_X;gx++){
+        const cx1=Math.floor(roi.x1+gx*cellW);
+        const cy1=Math.floor(roi.y1+gy*cellH);
+        const cx2=Math.max(cx1+1,Math.ceil(roi.x1+(gx+1)*cellW));
+        const cy2=Math.max(cy1+1,Math.ceil(roi.y1+(gy+1)*cellH));
+        const cell={x1:Math.max(1,cx1),y1:Math.max(1,cy1),x2:Math.min(W-1,cx2),y2:Math.min(H-1,cy2)};
+        const rs=residualStats(luma,cell);
+        const es=edgeStats(luma,cell);
+        const ls=rectStats(luma,cell);
+        const darkness=Math.max(0,Math.min(1,(255-ls.mean)/255));
+        const localVariance=Math.max(0,Math.min(3,ls.sd/ctrlLuma));
+        spatialSignature.push(
+          Math.max(0,Math.min(3,rs.mean/ctrlRes)),
+          Math.max(0,Math.min(3,es.mean/ctrlEdge)),
+          darkness,
+          localVariance
+        );
+      }
+    }
+
     return {
       rawScore,
       supportSignals,
       features:[channelResidualScore,lumaResidualScore,edgeScore,textureScore,channelDivergenceScore],
+      spatialSignature,
+      spatialSignatureVersion:'roi-grid-v1',
       roi,
     };
   } catch(error) {
@@ -4467,7 +4502,38 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       if(v) negativeVectors.push({path:samplePath,vector:v});
     }
     const targetFeature=target.features;
-    const negativeSimilarities=negativeVectors.map(x=>({file:path.basename(x.path),similarity:vectorSimilarity(targetFeature,x.vector.features),rawScore:x.vector.rawScore}));
+
+    // V15.3.2: known-fake similarity is primarily sample-specific local ROI
+    // morphology. The old implementation compared only five aggregate scores,
+    // so four unrelated fake samples with identical aggregate features all
+    // collapsed to cosine similarity ~= 1.
+    const spatialSignatureSimilarity=(a,b)=>{
+      if(!Array.isArray(a)||!Array.isArray(b)||!a.length||a.length!==b.length) return 0;
+      let abs=0, count=0;
+      for(let i=0;i<a.length;i++){
+        const av=Number(a[i]), bv=Number(b[i]);
+        if(!Number.isFinite(av)||!Number.isFinite(bv)) continue;
+        abs += Math.min(1,Math.abs(av-bv));
+        count++;
+      }
+      if(!count) return 0;
+      return Math.max(0,Math.min(1,1-abs/count));
+    };
+    const aggregateSimilarity=(a,b)=>vectorSimilarity(a,b);
+    const negativeSimilarities=negativeVectors.map(x=>{
+      const spatial=spatialSignatureSimilarity(target.spatialSignature,x.vector.spatialSignature);
+      const aggregate=aggregateSimilarity(targetFeature,x.vector.features);
+      // Aggregate signal remains a weak corroborator only; it cannot dominate
+      // the sample-specific local signature.
+      const similarity=spatial*0.85+aggregate*0.15;
+      return {
+        file:path.basename(x.path),
+        similarity,
+        spatialSimilarity:spatial,
+        aggregateSimilarity:aggregate,
+        rawScore:x.vector.rawScore
+      };
+    });
     negativeSimilarities.sort((a,b)=>b.similarity-a.similarity);
     const bestNegativeSimilarity=negativeSimilarities[0]?.similarity||0;
     const fakePatternScore=negativeVectors.length?clamp100((bestNegativeSimilarity-0.82)/0.18*100):null;
