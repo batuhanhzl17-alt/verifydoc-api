@@ -4666,6 +4666,10 @@ async function runV68Forensics(targetPath, amountForensics=null, bank=null, refe
 // These are corroborating signals. They never declare a document fake alone.
 // Background/line/repeated-template regions are deliberately filtered out.
 // =====================================================
+// VERIFYDOC TYPOGRAPHY V1.2.1 ROI-LOCK HOTFIX
+// Ensures the reference amount geometry is always passed explicitly to the
+// reference forensic engine and never depends on an undeclared outer binding.
+
 const openSourceForensicsCache = new Map();
 
 function osfSafeString(v) {
@@ -7774,7 +7778,8 @@ function rfFieldLabelText(label){
   return String(label?.labelText || label?.text || '').toLocaleLowerCase('tr-TR').replace(/\s+/g,' ').trim();
 }
 
-async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null, amountForensics = null, referenceAmountField = null) {
+async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null, amountForensics = null, referenceAmountFieldArg = null) {
+  const referenceAmountField = referenceAmountFieldArg || null;
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath || !targetOCR?.success) return null;
   try {
@@ -14654,13 +14659,22 @@ if (type === "pdf" && reference?.path) {
 
 if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
   try {
+    const safeReferenceAmountField = referenceAmountField || null;
+    console.log("REFERENCE FORENSIC AMOUNT FIELD HANDOFF V1.2.1:", JSON.stringify({
+      available: Boolean(safeReferenceAmountField),
+      source: safeReferenceAmountField?.source || safeReferenceAmountField?.templateRole || null,
+      xNorm: safeReferenceAmountField?.xNorm ?? null,
+      yNorm: safeReferenceAmountField?.yNorm ?? null,
+      widthNorm: safeReferenceAmountField?.widthNorm ?? null,
+      heightNorm: safeReferenceAmountField?.heightNorm ?? null
+    }));
     referenceForensics = await runReferenceForensicEngine(
       forensicTargetPath,
       bank,
       paddleImageOCR,
       getVisualReferencePath(reference),
       amountForensics,
-      referenceAmountField
+      safeReferenceAmountField
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
