@@ -7774,7 +7774,7 @@ function rfFieldLabelText(label){
   return String(label?.labelText || label?.text || '').toLocaleLowerCase('tr-TR').replace(/\s+/g,' ').trim();
 }
 
-async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null) {
+async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null, amountForensics = null, referenceAmountField = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath || !targetOCR?.success) return null;
   try {
@@ -8175,6 +8175,44 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const tpSemanticField=(key)=>TP_GENERIC_CRITICAL_MAP[String(key||'')] || String(key||'');
         const tpAllowedFieldKey=(key)=>TP_ALLOWED_FIELDS.has(tpSemanticField(key));
 
+        // V1.2 ROI LOCK: critical typography is allowed only when the candidate
+        // is semantically valid for the requested field. The previous V1.1
+        // resolver still accepted a nearby OCR region after the broad value
+        // resolver had already classified it as text/numeric. That is exactly
+        // how MÜŞTERİ ÜNVANI -> IBAN, SIRA NO -> footer sentence and FİŞ NO ->
+        // bank name could enter Typography. V1.2 never falls back to an
+        // unrelated OCR region: invalid candidate => valueComparable:false.
+        const tpCompact=(v)=>normalizeFieldTextForMatch(String(v||''))
+          .replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
+        const tpLooksIBAN=(v)=>/^TR\s*\d{2}(?:\s*[A-Z0-9]{4}){4,7}$/i.test(String(v||'').replace(/[^A-Z0-9 ]/gi,' ').replace(/\s+/g,' ').trim()) || /\bTR\d{24}\b/i.test(String(v||'').replace(/\s+/g,''));
+        const tpLooksAmount=(v)=>/^(?:\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?:\s*(?:TL|TRY|EUR|USD|GBP|₺))?$/i.test(String(v||'').trim());
+        const tpLooksNumericId=(v)=>{ const s=String(v||'').trim(); return /\d{4,}/.test(s.replace(/\s+/g,'')) && s.length<=40 && !/[.!?]{2,}/.test(s); };
+        const tpLooksName=(v)=>{ const s=String(v||'').trim(); if(!s||s.length<2||s.length>90)return false; if(tpLooksIBAN(s)||/^TR\d/i.test(s.replace(/\s+/g,'')))return false; if(/(?:sorgu|sorgulama|fiş\s*no|fis\s*no|referans\s*no|işlem\s*no|islem\s*no)/i.test(s))return false; const letters=(s.match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g)||[]).length; const digits=(s.match(/\d/g)||[]).length; return letters>=3 && digits<=Math.max(2,Math.floor(letters*.25)); };
+        const tpLooksAddress=(v)=>{ const s=String(v||'').trim(); if(!s||s.length<8||s.length>180||tpLooksIBAN(s))return false; return /(?:mah(?:allesi)?|mah\.|cad(?:desi)?|cad\.|sok(?:ak)?|sok\.|bulvar|blv|no\s*[:.]?|apt|kat|daire|istanbul|ankara|\bTR\b)/i.test(s); };
+        const tpCriticalValueGate=(semanticField, text, labelText='')=>{
+          const s=String(text||'').trim();
+          const f=String(semanticField||'');
+          if(!s || !tpSingleLine(s,180)) return {ok:false,reason:'empty-or-multiline'};
+          if(f==='amount') {
+            // Amount ROI must be the amount token itself. A region containing
+            // SORGU NO / reference number is never an amount ROI.
+            if(/(?:sorgu|sorgulama|işlem\s*no|islem\s*no|referans\s*no|fiş\s*no|fis\s*no)/i.test(s)) return {ok:false,reason:'amount-region-contains-secondary-identifier'};
+            return {ok:tpLooksAmount(s),reason:tpLooksAmount(s)?'amount-token':'not-amount-token'};
+          }
+          if(f==='iban') return {ok:tpLooksIBAN(s),reason:tpLooksIBAN(s)?'iban-pattern':'not-iban'};
+          if(f==='senderName'||f==='recipientName') return {ok:tpLooksName(s),reason:tpLooksName(s)?'name-like':'not-name-like'};
+          if(f==='transactionNo'||f==='accountNo'||f==='taxNo') return {ok:tpLooksNumericId(s),reason:tpLooksNumericId(s)?'short-identifier':'not-identifier'};
+          if(f==='address'||f==='senderAddress'||f==='recipientAddress') return {ok:tpLooksAddress(s),reason:tpLooksAddress(s)?'address-like':'not-address-like'};
+          return {ok:false,reason:'semantic-field-not-whitelisted'};
+        };
+        const tpCriticalKeyAlias=(key)=>{
+          const k=String(key||'');
+          if(/^generic:ESENTEPE/i.test(k) || /^generic:.*\bADRES\b/i.test(k)) return 'address';
+          if(/^generic:ALICI\s+UNVANI/i.test(k)) return 'recipientName';
+          if(/^generic:ALICI\s+IBAN/i.test(k)) return 'iban';
+          return tpSemanticField(k);
+        };
+
         const tpNorm=(v)=>normalizeFieldTextForMatch(String(v||''))
           .replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
         const tpDistance=(a,b)=>{
@@ -8346,8 +8384,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
         for(const m of matches){
           const key=String(m?.rl?.rule?.key||'');
-          const semanticKey=tpSemanticField(key);
-          if(!tpAllowedFieldKey(key))continue;
+          const semanticKey=tpCriticalKeyAlias(key);
+          if(!TP_ALLOWED_FIELDS.has(semanticKey))continue;
 
           const refLabelText=tpLabelClean(m?.rl?.labelText || m?.rl?.text);
           const tarLabelText=tpLabelClean(m?.tl?.labelText || m?.tl?.text);
@@ -8393,12 +8431,49 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           let valueRefText='',valueTarText='';
           let refValueChar=null,tarValueChar=null;
           let sameValueGlyph=null;
-          const valueRefRaw=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key);
-          const valueTarRaw=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
+          let valueRefRaw=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key);
+          let valueTarRaw=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
+
+          // V1.2: amount is a special hard lock. The target amount ROI is the
+          // ROI already established by Amount Forensics; never let the generic
+          // OCR value resolver replace it with `0 TL SORGU NO: ...`. The
+          // reference amount ROI comes from the trusted reference amount anchor.
+          if(semanticKey==='amount'){
+            if(amountForensics?.region && referenceAmountField && refSize?.width && refSize?.height && targetSize?.width && targetSize?.height){
+              const rr={
+                x1:Math.max(0,Math.round(Number(referenceAmountField.xNorm||0)*refSize.width)),
+                y1:Math.max(0,Math.round(Number(referenceAmountField.yNorm||0)*refSize.height)),
+                x2:Math.min(refSize.width,Math.round((Number(referenceAmountField.xNorm||0)+Number(referenceAmountField.widthNorm||0))*refSize.width)),
+                y2:Math.min(refSize.height,Math.round((Number(referenceAmountField.yNorm||0)+Number(referenceAmountField.heightNorm||0))*refSize.height))
+              };
+              const tr={...amountForensics.region};
+              const refAnchorRegion=refRegions.filter(x=>x?.region&&String(x.text||'').trim()).sort((a,b)=>{
+                const ac=(Math.max(0,Math.min(a.region.x2,rr.x2)-Math.max(a.region.x1,rr.x1))*Math.max(0,Math.min(a.region.y2,rr.y2)-Math.max(a.region.y1,rr.y1)));
+                const bc=(Math.max(0,Math.min(b.region.x2,rr.x2)-Math.max(b.region.x1,rr.x1))*Math.max(0,Math.min(b.region.y2,rr.y2)-Math.max(b.region.y1,rr.y1)));
+                return bc-ac;
+              })[0];
+              valueRefRaw=refAnchorRegion ? {...refAnchorRegion,region:rr} : {text:String(m?.rl?.valueText||'').trim(),region:rr,score:99};
+              valueTarRaw={text:String(amountForensics.selectedAmountText||amountForensics.amountText||'').trim(),region:tr,score:99};
+            } else {
+              // No trusted amount ROI => skip rather than falling back to a
+              // nearby OCR region.
+              valueRefRaw=null; valueTarRaw=null;
+            }
+          }
+
           if(valueRefRaw&&valueTarRaw){
             valueRefText=tpValueText(valueRefRaw.text);
             valueTarText=tpValueText(valueTarRaw.text);
-            valueComparable=tpValueComparable(semanticKey,valueRefText,valueTarText);
+            const refGate=tpCriticalValueGate(semanticKey,valueRefText,refLabelText);
+            const tarGate=tpCriticalValueGate(semanticKey,valueTarText,tarLabelText);
+            valueComparable=refGate.ok && tarGate.ok && tpValueComparable(semanticKey,valueRefText,valueTarText);
+            if(!refGate.ok || !tarGate.ok){
+              valueRefRaw=null;
+              valueTarRaw=null;
+              valueRefText='';
+              valueTarText='';
+              valueComparable=false;
+            }
             const vrConf=tpConfidence(valueRefRaw),vtConf=tpConfidence(valueTarRaw);
             if(vrConf!==null&&vrConf<65)valueComparable=false;
             if(vtConf!==null&&vtConf<65)valueComparable=false;
@@ -8508,7 +8583,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
 
-        console.log('TYPOGRAPHY CRITICAL ROI V1.1 SCALE-AWARE:', JSON.stringify({
+        console.log('TYPOGRAPHY CRITICAL ROI V1.2 ROI-LOCK SCALE-AWARE:', JSON.stringify({
           criticalFields:[...TP_ALLOWED_FIELDS],
           scalePolicy:'document-normalized character/ink scale is measured; not discarded during ROI normalization',
           scaleFeatures:['documentCharacterHeightNorm','documentCharacterWidthNorm','documentInkHeightNorm','documentInkWidthNorm'],
@@ -14583,7 +14658,9 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePath(reference)
+      getVisualReferencePath(reference),
+      amountForensics,
+      referenceAmountField
     );
     referenceForensics = synchronizeReferenceForensicDecision(referenceForensics);
     console.log("REFERENCE FORENSIC ENGINE V26:", JSON.stringify(referenceForensics));
