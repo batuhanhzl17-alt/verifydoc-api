@@ -8648,19 +8648,31 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
                   (Number(a.distance)-Number(b.distance))
                 );
 
-              // Prefer a real amount token in/near the trusted anchor, but never
-              // reject the trusted ROI solely because OCR missed the token.
+              // V1.2.9: resolve the reference amount VALUE, not only its ROI.
+              // The trusted anchor remains authoritative for geometry. OCR is
+              // searched inside/near that anchor for the actual numeric amount.
               const refAnchorCandidate=refAmountCandidates.find(x=>x.amountLike&&
                 (x.overlap>0 || x.distance<=0.045)) || null;
-              const refAnchorRegion=refAnchorCandidate?.x||null;
-              const refAmountText=String(refAnchorCandidate?.x?.text||'').trim();
+              const nearbyAmountCandidates=refAmountCandidates.filter(x=>x.amountLike&&
+                (x.overlap>0 || x.distance<=0.065)).slice(0,6);
+              let refAmountText=String(refAnchorCandidate?.x?.text||'').trim();
+              if(!refAmountText && nearbyAmountCandidates.length){
+                refAmountText=nearbyAmountCandidates
+                  .sort((a,b)=>Number(a.distance)-Number(b.distance))
+                  .map(x=>String(x.x?.text||'').trim())
+                  .filter(Boolean)
+                  .join(' ')
+                  .trim();
+              }
+              if(refAmountText && !rfCriticalLooksAmountV126(refAmountText)) refAmountText='';
+
 
               valueRefRaw={
                 text:refAmountText,
                 region:rr,
                 score:99,
                 criticalROI:true,
-                resolver:'trusted-reference-amount-anchor-v127',
+                resolver:'trusted-reference-amount-anchor-v129',
                 roiOnly:!refAmountText
               };
               valueTarRaw={
@@ -8668,7 +8680,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
                 region:tr,
                 score:99,
                 criticalROI:true,
-                resolver:'amount-forensics-region-v127'
+                resolver:'amount-forensics-region-v129'
               };
             } else {
               valueRefRaw=null;
@@ -8834,7 +8846,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
 
-        console.log('TYPOGRAPHY CRITICAL ROI V1.2.8 RESOLVER:',JSON.stringify({
+        console.log('TYPOGRAPHY CRITICAL ROI V1.2.9 RESOLVER:',JSON.stringify({
           policy:'typed semantic ROI; explicit trusted amount ROI; wrong ROI => skip; literal value equality not required for dynamic critical fields',
           profiles:typographyFieldProfiles.map(p=>({field:p.field,valueComparable:p.valueComparable,valueReference:p.valueReference||null,valueTarget:p.valueTarget||null})).slice(0,30)
         }));
