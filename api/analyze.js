@@ -6639,6 +6639,89 @@ function rfLooksLikeLabelRegion(region) {
   return !!generic && (labelWords.test(n) || uppercaseRatio >= 0.78);
 }
 
+
+// =====================================================
+// TYPOGRAPHY CRITICAL ROI RESOLVER V1.2.6
+// =====================================================
+function rfCriticalSemanticKeyV126(field,labelText=''){
+  const raw=String(field||'');
+  const n=normalizeFieldTextForMatch(labelText||raw.replace(/^generic:/i,'')).replace(/[:：]/g,' ').replace(/\s+/g,' ').trim();
+  if(/iban|iban\s*\/?\s*kart\s*no/i.test(n))return 'iban';
+  if(/eft\s+tutari|giden\s+fast\s+tutari|giden\s+eft\s+tutari|islem\s+tutari|tutar/i.test(n))return 'amount';
+  if(/musteri\s+unvani|musteri\s+adi|gonderen\s+(?:ad|adi|unvani)|gonderici\s+(?:ad|adi|unvani)|giden\s+fast\s+eft/i.test(n))return 'senderName';
+  if(/alici\s+(?:ad|adi|unvani|unvan)/i.test(n))return 'recipientName';
+  if(/sira\s+no|fis\s+no|islem\s+no|sorgu\s+no|referans\s+no/i.test(n))return 'transactionNo';
+  if(/esentepe|adres|address/i.test(n))return 'address';
+  if(/^generic:IBAN\/KART NO$/i.test(raw))return 'iban';
+  if(/^generic:EFT TUTARI$/i.test(raw))return 'amount';
+  if(/^generic:MUSTERI UNVANI$/i.test(raw)||/^generic:GIDEN FAST EFT$/i.test(raw))return 'senderName';
+  if(/^generic:ALICI UNVANI$/i.test(raw))return 'recipientName';
+  if(/^generic:ALICI IBAN$/i.test(raw))return 'iban';
+  if(/^generic:(?:SIRA NO|FIS NO)$/i.test(raw))return 'transactionNo';
+  if(/^generic:(?:ESENTEPE|ADRES)/i.test(raw))return 'address';
+  return rfInferSemanticFieldKey(field,labelText);
+}
+function rfCriticalCandidateBoxV126(region){
+  const r=region?.region||region;if(!r)return null;
+  const x1=Number(r.x1),y1=Number(r.y1),x2=Number(r.x2),y2=Number(r.y2);
+  if(![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1)return null;
+  return{x1,y1,x2,y2};
+}
+function rfCriticalOverlapAreaV126(a,b){
+  const A=rfCriticalCandidateBoxV126(a),B=rfCriticalCandidateBoxV126(b);if(!A||!B)return 0;
+  return Math.max(0,Math.min(A.x2,B.x2)-Math.max(A.x1,B.x1))*Math.max(0,Math.min(A.y2,B.y2)-Math.max(A.y1,B.y1));
+}
+function rfCriticalLooksIbanV126(text){return /^TR\d{24}$/i.test(String(text||'').toUpperCase().replace(/[^A-Z0-9]/g,''));}
+function rfCriticalLooksAmountV126(text){
+  const s=String(text||'').trim();
+  if(!s||/(?:sorgu|sorgulama|işlem\s*no|islem\s*no|referans\s*no|fiş\s*no|fis\s*no)/i.test(s))return false;
+  return /^(?:\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?:\s*(?:TL|TRY|EUR|USD|GBP|₺))?$/i.test(s);
+}
+function rfCriticalLooksNumericIdV126(text){const s=String(text||'').trim(),d=s.replace(/\D/g,'');return d.length>=4&&d.length<=40&&!/[!?]{2,}/.test(s);}
+function rfCriticalLooksNameV126(text){
+  const s=String(text||'').trim();if(!s||s.length<3||s.length>100||rfCriticalLooksIbanV126(s))return false;
+  if(/(?:sorgu|sorgulama|fiş\s*no|fis\s*no|referans\s*no|işlem\s*no|islem\s*no)/i.test(s))return false;
+  const letters=(s.match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g)||[]).length,digits=(s.match(/\d/g)||[]).length;
+  return letters>=3&&digits<=Math.max(2,Math.floor(letters*.25));
+}
+function rfCriticalLooksAddressV126(text){
+  const s=String(text||'').trim();if(!s||s.length<8||s.length>180||rfCriticalLooksIbanV126(s))return false;
+  return /(?:mah(?:allesi)?|mah\.|cad(?:desi)?|cad\.|sok(?:ak)?|sok\.|bulvar|blv|no\s*[:.]?|apt|kat|daire|istanbul|ankara|romanya|romania|esentepe)/i.test(s);
+}
+function rfCriticalCandidateScoreV126(label,candidate,semanticKey){
+  const lr=rfCriticalCandidateBoxV126(label),cr=rfCriticalCandidateBoxV126(candidate);if(!lr||!cr)return Infinity;
+  const lh=Math.max(6,lr.y2-lr.y1),lcX=(lr.x1+lr.x2)/2,lcY=(lr.y1+lr.y2)/2,ccX=(cr.x1+cr.x2)/2,ccY=(cr.y1+cr.y2)/2;
+  const vertical=Math.min(lr.y2,cr.y2)-Math.max(lr.y1,cr.y1),rightGap=cr.x1-lr.x2,belowGap=cr.y1-lr.y2,xGap=Math.abs(ccX-lcX);
+  let cost=Infinity;
+  if(vertical>=-lh*.45&&rightGap>=-lh*.25&&rightGap<Math.max(420,lh*18))cost=Math.abs(rightGap)/Math.max(1,lh)+Math.abs(ccY-lcY)/Math.max(1,lh)*.7;
+  const belowLimit=semanticKey==='address'?Math.max(260,lh*7):(semanticKey==='senderName'||semanticKey==='recipientName')?Math.max(150,lh*5):Math.max(100,lh*3.5);
+  const xLimit=semanticKey==='address'?Math.max(520,lh*16):Math.max(320,lh*11);
+  if(belowGap>=-lh*.30&&belowGap<belowLimit&&xGap<xLimit)cost=Math.min(cost,3+Math.max(0,belowGap)/Math.max(1,lh)+xGap/Math.max(1,lh)*.18);
+  return cost;
+}
+function rfResolveCriticalValueRegionV126(regions,label,field,options={}){
+  if(!label?.region)return null;
+  const semanticKey=rfCriticalSemanticKeyV126(field,label?.labelText||label?.text||'');
+  if(options?.explicitRegion){
+    const r=rfCriticalCandidateBoxV126(options.explicitRegion);
+    if(r&&(r.x2-r.x1)>2&&(r.y2-r.y1)>2)return{text:String(options.explicitText??options.explicitRegion?.text??'').trim(),region:r,score:100,criticalROI:true,resolver:options.source||'explicit-trusted-roi-v126'};
+  }
+  const candidates=(Array.isArray(regions)?regions:[]).filter(v=>v&&v!==label&&v.region&&String(v.text||'').trim()).map(v=>{
+    const text=String(v.text||'').trim();let ok=false;
+    if(semanticKey==='iban')ok=rfCriticalLooksIbanV126(text);
+    else if(semanticKey==='amount')ok=rfCriticalLooksAmountV126(text);
+    else if(semanticKey==='transactionNo')ok=rfCriticalLooksNumericIdV126(text);
+    else if(semanticKey==='senderName'||semanticKey==='recipientName')ok=rfCriticalLooksNameV126(text);
+    else if(semanticKey==='address')ok=rfCriticalLooksAddressV126(text);
+    if(!ok||rfLooksLikeLabelRegion(v))return null;
+    const cost=rfCriticalCandidateScoreV126(label,v,semanticKey);if(!Number.isFinite(cost))return null;
+    const limit=semanticKey==='address'?16:semanticKey==='iban'?14:(semanticKey==='transactionNo'||semanticKey==='amount')?10:14;
+    if(cost>limit)return null;
+    return{...v,criticalROI:true,resolver:'semantic-typed-relative-v126',_cost:cost};
+  }).filter(Boolean).sort((a,b)=>a._cost-b._cost);
+  return candidates[0]||null;
+}
+
 function rfFindValueRegion(regions, label, expectedField = null) {
   if (!label?.region) return null;
   const rawField = String(expectedField || label?.rule?.key || '');
@@ -8457,10 +8540,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           let valueRefText='',valueTarText='';
           let refValueChar=null,tarValueChar=null;
           let sameValueGlyph=null;
-          let valueRefRaw=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key);
-          let valueTarRaw=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
+          let valueRefRaw=rfResolveCriticalValueRegionV126(refRegions,m.rl,key,{source:'semantic-typed-relative-v126'});
+          let valueTarRaw=rfResolveCriticalValueRegionV126(targetRegions,m.tl,key,{source:'semantic-typed-relative-v126'});
 
-          // V1.2: amount is a special hard lock. The target amount ROI is the
+          // V1.2.6: amount is a special hard lock. The target amount ROI is the
           // ROI already established by Amount Forensics; never let the generic
           // OCR value resolver replace it with `0 TL SORGU NO: ...`. The
           // reference amount ROI comes from the trusted reference amount anchor.
@@ -8473,13 +8556,13 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
                 y2:Math.min(refSize.height,Math.round((Number(referenceAmountField.yNorm||0)+Number(referenceAmountField.heightNorm||0))*refSize.height))
               };
               const tr={...amountForensics.region};
-              const refAnchorRegion=refRegions.filter(x=>x?.region&&String(x.text||'').trim()).sort((a,b)=>{
-                const ac=(Math.max(0,Math.min(a.region.x2,rr.x2)-Math.max(a.region.x1,rr.x1))*Math.max(0,Math.min(a.region.y2,rr.y2)-Math.max(a.region.y1,rr.y1)));
-                const bc=(Math.max(0,Math.min(b.region.x2,rr.x2)-Math.max(b.region.x1,rr.x1))*Math.max(0,Math.min(b.region.y2,rr.y2)-Math.max(b.region.y1,rr.y1)));
-                return bc-ac;
-              })[0];
-              valueRefRaw=refAnchorRegion ? {...refAnchorRegion,region:rr} : {text:String(m?.rl?.valueText||'').trim(),region:rr,score:99};
-              valueTarRaw={text:String(amountForensics.selectedAmountText||amountForensics.amountText||'').trim(),region:tr,score:99};
+              const refAmountCandidates=refRegions.filter(x=>x?.region&&String(x.text||'').trim()).map(x=>({
+                x,overlap:rfCriticalOverlapAreaV126(x.region,rr),amountLike:rfCriticalLooksAmountV126(x.text)
+              })).filter(x=>x.overlap>0).sort((a,b)=>(Number(b.amountLike)-Number(a.amountLike))||(b.overlap-a.overlap));
+              const refAnchorRegion=refAmountCandidates[0]?.x||null;
+              const refAmountText=refAmountCandidates.find(x=>x.amountLike)?.x?.text||refAnchorRegion?.text||'';
+              valueRefRaw={text:String(refAmountText).trim(),region:rr,score:99,criticalROI:true,resolver:'trusted-reference-amount-anchor-v126'};
+              valueTarRaw={text:String(amountForensics.selectedAmountText||amountForensics.amountText||'').trim(),region:tr,score:99,criticalROI:true,resolver:'amount-forensics-region-v126'};
             } else {
               // No trusted amount ROI => skip rather than falling back to a
               // nearby OCR region.
@@ -8492,7 +8575,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             valueTarText=tpValueText(valueTarRaw.text);
             const refGate=tpCriticalValueGate(semanticKey,valueRefText,refLabelText);
             const tarGate=tpCriticalValueGate(semanticKey,valueTarText,tarLabelText);
-            valueComparable=refGate.ok && tarGate.ok && tpValueComparable(semanticKey,valueRefText,valueTarText);
+            const trustedROI=valueRefRaw?.criticalROI===true&&valueTarRaw?.criticalROI===true;
+            const dynamicCriticalField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(semanticKey));
+            valueComparable=trustedROI&&refGate.ok&&tarGate.ok&&(dynamicCriticalField?true:tpValueComparable(semanticKey,valueRefText,valueTarText));
             if(!refGate.ok || !tarGate.ok){
               valueRefRaw=null;
               valueTarRaw=null;
@@ -8608,6 +8693,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           // value changes make shared-glyph segmentation too unstable.
           if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
+
+        console.log('TYPOGRAPHY CRITICAL ROI V1.2.6 RESOLVER:',JSON.stringify({
+          policy:'typed semantic ROI; explicit trusted amount ROI; wrong ROI => skip; literal value equality not required for dynamic critical fields',
+          profiles:typographyFieldProfiles.map(p=>({field:p.field,valueComparable:p.valueComparable,valueReference:p.valueReference||null,valueTarget:p.valueTarget||null})).slice(0,30)
+        }));
 
         console.log('TYPOGRAPHY CRITICAL ROI V1.2 ROI-LOCK SCALE-AWARE:', JSON.stringify({
           criticalFields:[...TP_ALLOWED_FIELDS],
