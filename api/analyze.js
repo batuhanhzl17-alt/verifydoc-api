@@ -6641,6 +6641,9 @@ function rfLooksLikeLabelRegion(region) {
 
 
 // =====================================================
+// TYPOGRAPHY CRITICAL ROI RESOLVER V1.2.8
+// Esentepe/address removed; amount/customer/recipient ROI strengthened.
+// =====================================================
 // TYPOGRAPHY CRITICAL ROI RESOLVER V1.2.6
 // =====================================================
 function rfCriticalSemanticKeyV126(field,labelText=''){
@@ -6651,14 +6654,12 @@ function rfCriticalSemanticKeyV126(field,labelText=''){
   if(/musteri\s+unvani|musteri\s+adi|gonderen\s+(?:ad|adi|unvani)|gonderici\s+(?:ad|adi|unvani)|giden\s+fast\s+eft/i.test(n))return 'senderName';
   if(/alici\s+(?:ad|adi|unvani|unvan)/i.test(n))return 'recipientName';
   if(/sira\s+no|fis\s+no|islem\s+no|sorgu\s+no|referans\s+no/i.test(n))return 'transactionNo';
-  if(/esentepe|adres|address/i.test(n))return 'address';
   if(/^generic:IBAN\/KART NO$/i.test(raw))return 'iban';
   if(/^generic:EFT TUTARI$/i.test(raw))return 'amount';
   if(/^generic:MUSTERI UNVANI$/i.test(raw)||/^generic:GIDEN FAST EFT$/i.test(raw))return 'senderName';
   if(/^generic:ALICI UNVANI$/i.test(raw))return 'recipientName';
   if(/^generic:ALICI IBAN$/i.test(raw))return 'iban';
   if(/^generic:(?:SIRA NO|FIS NO)$/i.test(raw))return 'transactionNo';
-  if(/^generic:(?:ESENTEPE|ADRES)/i.test(raw))return 'address';
   return rfInferSemanticFieldKey(field,labelText);
 }
 function rfCriticalCandidateBoxV126(region){
@@ -6694,8 +6695,8 @@ function rfCriticalCandidateScoreV126(label,candidate,semanticKey){
   const vertical=Math.min(lr.y2,cr.y2)-Math.max(lr.y1,cr.y1),rightGap=cr.x1-lr.x2,belowGap=cr.y1-lr.y2,xGap=Math.abs(ccX-lcX);
   let cost=Infinity;
   if(vertical>=-lh*.45&&rightGap>=-lh*.25&&rightGap<Math.max(420,lh*18))cost=Math.abs(rightGap)/Math.max(1,lh)+Math.abs(ccY-lcY)/Math.max(1,lh)*.7;
-  const belowLimit=semanticKey==='address'?Math.max(260,lh*7):(semanticKey==='senderName'||semanticKey==='recipientName')?Math.max(150,lh*5):Math.max(100,lh*3.5);
-  const xLimit=semanticKey==='address'?Math.max(520,lh*16):Math.max(320,lh*11);
+  const belowLimit=(semanticKey==='senderName'||semanticKey==='recipientName')?Math.max(220,lh*7):Math.max(100,lh*3.5);
+  const xLimit=(semanticKey==='senderName'||semanticKey==='recipientName')?Math.max(520,lh*18):Math.max(320,lh*11);
   if(belowGap>=-lh*.30&&belowGap<belowLimit&&xGap<xLimit)cost=Math.min(cost,3+Math.max(0,belowGap)/Math.max(1,lh)+xGap/Math.max(1,lh)*.18);
   return cost;
 }
@@ -6703,31 +6704,44 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
   const semanticKey=rfCriticalSemanticKeyV126(field,label?.labelText||label?.text||'');
   const labelText=String(label?.labelText||label?.text||'').trim();
 
-  // V1.2.7: OCR can return LABEL:VALUE in one region. Split it semantically
-  // before searching nearby regions. This is especially important for
-  // MÜŞTERİ ÜNVANI / ALICI ÜNVANI.
-  if(label?.region && /[:：]/.test(labelText)){
-    const parts=labelText.split(/[:：]/);
-    const left=String(parts.shift()||'').trim();
-    const inlineValue=parts.join(':').trim();
-    const leftKey=rfCriticalSemanticKeyV126(field,left);
-    const sameSemantic=leftKey===semanticKey;
-    let valid=false;
-    if(sameSemantic){
-      if(semanticKey==='iban') valid=rfCriticalLooksIbanV126(inlineValue);
-      else if(semanticKey==='amount') valid=rfCriticalLooksAmountV126(inlineValue);
-      else if(semanticKey==='transactionNo') valid=rfCriticalLooksNumericIdV126(inlineValue);
-      else if(semanticKey==='senderName'||semanticKey==='recipientName') valid=rfCriticalLooksNameV126(inlineValue);
-      else if(semanticKey==='address') valid=rfCriticalLooksAddressV126(inlineValue);
+  // V1.2.8: OCR can return LABEL:VALUE, or LABEL VALUE, in one region.
+  // Resolve only the requested semantic field. This is intentionally limited
+  // to amount/name/identifier/IBAN fields; address is no longer a critical ROI.
+  if(label?.region){
+    const rawLabelText=String(label?.text||labelText||'').trim();
+    let inlineValue='';
+    let left='';
+    if(/[:：]/.test(rawLabelText)){
+      const parts=rawLabelText.split(/[:：]/);
+      left=String(parts.shift()||'').trim();
+      inlineValue=parts.join(':').trim();
+    } else if(semanticKey==='senderName'||semanticKey==='recipientName'){
+      const normalizedRaw=normalizeFieldTextForMatch(rawLabelText);
+      const normalizedLabel=normalizeFieldTextForMatch(labelText);
+      if(normalizedLabel && normalizedRaw.startsWith(normalizedLabel) && normalizedRaw.length>normalizedLabel.length){
+        left=labelText;
+        inlineValue=rawLabelText.slice(String(labelText).length).replace(/^[\s\-–—]+/,'').trim();
+      }
     }
-    if(valid){
-      return {
-        text:inlineValue,
-        region:rfCriticalCandidateBoxV126(label.region),
-        score:100,
-        criticalROI:true,
-        resolver:'inline-semantic-value-v127'
-      };
+    if(inlineValue){
+      const leftKey=rfCriticalSemanticKeyV126(field,left);
+      const sameSemantic=leftKey===semanticKey;
+      let valid=false;
+      if(sameSemantic){
+        if(semanticKey==='iban') valid=rfCriticalLooksIbanV126(inlineValue);
+        else if(semanticKey==='amount') valid=rfCriticalLooksAmountV126(inlineValue);
+        else if(semanticKey==='transactionNo') valid=rfCriticalLooksNumericIdV126(inlineValue);
+        else if(semanticKey==='senderName'||semanticKey==='recipientName') valid=rfCriticalLooksNameV126(inlineValue);
+      }
+      if(valid){
+        return {
+          text:inlineValue,
+          region:rfCriticalCandidateBoxV126(label.region),
+          score:100,
+          criticalROI:true,
+          resolver:'inline-semantic-value-v128'
+        };
+      }
     }
   }
 
@@ -8326,7 +8340,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         // promotions in earlier versions. Generic bank labels are mapped to a
         // semantic field only when their label is an exact/near-exact critical label.
         const TP_ALLOWED_FIELDS=new Set([
-          'amount','iban','senderName','recipientName','senderAddress','recipientAddress','address',
+          'amount','iban','senderName','recipientName',
           'transactionNo','accountNo','taxNo'
         ]);
         const TP_GENERIC_CRITICAL_MAP={
@@ -8335,8 +8349,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           'generic:MUSTERI UNVANI':'senderName',
           'generic:SIRA NO':'transactionNo',
           'generic:FIS NO':'transactionNo',
-          'generic:ESENTEPE':'address',
-          'generic:ADRES':'address',
           'generic:ALICI UNVANI':'recipientName',
           'generic:ALICI IBAN':'iban',
           'generic:IBAN/KART NO':'iban'
@@ -8524,7 +8536,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const sharedCount = Number(sameValueGlyph?.sharedCount || 0);
           const sharedDistance = Number(sameValueGlyph?.distance);
           if(!exactValue){
-            const dynamicField = ['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(field||''));
+            const dynamicField = ['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName'].includes(String(field||''));
             if(!dynamicField){
               if(!Number.isFinite(sharedDistance) || sharedCount < 4) return null;
               if(sharedDistance < 0.50) return null;
@@ -8670,7 +8682,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             const refGate=tpCriticalValueGate(semanticKey,valueRefText,refLabelText);
             const tarGate=tpCriticalValueGate(semanticKey,valueTarText,tarLabelText);
             const trustedROI=valueRefRaw?.criticalROI===true&&valueTarRaw?.criticalROI===true;
-            const dynamicCriticalField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(semanticKey));
+            const dynamicCriticalField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName'].includes(String(semanticKey));
             const trustedAmountRoiOnly =
               semanticKey==='amount' &&
               trustedROI &&
@@ -8679,11 +8691,18 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
             valueComparable=trustedROI&&refGate.ok&&tarGate.ok&&(dynamicCriticalField?true:tpValueComparable(semanticKey,valueRefText,valueTarText));
 
+            if(semanticKey==='amount' && trustedROI && tarGate.ok){
+              // V1.2.8: Amount Forensics + trusted reference anchor are sufficient
+              // to establish the amount ROI. Reference OCR may legitimately be
+              // empty; Typography must still compare the raster ROI.
+              valueComparable=true;
+            }
+
             if(trustedAmountRoiOnly){
               // The reference OCR text is not required when the trusted
               // reference amount anchor itself is available. Keep the ROI for
-              // raster comparison, but do not claim literal value comparability.
-              valueComparable=false;
+              // raster comparison and treat the trusted ROI pair as comparable.
+              valueComparable=true;
             } else if(!refGate.ok || !tarGate.ok){
               // Do not destroy a trusted amount ROI merely because OCR failed
               // to provide the reference token. Other fields still require a
@@ -8735,7 +8754,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           );
           // V21: do not use whole-value character geometry as the primary
           // evidence. Use the same-character glyph comparison instead.
-          const dynamicSemanticField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(semanticKey));
+          const dynamicSemanticField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName'].includes(String(semanticKey));
           const dynamicContentDifferent =
             dynamicSemanticField &&
             valueRefText &&
@@ -8815,7 +8834,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
 
-        console.log('TYPOGRAPHY CRITICAL ROI V1.2.7 RESOLVER:',JSON.stringify({
+        console.log('TYPOGRAPHY CRITICAL ROI V1.2.8 RESOLVER:',JSON.stringify({
           policy:'typed semantic ROI; explicit trusted amount ROI; wrong ROI => skip; literal value equality not required for dynamic critical fields',
           profiles:typographyFieldProfiles.map(p=>({field:p.field,valueComparable:p.valueComparable,valueReference:p.valueReference||null,valueTarget:p.valueTarget||null})).slice(0,30)
         }));
@@ -14896,7 +14915,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
     // reference amount anchor explicitly for the Reference Forensic Engine.
     // The target amount ROI still comes from amountForensics.region.
     const safeReferenceAmountField = (await getReferenceAmountAnchor(bank)) || null;
-    console.log("VERIFYDOC TYPOGRAPHY V1.2.5 ACTIVE");
+    console.log("VERIFYDOC TYPOGRAPHY V1.2.8 ACTIVE");
     console.log("REFERENCE FORENSIC AMOUNT FIELD HANDOFF V1.2.2:", JSON.stringify({
       available: Boolean(safeReferenceAmountField),
       source: safeReferenceAmountField?.source || safeReferenceAmountField?.templateRole || null,
