@@ -1,6 +1,7 @@
 import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
+import fsSync from "fs"
 import path from "path"
 import { createHash, createHmac } from "crypto"
 import { execFile } from "child_process"
@@ -4417,12 +4418,40 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
       }
     }
 
+    // V15.4 document-wide local signature. This is independent of the amount ROI
+    // so manipulations in IBAN/name/date/description can participate in matching.
+    const documentSpatialSignature=[];
+    const DOC_GRID_X=12, DOC_GRID_Y=6;
+    const docCellW=W/DOC_GRID_X, docCellH=H/DOC_GRID_Y;
+    const globalLuma=Math.max(1,rectStats(luma,{x1:1,y1:1,x2:Math.max(2,W-1),y2:Math.max(2,H-1)}).sd || 1);
+    for(let gy=0;gy<DOC_GRID_Y;gy++){
+      for(let gx=0;gx<DOC_GRID_X;gx++){
+        const cell={
+          x1:Math.max(1,Math.floor(gx*docCellW)),
+          y1:Math.max(1,Math.floor(gy*docCellH)),
+          x2:Math.min(W-1,Math.max(2,Math.ceil((gx+1)*docCellW))),
+          y2:Math.min(H-1,Math.max(2,Math.ceil((gy+1)*docCellH)))
+        };
+        const rs=residualStats(luma,cell);
+        const es=edgeStats(luma,cell);
+        const ls=rectStats(luma,cell);
+        documentSpatialSignature.push(
+          Math.max(0,Math.min(3,rs.mean/ctrlRes)),
+          Math.max(0,Math.min(3,es.mean/ctrlEdge)),
+          Math.max(0,Math.min(1,(255-ls.mean)/255)),
+          Math.max(0,Math.min(3,ls.sd/globalLuma))
+        );
+      }
+    }
+
     return {
       rawScore,
       supportSignals,
       features:[channelResidualScore,lumaResidualScore,edgeScore,textureScore,channelDivergenceScore],
       spatialSignature,
+      documentSpatialSignature,
       spatialSignatureVersion:'roi-grid-v1',
+      documentSpatialSignatureVersion:'document-grid-v1',
       roi,
     };
   } catch(error) {
@@ -4459,7 +4488,13 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
   try {
     if(!targetPath) return {available:false,engine,score:0,severity:'unknown',reason:'no-target'};
     const stat=await fs.stat(targetPath);
-    const cacheKey=`paintover-v2:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${JSON.stringify(amountForensics?.region||null)}`;
+    const negCacheParts=Array.isArray(negativeSamples)
+      ? negativeSamples.map(x=>typeof x==='string'?x:x?.path).filter(Boolean).map(p=>{
+          try { const st=fsSync.statSync(p); return `${p}:${st.size}:${st.mtimeMs}`; }
+          catch { return `${p}:missing`; }
+        }).join('|')
+      : 'auto-negative-set';
+    const cacheKey=`paintover-v2:v15.4-multiroi:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${JSON.stringify(amountForensics?.region||null)}:${negCacheParts}`;
     const cached=paintOverV2Cache.get(cacheKey);
     if(cached) return JSON.parse(JSON.stringify(cached));
 
@@ -4521,15 +4556,18 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
     };
     const aggregateSimilarity=(a,b)=>vectorSimilarity(a,b);
     const negativeSimilarities=negativeVectors.map(x=>{
-      const spatial=spatialSignatureSimilarity(target.spatialSignature,x.vector.spatialSignature);
+      const amountRoiSimilarity=spatialSignatureSimilarity(target.spatialSignature,x.vector.spatialSignature);
+      const documentSimilarity=spatialSignatureSimilarity(target.documentSpatialSignature,x.vector.documentSpatialSignature);
       const aggregate=aggregateSimilarity(targetFeature,x.vector.features);
-      // Aggregate signal remains a weak corroborator only; it cannot dominate
-      // the sample-specific local signature.
-      const similarity=spatial*0.85+aggregate*0.15;
+      // V15.4: document-local evidence is primary; amount ROI and aggregate
+      // evidence are corroboration only. This prevents unrelated samples from
+      // collapsing to the same similarity because their generic scores match.
+      const similarity=documentSimilarity*0.70+amountRoiSimilarity*0.15+aggregate*0.15;
       return {
         file:path.basename(x.path),
         similarity,
-        spatialSimilarity:spatial,
+        documentSimilarity,
+        spatialSimilarity:amountRoiSimilarity,
         aggregateSimilarity:aggregate,
         rawScore:x.vector.rawScore
       };
