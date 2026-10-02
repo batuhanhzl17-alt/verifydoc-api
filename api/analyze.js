@@ -8719,20 +8719,24 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           provisional:true,
         });
       }
-      // One field is never enough. Repeated evidence across >=3 distinct
-      // semantic value fields is the minimum provisional promotion gate.
-      if(provisional.length>=3){
+      // V1.2.4: a single trusted reference must not erase a strong, repeated
+      // same-value typography comparison. Keep it as PROVISIONAL evidence when
+      // at least one critical value field passes the repeated-glyph gate.
+      // This does NOT make the field a standalone fraud verdict; downstream
+      // corroboration gates remain responsible for user-facing promotion.
+      if(provisional.length>=1){
         ref.characterFindings=provisional;
         ref.typographyCredibleFieldCount=provisional.length;
         ref.typographyScore=rfClamp100(
           Math.min(50,provisional.filter(x=>x.severity==='strong').length*18)+
-          Math.min(20,provisional.length>=3?12:0)
+          Math.min(20,provisional.length>=3?12:provisional.length===2?8:5)
         );
-        ref.typographySeverity=provisional.length>=4?'strong':'medium';
-        ref.typographyCredibility=provisional.length>=4?'strong':'medium';
+        ref.typographySeverity=provisional.length>=4?'strong':provisional.length>=2?'medium':'low';
+        ref.typographyCredibility=provisional.length>=3?'strong':provisional.length>=2?'medium':'weak';
         singleReferencePromotions.set(ref.file,{
           promotedFieldCount:provisional.length,
-          fields:provisional.map(x=>String(x.field||'').replace(/:value$/i,''))
+          fields:provisional.map(x=>String(x.field||'').replace(/:value$/i,'')),
+          mode:'single-reference-provisional-v1.2.4'
         });
       }else{
         ref.characterFindings=[];
