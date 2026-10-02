@@ -6699,26 +6699,81 @@ function rfCriticalCandidateScoreV126(label,candidate,semanticKey){
   if(belowGap>=-lh*.30&&belowGap<belowLimit&&xGap<xLimit)cost=Math.min(cost,3+Math.max(0,belowGap)/Math.max(1,lh)+xGap/Math.max(1,lh)*.18);
   return cost;
 }
-function rfResolveCriticalValueRegionV126(regions,label,field,options={}){
-  if(!label?.region)return null;
+function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
   const semanticKey=rfCriticalSemanticKeyV126(field,label?.labelText||label?.text||'');
+  const labelText=String(label?.labelText||label?.text||'').trim();
+
+  // V1.2.7: OCR can return LABEL:VALUE in one region. Split it semantically
+  // before searching nearby regions. This is especially important for
+  // MÜŞTERİ ÜNVANI / ALICI ÜNVANI.
+  if(label?.region && /[:：]/.test(labelText)){
+    const parts=labelText.split(/[:：]/);
+    const left=String(parts.shift()||'').trim();
+    const inlineValue=parts.join(':').trim();
+    const leftKey=rfCriticalSemanticKeyV126(field,left);
+    const sameSemantic=leftKey===semanticKey;
+    let valid=false;
+    if(sameSemantic){
+      if(semanticKey==='iban') valid=rfCriticalLooksIbanV126(inlineValue);
+      else if(semanticKey==='amount') valid=rfCriticalLooksAmountV126(inlineValue);
+      else if(semanticKey==='transactionNo') valid=rfCriticalLooksNumericIdV126(inlineValue);
+      else if(semanticKey==='senderName'||semanticKey==='recipientName') valid=rfCriticalLooksNameV126(inlineValue);
+      else if(semanticKey==='address') valid=rfCriticalLooksAddressV126(inlineValue);
+    }
+    if(valid){
+      return {
+        text:inlineValue,
+        region:rfCriticalCandidateBoxV126(label.region),
+        score:100,
+        criticalROI:true,
+        resolver:'inline-semantic-value-v127'
+      };
+    }
+  }
+
+  if(!label?.region)return null;
+
   if(options?.explicitRegion){
     const r=rfCriticalCandidateBoxV126(options.explicitRegion);
-    if(r&&(r.x2-r.x1)>2&&(r.y2-r.y1)>2)return{text:String(options.explicitText??options.explicitRegion?.text??'').trim(),region:r,score:100,criticalROI:true,resolver:options.source||'explicit-trusted-roi-v126'};
+    if(r&&(r.x2-r.x1)>2&&(r.y2-r.y1)>2){
+      return {
+        text:String(options.explicitText??options.explicitRegion?.text??'').trim(),
+        region:r,
+        score:100,
+        criticalROI:true,
+        resolver:options.source||'explicit-trusted-roi-v127'
+      };
+    }
   }
-  const candidates=(Array.isArray(regions)?regions:[]).filter(v=>v&&v!==label&&v.region&&String(v.text||'').trim()).map(v=>{
-    const text=String(v.text||'').trim();let ok=false;
-    if(semanticKey==='iban')ok=rfCriticalLooksIbanV126(text);
-    else if(semanticKey==='amount')ok=rfCriticalLooksAmountV126(text);
-    else if(semanticKey==='transactionNo')ok=rfCriticalLooksNumericIdV126(text);
-    else if(semanticKey==='senderName'||semanticKey==='recipientName')ok=rfCriticalLooksNameV126(text);
-    else if(semanticKey==='address')ok=rfCriticalLooksAddressV126(text);
-    if(!ok||rfLooksLikeLabelRegion(v))return null;
-    const cost=rfCriticalCandidateScoreV126(label,v,semanticKey);if(!Number.isFinite(cost))return null;
-    const limit=semanticKey==='address'?16:semanticKey==='iban'?14:(semanticKey==='transactionNo'||semanticKey==='amount')?10:14;
-    if(cost>limit)return null;
-    return{...v,criticalROI:true,resolver:'semantic-typed-relative-v126',_cost:cost};
-  }).filter(Boolean).sort((a,b)=>a._cost-b._cost);
+
+  const candidates=(Array.isArray(regions)?regions:[])
+    .filter(v=>v&&v!==label&&v.region&&String(v.text||'').trim())
+    .map(v=>{
+      const text=String(v.text||'').trim();
+      let ok=false;
+      if(semanticKey==='iban')ok=rfCriticalLooksIbanV126(text);
+      else if(semanticKey==='amount')ok=rfCriticalLooksAmountV126(text);
+      else if(semanticKey==='transactionNo')ok=rfCriticalLooksNumericIdV126(text);
+      else if(semanticKey==='senderName'||semanticKey==='recipientName')ok=rfCriticalLooksNameV126(text);
+      else if(semanticKey==='address')ok=rfCriticalLooksAddressV126(text);
+
+      // Footer/boilerplate is never a customer/recipient name.
+      if((semanticKey==='senderName'||semanticKey==='recipientName') &&
+        /müşterinin yaptığı işlemlere ilişkin dekont asıllarının bir örneğidir|dekont asıllarının|işlemlere ilişkin/i.test(text)){
+        ok=false;
+      }
+
+      if(!ok||rfLooksLikeLabelRegion(v))return null;
+      const cost=rfCriticalCandidateScoreV126(label,v,semanticKey);
+      if(!Number.isFinite(cost))return null;
+      const limit=semanticKey==='address'?16:semanticKey==='iban'?14:
+        (semanticKey==='transactionNo'||semanticKey==='amount')?10:14;
+      if(cost>limit)return null;
+      return {...v,criticalROI:true,resolver:'semantic-typed-relative-v127',_cost:cost};
+    })
+    .filter(Boolean)
+    .sort((a,b)=>a._cost-b._cost);
+
   return candidates[0]||null;
 }
 
@@ -7867,6 +7922,11 @@ function rfFieldLabelText(label){
   return String(label?.labelText || label?.text || '').toLocaleLowerCase('tr-TR').replace(/\s+/g,' ').trim();
 }
 
+// V1.2.7 Critical ROI resolver patch:
+// - Amount = direct Amount Forensics ROI + trusted reference anchor.
+// - Customer/recipient names = semantic inline/relative value ROI only.
+// - Dynamic transaction IDs are never treated as literal-value mismatches.
+// - V15.2, Amount Forensics and Known-Fake layers remain untouched.
 async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null, amountForensics = null, referenceAmountFieldArg = null) {
   const referenceAmountField = referenceAmountFieldArg || null;
   const normalizedBank = normalizeBank(bank);
@@ -8540,13 +8600,15 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           let valueRefText='',valueTarText='';
           let refValueChar=null,tarValueChar=null;
           let sameValueGlyph=null;
-          let valueRefRaw=rfResolveCriticalValueRegionV126(refRegions,m.rl,key,{source:'semantic-typed-relative-v126'});
-          let valueTarRaw=rfResolveCriticalValueRegionV126(targetRegions,m.tl,key,{source:'semantic-typed-relative-v126'});
+          let valueRefRaw=rfResolveCriticalValueRegionV127(refRegions,m.rl,key,{source:'semantic-typed-relative-v127'});
+          let valueTarRaw=rfResolveCriticalValueRegionV127(targetRegions,m.tl,key,{source:'semantic-typed-relative-v127'});
 
-          // V1.2.6: amount is a special hard lock. The target amount ROI is the
-          // ROI already established by Amount Forensics; never let the generic
-          // OCR value resolver replace it with `0 TL SORGU NO: ...`. The
-          // reference amount ROI comes from the trusted reference amount anchor.
+          // V1.2.7 AMOUNT HARD LOCK:
+          // Amount Forensics is the authoritative target ROI. Never replace it
+          // with a nearby OCR number. The trusted reference anchor supplies the
+          // reference ROI. OCR text is optional for the reference side; the ROI
+          // itself remains valid even if PaddleOCR does not place a token exactly
+          // inside the normalized anchor.
           if(semanticKey==='amount'){
             if(amountForensics?.region && referenceAmountField && refSize?.width && refSize?.height && targetSize?.width && targetSize?.height){
               const rr={
@@ -8556,17 +8618,49 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
                 y2:Math.min(refSize.height,Math.round((Number(referenceAmountField.yNorm||0)+Number(referenceAmountField.heightNorm||0))*refSize.height))
               };
               const tr={...amountForensics.region};
-              const refAmountCandidates=refRegions.filter(x=>x?.region&&String(x.text||'').trim()).map(x=>({
-                x,overlap:rfCriticalOverlapAreaV126(x.region,rr),amountLike:rfCriticalLooksAmountV126(x.text)
-              })).filter(x=>x.overlap>0).sort((a,b)=>(Number(b.amountLike)-Number(a.amountLike))||(b.overlap-a.overlap));
-              const refAnchorRegion=refAmountCandidates[0]?.x||null;
-              const refAmountText=refAmountCandidates.find(x=>x.amountLike)?.x?.text||refAnchorRegion?.text||'';
-              valueRefRaw={text:String(refAmountText).trim(),region:rr,score:99,criticalROI:true,resolver:'trusted-reference-amount-anchor-v126'};
-              valueTarRaw={text:String(amountForensics.selectedAmountText||amountForensics.amountText||'').trim(),region:tr,score:99,criticalROI:true,resolver:'amount-forensics-region-v126'};
+
+              const refAmountCandidates=refRegions
+                .filter(x=>x?.region&&String(x.text||'').trim())
+                .map(x=>{
+                  const overlap=rfCriticalOverlapAreaV126(x.region,rr);
+                  const cx=((Number(x.region.x1)+Number(x.region.x2))/2)/Math.max(1,refSize.width);
+                  const cy=((Number(x.region.y1)+Number(x.region.y2))/2)/Math.max(1,refSize.height);
+                  const ax=(Number(referenceAmountField.xNorm||0)+Number(referenceAmountField.widthNorm||0)/2);
+                  const ay=(Number(referenceAmountField.yNorm||0)+Number(referenceAmountField.heightNorm||0)/2);
+                  const distance=Math.hypot(cx-ax,cy-ay);
+                  return {x,overlap,distance,amountLike:rfCriticalLooksAmountV126(x.text)};
+                })
+                .sort((a,b)=>
+                  (Number(b.amountLike)-Number(a.amountLike)) ||
+                  (Number(b.overlap)-Number(a.overlap)) ||
+                  (Number(a.distance)-Number(b.distance))
+                );
+
+              // Prefer a real amount token in/near the trusted anchor, but never
+              // reject the trusted ROI solely because OCR missed the token.
+              const refAnchorCandidate=refAmountCandidates.find(x=>x.amountLike&&
+                (x.overlap>0 || x.distance<=0.045)) || null;
+              const refAnchorRegion=refAnchorCandidate?.x||null;
+              const refAmountText=String(refAnchorCandidate?.x?.text||'').trim();
+
+              valueRefRaw={
+                text:refAmountText,
+                region:rr,
+                score:99,
+                criticalROI:true,
+                resolver:'trusted-reference-amount-anchor-v127',
+                roiOnly:!refAmountText
+              };
+              valueTarRaw={
+                text:String(amountForensics.selectedAmountText||amountForensics.amountText||'').trim(),
+                region:tr,
+                score:99,
+                criticalROI:true,
+                resolver:'amount-forensics-region-v127'
+              };
             } else {
-              // No trusted amount ROI => skip rather than falling back to a
-              // nearby OCR region.
-              valueRefRaw=null; valueTarRaw=null;
+              valueRefRaw=null;
+              valueTarRaw=null;
             }
           }
 
@@ -8577,14 +8671,32 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             const tarGate=tpCriticalValueGate(semanticKey,valueTarText,tarLabelText);
             const trustedROI=valueRefRaw?.criticalROI===true&&valueTarRaw?.criticalROI===true;
             const dynamicCriticalField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(semanticKey));
+            const trustedAmountRoiOnly =
+              semanticKey==='amount' &&
+              trustedROI &&
+              valueRefRaw?.roiOnly===true &&
+              tarGate.ok;
+
             valueComparable=trustedROI&&refGate.ok&&tarGate.ok&&(dynamicCriticalField?true:tpValueComparable(semanticKey,valueRefText,valueTarText));
-            if(!refGate.ok || !tarGate.ok){
-              valueRefRaw=null;
-              valueTarRaw=null;
-              valueRefText='';
-              valueTarText='';
+
+            if(trustedAmountRoiOnly){
+              // The reference OCR text is not required when the trusted
+              // reference amount anchor itself is available. Keep the ROI for
+              // raster comparison, but do not claim literal value comparability.
+              valueComparable=false;
+            } else if(!refGate.ok || !tarGate.ok){
+              // Do not destroy a trusted amount ROI merely because OCR failed
+              // to provide the reference token. Other fields still require a
+              // semantically valid value on both sides.
+              if(!(semanticKey==='amount' && trustedROI)){
+                valueRefRaw=null;
+                valueTarRaw=null;
+                valueRefText='';
+                valueTarText='';
+              }
               valueComparable=false;
             }
+
             const vrConf=tpConfidence(valueRefRaw),vtConf=tpConfidence(valueTarRaw);
             if(vrConf!==null&&vrConf<65)valueComparable=false;
             if(vtConf!==null&&vtConf<65)valueComparable=false;
@@ -8623,7 +8735,16 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           );
           // V21: do not use whole-value character geometry as the primary
           // evidence. Use the same-character glyph comparison instead.
-          const valueFinding=rfDynamicValueFinding(key,refLabelText,valueTarText,sameValueGlyph);
+          const dynamicSemanticField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(semanticKey));
+          const dynamicContentDifferent =
+            dynamicSemanticField &&
+            valueRefText &&
+            valueTarText &&
+            tpNorm(valueRefText)!==tpNorm(valueTarText);
+          const valueFinding =
+            dynamicContentDifferent
+              ? null
+              : rfDynamicValueFinding(key,refLabelText,valueTarText,sameValueGlyph);
           // V23 primary typography evidence: internal style substitution.
           // This compares value-vs-label typography relationship in target vs
           // reference, so a global camera/JPEG rendering shift largely cancels.
@@ -8694,7 +8815,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
 
-        console.log('TYPOGRAPHY CRITICAL ROI V1.2.6 RESOLVER:',JSON.stringify({
+        console.log('TYPOGRAPHY CRITICAL ROI V1.2.7 RESOLVER:',JSON.stringify({
           policy:'typed semantic ROI; explicit trusted amount ROI; wrong ROI => skip; literal value equality not required for dynamic critical fields',
           profiles:typographyFieldProfiles.map(p=>({field:p.field,valueComparable:p.valueComparable,valueReference:p.valueReference||null,valueTarget:p.valueTarget||null})).slice(0,30)
         }));
