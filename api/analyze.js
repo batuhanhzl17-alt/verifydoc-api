@@ -6953,6 +6953,16 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
     const inkAspect = inkH ? inkW / inkH : 0;
     const characterHeightToInkHeight = medianBodyHeight / Math.max(1, inkH);
     const characterWidthToHeight = medianBodyHeight ? medianBodyWidth / medianBodyHeight : 0;
+    // V1.1 forensic scale features: absolute pixel size is NOT compared directly
+    // because reference/target can have different raster resolutions. Instead,
+    // character size is normalized to the ORIGINAL document dimensions. This
+    // preserves scale drift as a measurable feature instead of erasing it during
+    // ROI resize. A global resize affects label and value similarly; a locally
+    // substituted value font creates a relative scale deviation.
+    const documentCharacterHeightNorm = imageSize.height ? (medianBodyHeight / 96) * (h / imageSize.height) : 0;
+    const documentCharacterWidthNorm = imageSize.width ? (medianBodyWidth / 240) * (w / imageSize.width) : 0;
+    const documentInkHeightNorm = imageSize.height ? (inkH / 96) * (h / imageSize.height) : 0;
+    const documentInkWidthNorm = imageSize.width ? (inkW / 240) * (w / imageSize.width) : 0;
     const characterFillRatio = medianFillRatio;
     const characterGapToHeight = medianBodyHeight ? rfMedian(gaps) : 0;
     const characterAreaToInkArea = medianBodyArea / Math.max(1, tightInkArea);
@@ -6965,6 +6975,13 @@ async function rfCharacterMetrics(imageBuffer, region, imageSize) {
       // Scale-free typography fingerprint used by v2 distance scoring.
       characterHeightToInkHeight,
       characterWidthToHeight,
+      // Scale is intentionally retained as a forensic signal.
+      documentCharacterHeightNorm,
+      documentCharacterWidthNorm,
+      documentInkHeightNorm,
+      documentInkWidthNorm,
+      regionWidthNorm: imageSize.width ? w / imageSize.width : 0,
+      regionHeightNorm: imageSize.height ? h / imageSize.height : 0,
       characterFillRatio,
       characterGapToHeight,
       characterAreaToInkArea,
@@ -8135,11 +8152,28 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         // + yeterli metin benzerliği + temiz tek satır koşullarında yapılır.
         const typographyFindings=[];
         const typographyFieldProfiles=[];
+        // V1.1: Typography is deliberately restricted to the critical semantic
+        // fields. Broad whole-document matching was the source of wrong-place
+        // promotions in earlier versions. Generic bank labels are mapped to a
+        // semantic field only when their label is an exact/near-exact critical label.
         const TP_ALLOWED_FIELDS=new Set([
-          'branch','date','time','description','transactionNo','accountNo','taxNo',
-          'amount','iban','senderName','recipientName','senderAddress','recipientAddress','address'
+          'amount','iban','senderName','recipientName','senderAddress','recipientAddress','address',
+          'transactionNo','accountNo','taxNo'
         ]);
-        const tpAllowedFieldKey=(key)=>TP_ALLOWED_FIELDS.has(String(key||'')) || String(key||'').startsWith('generic:');
+        const TP_GENERIC_CRITICAL_MAP={
+          'generic:GIDEN FAST EFT':'senderName',
+          'generic:EFT TUTARI':'amount',
+          'generic:MUSTERI UNVANI':'senderName',
+          'generic:SIRA NO':'transactionNo',
+          'generic:FIS NO':'transactionNo',
+          'generic:ESENTEPE':'address',
+          'generic:ADRES':'address',
+          'generic:ALICI UNVANI':'recipientName',
+          'generic:ALICI IBAN':'iban',
+          'generic:IBAN/KART NO':'iban'
+        };
+        const tpSemanticField=(key)=>TP_GENERIC_CRITICAL_MAP[String(key||'')] || String(key||'');
+        const tpAllowedFieldKey=(key)=>TP_ALLOWED_FIELDS.has(tpSemanticField(key));
 
         const tpNorm=(v)=>normalizeFieldTextForMatch(String(v||''))
           .replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
@@ -8199,13 +8233,18 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           };
           return (patterns[field]||[]).some(re=>re.test(n));
         };
-        const tpValueComparable=(a,b)=>{
+        const tpValueComparable=(field,a,b)=>{
           const aa=tpValueText(a),bb=tpValueText(b);
-          if(!aa||!bb||!tpSingleLine(aa,90)||!tpSingleLine(bb,90))return false;
+          if(!aa||!bb||!tpSingleLine(aa,110)||!tpSingleLine(bb,110))return false;
           const ka=tpKind(aa),kb=tpKind(bb);
           if(ka==='other'||kb==='other'||ka!==kb)return false;
+          const f=String(field||'');
+          // Dynamic financial/identifier fields must remain comparable even when
+          // the actual value length changes (750 -> 1000, one IBAN -> another).
+          // Literal text similarity is never required for these fields.
+          if(['amount','iban','transactionNo','accountNo','taxNo'].includes(f)) return true;
           const lenRatio=Math.min(aa.length,bb.length)/Math.max(aa.length,bb.length);
-          return lenRatio>=0.55;
+          return lenRatio>=0.30;
         };
         const tpSafeRegion=(r)=>{
           if(!r?.region)return false;
@@ -8214,106 +8253,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           if(!(w>2&&h>2))return false;
           const aspect=w/Math.max(1,h);
           return aspect>=1.15 && aspect<=90;
-        };
-
-        // V15.4.4 — CRITICAL TYPOGRAPHY ROI V1 (ENPARA)
-        // Typography is intentionally restricted to a small, semantically safe
-        // field whitelist. The goal is to prevent the value resolver from ever
-        // assigning an unrelated OCR line (for example a footer or bank name) to
-        // a field such as SIRA NO / FIS NO / IBAN.
-        const tpEnparaCriticalSpec=(fieldKey,labelText)=>{
-          const rawKey=String(fieldKey||'');
-          const n=normalizeFieldTextForMatch(String(labelText||'')).replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
-          const compact=n.replace(/\s+/g,'');
-          if(/giden\s+fast(?:\s+eft)?|giden\s+eft/.test(n) || /gidenfast(?:eft)?/.test(compact))
-            return {name:'GIDEN FAST EFT',semantic:'text',required:true};
-          if(/eft\s+tutari|giden\s+fast\s+tutari|giden\s+eft\s+tutari|\btutar\b/.test(n))
-            return {name:'EFT TUTARI',semantic:'amount',required:true};
-          if(/musteri\s+unvani|musteri\s+adi|gonderen\s+unvani/.test(n))
-            return {name:'MUSTERI UNVANI',semantic:'text',required:true};
-          if(/sira\s+no|sira\s+numarasi/.test(n))
-            return {name:'SIRA NO',semantic:'numeric-id',required:true};
-          if(/fis\s+no|fis\s+numarasi/.test(n))
-            return {name:'FIS NO',semantic:'numeric-id',required:true};
-          if(/alici\s+(unvani|adi|ad\s+soyad)|alacakli\s+(unvani|adi|ad\s+soyad)/.test(n))
-            return {name:'ALICI UNVANI',semantic:'text',required:true};
-          if(/alici\s+iban|alacakli\s+iban|iban(?:\s*\/\s*kart)?\s*no/.test(n) || /iban/i.test(rawKey))
-            return {name:'ALICI IBAN',semantic:'iban',required:true};
-          if(/adres/.test(n) || /esentepe|sisl|istanbul/.test(n) || /address/i.test(rawKey))
-            return {name:'ADRES',semantic:'address',required:true};
-          return null;
-        };
-
-        const tpEnparaSemanticType=(semantic,text)=>{
-          const s=String(text||'').trim();
-          if(!s)return 'other';
-          if(semantic==='iban') return rfValueTypeForField('iban',s,'IBAN NO');
-          if(semantic==='amount') return rfValueTypeForField('amount',s,'EFT TUTARI');
-          if(semantic==='numeric-id') return rfValueTypeForField('transactionNo',s,'SIRA NO');
-          if(semantic==='address'){
-            const looksAddress=/\b(?:cad|caddesi|sok|sokak|mah|mahalle|no[: ]|istanbul|ankara|esentepe|sisli|\d{3,})\b/i.test(s);
-            return looksAddress && /[A-Za-zÇĞİÖŞÜçğıöşü]{3,}/.test(s) ? 'text' : 'other';
-          }
-          return /[A-Za-zÇĞİÖŞÜçğıöşü]{2,}/.test(s) ? 'text' : 'other';
-        };
-
-        const tpEnparaAmountCrop=(candidate)=>{
-          if(!candidate?.region)return candidate;
-          const text=String(candidate.text||'').trim();
-          const m=text.match(/(?:^|\s)(\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?=\s*(?:TL|TRY|₺)?(?:\s|$))/i);
-          if(!m)return candidate;
-          const start=Math.max(0,text.indexOf(m[1]));
-          const end=start+m[1].length;
-          const ratioStart=start/Math.max(1,text.length);
-          const ratioEnd=end/Math.max(1,text.length);
-          const r=candidate.region;
-          const width=Number(r.x2)-Number(r.x1);
-          if(!(width>4))return candidate;
-          return {
-            ...candidate,
-            text:m[1],
-            region:{...r,x1:Number(r.x1)+width*ratioStart,x2:Number(r.x1)+width*ratioEnd}
-          };
-        };
-
-        const tpEnparaResolveValueROI=(regions,label,fieldKey)=>{
-          const spec=tpEnparaCriticalSpec(fieldKey,label?.text||label?.labelText||'');
-          if(!spec || !label?.region)return null;
-          const lr=label.region;
-          const lh=Math.max(6,Number(lr.y2)-Number(lr.y1));
-          const ly=(Number(lr.y1)+Number(lr.y2))/2;
-          const lx=(Number(lr.x1)+Number(lr.x2))/2;
-          const candidates=[];
-          for(const v of regions||[]){
-            if(v===label || !v?.region || !String(v.text||'').trim())continue;
-            if(rfLooksLikeLabelRegion(v))continue;
-            const rawText=String(v.text||'').trim();
-            const semanticType=tpEnparaSemanticType(spec.semantic,rawText);
-            if(semanticType==='other')continue;
-            const r=v.region;
-            const vertical=Math.min(Number(lr.y2),Number(r.y2))-Math.max(Number(lr.y1),Number(r.y1));
-            const rightGap=Number(r.x1)-Number(lr.x2);
-            const centerY=(Number(r.y1)+Number(r.y2))/2;
-            const sameRow=vertical>=-lh*.45;
-            let cost=Infinity;
-            if(sameRow && rightGap>=-lh*.25 && rightGap<Math.max(280,lh*18)){
-              cost=Math.max(0,rightGap)/Math.max(1,lh)+Math.abs(centerY-ly)/Math.max(1,lh)*.65;
-            }else{
-              const belowGap=Number(r.y1)-Number(lr.y2);
-              const xGap=Math.abs(((Number(r.x1)+Number(r.x2))/2)-lx);
-              if(belowGap>=-lh*.25 && belowGap<Math.max(150,lh*7) && xGap<Math.max(240,lh*12))
-                cost=3.0+Math.max(0,belowGap)/Math.max(1,lh)+xGap/Math.max(1,lh)*.22;
-            }
-            if(!Number.isFinite(cost))continue;
-            // Numeric IDs may contain separators, but never prose.
-            if(spec.semantic==='numeric-id' && !/^\s*[A-Za-z0-9][A-Za-z0-9 -]{2,24}\s*$/.test(rawText))continue;
-            candidates.push({v,cost,semanticType});
-          }
-          candidates.sort((a,b)=>a.cost-b.cost);
-          const best=candidates[0];
-          if(!best)return null;
-          const out=spec.semantic==='amount'?tpEnparaAmountCrop(best.v):best.v;
-          return {...out,criticalTypography:true,criticalField:spec.name,semanticType:spec.semanticType||spec.semantic};
         };
 
         // V23: Compare the VALUE's typography to the LABEL's typography within
@@ -8340,7 +8279,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             ['heightToInk',tpRatio(valueChar.characterHeightToInkHeight,labelChar.characterHeightToInkHeight)],
             ['areaToInk',tpRatio(valueChar.characterAreaToInkArea,labelChar.characterAreaToInkArea)],
             ['heightSpread',tpRatio(valueChar.heightSpreadLocal,labelChar.heightSpreadLocal)],
-            ['widthSpread',tpRatio(valueChar.widthSpreadLocal,labelChar.widthSpreadLocal)]
+            ['widthSpread',tpRatio(valueChar.widthSpreadLocal,labelChar.widthSpreadLocal)],
+            // V1.1: preserve relative scale instead of normalizing it away.
+            ['documentCharacterHeight',tpRatio(valueChar.documentCharacterHeightNorm,labelChar.documentCharacterHeightNorm)],
+            ['documentCharacterWidth',tpRatio(valueChar.documentCharacterWidthNorm,labelChar.documentCharacterWidthNorm)],
+            ['documentInkHeight',tpRatio(valueChar.documentInkHeightNorm,labelChar.documentInkHeightNorm)],
+            ['documentInkWidth',tpRatio(valueChar.documentInkWidthNorm,labelChar.documentInkWidthNorm)]
           ];
           const out={};
           for(const [k,v] of pairs)if(Number.isFinite(v)&&v>0)out[k]=v;
@@ -8373,8 +8317,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const sharedCount = Number(sameValueGlyph?.sharedCount || 0);
           const sharedDistance = Number(sameValueGlyph?.distance);
           if(!exactValue){
-            if(!Number.isFinite(sharedDistance) || sharedCount < 4) return null;
-            if(sharedDistance < 0.50) return null;
+            const dynamicField = ['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(field||''));
+            if(!dynamicField){
+              if(!Number.isFinite(sharedDistance) || sharedCount < 4) return null;
+              if(sharedDistance < 0.50) return null;
+            }
           }
           // Require several relation dimensions to move together. One metric
           // alone is too sensitive to OCR segmentation or camera noise.
@@ -8399,6 +8346,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
         for(const m of matches){
           const key=String(m?.rl?.rule?.key||'');
+          const semanticKey=tpSemanticField(key);
           if(!tpAllowedFieldKey(key))continue;
 
           const refLabelText=tpLabelClean(m?.rl?.labelText || m?.rl?.text);
@@ -8412,15 +8360,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           // label text is exact (or near-exact). This is important for fields
           // such as DOKÜMAN NUMARASI / İŞLEM YERİ that are real fields in a
           // trusted bank reference but are not hard-coded canonical vocabulary.
-          const refCanonical=tpCanonicalLabel(key,refLabelText);
-          const tarCanonical=tpCanonicalLabel(key,tarLabelText);
+          const refCanonical=tpCanonicalLabel(semanticKey,refLabelText);
+          const tarCanonical=tpCanonicalLabel(semanticKey,tarLabelText);
           const genericKey=String(key).startsWith('generic:');
           const genericExact=genericKey && tpNorm(refLabelText)===tpNorm(tarLabelText);
-          const enparaCriticalSpec = normalizedBank === 'enpara'
-            ? tpEnparaCriticalSpec(key, refLabelText)
-            : null;
-          if(normalizedBank === 'enpara' && !enparaCriticalSpec) continue;
-          if((!refCanonical||!tarCanonical) && !genericExact && !enparaCriticalSpec)continue;
+          if((!refCanonical||!tarCanonical) && !genericExact)continue;
 
           const labelDistance=tpDistance(refLabelText,tarLabelText);
           const exactLabel=tpNorm(refLabelText)===tpNorm(tarLabelText);
@@ -8449,17 +8393,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           let valueRefText='',valueTarText='';
           let refValueChar=null,tarValueChar=null;
           let sameValueGlyph=null;
-          const isEnparaCritical = normalizedBank === 'enpara' && Boolean(tpEnparaCriticalSpec(m.rl.rule.key,m.rl.labelText||m.rl.text));
-          const valueRefRaw=isEnparaCritical
-            ? tpEnparaResolveValueROI(refRegions,m.rl,m.rl.rule.key)
-            : rfFindValueRegion(refRegions,m.rl,m.rl.rule.key);
-          const valueTarRaw=isEnparaCritical
-            ? tpEnparaResolveValueROI(targetRegions,m.tl,m.tl.rule.key)
-            : rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
+          const valueRefRaw=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key);
+          const valueTarRaw=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
           if(valueRefRaw&&valueTarRaw){
             valueRefText=tpValueText(valueRefRaw.text);
             valueTarText=tpValueText(valueTarRaw.text);
-            valueComparable=tpValueComparable(valueRefText,valueTarText);
+            valueComparable=tpValueComparable(semanticKey,valueRefText,valueTarText);
             const vrConf=tpConfidence(valueRefRaw),vtConf=tpConfidence(valueTarRaw);
             if(vrConf!==null&&vrConf<65)valueComparable=false;
             if(vtConf!==null&&vtConf<65)valueComparable=false;
@@ -8503,7 +8442,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           // This compares value-vs-label typography relationship in target vs
           // reference, so a global camera/JPEG rendering shift largely cancels.
           const internalStyleFinding=tpInternalStyleFinding(
-            key,refLabelText,valueRefText,valueTarText,refValueChar,tarValueChar,refChar,tarChar,sameValueGlyph
+            semanticKey,refLabelText,valueTarText,valueRefText,valueTarText,refValueChar,tarValueChar,refChar,tarChar,sameValueGlyph
           );
 
           const profile={
@@ -8516,12 +8455,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             labelCharacterDistance:Number.isFinite(labelCharDistance)?Number(labelCharDistance.toFixed(4)):null,
             labelDiacriticDistance:Number.isFinite(labelDiaDistance)?Number(labelDiaDistance.toFixed(4)):null,
             valueComparable,
-            criticalTypographyField:Boolean(isEnparaCritical),
-            criticalTypographyName:isEnparaCritical ? enparaCriticalSpec.name : null,
-            valueROITrusted:Boolean(valueRefRaw&&valueTarRaw),
-            valueROIReason:(valueRefRaw&&valueTarRaw)?'trusted-critical-roi':'no-trusted-critical-roi',
-            valueSemanticTypeReference:rfValueTypeForField(key,valueRefText,refLabelText),
-            valueSemanticTypeTarget:rfValueTypeForField(key,valueTarText,tarLabelText),
+            valueSemanticTypeReference:rfValueTypeForField(semanticKey,valueRefText,refLabelText),
+            valueSemanticTypeTarget:rfValueTypeForField(semanticKey,valueTarText,tarLabelText),
             valueReference:valueRefText||null,
             valueTarget:valueTarText||null,
             valueCharacterDistance:Number.isFinite(valueDistance)?Number(valueDistance.toFixed(4)):null,
@@ -8534,6 +8469,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             rasterNormalization:'luma-jpeg-q90-444-v15.4.3',
             labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
             labelTargetProfile:{characterWidthToHeight:Number(tarChar.characterWidthToHeight?.toFixed?.(4) ?? tarChar.characterWidthToHeight),characterFillRatio:Number(tarChar.characterFillRatio?.toFixed?.(4) ?? tarChar.characterFillRatio),characterGapToHeight:Number(tarChar.characterGapToHeight?.toFixed?.(4) ?? tarChar.characterGapToHeight),diacriticCount:Number(tarChar.diacriticCount||0)},
+            scaleForensics:{
+              reference:{characterHeightNorm:Number(refChar.documentCharacterHeightNorm?.toFixed?.(6) ?? refChar.documentCharacterHeightNorm),characterWidthNorm:Number(refChar.documentCharacterWidthNorm?.toFixed?.(6) ?? refChar.documentCharacterWidthNorm),inkHeightNorm:Number(refChar.documentInkHeightNorm?.toFixed?.(6) ?? refChar.documentInkHeightNorm),inkWidthNorm:Number(refChar.documentInkWidthNorm?.toFixed?.(6) ?? refChar.documentInkWidthNorm)},
+              target:{characterHeightNorm:Number(tarChar.documentCharacterHeightNorm?.toFixed?.(6) ?? tarChar.documentCharacterHeightNorm),characterWidthNorm:Number(tarChar.documentCharacterWidthNorm?.toFixed?.(6) ?? tarChar.documentCharacterWidthNorm),inkHeightNorm:Number(tarChar.documentInkHeightNorm?.toFixed?.(6) ?? tarChar.documentInkHeightNorm),inkWidthNorm:Number(tarChar.documentInkWidthNorm?.toFixed?.(6) ?? tarChar.documentInkWidthNorm)},
+              relationDistance: (()=>{ const vals=[tpLogRatio(refChar.documentCharacterHeightNorm,tarChar.documentCharacterHeightNorm),tpLogRatio(refChar.documentCharacterWidthNorm,tarChar.documentCharacterWidthNorm),tpLogRatio(refChar.documentInkHeightNorm,tarChar.documentInkHeightNorm),tpLogRatio(refChar.documentInkWidthNorm,tarChar.documentInkWidthNorm)].filter(Number.isFinite); return vals.length?Number(rfMedian(vals).toFixed(4)):null; })()
+            },
           };
           // V22: label-only raster differences are not enough. PDF-vs-camera/JPEG
           // rendering commonly changes label edges even when the document is genuine.
@@ -8546,7 +8486,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             labelFinding: labelFinding ? {...labelFinding,scope:'label',labelText:refLabelText,targetLabelText:tarLabelText} : null,
             valueFinding: valueFinding ? {...valueFinding,scope:'value',labelText:refLabelText,targetLabelText:tarLabelText} : null,
           });
-          if(internalStyleFinding && (!isEnparaCritical || (valueRefRaw&&valueTarRaw&&valueComparable))){
+          if(internalStyleFinding){
             // V25: the annotation must point to the SAME target value ROI that
             // produced the typography evidence. Never annotate the label as the
             // fraud location. Keep both target/reference boxes for traceability.
@@ -8568,7 +8508,14 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
 
-        console.log('TYPOGRAPHY CRITICAL ROI V1 + V23.1 RASTER-NORMALIZED:',JSON.stringify({
+        console.log('TYPOGRAPHY CRITICAL ROI V1.1 SCALE-AWARE:', JSON.stringify({
+          criticalFields:[...TP_ALLOWED_FIELDS],
+          scalePolicy:'document-normalized character/ink scale is measured; not discarded during ROI normalization',
+          scaleFeatures:['documentCharacterHeightNorm','documentCharacterWidthNorm','documentInkHeightNorm','documentInkWidthNorm'],
+          profiles:typographyFieldProfiles.map(p=>({field:p.field,valueComparable:p.valueComparable,scaleRelationDistance:p.scaleForensics?.relationDistance||null})).slice(0,30)
+        }));
+
+        console.log('TYPOGRAPHY PRECISION GATE V23.1 RASTER-NORMALIZED:',JSON.stringify({
           matchedFields:matches.length,
           allowedFieldCandidates:matches.filter(m=>tpAllowedFieldKey(String(m?.rl?.rule?.key||''))).length,
           profilesBeforeDedup:typographyFieldProfiles.length,
