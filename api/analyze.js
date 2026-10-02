@@ -1,7 +1,6 @@
 import OpenAI from "openai"
 import formidable from "formidable"
 import fs from "fs/promises"
-import fsSync from "fs"
 import path from "path"
 import { createHash, createHmac } from "crypto"
 import { execFile } from "child_process"
@@ -4272,7 +4271,7 @@ async function listPaintOverV2Samples(bank, kind = "genuine") {
   }
 }
 
-async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank = null, options = null) {
+async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank = null) {
   if (!targetPath) return null;
   try {
     const encoded = await fs.readFile(targetPath);
@@ -4285,55 +4284,6 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
     const base = await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().raw().toBuffer();
 
     let roi = v68RegionTo512(amountForensics?.region, sourceW, sourceH, W, H);
-    let roiSource = roi ? 'amount-forensics' : null;
-
-    // V15.4.1: negative samples must not all be forced onto the bank amount
-    // anchor. When building a known-fake fingerprint, locate the strongest
-    // local residual/edge anomaly first and use that sample's own ROI.
-    // This keeps fake.3000 / fake.8000 / fake.iban / fake.iban2 sample-specific.
-    if (!roi && options?.autoRoi === true) {
-      try {
-        const detect = await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().greyscale().raw().toBuffer();
-        const sampleW = Math.max(12, Math.min(64, Math.round(W * 0.10)));
-        const sampleH = Math.max(8, Math.min(28, Math.round(H * 0.028)));
-        let best = null;
-        const stepX = Math.max(8, Math.floor(sampleW * 0.55));
-        const stepY = Math.max(6, Math.floor(sampleH * 0.75));
-        for (let y1 = 8; y1 + sampleH < H - 8; y1 += stepY) {
-          for (let x1 = 8; x1 + sampleW < W - 8; x1 += stepX) {
-            const r = {x1, y1, x2:x1+sampleW, y2:y1+sampleH};
-            const inner = {x1:r.x1+2,y1:r.y1+2,x2:r.x2-2,y2:r.y2-2};
-            const ring = {x1:Math.max(1,r.x1-3),y1:Math.max(1,r.y1-3),x2:Math.min(W-1,r.x2+3),y2:Math.min(H-1,r.y2+3)};
-            let n=0,sum=0,edge=0,ringSum=0,ringEdge=0;
-            for(let yy=inner.y1;yy<inner.y2;yy++) for(let xx=inner.x1;xx<inner.x2;xx++){
-              const i=yy*W+xx; const v=detect[i];
-              const local=(detect[i-1]+detect[i+1]+detect[i-W]+detect[i+W])*0.25;
-              sum+=Math.abs(v-local);
-              const gx=Math.abs(detect[i+1]-detect[i-1]), gy=Math.abs(detect[i+W]-detect[i-W]);
-              edge+=Math.sqrt(gx*gx+gy*gy); n++;
-            }
-            for(let yy=ring.y1;yy<ring.y2;yy++) for(let xx=ring.x1;xx<ring.x2;xx++){
-              if(xx>=r.x1&&xx<r.x2&&yy>=r.y1&&yy<r.y2) continue;
-              const i=yy*W+xx; const v=detect[i];
-              const local=(detect[i-1]+detect[i+1]+detect[i-W]+detect[i+W])*0.25;
-              ringSum+=Math.abs(v-local);
-              const gx=Math.abs(detect[i+1]-detect[i-1]), gy=Math.abs(detect[i+W]-detect[i-W]);
-              ringEdge+=Math.sqrt(gx*gx+gy*gy);
-            }
-            if(n<20) continue;
-            const residualMean=sum/n, edgeMean=edge/n;
-            const ringCount=Math.max(1,(ring.x2-ring.x1)*(ring.y2-ring.y1)-sampleW*sampleH);
-            const ringResidual=ringSum/ringCount, ringEdgeMean=ringEdge/ringCount;
-            const residualContrast=residualMean/Math.max(1,ringResidual);
-            const edgeContrast=edgeMean/Math.max(1,ringEdgeMean);
-            const score=Math.min(5,residualContrast)*0.58+Math.min(5,edgeContrast)*0.42;
-            if(!best || score>best.score) best={score,roi:r,residualContrast,edgeContrast};
-          }
-        }
-        if(best) { roi=best.roi; roiSource='auto-local-anomaly'; }
-      } catch {}
-    }
-
     if (!roi && bank) {
       try {
         const anchor = await getReferenceAmountAnchor(bank);
@@ -4344,7 +4294,6 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
             x2: Math.round((anchor.xNorm + anchor.widthNorm) * W),
             y2: Math.round((anchor.yNorm + anchor.heightNorm) * H),
           };
-          roiSource = 'bank-reference-anchor';
         }
       } catch {}
     }
@@ -4468,42 +4417,13 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
       }
     }
 
-    // V15.4 document-wide local signature. This is independent of the amount ROI
-    // so manipulations in IBAN/name/date/description can participate in matching.
-    const documentSpatialSignature=[];
-    const DOC_GRID_X=12, DOC_GRID_Y=6;
-    const docCellW=W/DOC_GRID_X, docCellH=H/DOC_GRID_Y;
-    const globalLuma=Math.max(1,rectStats(luma,{x1:1,y1:1,x2:Math.max(2,W-1),y2:Math.max(2,H-1)}).sd || 1);
-    for(let gy=0;gy<DOC_GRID_Y;gy++){
-      for(let gx=0;gx<DOC_GRID_X;gx++){
-        const cell={
-          x1:Math.max(1,Math.floor(gx*docCellW)),
-          y1:Math.max(1,Math.floor(gy*docCellH)),
-          x2:Math.min(W-1,Math.max(2,Math.ceil((gx+1)*docCellW))),
-          y2:Math.min(H-1,Math.max(2,Math.ceil((gy+1)*docCellH)))
-        };
-        const rs=residualStats(luma,cell);
-        const es=edgeStats(luma,cell);
-        const ls=rectStats(luma,cell);
-        documentSpatialSignature.push(
-          Math.max(0,Math.min(3,rs.mean/ctrlRes)),
-          Math.max(0,Math.min(3,es.mean/ctrlEdge)),
-          Math.max(0,Math.min(1,(255-ls.mean)/255)),
-          Math.max(0,Math.min(3,ls.sd/globalLuma))
-        );
-      }
-    }
-
     return {
       rawScore,
       supportSignals,
       features:[channelResidualScore,lumaResidualScore,edgeScore,textureScore,channelDivergenceScore],
       spatialSignature,
-      documentSpatialSignature,
       spatialSignatureVersion:'roi-grid-v1',
-      documentSpatialSignatureVersion:'document-grid-v1',
       roi,
-      roiSource: roiSource || 'unknown',
     };
   } catch(error) {
     console.warn('PAINT-OVER V2 VECTOR HATASI:',error?.message||error);
@@ -4539,13 +4459,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
   try {
     if(!targetPath) return {available:false,engine,score:0,severity:'unknown',reason:'no-target'};
     const stat=await fs.stat(targetPath);
-    const negCacheParts=Array.isArray(negativeSamples)
-      ? negativeSamples.map(x=>typeof x==='string'?x:x?.path).filter(Boolean).map(p=>{
-          try { const st=fsSync.statSync(p); return `${p}:${st.size}:${st.mtimeMs}`; }
-          catch { return `${p}:missing`; }
-        }).join('|')
-      : 'auto-negative-set';
-    const cacheKey=`paintover-v2:v15.4.1-sample-roi:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${JSON.stringify(amountForensics?.region||null)}:${negCacheParts}`;
+    const cacheKey=`paintover-v2:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${JSON.stringify(amountForensics?.region||null)}`;
     const cached=paintOverV2Cache.get(cacheKey);
     if(cached) return JSON.parse(JSON.stringify(cached));
 
@@ -4584,7 +4498,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       : await listPaintOverV2Samples(bank,'negative');
     const negativeVectors=[];
     for(const samplePath of negPaths){
-      const v=await extractPaintOverV2Vector(samplePath,null,bank,{autoRoi:true});
+      const v=await extractPaintOverV2Vector(samplePath,null,bank);
       if(v) negativeVectors.push({path:samplePath,vector:v});
     }
     const targetFeature=target.features;
@@ -4607,24 +4521,17 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
     };
     const aggregateSimilarity=(a,b)=>vectorSimilarity(a,b);
     const negativeSimilarities=negativeVectors.map(x=>{
-      const amountRoiSimilarity=spatialSignatureSimilarity(target.spatialSignature,x.vector.spatialSignature);
-      const documentSimilarity=spatialSignatureSimilarity(target.documentSpatialSignature,x.vector.documentSpatialSignature);
+      const spatial=spatialSignatureSimilarity(target.spatialSignature,x.vector.spatialSignature);
       const aggregate=aggregateSimilarity(targetFeature,x.vector.features);
-      // V15.4.1: aggregate PaintOver scores are intentionally low-weight because
-      // they saturate on many manipulated samples. The sample-specific ROI and
-      // document-local morphology carry the ranking signal.
-      const roiSourceBonus = x.vector.roiSource === 'auto-local-anomaly' ? 1 : 0;
-      const similarity=documentSimilarity*0.60+amountRoiSimilarity*0.35+aggregate*0.05;
+      // Aggregate signal remains a weak corroborator only; it cannot dominate
+      // the sample-specific local signature.
+      const similarity=spatial*0.85+aggregate*0.15;
       return {
         file:path.basename(x.path),
         similarity,
-        documentSimilarity,
-        spatialSimilarity:amountRoiSimilarity,
+        spatialSimilarity:spatial,
         aggregateSimilarity:aggregate,
-        rawScore:x.vector.rawScore,
-        roi:x.vector.roi,
-        roiSource:x.vector.roiSource || 'unknown',
-        roiSourceBonus
+        rawScore:x.vector.rawScore
       };
     });
     negativeSimilarities.sort((a,b)=>b.similarity-a.similarity);
@@ -8607,15 +8514,72 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     const supportedTypographyFields=new Set([...typographySupport.entries()]
       .filter(([,rows])=>rows.length>=2)
       .map(([field])=>field));
-    for(const ref of referenceResults){
-      ref.characterFindings=(ref.characterFindings||[]).filter(f=>supportedTypographyFields.has(String(f?.field||'').replace(/:value$/i,'')));
-      ref.typographyCredibleFieldCount=new Set(ref.characterFindings.map(f=>String(f.field||'').replace(/:value$/i,''))).size;
-      ref.typographyScore=ref.characterFindings.length ? rfClamp100(ref.typographyScore) : 0;
-      ref.typographySeverity=ref.characterFindings.length ? ref.typographySeverity : 'insufficient-data';
-      ref.typographyCredibility=ref.characterFindings.length ? ref.typographyCredibility : 'none';
+
+    // V13.1: A single trusted reference is still useful for raster typography
+    // diagnostics, but it cannot provide ensemble consensus. Promote only the
+    // repeated legacy value-render observations as PROVISIONAL evidence. This
+    // does not bypass the downstream camera/JPEG risk guard; it merely prevents
+    // strong per-field measurements from disappearing at the promotion gate.
+    const singleReferencePromotions=new Map();
+    if(referenceResults.length===1){
+      const ref=referenceResults[0];
+      const provisional=[];
+      const seen=new Set();
+      for(const profile of ref.typographyFieldProfiles||[]){
+        const finding=profile?.valueFinding || profile?.legacySharedGlyphFinding;
+        if(!finding || finding.severity!=='strong') continue;
+        const base=String(finding.field||'').replace(/:value$/i,'');
+        if(!base || seen.has(base)) continue;
+        const shared=Number(finding.sharedCharacterCount)||0;
+        const high=Number(finding.repeatedHighDistanceGlyphCount)||0;
+        const distance=Number(finding.characterDistance)||0;
+        // Require a genuinely repeated glyph pattern, not a one-character
+        // mismatch. Thresholds are intentionally conservative.
+        if(shared<6 || high<4 || high/shared<0.60 || distance<0.60) continue;
+        seen.add(base);
+        provisional.push({
+          ...finding,
+          promotionMode:'single-reference-provisional',
+          ensembleReferenceCount:1,
+          provisional:true,
+        });
+      }
+      // One field is never enough. Repeated evidence across >=3 distinct
+      // semantic value fields is the minimum provisional promotion gate.
+      if(provisional.length>=3){
+        ref.characterFindings=provisional;
+        ref.typographyCredibleFieldCount=provisional.length;
+        ref.typographyScore=rfClamp100(
+          Math.min(50,provisional.filter(x=>x.severity==='strong').length*18)+
+          Math.min(20,provisional.length>=3?12:0)
+        );
+        ref.typographySeverity=provisional.length>=4?'strong':'medium';
+        ref.typographyCredibility=provisional.length>=4?'strong':'medium';
+        singleReferencePromotions.set(ref.file,{
+          promotedFieldCount:provisional.length,
+          fields:provisional.map(x=>String(x.field||'').replace(/:value$/i,''))
+        });
+      }else{
+        ref.characterFindings=[];
+        ref.typographyCredibleFieldCount=0;
+        ref.typographyScore=0;
+        ref.typographySeverity='insufficient-data';
+        ref.typographyCredibility='none';
+      }
+    } else {
+      for(const ref of referenceResults){
+        ref.characterFindings=(ref.characterFindings||[]).filter(f=>supportedTypographyFields.has(String(f?.field||'').replace(/:value$/i,'')));
+        ref.typographyCredibleFieldCount=new Set(ref.characterFindings.map(f=>String(f.field||'').replace(/:value$/i,''))).size;
+        ref.typographyScore=ref.characterFindings.length ? rfClamp100(ref.typographyScore) : 0;
+        ref.typographySeverity=ref.characterFindings.length ? ref.typographySeverity : 'insufficient-data';
+        ref.typographyCredibility=ref.characterFindings.length ? ref.typographyCredibility : 'none';
+      }
     }
-    console.log('TYPOGRAPHY ENSEMBLE SUPPORT V13:',JSON.stringify({
+    console.log('TYPOGRAPHY ENSEMBLE SUPPORT V13.1:',JSON.stringify({
       referenceCount:referenceResults.length,
+      singleReferencePromotion:singleReferencePromotions.size>0,
+      singleReferenceValueFieldCount:[...singleReferencePromotions.values()][0]?.promotedFieldCount||0,
+      singleReferencePromotedFields:[...singleReferencePromotions.values()][0]?.fields||[],
       fieldSupport:[...typographySupport.entries()].map(([field,rows])=>({field,referenceCount:rows.length,references:rows.map(x=>x.ref)})),
       supportedFields:[...supportedTypographyFields]
     }));
