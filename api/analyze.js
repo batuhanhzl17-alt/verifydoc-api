@@ -6794,6 +6794,23 @@ function rfSafeRel(a, b, scale = 1) {
 // şablon fontuyla yazılmışsa gereksiz şekilde sahtecilik sinyali üretmez.
 // Ölçülen özellikler çözünürlükten bağımsızlaştırılmış 160x80 ROI üzerinde
 // hesaplanır.
+async function rfTypographyRasterNormalize(imageBuffer) {
+  if (!imageBuffer) return null;
+  try {
+    // V15.4.3: Reference and Telegram/JPEG targets can arrive with different
+    // quantization/raster histories. Re-encode BOTH typography inputs through
+    // the same luminance JPEG pipeline before glyph metrics are extracted.
+    // This preserves dimensions/ROI coordinates while reducing codec-history
+    // differences that otherwise inflate connected-component/glyph deltas.
+    return await sharp(imageBuffer)
+      .grayscale()
+      .jpeg({ quality: 90, chromaSubsampling: '4:4:4' })
+      .toBuffer();
+  } catch {
+    return imageBuffer;
+  }
+}
+
 async function rfCharacterMetrics(imageBuffer, region, imageSize) {
   if (!imageBuffer || !region || !imageSize?.width || !imageSize?.height) return null;
   try {
@@ -7749,6 +7766,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     const targetSize = { width:Number(targetMeta.width)||0, height:Number(targetMeta.height)||0 };
     if (!targetSize.width || !targetSize.height) return null;
 
+    // V15.4.3 typography-only normalization. Other forensic engines continue
+    // to use the original targetBuffer unchanged.
+    const targetTypographyBuffer = await rfTypographyRasterNormalize(targetBuffer);
+
     const allReferencePaths = await getReferenceFiles(normalizedBank);
     const requestedReferencePaths = Array.isArray(selectedReferencePath)
       ? selectedReferencePath
@@ -7892,6 +7913,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const refMeta=await sharp(refBuffer).metadata();
         const refSize={width:Number(refMeta.width)||0,height:Number(refMeta.height)||0};
         if(!refSize.width||!refSize.height)continue;
+
+        // Same raster normalization as the target, used ONLY by typography.
+        const refTypographyBuffer = await rfTypographyRasterNormalize(refBuffer);
 
         const refId=createHash('sha256').update(raw).digest('hex').slice(0,16);
         const cacheKey=`rfocr39:${normalizedBank}:${refId}`;
@@ -8304,14 +8328,14 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
           const refLabelRegion=rfFocusLabelRegion(m.rl.region,refLabelText);
           const tarLabelRegion=rfFocusLabelRegion(m.tl.region,tarLabelText);
-          let refChar=await rfCharacterMetrics(refBuffer,refLabelRegion,refSize);
-          let tarChar=await rfCharacterMetrics(targetBuffer,tarLabelRegion,targetSize);
+          let refChar=await rfCharacterMetrics(refTypographyBuffer,refLabelRegion,refSize);
+          let tarChar=await rfCharacterMetrics(targetTypographyBuffer,tarLabelRegion,targetSize);
           // OCR boxes can differ between PDF-derived reference and camera/JPG target.
           // If the tight label ROI cannot yield a stable raster profile, retry on the
           // complete OCR region before abandoning the field. This is especially
           // important for bank-specific generic labels such as SENARYO/DEKONT TIPI.
-          if(!refChar) refChar=await rfCharacterMetrics(refBuffer,m.rl.region,refSize);
-          if(!tarChar) tarChar=await rfCharacterMetrics(targetBuffer,m.tl.region,targetSize);
+          if(!refChar) refChar=await rfCharacterMetrics(refTypographyBuffer,m.rl.region,refSize);
+          if(!tarChar) tarChar=await rfCharacterMetrics(targetTypographyBuffer,m.tl.region,targetSize);
           if(!refChar||!tarChar)continue;
 
           const labelCharDistance=rfCharacterDistance(refChar,tarChar);
@@ -8337,23 +8361,23 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             // that different digits should have identical glyph shapes.
             const rr=rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key);
             const tr=rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key);
-            refValueChar=await rfCharacterMetrics(refBuffer,rr,refSize);
-            tarValueChar=await rfCharacterMetrics(targetBuffer,tr,targetSize);
-            if(!refValueChar) refValueChar=await rfCharacterMetrics(refBuffer,valueRefRaw.region,refSize);
-            if(!tarValueChar) tarValueChar=await rfCharacterMetrics(targetBuffer,valueTarRaw.region,targetSize);
+            refValueChar=await rfCharacterMetrics(refTypographyBuffer,rr,refSize);
+            tarValueChar=await rfCharacterMetrics(targetTypographyBuffer,tr,targetSize);
+            if(!refValueChar) refValueChar=await rfCharacterMetrics(refTypographyBuffer,valueRefRaw.region,refSize);
+            if(!tarValueChar) tarValueChar=await rfCharacterMetrics(targetTypographyBuffer,valueTarRaw.region,targetSize);
 
             if(refValueChar&&tarValueChar){
               valueDistance=rfCharacterDistance(refValueChar,tarValueChar);
               valueDiaDistance=rfDiacriticDistance(refValueChar,tarValueChar,valueRefText,valueTarText);
               if(valueComparable){
                 if(key==='amount'){
-                  const refGlyphs=await rfNumericGlyphSequence(refBuffer,rr,refSize,valueRefText);
-                  const tarGlyphs=await rfNumericGlyphSequence(targetBuffer,tr,targetSize,valueTarText);
+                  const refGlyphs=await rfNumericGlyphSequence(refTypographyBuffer,rr,refSize,valueRefText);
+                  const tarGlyphs=await rfNumericGlyphSequence(targetTypographyBuffer,tr,targetSize,valueTarText);
                   const sameDigitDistance=rfNumericGlyphDistance(refGlyphs,tarGlyphs);
                   if(Number.isFinite(sameDigitDistance)) valueDistance=Math.max(Number(valueDistance)||0,sameDigitDistance);
                 }
-                const refGeneralGlyphs=await rfGeneralGlyphSequence(refBuffer,rr,refSize,valueRefText);
-                const tarGeneralGlyphs=await rfGeneralGlyphSequence(targetBuffer,tr,targetSize,valueTarText);
+                const refGeneralGlyphs=await rfGeneralGlyphSequence(refTypographyBuffer,rr,refSize,valueRefText);
+                const tarGeneralGlyphs=await rfGeneralGlyphSequence(targetTypographyBuffer,tr,targetSize,valueTarText);
                 sameValueGlyph=rfSharedCharacterGlyphDistance(refGeneralGlyphs,tarGeneralGlyphs);
               }
             }
@@ -8394,6 +8418,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             valueRepeatedHighDistanceGlyphCount:Number(sameValueGlyph?.highCount)||0,
             valueRepeatedStrongDistanceGlyphCount:Number(sameValueGlyph?.strongCount)||0,
             internalStyleFinding:internalStyleFinding?{...internalStyleFinding}:null,
+            rasterNormalization:'luma-jpeg-q90-444-v15.4.3',
             labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
             labelTargetProfile:{characterWidthToHeight:Number(tarChar.characterWidthToHeight?.toFixed?.(4) ?? tarChar.characterWidthToHeight),characterFillRatio:Number(tarChar.characterFillRatio?.toFixed?.(4) ?? tarChar.characterFillRatio),characterGapToHeight:Number(tarChar.characterGapToHeight?.toFixed?.(4) ?? tarChar.characterGapToHeight),diacriticCount:Number(tarChar.diacriticCount||0)},
           };
@@ -8430,7 +8455,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
 
-        console.log('TYPOGRAPHY PRECISION GATE V23:',JSON.stringify({
+        console.log('TYPOGRAPHY PRECISION GATE V23.1 RASTER-NORMALIZED:',JSON.stringify({
           matchedFields:matches.length,
           allowedFieldCandidates:matches.filter(m=>tpAllowedFieldKey(String(m?.rl?.rule?.key||''))).length,
           profilesBeforeDedup:typographyFieldProfiles.length,
@@ -8535,7 +8560,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const distance=Number(finding.characterDistance)||0;
         // Require a genuinely repeated glyph pattern, not a one-character
         // mismatch. Thresholds are intentionally conservative.
-        if(shared<6 || high<4 || high/shared<0.60 || distance<0.60) continue;
+        // V15.4.3: after common JPEG/luminance normalization, require the
+        // repeated glyph signal to remain strong. This is deliberately a
+        // promotion gate only; raw diagnostics are preserved elsewhere.
+        if(shared<6 || high<4 || high/shared<0.68 || distance<0.64) continue;
         seen.add(base);
         provisional.push({
           ...finding,
@@ -16345,13 +16373,13 @@ if (referenceForensics) {
   // bağlandığını doğruluyoruz. Risk skoruna dahil edilmez.
   const typographyForensics = {
     available: true,
-    engine: 'reference-glyph-raster-typography-v5-v23-internal-style-substitution-v24-annotated',
+    engine: 'reference-glyph-raster-typography-v5-v23-internal-style-substitution-v24-annotated-v15.4.3-raster-normalized',
     score: Number(referenceForensics.typographyScore || 0),
     severity: referenceForensics.typographySeverity || 'insufficient-data',
     credibility: referenceForensics.typographyCredibility || 'none',
     credibleFieldCount: Number(referenceForensics.typographyCredibleFieldCount || 0),
     characterFindingCount: Number(referenceForensics.characterFindingCount || 0),
-    typographyMethod: 'internal value-vs-label style substitution; literal value similarity is diagnostic only',
+    typographyMethod: 'internal value-vs-label style substitution + common luminance JPEG Q90 raster normalization; literal value similarity is diagnostic only',
     characterFindings: Array.isArray(referenceForensics.characterFindings)
       ? referenceForensics.characterFindings.slice(0, 40)
       : [],
@@ -16363,7 +16391,7 @@ if (referenceForensics) {
       : []
   };
   result.typographyForensics = typographyForensics;
-  console.log('TYPOGRAPHY FORENSICS V26:', JSON.stringify(typographyForensics));
+  console.log('TYPOGRAPHY FORENSICS V26.1:', JSON.stringify(typographyForensics));
 }
 
 // Referans alan motoru bulgu üretmese bile bağımsız layout motoru
