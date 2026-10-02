@@ -8535,6 +8535,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
     if(!referenceResults.length)return null;
 
+    // TYPOGRAPHY PROMOTION V1 — single-reference controlled promotion
     // V13: a typography anomaly must repeat across the Telegram reference
     // ensemble. One clean reference can differ because of OCR segmentation,
     // JPEG ringing or a different dynamic value. Collapse value findings by
@@ -8549,8 +8550,26 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         typographySupport.get(base).push({ref:ref.file,finding});
       }
     }
+    // V1 Typography Promotion: keep the multi-reference gate when an ensemble
+    // exists, but do not make a single trusted bank reference permanently
+    // incapable of promoting typography. With one trusted reference, promotion
+    // still requires TWO DISTINCT semantic value fields in the same reference.
+    // Label-only findings are never promoted by this gate.
+    const singleReferenceTypographyFields = referenceResults.length===1
+      ? new Set(
+          (referenceResults[0]?.characterFindings||[])
+            .filter(f=>String(f?.field||'').endsWith(':value'))
+            .map(f=>String(f.field).replace(/:value$/i,''))
+        )
+      : new Set();
+    const singleReferenceTypographyEligible =
+      referenceResults.length===1 && singleReferenceTypographyFields.size>=2;
+
     const supportedTypographyFields=new Set([...typographySupport.entries()]
-      .filter(([,rows])=>rows.length>=2)
+      .filter(([,rows])=>
+        rows.length>=2 ||
+        (singleReferenceTypographyEligible && rows.length>=1)
+      )
       .map(([field])=>field));
     for(const ref of referenceResults){
       ref.characterFindings=(ref.characterFindings||[]).filter(f=>supportedTypographyFields.has(String(f?.field||'').replace(/:value$/i,'')));
@@ -8561,6 +8580,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     }
     console.log('TYPOGRAPHY ENSEMBLE SUPPORT V13:',JSON.stringify({
       referenceCount:referenceResults.length,
+      singleReferencePromotion:singleReferenceTypographyEligible,
+      singleReferenceValueFieldCount:singleReferenceTypographyFields.size,
       fieldSupport:[...typographySupport.entries()].map(([field,rows])=>({field,referenceCount:rows.length,references:rows.map(x=>x.ref)})),
       supportedFields:[...supportedTypographyFields]
     }));
