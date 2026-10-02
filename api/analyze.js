@@ -1827,55 +1827,20 @@ const NEGATIVE_SAMPLE_MAP = {
 
 async function loadNegativeSampleFiles(bank) {
   const normalizedBank = normalizeBank(bank);
-  if (!normalizedBank) return [];
-
-  const negativeRoot = path.join(process.cwd(), "negative_samples");
-  const bankDir = path.join(negativeRoot, normalizedBank);
-  const allowedExt = /\.(?:jpe?g|png|webp|pdf)$/i;
+  const names = NEGATIVE_SAMPLE_MAP[normalizedBank] || [];
+  if (!names.length) return [];
   const out = [];
-
-  // V15.3: negative_samples/<bank>/ klasoru canonical kaynaktir.
-  // Boylece yeni bir sahte ornek eklendiginde kod/map degistirmek gerekmez.
-  try {
-    const entries = await fs.readdir(bankDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || !allowedExt.test(entry.name)) continue;
-      const filePath = path.join(bankDir, entry.name);
-      try {
-        const buffer = await fs.readFile(filePath);
-        if (buffer?.length) {
-          out.push({
-            bank: normalizedBank,
-            fileName: entry.name,
-            path: filePath,
-            base64: buffer.toString("base64"),
-          });
-        }
-      } catch {
-        console.log("NEGATIVE SAMPLE OKUNAMADI:", filePath);
+  for (const name of names) {
+    const filePath = path.join(process.cwd(), "negative_samples", name);
+    try {
+      const buffer = await fs.readFile(filePath);
+      if (buffer?.length) {
+        out.push({ bank: normalizedBank, fileName: path.basename(filePath), path: filePath, base64: buffer.toString("base64") });
       }
-    }
-  } catch (error) {
-    // Backward compatibility for older deployments that still use the map.
-    const names = NEGATIVE_SAMPLE_MAP[normalizedBank] || [];
-    for (const name of names) {
-      const filePath = path.join(negativeRoot, name);
-      try {
-        const buffer = await fs.readFile(filePath);
-        if (buffer?.length) {
-          out.push({
-            bank: normalizedBank,
-            fileName: path.basename(filePath),
-            path: filePath,
-            base64: buffer.toString("base64"),
-          });
-        }
-      } catch {
-        console.log("NEGATIVE SAMPLE BULUNAMADI:", filePath);
-      }
+    } catch {
+      console.log("NEGATIVE SAMPLE BULUNAMADI:", filePath);
     }
   }
-
   return out;
 }
 
@@ -4078,8 +4043,19 @@ async function v68JPEGGridAnalysis(encodedBuffer, W=512, H=512, roi=null, contro
     }
     const periodicity=periodicN?Math.max(0,1-(periodic/periodicN)/20):0;
     const delta=Math.max(0,ratio-1);
+    const phaseStats=[];
+    if(roi){
+      for(let px=0;px<8;px++){
+        let s=0,n=0;
+        for(let y=roi.y1;y<roi.y2;y++) for(let x=roi.x1;x<roi.x2;x++) if((x%8)===px){s+=residual[y*W+x];n++;}
+        phaseStats.push(n?s/n:0);
+      }
+    }
+    const phaseMean=phaseStats.length?phaseStats.reduce((a,b)=>a+b,0)/phaseStats.length:0;
+    const phasePeak=phaseStats.length?Math.max(...phaseStats):0;
+    const phaseContrast=phaseMean?Math.max(0,Math.min(1,(phasePeak-phaseMean)/Math.max(.001,phaseMean))):0;
     const score=v68Clamp(delta*55+periodicity*25);
-    return {available:true,score:Math.round(score),roiBoundaryResidual:Number(roiB.toFixed(3)),roiInteriorResidual:Number(roiI.toFixed(3)),controlBoundaryResidual:Number(cb.toFixed(3)),controlInteriorResidual:Number(ci.toFixed(3)),boundaryRatio:Number(ratio.toFixed(3)),periodicity:Number(periodicity.toFixed(3)),quality:90,grid:'8x8'};
+    return {available:true,score:Math.round(score),roiBoundaryResidual:Number(roiB.toFixed(3)),roiInteriorResidual:Number(roiI.toFixed(3)),controlBoundaryResidual:Number(cb.toFixed(3)),controlInteriorResidual:Number(ci.toFixed(3)),boundaryRatio:Number(ratio.toFixed(3)),periodicity:Number(periodicity.toFixed(3)),quality:90,grid:'8x8',localPhase:{available:Boolean(roi),phaseMean:Number(phaseMean.toFixed(4)),phasePeak:Number(phasePeak.toFixed(4)),contrast:Number(phaseContrast.toFixed(3)),strong:phaseContrast>=0.25}};
   } catch(error){ return {available:false,score:0,error:error?.message||String(error)}; }
 }
 
@@ -4380,10 +4356,24 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
     const channelDivergenceScore=Math.min(100,Math.round((Math.max(...rgbMeans)-Math.min(...rgbMeans))*2));
     const supportSignals=[channelResidualScore>=55,lumaResidualScore>=55,edgeScore>=55,textureScore>=55,channelDivergenceScore>=55].filter(Boolean).length;
     const rawScore=Math.round(channelResidualScore*.25+lumaResidualScore*.25+edgeScore*.20+textureScore*.20+channelDivergenceScore*.10);
+    // V15.3.1: compact local residual signature prevents five coarse scores
+    // from collapsing every negative sample to cosine similarity 1.00.
+    const signature=[];
+    const pushGrid=(arr)=>{
+      for(let gy=0;gy<4;gy++) for(let gx=0;gx<8;gx++){
+        const x1=Math.floor(roi.x1+(roi.x2-roi.x1)*gx/8), x2=Math.floor(roi.x1+(roi.x2-roi.x1)*(gx+1)/8);
+        const y1=Math.floor(roi.y1+(roi.y2-roi.y1)*gy/4), y2=Math.floor(roi.y1+(roi.y2-roi.y1)*(gy+1)/4);
+        const rr={x1,y1,x2:Math.max(x1+1,x2),y2:Math.max(y1+1,y2)};
+        signature.push(Number(residualStats(arr,rr).mean.toFixed(4)));
+      }
+    };
+    pushGrid(luma);
+    pushGrid(chans[0]); pushGrid(chans[1]); pushGrid(chans[2]);
     return {
       rawScore,
       supportSignals,
       features:[channelResidualScore,lumaResidualScore,edgeScore,textureScore,channelDivergenceScore],
+      signature,
       roi,
     };
   } catch(error) {
@@ -4413,6 +4403,195 @@ function vectorSimilarity(a,b) {
   for(let i=0;i<a.length;i++){dot+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];}
   if(!na||!nb) return 0;
   return Math.max(0,Math.min(1,dot/(Math.sqrt(na)*Math.sqrt(nb))));
+}
+
+
+// =====================================================
+// V15.3.1 — JPEG / DCT / CHROMA FORENSICS (ADVISORY)
+// =====================================================
+// These layers are intentionally diagnostic first. They do not directly change
+// the deterministic final risk score until calibration against genuine/fake
+// samples is completed.
+function jpegReadU16BE(buf, i) { return ((buf[i] << 8) | buf[i + 1]) >>> 0; }
+
+function parseJpegQuantizationTables(buffer) {
+  const b = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  const tables = [];
+  if (b.length < 4 || b[0] !== 0xff || b[1] !== 0xd8) return {available:false, tables:[], error:'not-jpeg'};
+  let i = 2;
+  try {
+    while (i + 3 < b.length) {
+      while (i < b.length && b[i] !== 0xff) i++;
+      while (i < b.length && b[i] === 0xff) i++;
+      if (i >= b.length) break;
+      const marker = b[i++];
+      if (marker === 0xda || marker === 0xd9) break;
+      if (marker >= 0xd0 && marker <= 0xd7) continue;
+      if (i + 1 >= b.length) break;
+      const len = jpegReadU16BE(b, i);
+      if (len < 2 || i + len > b.length) break;
+      if (marker === 0xdb) {
+        let p = i + 2, end = i + len;
+        while (p < end) {
+          const info = b[p++];
+          const precision = info >> 4;
+          const id = info & 0x0f;
+          const bytesPer = precision === 0 ? 1 : 2;
+          if (p + 64 * bytesPer > end) break;
+          const values = [];
+          for (let n = 0; n < 64; n++) {
+            values.push(precision === 0 ? b[p++] : jpegReadU16BE(b, (p += 2) - 2));
+          }
+          tables.push({id, precision: precision === 0 ? 8 : 16, values});
+        }
+      }
+      i += len;
+    }
+    return {available:tables.length > 0, tables};
+  } catch (error) {
+    return {available:false, tables, error:error?.message || String(error)};
+  }
+}
+
+function jpegTableStats(table) {
+  const v = Array.isArray(table?.values) ? table.values : [];
+  if (v.length !== 64) return null;
+  const sorted = [...v].sort((a,b)=>a-b);
+  const mean = v.reduce((a,x)=>a+x,0)/64;
+  return {
+    id: table.id,
+    precision: table.precision,
+    min: sorted[0], max: sorted[63],
+    mean: Number(mean.toFixed(3)),
+    p50: sorted[31], p90: sorted[56],
+    dc: v[0], acMean: Number((v.slice(1).reduce((a,x)=>a+x,0)/63).toFixed(3)),
+    hash: createHash('sha256').update(Buffer.from(v)).digest('hex').slice(0,16)
+  };
+}
+
+function compareDqtSets(targetDqt, referenceDqt) {
+  const a = targetDqt?.tables || [], b = referenceDqt?.tables || [];
+  if (!a.length || !b.length) return {available:false, score:0, comparedTables:0};
+  const pairs = [];
+  for (const ta of a) {
+    const tb = b.find(x=>x.id===ta.id) || b[0];
+    if (!tb) continue;
+    const n = Math.min(64, ta.values.length, tb.values.length);
+    let mae=0, changed=0;
+    for(let i=0;i<n;i++){ const d=Math.abs(ta.values[i]-tb.values[i]); mae+=d; if(d>0) changed++; }
+    mae /= Math.max(1,n);
+    pairs.push({id:ta.id, mae:Number(mae.toFixed(3)), changedRatio:Number((changed/n).toFixed(3))});
+  }
+  const mae = pairs.length ? pairs.reduce((s,x)=>s+x.mae,0)/pairs.length : 0;
+  const changed = pairs.length ? pairs.reduce((s,x)=>s+x.changedRatio,0)/pairs.length : 0;
+  return {available:pairs.length>0, score:v68Clamp(mae*3.5+changed*35), comparedTables:pairs.length, pairs};
+}
+
+async function decodeForensicRaw(encoded, width, height) {
+  return sharp(encoded).rotate().resize({width,height,fit:'fill'}).removeAlpha().raw().toBuffer();
+}
+
+function localPixelResidual(rawA, rawB, W, H, region) {
+  if (!rawA || !rawB || !region) return {mean:0, p90:0, count:0};
+  const vals=[];
+  const x1=Math.max(0,Math.min(W-1,region.x1)), y1=Math.max(0,Math.min(H-1,region.y1));
+  const x2=Math.max(x1+1,Math.min(W,region.x2)), y2=Math.max(y1+1,Math.min(H,region.y2));
+  for(let y=y1;y<y2;y++) for(let x=x1;x<x2;x++) {
+    const i=(y*W+x)*3;
+    vals.push((Math.abs(rawA[i]-rawB[i])+Math.abs(rawA[i+1]-rawB[i+1])+Math.abs(rawA[i+2]-rawB[i+2]))/3);
+  }
+  if(!vals.length) return {mean:0,p90:0,count:0};
+  vals.sort((a,b)=>a-b);
+  return {mean:vals.reduce((a,x)=>a+x,0)/vals.length,p90:vals[Math.floor(.9*(vals.length-1))],count:vals.length};
+}
+
+async function runJpegGhostForensics(targetPath, amountForensics=null, bank=null) {
+  const engine='jpeg-ghost-forensics-v1';
+  try {
+    const encoded=await fs.readFile(targetPath);
+    const meta=await sharp(encoded).metadata();
+    const sourceW=Number(meta.width)||0, sourceH=Number(meta.height)||0;
+    if(!sourceW || !sourceH) return {available:false,engine,reason:'invalid-image'};
+    const W=Math.min(768,Math.max(256,sourceW)), H=Math.min(768,Math.max(256,sourceH));
+    const original=await decodeForensicRaw(encoded,W,H);
+    let roi=v68RegionTo512(amountForensics?.region,sourceW,sourceH,512,512);
+    if(roi) roi={x1:Math.round(roi.x1*W/512),y1:Math.round(roi.y1*H/512),x2:Math.round(roi.x2*W/512),y2:Math.round(roi.y2*H/512)};
+    if(!roi && bank){
+      try { const a=await getReferenceAmountAnchor(bank); if(a) roi={x1:Math.round(a.xNorm*W),y1:Math.round(a.yNorm*H),x2:Math.round((a.xNorm+a.widthNorm)*W),y2:Math.round((a.yNorm+a.heightNorm)*H)}; } catch {}
+    }
+    if(!roi) return {available:false,engine,reason:'amount-roi-unavailable'};
+    const rw=roi.x2-roi.x1, rh=roi.y2-roi.y1;
+    const controls=v68RingRegions(roi,W,H);
+    const qualities=[40,50,60,70,80,90,95];
+    const rows=[];
+    for(const quality of qualities){
+      const recompressed=await sharp(original,{raw:{width:W,height:H,channels:3}}).jpeg({quality,chromaSubsampling:'4:4:4'}).toBuffer();
+      const reread=await sharp(recompressed).raw().toBuffer();
+      const rr=localPixelResidual(original,reread,W,H,roi);
+      const cr=controls.map(r=>localPixelResidual(original,reread,W,H,r)).filter(x=>x.count>0);
+      const controlMean=cr.length?cr.reduce((s,x)=>s+x.mean,0)/cr.length:rr.mean;
+      const ratio=rr.mean/Math.max(.001,controlMean);
+      const peak=v68Clamp((ratio-1)*110 + Math.max(0,rr.p90-controlMean)*1.5);
+      rows.push({quality,roiMean:Number(rr.mean.toFixed(4)),roiP90:Number(rr.p90.toFixed(4)),controlMean:Number(controlMean.toFixed(4)),ratio:Number(ratio.toFixed(3)),score:Math.round(peak)});
+    }
+    rows.sort((a,b)=>b.score-a.score);
+    const best=rows[0]||null;
+    const score=best?.score||0;
+    return {available:true,engine,roi,qualities:rows,bestQuality:best?.quality||null,globalScore:Math.round(v68Clamp((rows.reduce((s,x)=>s+x.roiMean,0)/Math.max(1,rows.length))*2)),roiScore:score,peakStrength:Number((score/100).toFixed(3)),localized:score>=55,independentSignal:score>=65&&best?.ratio>=1.25,evidence:score>=65?'Amount ROI recompression davranışı kontrol bölgelerine göre belirgin biçimde farklılaştı; JPEG Ghost bağımsız bir corroborating sinyaldir, tek başına sahtecilik hükmü değildir.':'JPEG Ghost taramasında güçlü lokal recompression ayrışması oluşmadı.'};
+  } catch(error){ return {available:false,engine,score:0,error:error?.message||String(error)}; }
+}
+
+function dct8x8(block) {
+  const out=new Float64Array(64), c=Math.PI/16;
+  for(let v=0;v<8;v++) for(let u=0;u<8;u++) {
+    let sum=0;
+    for(let y=0;y<8;y++) for(let x=0;x<8;x++) sum += block[y*8+x]*Math.cos((2*x+1)*u*c)*Math.cos((2*y+1)*v*c);
+    out[v*8+u]=0.25*(u?1/Math.sqrt(2):1)*(v?1/Math.sqrt(2):1)*sum;
+  }
+  return out;
+}
+
+async function runLocalDoubleJpegDctForensics(targetPath, amountForensics=null) {
+  const engine='local-double-jpeg-dct-forensics-v1';
+  try {
+    const encoded=await fs.readFile(targetPath), meta=await sharp(encoded).metadata();
+    const W=Math.min(512,Number(meta.width)||0), H=Math.min(512,Number(meta.height)||0);
+    if(W<16||H<16) return {available:false,engine,reason:'image-too-small'};
+    const raw=await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).greyscale().raw().toBuffer();
+    let roi=v68RegionTo512(amountForensics?.region,Number(meta.width)||W,Number(meta.height)||H,512,512);
+    if(roi) roi={x1:Math.round(roi.x1*W/512),y1:Math.round(roi.y1*H/512),x2:Math.round(roi.x2*W/512),y2:Math.round(roi.y2*H/512)};
+    if(!roi) return {available:false,engine,reason:'amount-roi-unavailable'};
+    const vals=[];
+    for(let y=roi.y1;y+8<=roi.y2;y+=8) for(let x=roi.x1;x+8<=roi.x2;x+=8){
+      const block=[]; for(let yy=0;yy<8;yy++) for(let xx=0;xx<8;xx++) block.push(raw[(y+yy)*W+x+xx]-128);
+      const d=dct8x8(block); for(let i=1;i<64;i++) vals.push(Math.abs(d[i]));
+    }
+    if(vals.length<16) return {available:false,engine,reason:'insufficient-dct-blocks',roi};
+    vals.sort((a,b)=>a-b); const mean=vals.reduce((s,x)=>s+x,0)/vals.length;
+    const high=vals.slice(Math.floor(vals.length*.75));
+    const highMean=high.reduce((s,x)=>s+x,0)/Math.max(1,high.length);
+    const concentration=v68Clamp((highMean/Math.max(.001,mean)-1)*28);
+    const histogram=new Array(12).fill(0); for(const v of vals) histogram[Math.min(11,Math.floor(Math.log2(1+v)))]++;
+    const histPeak=Math.max(...histogram)/vals.length;
+    const score=Math.round(v68Clamp(concentration+histPeak*35));
+    return {available:true,engine,roi,blockCount:Math.floor(vals.length/63),coefficientCount:vals.length,highFrequencyMean:Number(highMean.toFixed(3)),meanAbsAc:Number(mean.toFixed(3)),histogramPeak:Number(histPeak.toFixed(3)),score,severity:score>=70?'strong':score>=40?'moderate':score>=20?'low':'none',independentSignal:score>=65};
+  } catch(error){ return {available:false,engine,score:0,error:error?.message||String(error)}; }
+}
+
+async function runLocalChromaForensics(targetPath, amountForensics=null) {
+  const engine='local-cbcr-forensics-v1';
+  try {
+    const encoded=await fs.readFile(targetPath), meta=await sharp(encoded).metadata();
+    const W=512,H=512, raw=await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().raw().toBuffer();
+    const roi=v68RegionTo512(amountForensics?.region,Number(meta.width)||W,Number(meta.height)||H,W,H);
+    if(!roi) return {available:false,engine,reason:'amount-roi-unavailable'};
+    const controls=v68RingRegions(roi,W,H), rf=v68ChannelFeatures(raw,W,H,roi);
+    const cs=controls.map(r=>v68ChannelFeatures(raw,W,H,r)).filter(x=>x.sampleCount>20);
+    if(!cs.length) return {available:false,engine,reason:'no-controls',roi};
+    const avg={sampleCount:cs.reduce((s,x)=>s+x.sampleCount,0)/cs.length,rgb:{mean:[0,1,2].map(i=>cs.reduce((s,x)=>s+x.rgb.mean[i],0)/cs.length),std:[0,1,2].map(i=>cs.reduce((s,x)=>s+x.rgb.std[i],0)/cs.length)},chroma:{rgMean:cs.reduce((s,x)=>s+x.chroma.rgMean,0)/cs.length,gbMean:cs.reduce((s,x)=>s+x.chroma.gbMean,0)/cs.length,rbMean:cs.reduce((s,x)=>s+x.chroma.rbMean,0)/cs.length},histogram:{r:[...new Array(16)].map((_,i)=>cs.reduce((s,x)=>s+x.histogram.r[i],0)/cs.length),g:[...new Array(16)].map((_,i)=>cs.reduce((s,x)=>s+x.histogram.g[i],0)/cs.length),b:[...new Array(16)].map((_,i)=>cs.reduce((s,x)=>s+x.histogram.b[i],0)/cs.length)}};
+    const score=Math.round(v68ChannelAnomaly(rf,avg));
+    return {available:true,engine,roi,score,severity:score>=70?'strong':score>=40?'moderate':score>=20?'low':'none',independentSignal:score>=65,chromaDelta:{rg:Number(Math.abs(rf.chroma.rgMean-avg.chroma.rgMean).toFixed(3)),gb:Number(Math.abs(rf.chroma.gbMean-avg.chroma.gbMean).toFixed(3)),rb:Number(Math.abs(rf.chroma.rbMean-avg.chroma.rbMean).toFixed(3))}};
+  } catch(error){ return {available:false,engine,score:0,error:error?.message||String(error)}; }
 }
 
 async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=null, negativeSamples=null) {
@@ -4463,20 +4642,30 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       if(v) negativeVectors.push({path:samplePath,vector:v});
     }
     const targetFeature=target.features;
-    const negativeSimilarities=negativeVectors.map(x=>({file:path.basename(x.path),similarity:vectorSimilarity(targetFeature,x.vector.features),rawScore:x.vector.rawScore}));
+    const targetSignature=target.signature||[];
+    const negativeSimilarities=negativeVectors.map(x=>{
+      const coarse=vectorSimilarity(targetFeature,x.vector.features);
+      const fine=vectorSimilarity(targetSignature,x.vector.signature||[]);
+      const similarity=targetSignature.length&&x.vector.signature?.length
+        ? Math.max(0,Math.min(1,coarse*.30+fine*.70))
+        : coarse;
+      return {file:path.basename(x.path),similarity,coarseSimilarity:coarse,fineSimilarity:fine,rawScore:x.vector.rawScore};
+    });
     negativeSimilarities.sort((a,b)=>b.similarity-a.similarity);
     const bestNegativeSimilarity=negativeSimilarities[0]?.similarity||0;
     const fakePatternScore=negativeVectors.length?clamp100((bestNegativeSimilarity-0.82)/0.18*100):null;
 
     const amountScore=clamp100(Number(amountForensics?.score)||0);
     const amountStrong=String(amountForensics?.severity||'').toLowerCase()==='strong' || (amountForensics?.status==='warning'&&amountScore>=70);
+    const fakeSupport=fakePatternScore!=null?fakePatternScore:0;
 
-    // V15.3: known-fake similarity is metadata/advisory evidence here.
-    // It MUST NOT alter the calibrated PaintOver score by itself. Final-risk
-    // promotion is handled later by the explicit V15.3 corroboration gate.
-    // This keeps genuine Telegram calibration and V15.2 regression behavior
-    // independent from the negative-sample pattern layer.
+    // Core V2 rule:
+    // 1) raw local signal is first calibrated against genuine Telegram data;
+    // 2) known-fake similarity can corroborate it;
+    // 3) Amount Forensics is corroboration only, never +10/+25 to PaintOver.
     let calibrated=baselineAvailable?telegramAdjusted:clamp100(target.rawScore);
+    if(fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
+    else if(fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
 
     // Amount Forensics can lift a borderline calibrated result only when the
     // image-local signal already survives Telegram calibration. It is not added
@@ -4485,9 +4674,10 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
 
     const strong=calibrated>=75 && (
       target.supportSignals>=3 ||
+      bestNegativeSimilarity>=0.90 ||
       (amountStrong && target.supportSignals>=2)
     );
-    const moderate=calibrated>=50 && target.supportSignals>=2;
+    const moderate=calibrated>=50 && (target.supportSignals>=2 || bestNegativeSimilarity>=0.85);
     const severity=strong?'strong':moderate?'moderate':calibrated>=25?'low':'none';
 
     const out={
@@ -15114,6 +15304,37 @@ if ((type === "image" || type === "pdf") && bank && reference) {
       : (visualReferencePath ? [visualReferencePath] : []);
     advancedForensics = await runV68Forensics(forensicTargetPath, amountForensics, bank, trustedReferencePaths);
     console.log("V68 ADVANCED FORENSICS:", JSON.stringify(advancedForensics));
+
+    // V15.3.1 advisory JPEG/DCT/chroma layers. Kept outside final fusion
+    // until calibrated on genuine + known-fake samples.
+    try {
+      const jpegGhost = await runJpegGhostForensics(forensicTargetPath, amountForensics, bank);
+      let dqtTarget = null, dqtReference = null, dqtComparison = null;
+      try {
+        const tb = await fs.readFile(forensicTargetPath);
+        dqtTarget = parseJpegQuantizationTables(tb);
+        if (trustedReferencePaths?.[0]) {
+          const rb = await fs.readFile(trustedReferencePaths[0]);
+          dqtReference = parseJpegQuantizationTables(rb);
+          dqtComparison = compareDqtSets(dqtTarget, dqtReference);
+        }
+      } catch(error) { dqtComparison = {available:false,score:0,error:error?.message||String(error)}; }
+      const doubleJpeg = await runLocalDoubleJpegDctForensics(forensicTargetPath, amountForensics);
+      const localChroma = await runLocalChromaForensics(forensicTargetPath, amountForensics);
+      if (advancedForensics?.metrics) {
+        advancedForensics.metrics.jpegGhost = jpegGhost;
+        advancedForensics.metrics.quantization = {target:dqtTarget?.tables?.map(jpegTableStats)||[], reference:dqtReference?.tables?.map(jpegTableStats)||[], comparison:dqtComparison};
+        advancedForensics.metrics.doubleJpeg = doubleJpeg;
+        advancedForensics.metrics.localChroma = localChroma;
+      }
+      console.log("V15.3.1 JPEG GHOST:", JSON.stringify(jpegGhost));
+      console.log("V15.3.1 DQT:", JSON.stringify(dqtComparison));
+      console.log("V15.3.1 DOUBLE JPEG/DCT:", JSON.stringify(doubleJpeg));
+      console.log("V15.3.1 LOCAL CB/CR:", JSON.stringify(localChroma));
+    } catch(error) {
+      console.warn("V15.3.1 JPEG FORENSICS HATASI:", error?.message || error);
+    }
+
     paintOverForensics = await runPaintOverForensics(forensicTargetPath, amountForensics);
     console.log("PAINT-OVER FORENSICS V1 ACTIVE:", JSON.stringify(paintOverForensics));
 
@@ -18829,83 +19050,6 @@ if (controlledAmountCorroborated) {
     paintOverScore: paintOverV152Score,
     paintOverSignals: paintOverV152Signals,
     paintOverAmountSupport: paintOverV152AmountSupport
-  }));
-}
-
-// =====================================================
-// V15.3: KNOWN-FAKE BASELINE CORROBORATION
-// =====================================================
-// negative_samples yalnızca bilinen sahte örneklerden oluşan ayrı bir
-// pattern/baseline katmanıdır. Tek başına similarity nihai riski yükseltmez.
-// Current upload hiçbir zaman baseline değildir; PaintOver V2 yalnızca
-// references/ ve negative_samples kaynaklarını kullanır.
-const knownFakePatternV153 =
-  result?.paintOverForensicsV2?.metrics?.knownFakePattern || null;
-const knownFakeAvailableV153 =
-  knownFakePatternV153?.available === true &&
-  Number(knownFakePatternV153?.sampleCount || 0) > 0;
-const knownFakeSimilarityV153 = Number(knownFakePatternV153?.bestSimilarity || 0);
-const knownFakeScoreV153 = Number(knownFakePatternV153?.score || 0);
-const strongKnownFakePatternV153 =
-  knownFakeAvailableV153 &&
-  knownFakeSimilarityV153 >= 0.90 &&
-  knownFakeScoreV153 >= 40;
-
-const rawPaintOverV153 =
-  result?.paintOverForensics || paintOverForensics || null;
-const rawPaintOverScoreV153 = Number(rawPaintOverV153?.score || 0);
-const rawPaintOverSignalsV153 = Number(rawPaintOverV153?.metrics?.supportSignals || 0);
-const independentPaintOverV153 =
-  rawPaintOverV153?.available === true &&
-  rawPaintOverScoreV153 >= 75 &&
-  rawPaintOverSignalsV153 >= 3;
-
-const knownFakeIndependentCorroborationV153 =
-  strongKnownFakePatternV153 &&
-  (
-    __controlledAmountPromotion?.eligible === true ||
-    independentPaintOverV153 ||
-    strongAmountSignal ||
-    strongAzureSignal ||
-    meaningfulPixelReferenceSignal
-  );
-
-if (knownFakeIndependentCorroborationV153) {
-  // Similarity tek başına floor oluşturmaz. Mevcut kategori ağırlıkları
-  // üzerinden kontrollü fusion yapılır; böylece yeni bir sabit overallRisk
-  // tabanı eklenmez.
-  result.categories = {
-    ...(result.categories || {}),
-    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 85)
-  };
-
-  const knownFakeFusedRisk = calculateOverallRisk(result);
-  finalRiskScore = Math.max(finalRiskScore, Number(knownFakeFusedRisk?.overallRisk || 0));
-  result.categories = {
-    ...(result.categories || {}),
-    ...(knownFakeFusedRisk?.categories || {})
-  };
-
-  console.log("V15.3 KNOWN-FAKE CORROBORATION:", JSON.stringify({
-    mode: "category-fusion",
-    knownFakeSampleCount: Number(knownFakePatternV153?.sampleCount || 0),
-    bestSimilarity: knownFakeSimilarityV153,
-    knownFakeScore: knownFakeScoreV153,
-    independentPaintOver: independentPaintOverV153,
-    controlledAmount: __controlledAmountPromotion?.eligible === true,
-    strongAmountSignal,
-    strongAzureSignal,
-    meaningfulPixelReferenceSignal,
-    editingRisk: result.categories?.editingRisk,
-    fusedRisk: finalRiskScore
-  }));
-} else if (knownFakeAvailableV153) {
-  console.log("V15.3 KNOWN-FAKE PATTERN (ADVISORY ONLY):", JSON.stringify({
-    sampleCount: Number(knownFakePatternV153?.sampleCount || 0),
-    bestSimilarity: knownFakeSimilarityV153,
-    score: knownFakeScoreV153,
-    promoted: false,
-    reason: "known-fake similarity alone is not final-risk evidence"
   }));
 }
 
