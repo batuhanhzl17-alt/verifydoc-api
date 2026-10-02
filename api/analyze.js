@@ -14659,8 +14659,13 @@ if (type === "pdf" && reference?.path) {
 
 if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
   try {
-    const safeReferenceAmountField = referenceAmountField || null;
-    console.log("REFERENCE FORENSIC AMOUNT FIELD HANDOFF V1.2.1:", JSON.stringify({
+    // V1.2.2: `referenceAmountField` inside analyzeAmountForensics is function-scoped.
+    // Never read that local from this outer pipeline block. Resolve the trusted
+    // reference amount anchor explicitly for the Reference Forensic Engine.
+    // The target amount ROI still comes from amountForensics.region.
+    const safeReferenceAmountField = (await getReferenceAmountAnchor(bank)) || null;
+    console.log("VERIFYDOC TYPOGRAPHY V1.2.2 ACTIVE");
+    console.log("REFERENCE FORENSIC AMOUNT FIELD HANDOFF V1.2.2:", JSON.stringify({
       available: Boolean(safeReferenceAmountField),
       source: safeReferenceAmountField?.source || safeReferenceAmountField?.templateRole || null,
       xNorm: safeReferenceAmountField?.xNorm ?? null,
