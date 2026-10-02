@@ -1827,10 +1827,10 @@ const NEGATIVE_SAMPLE_MAP = {
   // Bunlar yalnızca known-fake calibration/evidence için kullanılır;
   // trusted reference değildir.
   enpara: [
-    "fake.3000.jpg",
-    "fake.8000.jpg",
-    "fake.iban.jpg",
-    "fake.iban2.jpg",
+    "enpara/fake.3000.jpg",
+    "enpara/fake.8000.jpg",
+    "enpara/fake.iban.jpg",
+    "enpara/fake.iban2.jpg",
   ],
 };
 
