@@ -8001,6 +8001,13 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const stylePairs=[];
         for(const m of matches){
           const rr=rfFocusLabelRegion(m.rl.region,m.rl.text),tr=rfFocusLabelRegion(m.tl.region,m.tl.text);
+          // V1.2.3: ROI resolver may legitimately return null when OCR cannot
+          // produce a stable label crop. Never dereference a null ROI; skip that
+          // field and let the remaining trusted pairs continue through V26.
+          if(!rr?.region || !tr?.region){
+            console.log("REFERENCE FORENSIC ROI SKIP V1.2.3:",JSON.stringify({field:m?.rl?.rule?.key||null,reason:"label-roi-unavailable"}));
+            continue;
+          }
           const a=await rfStableTextMetrics(refBuffer,rr,refSize),b=await rfStableTextMetrics(targetBuffer,tr,targetSize);
           if(a&&b)stylePairs.push({field:m.rl.rule.key,a,b});
         }
@@ -8011,8 +8018,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const key=m.rl.rule.key;
           const refLabelRegion=rfFocusLabelRegion(m.rl.region,m.rl.text);
           const tarLabelRegion=rfFocusLabelRegion(m.tl.region,m.tl.text);
-          const refStyle=await rfStableTextMetrics(refBuffer,refLabelRegion,refSize);
-          const tarStyle=await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize);
+          const refStyle=(refLabelRegion?.region)?await rfStableTextMetrics(refBuffer,refLabelRegion,refSize):null;
+          const tarStyle=(tarLabelRegion?.region)?await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize):null;
           const rawStyle=rfStyleResidual(refStyle,tarStyle);
           const styleResidual=rfStyleResidual(refStyle,tarStyle,globalStyleBaseline);
           const refValue=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
@@ -8419,8 +8426,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
           const refLabelRegion=rfFocusLabelRegion(m.rl.region,refLabelText);
           const tarLabelRegion=rfFocusLabelRegion(m.tl.region,tarLabelText);
-          let refChar=await rfCharacterMetrics(refTypographyBuffer,refLabelRegion,refSize);
-          let tarChar=await rfCharacterMetrics(targetTypographyBuffer,tarLabelRegion,targetSize);
+          let refChar=refLabelRegion?.region ? await rfCharacterMetrics(refTypographyBuffer,refLabelRegion,refSize) : null;
+          let tarChar=tarLabelRegion?.region ? await rfCharacterMetrics(targetTypographyBuffer,tarLabelRegion,targetSize) : null;
           // OCR boxes can differ between PDF-derived reference and camera/JPG target.
           // If the tight label ROI cannot yield a stable raster profile, retry on the
           // complete OCR region before abandoning the field. This is especially
@@ -8487,12 +8494,12 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             // value similarity. This is the key change: 104028004619 vs
             // 320067009135 can still be compared structurally without pretending
             // that different digits should have identical glyph shapes.
-            const rr=rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key);
-            const tr=rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key);
-            refValueChar=await rfCharacterMetrics(refTypographyBuffer,rr,refSize);
-            tarValueChar=await rfCharacterMetrics(targetTypographyBuffer,tr,targetSize);
-            if(!refValueChar) refValueChar=await rfCharacterMetrics(refTypographyBuffer,valueRefRaw.region,refSize);
-            if(!tarValueChar) tarValueChar=await rfCharacterMetrics(targetTypographyBuffer,valueTarRaw.region,targetSize);
+            const rr=valueRefRaw?.region ? rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key) : null;
+            const tr=valueTarRaw?.region ? rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key) : null;
+            refValueChar=rr?.region ? await rfCharacterMetrics(refTypographyBuffer,rr,refSize) : null;
+            tarValueChar=tr?.region ? await rfCharacterMetrics(targetTypographyBuffer,tr,targetSize) : null;
+            if(!refValueChar && valueRefRaw?.region) refValueChar=await rfCharacterMetrics(refTypographyBuffer,valueRefRaw.region,refSize);
+            if(!tarValueChar && valueTarRaw?.region) tarValueChar=await rfCharacterMetrics(targetTypographyBuffer,valueTarRaw.region,targetSize);
 
             if(refValueChar&&tarValueChar){
               valueDistance=rfCharacterDistance(refValueChar,tarValueChar);
