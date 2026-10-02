@@ -4272,7 +4272,7 @@ async function listPaintOverV2Samples(bank, kind = "genuine") {
   }
 }
 
-async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank = null) {
+async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank = null, options = null) {
   if (!targetPath) return null;
   try {
     const encoded = await fs.readFile(targetPath);
@@ -4285,6 +4285,55 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
     const base = await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().raw().toBuffer();
 
     let roi = v68RegionTo512(amountForensics?.region, sourceW, sourceH, W, H);
+    let roiSource = roi ? 'amount-forensics' : null;
+
+    // V15.4.1: negative samples must not all be forced onto the bank amount
+    // anchor. When building a known-fake fingerprint, locate the strongest
+    // local residual/edge anomaly first and use that sample's own ROI.
+    // This keeps fake.3000 / fake.8000 / fake.iban / fake.iban2 sample-specific.
+    if (!roi && options?.autoRoi === true) {
+      try {
+        const detect = await sharp(encoded).rotate().resize({width:W,height:H,fit:'fill'}).removeAlpha().greyscale().raw().toBuffer();
+        const sampleW = Math.max(12, Math.min(64, Math.round(W * 0.10)));
+        const sampleH = Math.max(8, Math.min(28, Math.round(H * 0.028)));
+        let best = null;
+        const stepX = Math.max(8, Math.floor(sampleW * 0.55));
+        const stepY = Math.max(6, Math.floor(sampleH * 0.75));
+        for (let y1 = 8; y1 + sampleH < H - 8; y1 += stepY) {
+          for (let x1 = 8; x1 + sampleW < W - 8; x1 += stepX) {
+            const r = {x1, y1, x2:x1+sampleW, y2:y1+sampleH};
+            const inner = {x1:r.x1+2,y1:r.y1+2,x2:r.x2-2,y2:r.y2-2};
+            const ring = {x1:Math.max(1,r.x1-3),y1:Math.max(1,r.y1-3),x2:Math.min(W-1,r.x2+3),y2:Math.min(H-1,r.y2+3)};
+            let n=0,sum=0,edge=0,ringSum=0,ringEdge=0;
+            for(let yy=inner.y1;yy<inner.y2;yy++) for(let xx=inner.x1;xx<inner.x2;xx++){
+              const i=yy*W+xx; const v=detect[i];
+              const local=(detect[i-1]+detect[i+1]+detect[i-W]+detect[i+W])*0.25;
+              sum+=Math.abs(v-local);
+              const gx=Math.abs(detect[i+1]-detect[i-1]), gy=Math.abs(detect[i+W]-detect[i-W]);
+              edge+=Math.sqrt(gx*gx+gy*gy); n++;
+            }
+            for(let yy=ring.y1;yy<ring.y2;yy++) for(let xx=ring.x1;xx<ring.x2;xx++){
+              if(xx>=r.x1&&xx<r.x2&&yy>=r.y1&&yy<r.y2) continue;
+              const i=yy*W+xx; const v=detect[i];
+              const local=(detect[i-1]+detect[i+1]+detect[i-W]+detect[i+W])*0.25;
+              ringSum+=Math.abs(v-local);
+              const gx=Math.abs(detect[i+1]-detect[i-1]), gy=Math.abs(detect[i+W]-detect[i-W]);
+              ringEdge+=Math.sqrt(gx*gx+gy*gy);
+            }
+            if(n<20) continue;
+            const residualMean=sum/n, edgeMean=edge/n;
+            const ringCount=Math.max(1,(ring.x2-ring.x1)*(ring.y2-ring.y1)-sampleW*sampleH);
+            const ringResidual=ringSum/ringCount, ringEdgeMean=ringEdge/ringCount;
+            const residualContrast=residualMean/Math.max(1,ringResidual);
+            const edgeContrast=edgeMean/Math.max(1,ringEdgeMean);
+            const score=Math.min(5,residualContrast)*0.58+Math.min(5,edgeContrast)*0.42;
+            if(!best || score>best.score) best={score,roi:r,residualContrast,edgeContrast};
+          }
+        }
+        if(best) { roi=best.roi; roiSource='auto-local-anomaly'; }
+      } catch {}
+    }
+
     if (!roi && bank) {
       try {
         const anchor = await getReferenceAmountAnchor(bank);
@@ -4295,6 +4344,7 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
             x2: Math.round((anchor.xNorm + anchor.widthNorm) * W),
             y2: Math.round((anchor.yNorm + anchor.heightNorm) * H),
           };
+          roiSource = 'bank-reference-anchor';
         }
       } catch {}
     }
@@ -4453,6 +4503,7 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
       spatialSignatureVersion:'roi-grid-v1',
       documentSpatialSignatureVersion:'document-grid-v1',
       roi,
+      roiSource: roiSource || 'unknown',
     };
   } catch(error) {
     console.warn('PAINT-OVER V2 VECTOR HATASI:',error?.message||error);
@@ -4494,7 +4545,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
           catch { return `${p}:missing`; }
         }).join('|')
       : 'auto-negative-set';
-    const cacheKey=`paintover-v2:v15.4-multiroi:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${JSON.stringify(amountForensics?.region||null)}:${negCacheParts}`;
+    const cacheKey=`paintover-v2:v15.4.1-sample-roi:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${JSON.stringify(amountForensics?.region||null)}:${negCacheParts}`;
     const cached=paintOverV2Cache.get(cacheKey);
     if(cached) return JSON.parse(JSON.stringify(cached));
 
@@ -4533,7 +4584,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       : await listPaintOverV2Samples(bank,'negative');
     const negativeVectors=[];
     for(const samplePath of negPaths){
-      const v=await extractPaintOverV2Vector(samplePath,null,bank);
+      const v=await extractPaintOverV2Vector(samplePath,null,bank,{autoRoi:true});
       if(v) negativeVectors.push({path:samplePath,vector:v});
     }
     const targetFeature=target.features;
@@ -4559,17 +4610,21 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       const amountRoiSimilarity=spatialSignatureSimilarity(target.spatialSignature,x.vector.spatialSignature);
       const documentSimilarity=spatialSignatureSimilarity(target.documentSpatialSignature,x.vector.documentSpatialSignature);
       const aggregate=aggregateSimilarity(targetFeature,x.vector.features);
-      // V15.4: document-local evidence is primary; amount ROI and aggregate
-      // evidence are corroboration only. This prevents unrelated samples from
-      // collapsing to the same similarity because their generic scores match.
-      const similarity=documentSimilarity*0.70+amountRoiSimilarity*0.15+aggregate*0.15;
+      // V15.4.1: aggregate PaintOver scores are intentionally low-weight because
+      // they saturate on many manipulated samples. The sample-specific ROI and
+      // document-local morphology carry the ranking signal.
+      const roiSourceBonus = x.vector.roiSource === 'auto-local-anomaly' ? 1 : 0;
+      const similarity=documentSimilarity*0.60+amountRoiSimilarity*0.35+aggregate*0.05;
       return {
         file:path.basename(x.path),
         similarity,
         documentSimilarity,
         spatialSimilarity:amountRoiSimilarity,
         aggregateSimilarity:aggregate,
-        rawScore:x.vector.rawScore
+        rawScore:x.vector.rawScore,
+        roi:x.vector.roi,
+        roiSource:x.vector.roiSource || 'unknown',
+        roiSourceBonus
       };
     });
     negativeSimilarities.sort((a,b)=>b.similarity-a.similarity);
@@ -8535,7 +8590,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
     if(!referenceResults.length)return null;
 
-    // TYPOGRAPHY PROMOTION V1 — single-reference controlled promotion
     // V13: a typography anomaly must repeat across the Telegram reference
     // ensemble. One clean reference can differ because of OCR segmentation,
     // JPEG ringing or a different dynamic value. Collapse value findings by
@@ -8550,26 +8604,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         typographySupport.get(base).push({ref:ref.file,finding});
       }
     }
-    // V1 Typography Promotion: keep the multi-reference gate when an ensemble
-    // exists, but do not make a single trusted bank reference permanently
-    // incapable of promoting typography. With one trusted reference, promotion
-    // still requires TWO DISTINCT semantic value fields in the same reference.
-    // Label-only findings are never promoted by this gate.
-    const singleReferenceTypographyFields = referenceResults.length===1
-      ? new Set(
-          (referenceResults[0]?.characterFindings||[])
-            .filter(f=>String(f?.field||'').endsWith(':value'))
-            .map(f=>String(f.field).replace(/:value$/i,''))
-        )
-      : new Set();
-    const singleReferenceTypographyEligible =
-      referenceResults.length===1 && singleReferenceTypographyFields.size>=2;
-
     const supportedTypographyFields=new Set([...typographySupport.entries()]
-      .filter(([,rows])=>
-        rows.length>=2 ||
-        (singleReferenceTypographyEligible && rows.length>=1)
-      )
+      .filter(([,rows])=>rows.length>=2)
       .map(([field])=>field));
     for(const ref of referenceResults){
       ref.characterFindings=(ref.characterFindings||[]).filter(f=>supportedTypographyFields.has(String(f?.field||'').replace(/:value$/i,'')));
@@ -8580,8 +8616,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     }
     console.log('TYPOGRAPHY ENSEMBLE SUPPORT V13:',JSON.stringify({
       referenceCount:referenceResults.length,
-      singleReferencePromotion:singleReferenceTypographyEligible,
-      singleReferenceValueFieldCount:singleReferenceTypographyFields.size,
       fieldSupport:[...typographySupport.entries()].map(([field,rows])=>({field,referenceCount:rows.length,references:rows.map(x=>x.ref)})),
       supportedFields:[...supportedTypographyFields]
     }));
