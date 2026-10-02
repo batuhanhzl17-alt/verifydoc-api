@@ -6574,13 +6574,18 @@ function rfInferSemanticFieldKey(field, labelText = '') {
   const rawField = String(field || '');
   if (!rawField.startsWith('generic:')) return rawField;
   const n = normalizeFieldTextForMatch(labelText || rawField.slice(8)).replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
-  if (/alici\s+hesap\s+no.*iban|iban/.test(n)) return 'iban';
-  if (/alici\s+ad\s+soyad|alici\s+ad\s+soyad.*unvan/.test(n)) return 'recipientName';
-  if (/gonderen\s+ad\s+soyad|gonderici\s+ad\s+soyad/.test(n)) return 'senderName';
-  if (/islem\s+tutari|masraf\s+tutari|tutar/.test(n)) return 'amount';
+  // V1.2.5 CRITICAL ROI: bank-specific Enpara labels must resolve to the
+  // same semantic value type used by the critical typography gate. Without
+  // these aliases, labels such as GİDEN FAST EFT and MÜŞTERİ ÜNVANI became
+  // generic-text, so rfFindValueRegion() could legally attach an unrelated
+  // nearby text box. That is the wrong-place ROI bug we are fixing here.
+  if (/alici\s+iban|alici\s+hesap\s+no.*iban|iban\s*\/?\s*kart\s*no|iban/.test(n)) return 'iban';
+  if (/alici\s+(?:ad\s+soyad|unvan|ünvan)|alici\s*unvani|alici\s*adi/.test(n)) return 'recipientName';
+  if (/gonderen\s+ad\s+soyad|gonderici\s+ad\s+soyad|musteri\s+unvani|musteri\s+adi|giden\s+fast\s+eft/.test(n)) return 'senderName';
+  if (/eft\s+tutari|giden\s+eft\s+tutari|giden\s+fast\s+tutari|islem\s+tutari|masraf\s+tutari|tutar/.test(n)) return 'amount';
   if (/islem\s+tarihi|tarih/.test(n)) return 'date';
-  if (/sorgu\s+no|islem\s+no|fis\s+no|referans\s+no|numarasi|no$/.test(n)) return 'transactionNo';
-  if (/ticaret\s+merkezi\s+adresi|internet\s+sitesi\s+adresi|adres/.test(n)) return 'address';
+  if (/sira\s+no|fis\s+no|islem\s+no|sorgu\s+no|referans\s+no|numarasi|no$/.test(n)) return 'transactionNo';
+  if (/esentepe|ticaret\s+merkezi\s+adresi|internet\s+sitesi\s+adresi|adres/.test(n)) return 'address';
   if (/sicil\s+numarasi|vergi\s+no|tckn/.test(n)) return 'taxNo';
   if (/islem\s+turu|alici\s+banka|ticaret\s+unvani|unvan|subesiz\s+bankacilik|banka/.test(n)) return 'text';
   return 'generic-text';
@@ -6636,7 +6641,8 @@ function rfLooksLikeLabelRegion(region) {
 
 function rfFindValueRegion(regions, label, expectedField = null) {
   if (!label?.region) return null;
-  const field = String(expectedField || label?.rule?.key || '');
+  const rawField = String(expectedField || label?.rule?.key || '');
+  const field = rfInferSemanticFieldKey(rawField, label?.labelText || label?.text || '');
 
   // OCR frequently returns `LABEL : VALUE` as one region. Only accept it if
   // the text before the colon is actually the same semantic field.
@@ -8004,11 +8010,19 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           // V1.2.3: ROI resolver may legitimately return null when OCR cannot
           // produce a stable label crop. Never dereference a null ROI; skip that
           // field and let the remaining trusted pairs continue through V26.
-          if(!rr?.region || !tr?.region){
-            console.log("REFERENCE FORENSIC ROI SKIP V1.2.3:",JSON.stringify({field:m?.rl?.rule?.key||null,reason:"label-roi-unavailable"}));
-            continue;
+          if(!rr || !tr){
+            // V1.2.4: rfFocusLabelRegion() returns the ROI box directly.
+            // If a focused ROI cannot be produced, use the already-semantic
+            // matched OCR boxes instead of treating a valid match as absent.
+            const rrFallback = m?.rl?.region || null;
+            const trFallback = m?.tl?.region || null;
+            if(!rrFallback || !trFallback){
+              console.log("REFERENCE FORENSIC ROI SKIP V1.2.4:",JSON.stringify({field:m?.rl?.rule?.key||null,reason:"semantic-roi-unavailable"}));
+              continue;
+            }
+            console.log("REFERENCE FORENSIC ROI FALLBACK V1.2.4:",JSON.stringify({field:m?.rl?.rule?.key||null,source:"semantic-matched-ocr-region"}));
           }
-          const a=await rfStableTextMetrics(refBuffer,rr,refSize),b=await rfStableTextMetrics(targetBuffer,tr,targetSize);
+          const a=await rfStableTextMetrics(refBuffer,rr || m.rl.region,refSize),b=await rfStableTextMetrics(targetBuffer,tr || m.tl.region,targetSize);
           if(a&&b)stylePairs.push({field:m.rl.rule.key,a,b});
         }
         const globalStyleBaseline=rfMedianSigned(stylePairs.map(p=>rfStyleResidual(p.a,p.b)));
@@ -8018,8 +8032,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const key=m.rl.rule.key;
           const refLabelRegion=rfFocusLabelRegion(m.rl.region,m.rl.text);
           const tarLabelRegion=rfFocusLabelRegion(m.tl.region,m.tl.text);
-          const refStyle=(refLabelRegion?.region)?await rfStableTextMetrics(refBuffer,refLabelRegion,refSize):null;
-          const tarStyle=(tarLabelRegion?.region)?await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize):null;
+          const refStyle=refLabelRegion?await rfStableTextMetrics(refBuffer,refLabelRegion,refSize):null;
+          const tarStyle=tarLabelRegion?await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize):null;
           const rawStyle=rfStyleResidual(refStyle,tarStyle);
           const styleResidual=rfStyleResidual(refStyle,tarStyle,globalStyleBaseline);
           const refValue=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
@@ -8426,8 +8440,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
           const refLabelRegion=rfFocusLabelRegion(m.rl.region,refLabelText);
           const tarLabelRegion=rfFocusLabelRegion(m.tl.region,tarLabelText);
-          let refChar=refLabelRegion?.region ? await rfCharacterMetrics(refTypographyBuffer,refLabelRegion,refSize) : null;
-          let tarChar=tarLabelRegion?.region ? await rfCharacterMetrics(targetTypographyBuffer,tarLabelRegion,targetSize) : null;
+          let refChar=refLabelRegion ? await rfCharacterMetrics(refTypographyBuffer,refLabelRegion,refSize) : null;
+          let tarChar=tarLabelRegion ? await rfCharacterMetrics(targetTypographyBuffer,tarLabelRegion,targetSize) : null;
           // OCR boxes can differ between PDF-derived reference and camera/JPG target.
           // If the tight label ROI cannot yield a stable raster profile, retry on the
           // complete OCR region before abandoning the field. This is especially
@@ -8494,10 +8508,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             // value similarity. This is the key change: 104028004619 vs
             // 320067009135 can still be compared structurally without pretending
             // that different digits should have identical glyph shapes.
-            const rr=valueRefRaw?.region ? rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key) : null;
-            const tr=valueTarRaw?.region ? rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key) : null;
-            refValueChar=rr?.region ? await rfCharacterMetrics(refTypographyBuffer,rr,refSize) : null;
-            tarValueChar=tr?.region ? await rfCharacterMetrics(targetTypographyBuffer,tr,targetSize) : null;
+            const rr=valueRefRaw?.region ? rfFocusValueRegion(valueRefRaw.region,valueRefRaw.text,key) : (valueRefRaw?.region || null);
+            const tr=valueTarRaw?.region ? rfFocusValueRegion(valueTarRaw.region,valueTarRaw.text,key) : (valueTarRaw?.region || null);
+            refValueChar=rr ? await rfCharacterMetrics(refTypographyBuffer,rr,refSize) : null;
+            tarValueChar=tr ? await rfCharacterMetrics(targetTypographyBuffer,tr,targetSize) : null;
             if(!refValueChar && valueRefRaw?.region) refValueChar=await rfCharacterMetrics(refTypographyBuffer,valueRefRaw.region,refSize);
             if(!tarValueChar && valueTarRaw?.region) tarValueChar=await rfCharacterMetrics(targetTypographyBuffer,valueTarRaw.region,targetSize);
 
@@ -8719,24 +8733,20 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           provisional:true,
         });
       }
-      // V1.2.4: a single trusted reference must not erase a strong, repeated
-      // same-value typography comparison. Keep it as PROVISIONAL evidence when
-      // at least one critical value field passes the repeated-glyph gate.
-      // This does NOT make the field a standalone fraud verdict; downstream
-      // corroboration gates remain responsible for user-facing promotion.
-      if(provisional.length>=1){
+      // One field is never enough. Repeated evidence across >=3 distinct
+      // semantic value fields is the minimum provisional promotion gate.
+      if(provisional.length>=3){
         ref.characterFindings=provisional;
         ref.typographyCredibleFieldCount=provisional.length;
         ref.typographyScore=rfClamp100(
           Math.min(50,provisional.filter(x=>x.severity==='strong').length*18)+
-          Math.min(20,provisional.length>=3?12:provisional.length===2?8:5)
+          Math.min(20,provisional.length>=3?12:0)
         );
-        ref.typographySeverity=provisional.length>=4?'strong':provisional.length>=2?'medium':'low';
-        ref.typographyCredibility=provisional.length>=3?'strong':provisional.length>=2?'medium':'weak';
+        ref.typographySeverity=provisional.length>=4?'strong':'medium';
+        ref.typographyCredibility=provisional.length>=4?'strong':'medium';
         singleReferencePromotions.set(ref.file,{
           promotedFieldCount:provisional.length,
-          fields:provisional.map(x=>String(x.field||'').replace(/:value$/i,'')),
-          mode:'single-reference-provisional-v1.2.4'
+          fields:provisional.map(x=>String(x.field||'').replace(/:value$/i,''))
         });
       }else{
         ref.characterFindings=[];
@@ -14675,7 +14685,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
     // reference amount anchor explicitly for the Reference Forensic Engine.
     // The target amount ROI still comes from amountForensics.region.
     const safeReferenceAmountField = (await getReferenceAmountAnchor(bank)) || null;
-    console.log("VERIFYDOC TYPOGRAPHY V1.2.2 ACTIVE");
+    console.log("VERIFYDOC TYPOGRAPHY V1.2.5 ACTIVE");
     console.log("REFERENCE FORENSIC AMOUNT FIELD HANDOFF V1.2.2:", JSON.stringify({
       available: Boolean(safeReferenceAmountField),
       source: safeReferenceAmountField?.source || safeReferenceAmountField?.templateRole || null,
