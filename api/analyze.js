@@ -9,11 +9,12 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, inferDocumentFamily } from "./mathematical_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
 import { createRequire } from "module"
-import { pathToFileURL } from "url"
+import { fileURLToPath, pathToFileURL } from "url"
 const require = createRequire(import.meta.url);
 
 // Vercel/ESM ortamında @napi-rs/canvas named export her zaman düzgün gelmeyebilir.
@@ -67,6 +68,158 @@ const referenceAmountAnchorCache = new Map();
 // birden fazla kez istendiğinde aynı OCR sonucunu yeniden üretme.
 const paddleOCRCache = new Map();
 
+// =====================================================
+// MATHEMATICAL FORENSICS BASELINE
+// =====================================================
+const MATH_BASELINE_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "mathematical_forensics_baseline.json"
+);
+let mathematicalBaselineCache = null;
+
+async function loadMathematicalBaseline() {
+  if (mathematicalBaselineCache) return mathematicalBaselineCache;
+  try {
+    const raw = await fs.readFile(MATH_BASELINE_PATH, "utf8");
+    mathematicalBaselineCache = JSON.parse(raw);
+    return mathematicalBaselineCache;
+  } catch (error) {
+    console.warn("MATHEMATICAL BASELINE LOAD HATASI:", error?.message || error);
+    return null;
+  }
+}
+
+function getMathSemanticRois({ amountForensics = null, referenceForensics = null } = {}) {
+  const rois = {};
+  const amountField = Array.isArray(referenceForensics?.fields)
+    ? referenceForensics.fields.find(f => ['amount','totalAmount'].includes(String(f?.field || '').replace(/:value$/i, '')))
+    : null;
+  if (amountForensics?.region && amountField) {
+    const target = amountForensics.region;
+    const reference = amountField.referenceValueBox || amountField.referenceBox || null;
+    if (reference) rois.amount = { target, reference };
+  }
+
+  const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
+  const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
+    ? referenceForensics.typographyFieldProfiles : [];
+  const normalizeField = (v) => String(v || '').toLocaleLowerCase('tr-TR').replace(/[^a-z0-9çğıöşü]/gi, '');
+  const findField = (aliases) => {
+    const wanted = aliases.map(normalizeField);
+    const row = fields.find(f => wanted.includes(normalizeField(String(f?.field || '').replace(/:value$/i, ''))));
+    if (row) return row;
+    const profile = profiles.find(f => wanted.includes(normalizeField(String(f?.field || '').replace(/:value$/i, ''))));
+    return profile || null;
+  };
+
+  const recipientName = findField(['recipientName','aliciUnvani','aliciAdi']);
+  if (recipientName) {
+    const target = recipientName.targetValueBox || recipientName.targetBox || null;
+    const reference = recipientName.referenceValueBox || recipientName.referenceBox || null;
+    if (target && reference) rois.recipientName = { target, reference };
+  }
+
+  const recipientIban = findField(['recipientIban','iban','aliciIban']);
+  if (recipientIban) {
+    const target = recipientIban.targetValueBox || recipientIban.targetBox || null;
+    const reference = recipientIban.referenceValueBox || recipientIban.referenceBox || null;
+    if (target && reference) rois.recipientIban = { target, reference };
+  }
+
+  return rois;
+}
+
+async function runMathematicalForensics({ targetPath, targetText = "", bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
+  if (!targetPath || !bank) {
+    return { available: false, status: "missing-target-or-bank" };
+  }
+  const baseline = await loadMathematicalBaseline();
+  if (!baseline) return { available: false, status: "baseline-unavailable" };
+
+  const semanticRois = getMathSemanticRois({ amountForensics, referenceForensics });
+  const targetRegions = {};
+  const referenceRegions = {};
+  for (const [name, pair] of Object.entries(semanticRois)) {
+    if (pair?.target && pair?.reference) {
+      // The ROI extractor accepts boxes in native target/reference coordinates.
+      // Keep each side separate because reference and target raster sizes can differ.
+      targetRegions[name] = pair.target;
+      referenceRegions[name] = pair.reference;
+    }
+  }
+
+  const fingerprint = await extractMathematicalFingerprint(targetPath, { regions: targetRegions });
+  const family = inferDocumentFamily(fileName, targetText);
+  const reference = compareAgainstBaseline(fingerprint, baseline.reference, bank, family);
+  const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
+
+  let roiForensics = null;
+  if (referencePath && Object.keys(referenceRegions).length) {
+    try {
+      const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
+      roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
+    } catch (error) {
+      roiForensics = { available: false, status: 'roi-error', error: error?.message || String(error) };
+    }
+  }
+
+  const refScore = Number(reference?.bestMatch?.similarityScore || 0);
+  const negScore = Number(negative?.bestMatch?.similarityScore || 0);
+  const affinityDelta = Number((negScore - refScore).toFixed(2));
+
+  const flags = [];
+  if (reference?.available && negative?.available) {
+    const negReliability = String(negative?.bestMatch?.profile?.reliability || 'insufficient');
+    const refReliability = String(reference?.bestMatch?.profile?.reliability || 'insufficient');
+    const reliabilityPenalty = negReliability === 'low' ? 'low-sample' : 'population';
+    if (negScore >= 70 && affinityDelta >= 10 && negReliability !== 'low') {
+      flags.push({
+        code: "NEGATIVE_MATH_AFFINITY",
+        severity: "high",
+        reliability: reliabilityPenalty,
+        detail: `Matematiksel fingerprint known-negative dağılımına reference dağılımından daha yakın (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
+      });
+    } else if (negScore >= 60 && affinityDelta >= 5) {
+      flags.push({
+        code: "NEGATIVE_MATH_AFFINITY",
+        severity: negReliability === 'low' ? "low" : "medium",
+        reliability: reliabilityPenalty,
+        detail: `Known-negative matematiksel affinity sinyali var (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
+      });
+    }
+  }
+
+  const roiRows = Object.entries(roiForensics || {})
+    .filter(([, v]) => v?.available)
+    .map(([field, v]) => ({ field, meanDistance: v.meanDistance, maxCellDistance: v.maxCellDistance, topCells: v.topCells }));
+  const strongestRoi = roiRows.sort((a,b)=>Number(b.meanDistance)-Number(a.meanDistance))[0] || null;
+
+  return {
+    available: true,
+    version: 'MATH-FORENSICS-V1.1.0-16X16',
+    engine: 'mathematical-forensics-v1.1-16x16-semantic-roi',
+    bank,
+    family,
+    reference,
+    negative,
+    differential: {
+      negativeMinusReference: affinityDelta,
+      referenceSimilarity: refScore,
+      negativeSimilarity: negScore,
+    },
+    roi16x16: roiForensics,
+    roiSummary: {
+      available: roiRows.length > 0,
+      fieldsCompared: roiRows.map(x=>x.field),
+      strongestField: strongestRoi?.field || null,
+      strongestMeanDistance: strongestRoi?.meanDistance ?? null,
+      strongestMaxCellDistance: strongestRoi?.maxCellDistance ?? null,
+    },
+    fingerprint,
+    flags,
+  };
+}
 
 // =====================================================
 // GEÇMİŞ ŞÜPHELİ KAYITLAR — SUPABASE REST
@@ -6641,9 +6794,6 @@ function rfLooksLikeLabelRegion(region) {
 
 
 // =====================================================
-// TYPOGRAPHY CRITICAL ROI RESOLVER V1.2.8
-// Esentepe/address removed; amount/customer/recipient ROI strengthened.
-// =====================================================
 // TYPOGRAPHY CRITICAL ROI RESOLVER V1.2.6
 // =====================================================
 function rfCriticalSemanticKeyV126(field,labelText=''){
@@ -6654,12 +6804,14 @@ function rfCriticalSemanticKeyV126(field,labelText=''){
   if(/musteri\s+unvani|musteri\s+adi|gonderen\s+(?:ad|adi|unvani)|gonderici\s+(?:ad|adi|unvani)|giden\s+fast\s+eft/i.test(n))return 'senderName';
   if(/alici\s+(?:ad|adi|unvani|unvan)/i.test(n))return 'recipientName';
   if(/sira\s+no|fis\s+no|islem\s+no|sorgu\s+no|referans\s+no/i.test(n))return 'transactionNo';
+  if(/esentepe|adres|address/i.test(n))return 'address';
   if(/^generic:IBAN\/KART NO$/i.test(raw))return 'iban';
   if(/^generic:EFT TUTARI$/i.test(raw))return 'amount';
   if(/^generic:MUSTERI UNVANI$/i.test(raw)||/^generic:GIDEN FAST EFT$/i.test(raw))return 'senderName';
   if(/^generic:ALICI UNVANI$/i.test(raw))return 'recipientName';
   if(/^generic:ALICI IBAN$/i.test(raw))return 'iban';
   if(/^generic:(?:SIRA NO|FIS NO)$/i.test(raw))return 'transactionNo';
+  if(/^generic:(?:ESENTEPE|ADRES)/i.test(raw))return 'address';
   return rfInferSemanticFieldKey(field,labelText);
 }
 function rfCriticalCandidateBoxV126(region){
@@ -6695,8 +6847,8 @@ function rfCriticalCandidateScoreV126(label,candidate,semanticKey){
   const vertical=Math.min(lr.y2,cr.y2)-Math.max(lr.y1,cr.y1),rightGap=cr.x1-lr.x2,belowGap=cr.y1-lr.y2,xGap=Math.abs(ccX-lcX);
   let cost=Infinity;
   if(vertical>=-lh*.45&&rightGap>=-lh*.25&&rightGap<Math.max(420,lh*18))cost=Math.abs(rightGap)/Math.max(1,lh)+Math.abs(ccY-lcY)/Math.max(1,lh)*.7;
-  const belowLimit=(semanticKey==='senderName'||semanticKey==='recipientName')?Math.max(220,lh*7):Math.max(100,lh*3.5);
-  const xLimit=(semanticKey==='senderName'||semanticKey==='recipientName')?Math.max(520,lh*18):Math.max(320,lh*11);
+  const belowLimit=semanticKey==='address'?Math.max(260,lh*7):(semanticKey==='senderName'||semanticKey==='recipientName')?Math.max(150,lh*5):Math.max(100,lh*3.5);
+  const xLimit=semanticKey==='address'?Math.max(520,lh*16):Math.max(320,lh*11);
   if(belowGap>=-lh*.30&&belowGap<belowLimit&&xGap<xLimit)cost=Math.min(cost,3+Math.max(0,belowGap)/Math.max(1,lh)+xGap/Math.max(1,lh)*.18);
   return cost;
 }
@@ -6704,44 +6856,31 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
   const semanticKey=rfCriticalSemanticKeyV126(field,label?.labelText||label?.text||'');
   const labelText=String(label?.labelText||label?.text||'').trim();
 
-  // V1.2.8: OCR can return LABEL:VALUE, or LABEL VALUE, in one region.
-  // Resolve only the requested semantic field. This is intentionally limited
-  // to amount/name/identifier/IBAN fields; address is no longer a critical ROI.
-  if(label?.region){
-    const rawLabelText=String(label?.text||labelText||'').trim();
-    let inlineValue='';
-    let left='';
-    if(/[:：]/.test(rawLabelText)){
-      const parts=rawLabelText.split(/[:：]/);
-      left=String(parts.shift()||'').trim();
-      inlineValue=parts.join(':').trim();
-    } else if(semanticKey==='senderName'||semanticKey==='recipientName'){
-      const normalizedRaw=normalizeFieldTextForMatch(rawLabelText);
-      const normalizedLabel=normalizeFieldTextForMatch(labelText);
-      if(normalizedLabel && normalizedRaw.startsWith(normalizedLabel) && normalizedRaw.length>normalizedLabel.length){
-        left=labelText;
-        inlineValue=rawLabelText.slice(String(labelText).length).replace(/^[\s\-–—]+/,'').trim();
-      }
+  // V1.2.7: OCR can return LABEL:VALUE in one region. Split it semantically
+  // before searching nearby regions. This is especially important for
+  // MÜŞTERİ ÜNVANI / ALICI ÜNVANI.
+  if(label?.region && /[:：]/.test(labelText)){
+    const parts=labelText.split(/[:：]/);
+    const left=String(parts.shift()||'').trim();
+    const inlineValue=parts.join(':').trim();
+    const leftKey=rfCriticalSemanticKeyV126(field,left);
+    const sameSemantic=leftKey===semanticKey;
+    let valid=false;
+    if(sameSemantic){
+      if(semanticKey==='iban') valid=rfCriticalLooksIbanV126(inlineValue);
+      else if(semanticKey==='amount') valid=rfCriticalLooksAmountV126(inlineValue);
+      else if(semanticKey==='transactionNo') valid=rfCriticalLooksNumericIdV126(inlineValue);
+      else if(semanticKey==='senderName'||semanticKey==='recipientName') valid=rfCriticalLooksNameV126(inlineValue);
+      else if(semanticKey==='address') valid=rfCriticalLooksAddressV126(inlineValue);
     }
-    if(inlineValue){
-      const leftKey=rfCriticalSemanticKeyV126(field,left);
-      const sameSemantic=leftKey===semanticKey;
-      let valid=false;
-      if(sameSemantic){
-        if(semanticKey==='iban') valid=rfCriticalLooksIbanV126(inlineValue);
-        else if(semanticKey==='amount') valid=rfCriticalLooksAmountV126(inlineValue);
-        else if(semanticKey==='transactionNo') valid=rfCriticalLooksNumericIdV126(inlineValue);
-        else if(semanticKey==='senderName'||semanticKey==='recipientName') valid=rfCriticalLooksNameV126(inlineValue);
-      }
-      if(valid){
-        return {
-          text:inlineValue,
-          region:rfCriticalCandidateBoxV126(label.region),
-          score:100,
-          criticalROI:true,
-          resolver:'inline-semantic-value-v128'
-        };
-      }
+    if(valid){
+      return {
+        text:inlineValue,
+        region:rfCriticalCandidateBoxV126(label.region),
+        score:100,
+        criticalROI:true,
+        resolver:'inline-semantic-value-v127'
+      };
     }
   }
 
@@ -8340,7 +8479,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         // promotions in earlier versions. Generic bank labels are mapped to a
         // semantic field only when their label is an exact/near-exact critical label.
         const TP_ALLOWED_FIELDS=new Set([
-          'amount','iban','senderName','recipientName',
+          'amount','iban','senderName','recipientName','senderAddress','recipientAddress','address',
           'transactionNo','accountNo','taxNo'
         ]);
         const TP_GENERIC_CRITICAL_MAP={
@@ -8349,6 +8488,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           'generic:MUSTERI UNVANI':'senderName',
           'generic:SIRA NO':'transactionNo',
           'generic:FIS NO':'transactionNo',
+          'generic:ESENTEPE':'address',
+          'generic:ADRES':'address',
           'generic:ALICI UNVANI':'recipientName',
           'generic:ALICI IBAN':'iban',
           'generic:IBAN/KART NO':'iban'
@@ -8536,7 +8677,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const sharedCount = Number(sameValueGlyph?.sharedCount || 0);
           const sharedDistance = Number(sameValueGlyph?.distance);
           if(!exactValue){
-            const dynamicField = ['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName'].includes(String(field||''));
+            const dynamicField = ['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(field||''));
             if(!dynamicField){
               if(!Number.isFinite(sharedDistance) || sharedCount < 4) return null;
               if(sharedDistance < 0.50) return null;
@@ -8648,31 +8789,19 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
                   (Number(a.distance)-Number(b.distance))
                 );
 
-              // V1.2.9: resolve the reference amount VALUE, not only its ROI.
-              // The trusted anchor remains authoritative for geometry. OCR is
-              // searched inside/near that anchor for the actual numeric amount.
+              // Prefer a real amount token in/near the trusted anchor, but never
+              // reject the trusted ROI solely because OCR missed the token.
               const refAnchorCandidate=refAmountCandidates.find(x=>x.amountLike&&
                 (x.overlap>0 || x.distance<=0.045)) || null;
-              const nearbyAmountCandidates=refAmountCandidates.filter(x=>x.amountLike&&
-                (x.overlap>0 || x.distance<=0.065)).slice(0,6);
-              let refAmountText=String(refAnchorCandidate?.x?.text||'').trim();
-              if(!refAmountText && nearbyAmountCandidates.length){
-                refAmountText=nearbyAmountCandidates
-                  .sort((a,b)=>Number(a.distance)-Number(b.distance))
-                  .map(x=>String(x.x?.text||'').trim())
-                  .filter(Boolean)
-                  .join(' ')
-                  .trim();
-              }
-              if(refAmountText && !rfCriticalLooksAmountV126(refAmountText)) refAmountText='';
-
+              const refAnchorRegion=refAnchorCandidate?.x||null;
+              const refAmountText=String(refAnchorCandidate?.x?.text||'').trim();
 
               valueRefRaw={
                 text:refAmountText,
                 region:rr,
                 score:99,
                 criticalROI:true,
-                resolver:'trusted-reference-amount-anchor-v129',
+                resolver:'trusted-reference-amount-anchor-v127',
                 roiOnly:!refAmountText
               };
               valueTarRaw={
@@ -8680,7 +8809,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
                 region:tr,
                 score:99,
                 criticalROI:true,
-                resolver:'amount-forensics-region-v129'
+                resolver:'amount-forensics-region-v127'
               };
             } else {
               valueRefRaw=null;
@@ -8694,7 +8823,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             const refGate=tpCriticalValueGate(semanticKey,valueRefText,refLabelText);
             const tarGate=tpCriticalValueGate(semanticKey,valueTarText,tarLabelText);
             const trustedROI=valueRefRaw?.criticalROI===true&&valueTarRaw?.criticalROI===true;
-            const dynamicCriticalField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName'].includes(String(semanticKey));
+            const dynamicCriticalField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(semanticKey));
             const trustedAmountRoiOnly =
               semanticKey==='amount' &&
               trustedROI &&
@@ -8703,18 +8832,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
             valueComparable=trustedROI&&refGate.ok&&tarGate.ok&&(dynamicCriticalField?true:tpValueComparable(semanticKey,valueRefText,valueTarText));
 
-            if(semanticKey==='amount' && trustedROI && tarGate.ok){
-              // V1.2.8: Amount Forensics + trusted reference anchor are sufficient
-              // to establish the amount ROI. Reference OCR may legitimately be
-              // empty; Typography must still compare the raster ROI.
-              valueComparable=true;
-            }
-
             if(trustedAmountRoiOnly){
               // The reference OCR text is not required when the trusted
               // reference amount anchor itself is available. Keep the ROI for
-              // raster comparison and treat the trusted ROI pair as comparable.
-              valueComparable=true;
+              // raster comparison, but do not claim literal value comparability.
+              valueComparable=false;
             } else if(!refGate.ok || !tarGate.ok){
               // Do not destroy a trusted amount ROI merely because OCR failed
               // to provide the reference token. Other fields still require a
@@ -8766,7 +8888,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           );
           // V21: do not use whole-value character geometry as the primary
           // evidence. Use the same-character glyph comparison instead.
-          const dynamicSemanticField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName'].includes(String(semanticKey));
+          const dynamicSemanticField=['amount','iban','transactionNo','accountNo','taxNo','senderName','recipientName','senderAddress','recipientAddress','address'].includes(String(semanticKey));
           const dynamicContentDifferent =
             dynamicSemanticField &&
             valueRefText &&
@@ -8846,7 +8968,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           if(valueFinding) typographyFieldProfiles[typographyFieldProfiles.length-1].legacySharedGlyphFinding={...valueFinding};
         }
 
-        console.log('TYPOGRAPHY CRITICAL ROI V1.2.9 RESOLVER:',JSON.stringify({
+        console.log('TYPOGRAPHY CRITICAL ROI V1.2.7 RESOLVER:',JSON.stringify({
           policy:'typed semantic ROI; explicit trusted amount ROI; wrong ROI => skip; literal value equality not required for dynamic critical fields',
           profiles:typographyFieldProfiles.map(p=>({field:p.field,valueComparable:p.valueComparable,valueReference:p.valueReference||null,valueTarget:p.valueTarget||null})).slice(0,30)
         }));
@@ -14795,6 +14917,7 @@ let paintOverForensics = null;
 let paintOverForensicsV2 = null;
 let openSourceForensics = null;
 let fontForensics = null;
+let mathematicalForensics = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -14927,7 +15050,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
     // reference amount anchor explicitly for the Reference Forensic Engine.
     // The target amount ROI still comes from amountForensics.region.
     const safeReferenceAmountField = (await getReferenceAmountAnchor(bank)) || null;
-    console.log("VERIFYDOC TYPOGRAPHY V1.2.8 ACTIVE");
+    console.log("VERIFYDOC TYPOGRAPHY V1.2.5 ACTIVE");
     console.log("REFERENCE FORENSIC AMOUNT FIELD HANDOFF V1.2.2:", JSON.stringify({
       available: Boolean(safeReferenceAmountField),
       source: safeReferenceAmountField?.source || safeReferenceAmountField?.templateRole || null,
@@ -14973,6 +15096,35 @@ if ((type === "image" || type === "pdf") && bank) {
     }
   } catch (error) {
     console.warn("NEGATIVE SAMPLE FORENSICS HATASI:", error?.message || error);
+  }
+}
+
+// =====================================================
+// MATHEMATICAL FORENSICS V1
+// =====================================================
+// Independent mathematical fingerprint. It compares the target against
+// real/reference and known-negative populations for the detected bank.
+// It is advisory and does not replace the existing forensic engines.
+if (type === "image" || type === "pdf") {
+  try {
+    const mathText = [
+      extractedPdfText,
+      paddleOcrText,
+      paddleImageOCR?.text || ""
+    ].filter(Boolean).join("\n");
+    mathematicalForensics = await runMathematicalForensics({
+      targetPath: forensicTargetPath,
+      targetText: mathText,
+      bank,
+      fileName,
+      referencePath: reference?.path || null,
+      amountForensics,
+      referenceForensics
+    });
+    console.log("MATHEMATICAL FORENSICS V1:", JSON.stringify(mathematicalForensics));
+  } catch (error) {
+    console.warn("MATHEMATICAL FORENSICS V1 HATASI:", error?.message || error);
+    mathematicalForensics = { available: false, status: "error", error: error?.message || String(error) };
   }
 }
 
@@ -16748,6 +16900,9 @@ if (azureReferenceGeometry) {
 }
 if (referenceVisualAdjudication) {
   result.referenceVisualAdjudication = referenceVisualAdjudication;
+}
+if (mathematicalForensics) {
+  result.mathematicalForensics = mathematicalForensics;
 }
 if (negativeSampleForensics) {
   result.negativeSampleForensics = negativeSampleForensics;
@@ -19451,6 +19606,47 @@ result.riskLabel = finalRiskLabel;
 
 if (!controlledAmountCorroborated) {
   result.categories = finalDeterministicRisk.categories;
+}
+
+// Mathematical fingerprint is intentionally a corroborating signal, not an
+// automatic authenticity verdict. Require a reasonably sized baseline and
+// either a strong reference outlier or a clear known-negative affinity.
+const mathReference = result?.mathematicalForensics?.reference;
+const mathNegative = result?.mathematicalForensics?.negative;
+const mathReferenceReliable = ['medium', 'high'].includes(String(mathReference?.bestMatch?.profile?.reliability || ''));
+const mathNegativeReliable = ['medium', 'high'].includes(String(mathNegative?.bestMatch?.profile?.reliability || ''));
+const mathReferenceOutlier =
+  result?.mathematicalForensics?.available === true &&
+  mathReferenceReliable &&
+  Number(mathReference?.bestMatch?.robustDistance || 0) >= 2.5;
+const mathNegativeAffinity =
+  result?.mathematicalForensics?.available === true &&
+  mathNegativeReliable &&
+  Number(mathNegative?.bestMatch?.similarityScore || 0) >= 70 &&
+  Number(result?.mathematicalForensics?.differential?.negativeMinusReference || 0) >= 10;
+
+if (mathReferenceOutlier) {
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 48)
+  };
+}
+
+if (mathNegativeAffinity) {
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 60)
+  };
+}
+
+if (mathReferenceOutlier && mathNegativeAffinity) {
+  finalRiskScore = Math.max(finalRiskScore, 60);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 65)
+  };
 }
 
 // AI'ın overallRisk değerini kullanma.
