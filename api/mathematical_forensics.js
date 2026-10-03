@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import sharp from 'sharp';
 
-const VERSION = 'MATH-FORENSICS-V1.2.0-16X16';
+const VERSION = 'MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE';
 const DEFAULT_SIZE = 256;
 const TILE_GRID = 16;
 const ROI_CANVAS_WIDTH = 256;
@@ -570,6 +570,90 @@ function compareMetricObjects(target, reference) {
     sum += Math.min(d, 10); n++;
   }
   return { metricDistances: out, meanDistance: Number((sum / Math.max(1,n)).toFixed(3)) };
+}
+
+
+function normalizedBox(box, width, height) {
+  if (!box || !Number.isFinite(Number(width)) || !Number.isFinite(Number(height)) || width <= 0 || height <= 0) return null;
+  const x1 = clamp(Number(box.x1), 0, width);
+  const y1 = clamp(Number(box.y1), 0, height);
+  const x2 = clamp(Number(box.x2), 0, width);
+  const y2 = clamp(Number(box.y2), 0, height);
+  if (!(x2 > x1 && y2 > y1)) return null;
+  return { x1: x1 / width, y1: y1 / height, x2: x2 / width, y2: y2 / height };
+}
+
+function cellOverlapRatio(cell, box, grid = 16) {
+  if (!cell || !box) return 0;
+  const x1 = (cell.col - 1) / grid, y1 = (cell.row - 1) / grid;
+  const x2 = cell.col / grid, y2 = cell.row / grid;
+  const ix1 = Math.max(x1, box.x1), iy1 = Math.max(y1, box.y1);
+  const ix2 = Math.min(x2, box.x2), iy2 = Math.min(y2, box.y2);
+  const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+  const area = Math.max(1e-9, (x2 - x1) * (y2 - y1));
+  return inter / area;
+}
+
+export function compareGlobal16x16(targetFingerprint, referenceFingerprint, criticalRois = {}, options = {}) {
+  const targetTiles = Array.isArray(targetFingerprint?.raster?.tiles) ? targetFingerprint.raster.tiles : [];
+  const referenceTiles = Array.isArray(referenceFingerprint?.raster?.tiles) ? referenceFingerprint.raster.tiles : [];
+  const count = Math.min(targetTiles.length, referenceTiles.length, 256);
+  if (!count) return { available:false, reason:'global-tiles-missing', grid:'16x16', cellCount:0 };
+
+  const grid = 16;
+  const differentThreshold = Number.isFinite(Number(options.differentThreshold)) ? Number(options.differentThreshold) : 3.5;
+  const strongThreshold = Number.isFinite(Number(options.strongThreshold)) ? Number(options.strongThreshold) : 5;
+  const minOverlap = Number.isFinite(Number(options.minOverlap)) ? Number(options.minOverlap) : 0.20;
+  const cells = [];
+  for (let i = 0; i < count; i++) {
+    const a = targetTiles[i], b = referenceTiles[i];
+    const lapScale = Math.max(Math.abs(Number(b?.lapVar) || 0) * 0.05, 0.5);
+    const edgeScale = Math.max(Math.abs(Number(b?.edgeDensity) || 0) * 0.05, 0.005);
+    const stdScale = Math.max(Math.abs(Number(b?.std) || 0) * 0.05, 0.5);
+    const lap = Math.abs((Number(a?.lapVar)||0)-(Number(b?.lapVar)||0))/lapScale;
+    const edge = Math.abs((Number(a?.edgeDensity)||0)-(Number(b?.edgeDensity)||0))/edgeScale;
+    const sd = Math.abs((Number(a?.std)||0)-(Number(b?.std)||0))/stdScale;
+    const distance = (Math.min(lap,10)+Math.min(edge,10)+Math.min(sd,10))/3;
+    cells.push({ index:i, row:Math.floor(i/grid)+1, col:(i%grid)+1, laplacianDistance:Number(lap.toFixed(3)), edgeDistance:Number(edge.toFixed(3)), stdDistance:Number(sd.toFixed(3)), distance:Number(distance.toFixed(3)), different:distance >= differentThreshold, strong:distance >= strongThreshold });
+  }
+
+  const differentCells = cells.filter(c => c.different);
+  const strongCells = cells.filter(c => c.strong);
+  const roiHits = {};
+  for (const [field, roi] of Object.entries(criticalRois || {})) {
+    const targetBox = roi?.target || roi?.targetSourceBox || roi;
+    const normalized = normalizedBox(targetBox, targetFingerprint?.source?.width, targetFingerprint?.source?.height);
+    if (!normalized) { roiHits[field] = { available:false, reason:'target-roi-box-missing' }; continue; }
+    const hits = cells.filter(cell => cellOverlapRatio(cell, normalized, grid) >= minOverlap);
+    const diffHits = hits.filter(c => c.different);
+    const strongHits = hits.filter(c => c.strong);
+    roiHits[field] = {
+      available:true,
+      normalizedBox: normalized,
+      overlappingCells: hits.map(c=>c.index),
+      differentCells: diffHits.map(c=>c.index),
+      strongDifferentCells: strongHits.map(c=>c.index),
+      overlapCount:hits.length,
+      differentCount:diffHits.length,
+      strongDifferentCount:strongHits.length,
+      maxDistance: hits.length ? Number(Math.max(...hits.map(c=>c.distance)).toFixed(3)) : 0,
+      meanDistance: hits.length ? Number((hits.reduce((s,c)=>s+c.distance,0)/hits.length).toFixed(3)) : 0,
+    };
+  }
+
+  return {
+    available:true,
+    grid:'16x16',
+    cellCount:count,
+    thresholds:{differentThreshold,strongThreshold,minOverlap},
+    similarCount: count - differentCells.length,
+    differentCount: differentCells.length,
+    strongDifferentCount: strongCells.length,
+    similarityRatio: Number(((count - differentCells.length) / count).toFixed(4)),
+    cells,
+    topDifferentCells:[...differentCells].sort((a,b)=>b.distance-a.distance).slice(0,12),
+    criticalRoiHits: roiHits,
+  };
 }
 
 export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNames = ['amount','recipientName','recipientIban']) {
