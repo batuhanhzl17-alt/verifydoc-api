@@ -1,49 +1,540 @@
-# VerifyDoc Mathematical Forensics V1
+import fs from 'fs/promises';
+import path from 'path';
+import sharp from 'sharp';
 
-## Baseline
-- Reference population: 60 image/raster samples derived from the current `references/` set, including the supplied JPG references and first-page rasterizations of reference PDFs.
-- Negative population: 10 known-negative samples from `negative_samples/`.
-- Baseline file: `mathematical_forensics_baseline.json`.
+const VERSION = 'MATH-FORENSICS-V1.1.0-16X16';
+const DEFAULT_SIZE = 256;
+const TILE_GRID = 16;
+const ROI_CANVAS_WIDTH = 256;
+const ROI_CANVAS_HEIGHT = 96;
 
-## Features
-The fingerprint contains:
-- luminance mean/std and entropy
-- edge density and mean gradient
-- Laplacian variance
-- dark/bright pixel ratios
-- 8x8 DCT low/mid/high frequency energy and high-frequency ratio
-- JPEG quantization-table statistics and estimated JPEG quality when native JPEG data is available
-- horizontal/vertical 8x8 blockiness
-- 4x4 regional raster statistics
+const LUMA_Q50 = [
+  16,11,10,16,24,40,51,61,
+  12,12,14,19,26,58,60,55,
+  14,13,16,24,40,57,69,56,
+  14,17,22,29,51,87,80,62,
+  18,22,37,56,68,109,103,77,
+  24,35,55,64,81,104,113,92,
+  49,64,78,87,103,121,120,101,
+  72,92,95,98,112,100,103,99
+];
+const CHROMA_Q50 = [
+  17,18,24,47,99,99,99,99,
+  18,21,26,66,99,99,99,99,
+  24,26,56,99,99,99,99,99,
+  47,66,99,99,99,99,99,99,
+  99,99,99,99,99,99,99,99,
+  99,99,99,99,99,99,99,99,
+  99,99,99,99,99,99,99,99,
+  99,99,99,99,99,99,99,99
+];
 
-## Runtime flow
-1. `analyze.js` loads the baseline once and caches it.
-2. The target is fingerprinted after the existing PDF-to-raster step when needed.
-3. The target is compared against the selected bank's reference and known-negative populations.
-4. Comparisons use robust median/MAD-style distances with a relative floor, so tiny populations do not create artificial extreme z-scores.
-5. Mathematical evidence is returned as `result.mathematicalForensics` and is advisory.
-6. Only sufficiently populated mathematical signals can provide a controlled corroborating risk floor; the existing OCR, amount, reference, visual, layout, paint-over and font engines remain active.
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function mean(a) { return a.length ? a.reduce((s, v) => s + v, 0) / a.length : 0; }
+function variance(a, m = mean(a)) { return a.length ? a.reduce((s, v) => s + (v - m) ** 2, 0) / a.length : 0; }
+function std(a, m = mean(a)) { return Math.sqrt(variance(a, m)); }
+function median(a) {
+  if (!a.length) return 0;
+  const b = [...a].sort((x, y) => x - y);
+  const m = Math.floor(b.length / 2);
+  return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2;
+}
+function mad(a, med = median(a)) { return median(a.map(v => Math.abs(v - med))); }
+function entropyFromHistogram(hist, total) {
+  if (!total) return 0;
+  let e = 0;
+  for (const n of hist) if (n) { const p = n / total; e -= p * Math.log2(p); }
+  return e;
+}
 
-## Rebuilding the baseline
-Run after updating `references/` or `negative_samples/`:
+function jpegQuantizationTables(buf) {
+  const tables = {};
+  if (!buf || buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return tables;
+  let i = 2;
+  while (i + 3 < buf.length) {
+    while (i < buf.length && buf[i] !== 0xff) i++;
+    while (i < buf.length && buf[i] === 0xff) i++;
+    if (i >= buf.length) break;
+    const marker = buf[i++];
+    if (marker === 0xd9 || marker === 0xda) break;
+    if (marker >= 0xd0 && marker <= 0xd7) continue;
+    if (i + 1 >= buf.length) break;
+    const len = buf.readUInt16BE(i);
+    if (len < 2 || i + len > buf.length) break;
+    if (marker === 0xdb) {
+      let p = i + 2;
+      const end = i + len;
+      while (p < end) {
+        const info = buf[p++];
+        const precision = info >> 4;
+        const id = info & 0x0f;
+        const count = precision === 0 ? 64 : 128;
+        const values = [];
+        for (let k = 0; k < count && p < end; k++) {
+          values.push(precision === 0 ? buf[p++] : buf.readUInt16BE(p += 0, true));
+          if (precision !== 0) p += 2;
+        }
+        tables[id] = { precision: precision ? 16 : 8, values: values.slice(0, 64) };
+      }
+    }
+    i += len;
+  }
+  return tables;
+}
 
-```bash
-node build_mathematical_baseline.mjs
-```
+function jpegQualityEstimate(tables) {
+  const estimates = [];
+  for (const [id, table] of Object.entries(tables || {})) {
+    if (!table?.values?.length) continue;
+    const base = Number(id) === 0 ? LUMA_Q50 : CHROMA_Q50;
+    let bestQ = null;
+    let bestErr = Infinity;
+    for (let q = 1; q <= 100; q++) {
+      const scale = q < 50 ? 5000 / q : 200 - 2 * q;
+      let err = 0;
+      const n = Math.min(64, table.values.length);
+      for (let k = 0; k < n; k++) {
+        const expected = clamp(Math.floor((base[k] * scale + 50) / 100), 1, 255);
+        err += Math.abs(expected - table.values[k]);
+      }
+      err /= n;
+      if (err < bestErr) { bestErr = err; bestQ = q; }
+    }
+    estimates.push({ id: Number(id), quality: bestQ, error: bestErr });
+  }
+  if (!estimates.length) return null;
+  const q = estimates.reduce((s, x) => s + x.quality, 0) / estimates.length;
+  const e = estimates.reduce((s, x) => s + x.error, 0) / estimates.length;
+  return { estimatedQuality: q, fitError: e, tables: estimates };
+}
 
-The builder renders the first page of PDFs and fingerprints the resulting raster alongside native image samples.
+function makeDctCos() {
+  const c = Array.from({ length: 8 }, () => Array(8).fill(0));
+  for (let u = 0; u < 8; u++) for (let x = 0; x < 8; x++) c[u][x] = Math.cos(((2 * x + 1) * u * Math.PI) / 16);
+  return c;
+}
+const DCT_COS = makeDctCos();
+function dct8(block) {
+  const out = new Float64Array(64);
+  for (let u = 0; u < 8; u++) {
+    const au = u === 0 ? Math.SQRT1_2 : 1;
+    for (let v = 0; v < 8; v++) {
+      const av = v === 0 ? Math.SQRT1_2 : 1;
+      let s = 0;
+      for (let x = 0; x < 8; x++) for (let y = 0; y < 8; y++) {
+        s += block[x * 8 + y] * DCT_COS[u][x] * DCT_COS[v][y];
+      }
+      out[u * 8 + v] = 0.25 * au * av * s;
+    }
+  }
+  return out;
+}
 
-## Validation note
-Known negative samples were checked with leave-one-out comparisons where the population contained enough samples. Enpara negatives separated strongly from the reference population, and the two Ziraat negatives also showed a clear negative-population affinity. Banks with only one known-negative sample are deliberately treated as low-reliability rather than as a strong population claim.
+function clampBox(box, width, height) {
+  if (!box) return null;
+  const x1 = Number(box.x1 ?? box.x ?? 0);
+  const y1 = Number(box.y1 ?? box.y ?? 0);
+  const x2 = Number(box.x2 ?? (Number(box.x ?? 0) + Number(box.width ?? 0)));
+  const y2 = Number(box.y2 ?? (Number(box.y ?? 0) + Number(box.height ?? 0)));
+  const ax1 = Math.max(0, Math.min(width - 1, Math.round(Math.min(x1, x2))));
+  const ay1 = Math.max(0, Math.min(height - 1, Math.round(Math.min(y1, y2))));
+  const ax2 = Math.max(ax1 + 1, Math.min(width, Math.round(Math.max(x1, x2))));
+  const ay2 = Math.max(ay1 + 1, Math.min(height, Math.round(Math.max(y1, y2))));
+  if (ax2 - ax1 < 2 || ay2 - ay1 < 2) return null;
+  return { x1: ax1, y1: ay1, x2: ax2, y2: ay2 };
+}
 
+function normalizeRegionBox(box, sourceWidth, sourceHeight) {
+  if (!box) return null;
+  const b = { ...box };
+  const hasNorm = [b.xNorm, b.yNorm, b.widthNorm, b.heightNorm].every(v => Number.isFinite(Number(v)));
+  if (hasNorm) {
+    return clampBox({
+      x1: Number(b.xNorm) * sourceWidth,
+      y1: Number(b.yNorm) * sourceHeight,
+      x2: (Number(b.xNorm) + Number(b.widthNorm)) * sourceWidth,
+      y2: (Number(b.yNorm) + Number(b.heightNorm)) * sourceHeight,
+    }, sourceWidth, sourceHeight);
+  }
+  return clampBox(b, sourceWidth, sourceHeight);
+}
 
-## V1.1 — 16×16 semantic ROI extension
+function cropRaw(data, width, height, box) {
+  const b = clampBox(box, width, height);
+  if (!b) return null;
+  const w = b.x2 - b.x1, h = b.y2 - b.y1;
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const src = (b.y1 + y) * width + b.x1;
+    out.set(data.subarray(src, src + w), y * w);
+  }
+  return { data: Buffer.from(out), width: w, height: h, box: b };
+}
 
-This update keeps the V1 global mathematical fingerprint but changes the raster tile grid from 4×4 to **16×16**. It also adds optional semantic ROI analysis for:
-- `amount` / TUTAR
-- `recipientName` / ALICI ÜNVANI / ALICI ADI
-- `recipientIban` / ALICI IBAN
+function resizeGrayRaw(data, width, height, outWidth, outHeight) {
+  const out = new Uint8Array(outWidth * outHeight);
+  for (let y = 0; y < outHeight; y++) {
+    const sy = Math.min(height - 1, Math.floor((y + 0.5) * height / outHeight));
+    for (let x = 0; x < outWidth; x++) {
+      const sx = Math.min(width - 1, Math.floor((x + 0.5) * width / outWidth));
+      out[y * outWidth + x] = data[sy * width + sx];
+    }
+  }
+  return { data: out, width: outWidth, height: outHeight };
+}
 
-Each semantic ROI is normalized to a fixed canvas and then split into 16×16 cells. Per-cell Laplacian variance, edge density and local standard deviation are compared between target and reference. The runtime exposes `roi16x16` and `roiSummary` under `result.mathematicalForensics`.
+function roiFingerprintFromRaster(data, width, height) {
+  const normalized = resizeGrayRaw(data, width, height, ROI_CANVAS_WIDTH, ROI_CANVAS_HEIGHT);
+  const f = rasterFeatures(normalized.data, normalized.width, normalized.height);
+  return {
+    canvas: { width: ROI_CANVAS_WIDTH, height: ROI_CANVAS_HEIGHT },
+    metrics: {
+      luminanceMean: f.luminanceMean,
+      luminanceStd: f.luminanceStd,
+      entropy: f.entropy,
+      edgeDensity: f.edgeDensity,
+      meanGradient: f.meanGradient,
+      laplacianVariance: f.laplacianVariance,
+      dctLowEnergy: f.dctLowEnergy,
+      dctMidEnergy: f.dctMidEnergy,
+      dctHighEnergy: f.dctHighEnergy,
+      dctHighRatio: f.dctHighRatio,
+      blockinessHorizontal: f.blockinessHorizontal,
+      blockinessVertical: f.blockinessVertical,
+    },
+    tiles16x16: f.tiles,
+  };
+}
 
-The ROI engine is corroborating evidence only. It does not independently declare a document authentic/fake. Missing or unreliable semantic boxes cause that ROI to be reported as unavailable rather than inventing coordinates.
+function buildSemanticRois(regions = {}) {
+  const aliases = {
+    amount: ['amount', 'tutar', 'transactionAmount'],
+    recipientName: ['recipientName', 'recipient_name', 'aliciUnvani', 'aliciAdi', 'alıcıÜnvanı', 'alıcıAdı'],
+    recipientIban: ['recipientIban', 'recipient_iban', 'iban', 'aliciIban', 'alıcıIban'],
+  };
+  const out = {};
+  for (const [canonical, keys] of Object.entries(aliases)) {
+    for (const key of keys) {
+      if (regions?.[key]) { out[canonical] = regions[key]; break; }
+    }
+  }
+  return out;
+}
+
+function rasterFeatures(data, width, height) {
+  const n = width * height;
+  const hist = new Array(256).fill(0);
+  let sum = 0;
+  for (let i = 0; i < n; i++) { const v = data[i]; hist[v]++; sum += v; }
+  const m = sum / Math.max(1, n);
+  let s2 = 0;
+  for (let i = 0; i < n; i++) s2 += (data[i] - m) ** 2;
+
+  let edgeCount = 0;
+  let gradSum = 0;
+  let lapSum = 0;
+  let lapSq = 0;
+  const grads = [];
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const p = y * width + x;
+      const gx = -data[p-width-1] + data[p-width+1] - 2*data[p-1] + 2*data[p+1] - data[p+width-1] + data[p+width+1];
+      const gy = -data[p-width-1] - 2*data[p-width] - data[p-width+1] + data[p+width-1] + 2*data[p+width] + data[p+width+1];
+      const g = Math.hypot(gx, gy) / 8;
+      grads.push(g);
+      gradSum += g;
+      if (g > 18) edgeCount++;
+      const lap = data[p-1] + data[p+1] + data[p-width] + data[p+width] - 4*data[p];
+      lapSum += lap; lapSq += lap * lap;
+    }
+  }
+  const gradN = Math.max(1, grads.length);
+  const lapMean = lapSum / gradN;
+  const lapVar = Math.max(0, lapSq / gradN - lapMean * lapMean);
+
+  let dark = 0, bright = 0;
+  for (let i = 0; i < n; i++) { if (data[i] < 64) dark++; if (data[i] > 240) bright++; }
+
+  let dctLow = 0, dctMid = 0, dctHigh = 0, dctCount = 0;
+  const step = 16;
+  for (let y = 0; y + 8 <= height; y += step) {
+    for (let x = 0; x + 8 <= width; x += step) {
+      const block = new Float64Array(64);
+      let bm = 0;
+      for (let yy = 0; yy < 8; yy++) for (let xx = 0; xx < 8; xx++) bm += data[(y+yy)*width + x+xx];
+      bm /= 64;
+      for (let yy = 0; yy < 8; yy++) for (let xx = 0; xx < 8; xx++) block[yy*8+xx] = data[(y+yy)*width+x+xx] - bm;
+      const d = dct8(block);
+      for (let u = 0; u < 8; u++) for (let v = 0; v < 8; v++) {
+        if (u === 0 && v === 0) continue;
+        const e = d[u*8+v] ** 2;
+        if (u+v <= 2) dctLow += e;
+        else if (u+v <= 5) dctMid += e;
+        else dctHigh += e;
+      }
+      dctCount++;
+    }
+  }
+  const dctTotal = dctLow + dctMid + dctHigh || 1;
+
+  let blockH = 0, blockV = 0, nonH = 0, nonV = 0;
+  for (let y = 0; y < height; y++) for (let x = 1; x < width; x++) {
+    const d = Math.abs(data[y*width+x] - data[y*width+x-1]);
+    if (x % 8 === 0) { blockH += d; } else nonH += d;
+  }
+  for (let y = 1; y < height; y++) for (let x = 0; x < width; x++) {
+    const d = Math.abs(data[y*width+x] - data[(y-1)*width+x]);
+    if (y % 8 === 0) blockV += d; else nonV += d;
+  }
+  const hCount = Math.max(1, height * Math.floor((width-1)/8));
+  const vCount = Math.max(1, width * Math.floor((height-1)/8));
+  const nhCount = Math.max(1, height * (width-1) - hCount);
+  const nvCount = Math.max(1, width * (height-1) - vCount);
+
+  const tiles = [];
+  for (let ty = 0; ty < TILE_GRID; ty++) for (let tx = 0; tx < TILE_GRID; tx++) {
+    const x0 = Math.floor(tx * width / TILE_GRID), x1 = Math.floor((tx+1) * width / TILE_GRID);
+    const y0 = Math.floor(ty * height / TILE_GRID), y1 = Math.floor((ty+1) * height / TILE_GRID);
+    const vals = [];
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) vals.push(data[y*width+x]);
+    let te = 0, tl = 0, tl2 = 0, cnt = 0;
+    for (let y = Math.max(y0+1,1); y < Math.min(y1-1,height-1); y++) for (let x = Math.max(x0+1,1); x < Math.min(x1-1,width-1); x++) {
+      const p=y*width+x;
+      const gx=-data[p-width-1]+data[p-width+1]-2*data[p-1]+2*data[p+1]-data[p+width-1]+data[p+width+1];
+      const gy=-data[p-width-1]-2*data[p-width]-data[p-width+1]+data[p+width-1]+2*data[p+width]+data[p+width+1];
+      if (Math.hypot(gx,gy)/8 > 18) te++;
+      const lap=data[p-1]+data[p+1]+data[p-width]+data[p+width]-4*data[p];
+      tl+=lap; tl2+=lap*lap; cnt++;
+    }
+    const lmean=tl/Math.max(1,cnt);
+    tiles.push({mean:mean(vals), std:std(vals), edgeDensity:te/Math.max(1,cnt), lapVar:Math.max(0,tl2/Math.max(1,cnt)-lmean*lmean)});
+  }
+
+  return {
+    luminanceMean: m,
+    luminanceStd: Math.sqrt(s2 / Math.max(1,n)),
+    entropy: entropyFromHistogram(hist,n),
+    edgeDensity: edgeCount / gradN,
+    meanGradient: gradSum / gradN,
+    laplacianVariance: lapVar,
+    darkPixelRatio: dark / Math.max(1,n),
+    brightPixelRatio: bright / Math.max(1,n),
+    dctLowEnergy: dctLow / Math.max(1,dctCount),
+    dctMidEnergy: dctMid / Math.max(1,dctCount),
+    dctHighEnergy: dctHigh / Math.max(1,dctCount),
+    dctHighRatio: dctHigh / dctTotal,
+    blockinessHorizontal: (blockH / hCount) / Math.max(0.0001, nonH / nhCount),
+    blockinessVertical: (blockV / vCount) / Math.max(0.0001, nonV / nvCount),
+    tiles,
+  };
+}
+
+export async function extractMathematicalFingerprint(input, options = {}) {
+  const buffer = Buffer.isBuffer(input) ? input : await fs.readFile(input);
+  const meta = await sharp(buffer).metadata();
+  const rendered = await sharp(buffer)
+    .rotate()
+    .resize({ width: options.size || DEFAULT_SIZE, height: options.size || DEFAULT_SIZE, fit: 'fill' })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const raster = rasterFeatures(rendered.data, rendered.info.width, rendered.info.height);
+  const semanticRois = buildSemanticRois(options.regions || {});
+  const roi16x16 = {};
+  let roiBuffer = null;
+  if (Object.keys(semanticRois).length) {
+    try {
+      roiBuffer = await sharp(buffer).rotate().grayscale().raw().toBuffer({ resolveWithObject: true });
+    } catch (e) {
+      roiBuffer = null;
+    }
+  }
+  for (const [name, region] of Object.entries(semanticRois)) {
+    const box = normalizeRegionBox(region, meta.width || 0, meta.height || 0);
+    if (!box || !roiBuffer) continue;
+    // Crop the semantic ROI from the native raster, then normalize that ROI to a
+    // fixed canvas before its 16x16 grid is computed. This keeps ROI geometry
+    // independent from the document's native resolution.
+    try {
+      const crop = cropRaw(roiBuffer.data, roiBuffer.info.width, roiBuffer.info.height, {
+        x1: box.x1 * roiBuffer.info.width / Math.max(1, meta.width || roiBuffer.info.width),
+        y1: box.y1 * roiBuffer.info.height / Math.max(1, meta.height || roiBuffer.info.height),
+        x2: box.x2 * roiBuffer.info.width / Math.max(1, meta.width || roiBuffer.info.width),
+        y2: box.y2 * roiBuffer.info.height / Math.max(1, meta.height || roiBuffer.info.height),
+      });
+      if (crop) roi16x16[name] = { sourceBox: box, ...roiFingerprintFromRaster(crop.data, crop.width, crop.height) };
+    } catch (e) {
+      roi16x16[name] = { sourceBox: box, error: e?.message || String(e) };
+    }
+  }
+  const qTables = meta.format === 'jpeg' ? jpegQuantizationTables(buffer) : {};
+  const jpeg = meta.format === 'jpeg' ? jpegQualityEstimate(qTables) : null;
+  return {
+    version: VERSION,
+    source: { format: meta.format || null, width: meta.width || null, height: meta.height || null, channels: meta.channels || null, space: meta.space || null, chromaSubsampling: meta.chromaSubsampling || null, isProgressive: meta.isProgressive ?? null },
+    jpeg: { available: meta.format === 'jpeg', estimatedQuality: jpeg?.estimatedQuality ?? null, quantizationFitError: jpeg?.fitError ?? null, tableCount: Object.keys(qTables).length, quantizationMeans: Object.values(qTables).map(t => mean(t.values)), quantizationStds: Object.values(qTables).map(t => std(t.values)) },
+    raster,
+  };
+}
+
+const FEATURE_KEYS = [
+  'luminanceMean','luminanceStd','entropy','edgeDensity','meanGradient','laplacianVariance','darkPixelRatio','brightPixelRatio',
+  'dctLowEnergy','dctMidEnergy','dctHighEnergy','dctHighRatio','blockinessHorizontal','blockinessVertical',
+];
+
+function flattenFingerprint(fp) {
+  const r = fp?.raster || {};
+  return FEATURE_KEYS.map(k => Number(r[k]) || 0).concat([
+    Number(fp?.jpeg?.estimatedQuality) || 0,
+    Number(fp?.jpeg?.quantizationFitError) || 0,
+    mean(fp?.jpeg?.quantizationMeans || []),
+    mean(fp?.jpeg?.quantizationStds || []),
+    Number(fp?.source?.width) || 0,
+    Number(fp?.source?.height) || 0,
+  ]);
+}
+
+function summarize(values) {
+  const med = median(values), m = mean(values), s = std(values, m), md = mad(values, med);
+  return { mean:m, std:s, median:med, mad:md, min:Math.min(...values), max:Math.max(...values) };
+}
+
+export function buildBaseline(samples) {
+  const byKey = new Map();
+  for (const sample of samples) {
+    const bank = sample.bank || 'unknown';
+    const family = sample.family || 'unknown';
+    const key = `${bank}::${family}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(sample);
+  }
+  const profiles = {};
+  for (const [key, rows] of byKey) {
+    const bank = rows[0].bank, family = rows[0].family;
+    const featureStats = {};
+    for (const fk of FEATURE_KEYS) featureStats[fk] = summarize(rows.map(x => Number(x.fingerprint.raster?.[fk]) || 0));
+    const jpegQuality = rows.map(x => x.fingerprint.jpeg?.estimatedQuality).filter(Number.isFinite);
+    const qMean = rows.map(x => mean(x.fingerprint.jpeg?.quantizationMeans || [])).filter(Number.isFinite);
+    const qStd = rows.map(x => mean(x.fingerprint.jpeg?.quantizationStds || [])).filter(Number.isFinite);
+    profiles[key] = {
+      bank, family, sampleCount: rows.length,
+      sourceFormats: [...new Set(rows.map(x => x.fingerprint.source?.format).filter(Boolean))],
+      featureStats,
+      jpeg: {
+        sampleCount: jpegQuality.length,
+        estimatedQuality: jpegQuality.length ? summarize(jpegQuality) : null,
+        quantizationMean: qMean.length ? summarize(qMean) : null,
+        quantizationStd: qStd.length ? summarize(qStd) : null,
+      },
+      samples: rows.map(x => ({ id:x.id, source:x.source, sourceFormat:x.fingerprint.source?.format || null })),
+    };
+  }
+  return { version:VERSION, generatedAt:new Date().toISOString(), featureKeys:FEATURE_KEYS, profiles };
+}
+
+function robustDistance(value, stat) {
+  if (!stat) return 0;
+  const relativeFloor = Math.max(0.5, Math.abs(Number(stat.median) || 0) * 0.05);
+  const scale = Math.max(1e-6, Number(stat.mad) * 1.4826, Number(stat.std) || 0, relativeFloor);
+  return Math.abs(value - Number(stat.median)) / scale;
+}
+
+export function compareFingerprint(fingerprint, profile) {
+  if (!fingerprint || !profile) return { available:false, reason:'missing-input' };
+  const featureDistances = {};
+  let total = 0, count = 0;
+  for (const fk of FEATURE_KEYS) {
+    const v = Number(fingerprint.raster?.[fk]) || 0;
+    const d = robustDistance(v, profile.featureStats?.[fk]);
+    featureDistances[fk] = Number(d.toFixed(3));
+    total += Math.min(d, 8); count++;
+  }
+  const q = fingerprint.jpeg?.estimatedQuality;
+  if (Number.isFinite(q) && profile.jpeg?.estimatedQuality) { total += Math.min(robustDistance(q, profile.jpeg.estimatedQuality), 8); count++; }
+  const qmean = mean(fingerprint.jpeg?.quantizationMeans || []);
+  if (qmean && profile.jpeg?.quantizationMean) { total += Math.min(robustDistance(qmean, profile.jpeg.quantizationMean), 8); count++; }
+  const score = 100 * Math.exp(-((total / Math.max(1,count)) / 2.2));
+  const anomalies = Object.entries(featureDistances).filter(([,d]) => d >= 3).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([feature,distance])=>({feature,distance}));
+  const sampleCount = Number(profile.sampleCount) || 0;
+  const reliability = sampleCount >= 5 ? 'high' : sampleCount >= 3 ? 'medium' : sampleCount >= 1 ? 'low' : 'insufficient';
+  return { available:true, profile:{bank:profile.bank,family:profile.family,sampleCount,reliability}, similarityScore:Number(score.toFixed(2)), robustDistance:Number((total/Math.max(1,count)).toFixed(3)), featureDistances, anomalies };
+}
+
+function compareMetricObjects(target, reference) {
+  const keys = ['luminanceMean','luminanceStd','entropy','edgeDensity','meanGradient','laplacianVariance','dctLowEnergy','dctMidEnergy','dctHighEnergy','dctHighRatio','blockinessHorizontal','blockinessVertical'];
+  const out = {};
+  let sum = 0, n = 0;
+  for (const key of keys) {
+    const a = Number(target?.[key]), b = Number(reference?.[key]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    const scale = Math.max(Math.abs(b) * 0.05, 0.5);
+    const d = Math.abs(a - b) / scale;
+    out[key] = Number(d.toFixed(3));
+    sum += Math.min(d, 10); n++;
+  }
+  return { metricDistances: out, meanDistance: Number((sum / Math.max(1,n)).toFixed(3)) };
+}
+
+export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNames = ['amount','recipientName','recipientIban']) {
+  const result = {};
+  for (const name of roiNames) {
+    const t = targetFingerprint?.roi16x16?.[name];
+    const r = referenceFingerprint?.roi16x16?.[name];
+    if (!t?.metrics || !r?.metrics) {
+      result[name] = { available: false, reason: 'roi-missing-on-one-side' };
+      continue;
+    }
+    const metric = compareMetricObjects(t.metrics, r.metrics);
+    const targetTiles = Array.isArray(t.tiles16x16) ? t.tiles16x16 : [];
+    const referenceTiles = Array.isArray(r.tiles16x16) ? r.tiles16x16 : [];
+    const cells = [];
+    const count = Math.min(targetTiles.length, referenceTiles.length, 256);
+    for (let i = 0; i < count; i++) {
+      const a = targetTiles[i], b = referenceTiles[i];
+      const lapScale = Math.max(Math.abs(Number(b?.lapVar) || 0) * 0.05, 0.5);
+      const edgeScale = Math.max(Math.abs(Number(b?.edgeDensity) || 0) * 0.05, 0.005);
+      const stdScale = Math.max(Math.abs(Number(b?.std) || 0) * 0.05, 0.5);
+      const lap = Math.abs((Number(a?.lapVar)||0)-(Number(b?.lapVar)||0))/lapScale;
+      const edge = Math.abs((Number(a?.edgeDensity)||0)-(Number(b?.edgeDensity)||0))/edgeScale;
+      const sd = Math.abs((Number(a?.std)||0)-(Number(b?.std)||0))/stdScale;
+      const distance = (Math.min(lap,10)+Math.min(edge,10)+Math.min(sd,10))/3;
+      cells.push({ index:i, row:Math.floor(i/16)+1, col:(i%16)+1, laplacianDistance:Number(lap.toFixed(3)), edgeDistance:Number(edge.toFixed(3)), stdDistance:Number(sd.toFixed(3)), distance:Number(distance.toFixed(3)) });
+    }
+    cells.sort((a,b)=>b.distance-a.distance);
+    result[name] = {
+      available: true,
+      meanDistance: metric.meanDistance,
+      metricDistances: metric.metricDistances,
+      maxCellDistance: cells[0]?.distance || 0,
+      topCells: cells.slice(0, 8),
+      targetSourceBox: t.sourceBox || null,
+      referenceSourceBox: r.sourceBox || null,
+      grid: '16x16',
+      cellCount: cells.length,
+    };
+  }
+  return result;
+}
+
+export function compareAgainstBaseline(fingerprint, baseline, bank, family='unknown') {
+  if (!baseline?.profiles) return { available:false, reason:'baseline-missing' };
+  const candidates = Object.values(baseline.profiles).filter(p => p.bank === bank);
+  if (!candidates.length) return { available:false, reason:'bank-profile-missing', bank };
+  const exact = candidates.find(p => p.family === family);
+  const pool = exact ? [exact, ...candidates.filter(p => p !== exact)] : candidates;
+  const comparisons = pool.map(p => ({...compareFingerprint(fingerprint,p), family:p.family})).filter(x=>x.available);
+  comparisons.sort((a,b)=>b.similarityScore-a.similarityScore);
+  const best = comparisons[0] || null;
+  return { available:Boolean(best), bank, requestedFamily:family, bestMatch:best, candidates:comparisons.slice(0,8), profileCount:candidates.length };
+}
+
+export function inferDocumentFamily(name='', text='') {
+  const s = `${name} ${text}`.toLocaleLowerCase('tr-TR');
+  if (/hesap[-_ ]?hareket|hesap[-_ ]?ozeti/.test(s)) return 'ACCOUNT_STATEMENT';
+  if (/nakit avans|kk1|kredi kart/.test(s)) return 'CREDIT_CARD';
+  if (/havale|hvl/.test(s)) return 'HAVALE';
+  if (/fast/.test(s)) return 'FAST';
+  if (/eft/.test(s)) return 'EFT';
+  if (/e[- ]?dekont|dekont/.test(s)) return 'DEKONT';
+  return 'UNKNOWN';
+}
