@@ -90,7 +90,7 @@ async function loadMathematicalBaseline() {
   }
 }
 
-function getMathSemanticRois({ amountForensics = null, referenceForensics = null } = {}) {
+async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, bank = null } = {}) {
   const rois = {};
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
@@ -117,7 +117,7 @@ function getMathSemanticRois({ amountForensics = null, referenceForensics = null
   const canonicalField = (value) => {
     const raw = String(value || '').replace(/:value$/i, '');
     const n = normalizeField(raw);
-    if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani')) return 'recipientName';
+    if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani') || n.includes('aliciisimunvan')) return 'recipientName';
     if (n.includes('aliciiban') || n.includes('iban') || n.includes('ibankartno')) return 'recipientIban';
     if (n.includes('recipientname') || n.includes('aliciunvan') || n.includes('aliciadi')) return 'recipientName';
     if (n.includes('recipientiban')) return 'recipientIban';
@@ -142,12 +142,22 @@ function getMathSemanticRois({ amountForensics = null, referenceForensics = null
   };
 
   // Amount target ROI is intentionally taken from the trusted Amount Forensics
-  // region. Reference amount ROI comes from the semantic reference field.
+  // region. The reference side has two valid sources: the semantic field box,
+  // or the same trusted raster amount anchor used by Amount Forensics itself.
+  // The anchor fallback is important because some reference-field variants do
+  // not expose a value box even though the bank-specific amount geometry is known.
   const amountField = findField('amount');
-  if (amountForensics?.region && amountField) {
-    const boxes = boxFrom(amountField);
-    const reference = boxes.reference;
-    if (reference) rois.amount = { target: amountForensics.region, reference };
+  let amountReferenceBox = boxFrom(amountField).reference;
+  if (!amountReferenceBox && bank) {
+    try {
+      const anchor = await getReferenceAmountAnchor(bank);
+      if (anchor) amountReferenceBox = anchor;
+    } catch (error) {
+      console.warn('MATH AMOUNT ANCHOR FALLBACK HATASI:', error?.message || error);
+    }
+  }
+  if (amountForensics?.region && amountReferenceBox) {
+    rois.amount = { target: amountForensics.region, reference: amountReferenceBox, source: amountField ? 'semantic-reference-field' : 'trusted-reference-amount-anchor' };
   }
 
   const recipientName = findField('recipientName');
@@ -162,10 +172,10 @@ function getMathSemanticRois({ amountForensics = null, referenceForensics = null
     if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference };
   }
 
-  console.log('MATH SEMANTIC ROI RESOLVER V1.2:', JSON.stringify({
+  console.log('MATH SEMANTIC ROI RESOLVER V1.3:', JSON.stringify({
     fields: fields.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     profiles: profiles.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
-    resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => [k, {target:Boolean(v?.target), reference:Boolean(v?.reference)}])),
+    resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => [k, {target:Boolean(v?.target), reference:Boolean(v?.reference), source:v?.source || 'semantic-field'}])),
   }));
 
   return rois;
@@ -178,7 +188,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
   const baseline = await loadMathematicalBaseline();
   if (!baseline) return { available: false, status: "baseline-unavailable" };
 
-  const semanticRois = getMathSemanticRois({ amountForensics, referenceForensics });
+  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, bank });
   const targetRegions = {};
   const referenceRegions = {};
   for (const [name, pair] of Object.entries(semanticRois)) {
@@ -238,8 +248,8 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.1.1-16X16',
-    engine: 'mathematical-forensics-v1.1-16x16-semantic-roi',
+    version: 'MATH-FORENSICS-V1.2.0-16X16',
+    engine: 'mathematical-forensics-v1.2-16x16-semantic-roi-content-normalized',
     bank,
     family,
     reference,
@@ -15170,7 +15180,7 @@ if (type === "image" || type === "pdf") {
       amountForensics,
       referenceForensics
     });
-    console.log("MATHEMATICAL FORENSICS V1:", JSON.stringify(mathematicalForensics));
+    console.log("MATHEMATICAL FORENSICS V1.2:", JSON.stringify(mathematicalForensics));
   } catch (error) {
     console.warn("MATHEMATICAL FORENSICS V1 HATASI:", error?.message || error);
     mathematicalForensics = { available: false, status: "error", error: error?.message || String(error) };
