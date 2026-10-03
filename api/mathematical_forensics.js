@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import sharp from 'sharp';
 
-const VERSION = 'MATH-FORENSICS-V1.1.1-16X16';
+const VERSION = 'MATH-FORENSICS-V1.2.0-16X16';
 const DEFAULT_SIZE = 256;
 const TILE_GRID = 16;
 const ROI_CANVAS_WIDTH = 256;
@@ -171,8 +171,10 @@ function cropRaw(data, width, height, box) {
   return { data: Buffer.from(out), width: w, height: h, box: b };
 }
 
-function resizeGrayRaw(data, width, height, outWidth, outHeight) {
+function resizeGrayRaw(data, width, height, outWidth, outHeight, fill = 255) {
   const out = new Uint8Array(outWidth * outHeight);
+  out.fill(clamp(Math.round(fill), 0, 255));
+  if (!width || !height || !outWidth || !outHeight) return { data: out, width: outWidth, height: outHeight };
   for (let y = 0; y < outHeight; y++) {
     const sy = Math.min(height - 1, Math.floor((y + 0.5) * height / outHeight));
     for (let x = 0; x < outWidth; x++) {
@@ -183,11 +185,96 @@ function resizeGrayRaw(data, width, height, outWidth, outHeight) {
   return { data: out, width: outWidth, height: outHeight };
 }
 
+function borderMedian(data, width, height) {
+  const values = [];
+  if (!width || !height) return 255;
+  const stepX = Math.max(1, Math.floor(width / 64));
+  const stepY = Math.max(1, Math.floor(height / 32));
+  for (let x = 0; x < width; x += stepX) {
+    values.push(data[x], data[(height - 1) * width + x]);
+  }
+  for (let y = 0; y < height; y += stepY) {
+    values.push(data[y * width], data[y * width + width - 1]);
+  }
+  return median(values);
+}
+
+function findInkBounds(data, width, height) {
+  if (!width || !height) return null;
+  const bg = borderMedian(data, width, height);
+  const borderDelta = Math.max(8, Math.min(34, std(data.slice(0, Math.min(data.length, Math.max(width, height) * 2)))));
+  const threshold = clamp(bg - Math.max(12, borderDelta * 1.5), 80, 248);
+  let x1 = width, y1 = height, x2 = -1, y2 = -1, count = 0;
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      if (data[row + x] <= threshold) {
+        if (x < x1) x1 = x;
+        if (y < y1) y1 = y;
+        if (x > x2) x2 = x;
+        if (y > y2) y2 = y;
+        count++;
+      }
+    }
+  }
+  // Very sparse boxes can be OCR noise. Keep the original crop in that case.
+  if (count < Math.max(4, Math.floor(width * height * 0.002)) || x2 < x1 || y2 < y1) {
+    return { x1: 0, y1: 0, x2: width, y2: height, background: bg, threshold, detected: false };
+  }
+  const padX = Math.max(1, Math.round((x2 - x1 + 1) * 0.04));
+  const padY = Math.max(1, Math.round((y2 - y1 + 1) * 0.10));
+  return {
+    x1: Math.max(0, x1 - padX), y1: Math.max(0, y1 - padY),
+    x2: Math.min(width, x2 + 1 + padX), y2: Math.min(height, y2 + 1 + padY),
+    background: bg, threshold, detected: true, inkPixels: count,
+  };
+}
+
+function letterboxGrayRaw(data, width, height, outWidth, outHeight, fill = 255) {
+  const out = new Uint8Array(outWidth * outHeight);
+  out.fill(clamp(Math.round(fill), 0, 255));
+  if (!width || !height) return { data: out, width: outWidth, height: outHeight, scale: 1, offsetX: 0, offsetY: 0 };
+  const scale = Math.min(outWidth / width, outHeight / height);
+  const rw = Math.max(1, Math.min(outWidth, Math.round(width * scale)));
+  const rh = Math.max(1, Math.min(outHeight, Math.round(height * scale)));
+  const resized = resizeGrayRaw(data, width, height, rw, rh, fill);
+  const ox = Math.floor((outWidth - rw) / 2);
+  const oy = Math.floor((outHeight - rh) / 2);
+  for (let y = 0; y < rh; y++) out.set(resized.data.subarray(y * rw, (y + 1) * rw), (oy + y) * outWidth + ox);
+  return { data: out, width: outWidth, height: outHeight, scale, offsetX: ox, offsetY: oy, resizedWidth: rw, resizedHeight: rh };
+}
+
 function roiFingerprintFromRaster(data, width, height) {
-  const normalized = resizeGrayRaw(data, width, height, ROI_CANVAS_WIDTH, ROI_CANVAS_HEIGHT);
+  const inkBox = findInkBounds(data, width, height);
+  const contentCrop = cropRaw(data, width, height, inkBox);
+  const contentData = contentCrop?.data || data;
+  const contentWidth = contentCrop?.width || width;
+  const contentHeight = contentCrop?.height || height;
+  const background = Number(inkBox?.background ?? borderMedian(data, width, height));
+  // Preserve the text's aspect ratio. The old fit-fill normalization stretched
+  // a 65x18 target box into the same 256x96 canvas as a 188x44 reference box,
+  // creating artificial edge/laplacian differences. Letterboxing after ink-box
+  // detection removes that scale/aspect artifact while retaining the glyph shape.
+  const normalized = letterboxGrayRaw(
+    contentData, contentWidth, contentHeight,
+    ROI_CANVAS_WIDTH, ROI_CANVAS_HEIGHT, background
+  );
+  const rawNormalized = resizeGrayRaw(data, width, height, ROI_CANVAS_WIDTH, ROI_CANVAS_HEIGHT, background);
   const f = rasterFeatures(normalized.data, normalized.width, normalized.height);
+  const raw = rasterFeatures(rawNormalized.data, rawNormalized.width, rawNormalized.height);
   return {
     canvas: { width: ROI_CANVAS_WIDTH, height: ROI_CANVAS_HEIGHT },
+    normalization: 'content-ink-bbox-letterbox-v2',
+    alignment: {
+      sourceWidth: width, sourceHeight: height,
+      sourceAspect: Number((width / Math.max(1, height)).toFixed(4)),
+      contentBox: inkBox,
+      contentWidth, contentHeight,
+      contentAspect: Number((contentWidth / Math.max(1, contentHeight)).toFixed(4)),
+      scale: Number((normalized.scale || 1).toFixed(5)),
+      resizedWidth: normalized.resizedWidth || ROI_CANVAS_WIDTH,
+      resizedHeight: normalized.resizedHeight || ROI_CANVAS_HEIGHT,
+    },
     metrics: {
       luminanceMean: f.luminanceMean,
       luminanceStd: f.luminanceStd,
@@ -201,6 +288,12 @@ function roiFingerprintFromRaster(data, width, height) {
       dctHighRatio: f.dctHighRatio,
       blockinessHorizontal: f.blockinessHorizontal,
       blockinessVertical: f.blockinessVertical,
+    },
+    rawMetrics: {
+      luminanceMean: raw.luminanceMean, luminanceStd: raw.luminanceStd, entropy: raw.entropy,
+      edgeDensity: raw.edgeDensity, meanGradient: raw.meanGradient, laplacianVariance: raw.laplacianVariance,
+      dctLowEnergy: raw.dctLowEnergy, dctMidEnergy: raw.dctMidEnergy, dctHighEnergy: raw.dctHighEnergy,
+      dctHighRatio: raw.dctHighRatio, blockinessHorizontal: raw.blockinessHorizontal, blockinessVertical: raw.blockinessVertical,
     },
     tiles16x16: f.tiles,
   };
@@ -505,6 +598,12 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
       cells.push({ index:i, row:Math.floor(i/16)+1, col:(i%16)+1, laplacianDistance:Number(lap.toFixed(3)), edgeDistance:Number(edge.toFixed(3)), stdDistance:Number(sd.toFixed(3)), distance:Number(distance.toFixed(3)) });
     }
     cells.sort((a,b)=>b.distance-a.distance);
+    const ta = t.alignment || {};
+    const ra = r.alignment || {};
+    const safeLogRatio = (a, b) => {
+      const x = Number(a), y = Number(b);
+      return Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0 ? Math.abs(Math.log(x / y)) : null;
+    };
     result[name] = {
       available: true,
       meanDistance: metric.meanDistance,
@@ -513,6 +612,14 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
       topCells: cells.slice(0, 8),
       targetSourceBox: t.sourceBox || null,
       referenceSourceBox: r.sourceBox || null,
+      normalization: t.normalization || r.normalization || null,
+      alignment: {
+        target: ta,
+        reference: ra,
+        contentAspectDistance: safeLogRatio(ta.contentAspect, ra.contentAspect),
+        contentScaleRelation: safeLogRatio(ta.scale, ra.scale),
+      },
+      rawMetricDistances: compareMetricObjects(t.rawMetrics, r.rawMetrics).metricDistances,
       grid: '16x16',
       cellCount: cells.length,
     };
