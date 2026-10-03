@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import sharp from 'sharp';
 
-const VERSION = 'MATH-FORENSICS-V1.1.0-16X16';
+const VERSION = 'MATH-FORENSICS-V1.1.1-16X16';
 const DEFAULT_SIZE = 256;
 const TILE_GRID = 16;
 const ROI_CANVAS_WIDTH = 256;
@@ -373,6 +373,10 @@ export async function extractMathematicalFingerprint(input, options = {}) {
     version: VERSION,
     source: { format: meta.format || null, width: meta.width || null, height: meta.height || null, channels: meta.channels || null, space: meta.space || null, chromaSubsampling: meta.chromaSubsampling || null, isProgressive: meta.isProgressive ?? null },
     jpeg: { available: meta.format === 'jpeg', estimatedQuality: jpeg?.estimatedQuality ?? null, quantizationFitError: jpeg?.fitError ?? null, tableCount: Object.keys(qTables).length, quantizationMeans: Object.values(qTables).map(t => mean(t.values)), quantizationStds: Object.values(qTables).map(t => std(t.values)) },
+    // V1.1.1: expose the semantic ROI fingerprints to the caller. The ROI
+    // extraction loop above was running correctly, but this object was omitted
+    // from the returned fingerprint, so analyze.js always saw roi16x16 as null.
+    roi16x16,
     raster,
   };
 }
