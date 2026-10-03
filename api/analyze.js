@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, inferDocumentFamily } from "./mathematical_forensics.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -206,10 +206,17 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
   const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
 
   let roiForensics = null;
+  let global16x16 = { available: false, reason: 'reference-unavailable' };
   if (referencePath && Object.keys(referenceRegions).length) {
     try {
       const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
+      const criticalRoiBoxes = Object.fromEntries(Object.entries(semanticRois).map(([field, pair]) => [field, { target: pair?.target, reference: pair?.reference }]));
+      global16x16 = compareGlobal16x16(fingerprint, referenceFingerprint, criticalRoiBoxes, {
+        differentThreshold: 3.5,
+        strongThreshold: 5,
+        minOverlap: 0.20,
+      });
     } catch (error) {
       roiForensics = { available: false, status: 'roi-error', error: error?.message || String(error) };
     }
@@ -244,12 +251,41 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
   const roiRows = Object.entries(roiForensics || {})
     .filter(([, v]) => v?.available)
     .map(([field, v]) => ({ field, meanDistance: v.meanDistance, maxCellDistance: v.maxCellDistance, topCells: v.topCells }));
+
+  const criticalRoiMismatches = Object.entries(global16x16?.criticalRoiHits || {})
+    .filter(([, hit]) => hit?.available && hit.differentCount > 0)
+    .map(([field, hit]) => {
+      const roi = roiForensics?.[field];
+      const roiMean = Number(roi?.meanDistance || 0);
+      const roiStrong = roiMean >= 3 || Number(roi?.maxCellDistance || 0) >= 6;
+      return {
+        field,
+        globalDifferentCount: hit.differentCount,
+        globalStrongDifferentCount: hit.strongDifferentCount,
+        globalMaxDistance: hit.maxDistance,
+        globalMeanDistance: hit.meanDistance,
+        roiMeanDistance: roiMean,
+        roiMaxCellDistance: Number(roi?.maxCellDistance || 0),
+        strong: Boolean(hit.strongDifferentCount > 0 && roiStrong),
+      };
+    });
+
+  const strongCriticalRoiMismatches = criticalRoiMismatches.filter(x => x.strong);
+  if (strongCriticalRoiMismatches.length) {
+    flags.push({
+      code: 'CRITICAL_ROI_MISMATCH',
+      severity: 'high',
+      reliability: 'forensic-signal',
+      fields: strongCriticalRoiMismatches.map(x => x.field),
+      detail: `Global 16x16 karşılaştırmada referanstan güçlü ayrışan hücre(ler) kritik ROI ile örtüşüyor: ${strongCriticalRoiMismatches.map(x => x.field).join(', ')}. Bu sinyal tek başına kesin sahtecilik hükmü değildir; kritik alan uyumsuzluğu olarak değerlendirilmelidir.`,
+    });
+  }
   const strongestRoi = roiRows.sort((a,b)=>Number(b.meanDistance)-Number(a.meanDistance))[0] || null;
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.2.0-16X16',
-    engine: 'mathematical-forensics-v1.2-16x16-semantic-roi-content-normalized',
+    version: 'MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE',
+    engine: 'mathematical-forensics-v1.2.1-16x16-critical-roi-gate',
     bank,
     family,
     reference,
@@ -259,6 +295,8 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
       referenceSimilarity: refScore,
       negativeSimilarity: negScore,
     },
+    global16x16,
+    criticalRoiMismatches,
     roi16x16: roiForensics,
     roiSummary: {
       available: roiRows.length > 0,
