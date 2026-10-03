@@ -92,40 +92,81 @@ async function loadMathematicalBaseline() {
 
 function getMathSemanticRois({ amountForensics = null, referenceForensics = null } = {}) {
   const rois = {};
-  const amountField = Array.isArray(referenceForensics?.fields)
-    ? referenceForensics.fields.find(f => ['amount','totalAmount'].includes(String(f?.field || '').replace(/:value$/i, '')))
-    : null;
-  if (amountForensics?.region && amountField) {
-    const target = amountForensics.region;
-    const reference = amountField.referenceValueBox || amountField.referenceBox || null;
-    if (reference) rois.amount = { target, reference };
-  }
-
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
     ? referenceForensics.typographyFieldProfiles : [];
-  const normalizeField = (v) => String(v || '').toLocaleLowerCase('tr-TR').replace(/[^a-z0-9çğıöşü]/gi, '');
-  const findField = (aliases) => {
-    const wanted = aliases.map(normalizeField);
-    const row = fields.find(f => wanted.includes(normalizeField(String(f?.field || '').replace(/:value$/i, ''))));
-    if (row) return row;
-    const profile = profiles.find(f => wanted.includes(normalizeField(String(f?.field || '').replace(/:value$/i, ''))));
-    return profile || null;
+  const findings = Array.isArray(referenceForensics?.characterFindings)
+    ? referenceForensics.characterFindings : [];
+
+  const normalizeField = (v) => String(v || '')
+    .toLocaleLowerCase('tr-TR')
+    .replace(/[ç]/g, 'c')
+    .replace(/[ğ]/g, 'g')
+    .replace(/[ı]/g, 'i')
+    .replace(/[ö]/g, 'o')
+    .replace(/[ş]/g, 's')
+    .replace(/[ü]/g, 'u')
+    .replace(/[İ]/g, 'i')
+    .replace(/[:_\s\-\/]+/g, '')
+    .replace(/[^a-z0-9]/gi, '');
+
+  // The reference engine keeps some bank-specific labels as generic keys.
+  // Canonicalize those keys before looking for the three semantic ROIs.
+  // Example: generic:ALICI UNVANI -> recipientName,
+  // generic:IBAN/KART NO -> recipientIban.
+  const canonicalField = (value) => {
+    const raw = String(value || '').replace(/:value$/i, '');
+    const n = normalizeField(raw);
+    if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani')) return 'recipientName';
+    if (n.includes('aliciiban') || n.includes('iban') || n.includes('ibankartno')) return 'recipientIban';
+    if (n.includes('recipientname') || n.includes('aliciunvan') || n.includes('aliciadi')) return 'recipientName';
+    if (n.includes('recipientiban')) return 'recipientIban';
+    if (n === 'amount' || n === 'totalamount' || n.includes('efttutari') || n.includes('fasttutari') || n.includes('islemtutari')) return 'amount';
+    return n;
   };
 
-  const recipientName = findField(['recipientName','aliciUnvani','aliciAdi']);
-  if (recipientName) {
-    const target = recipientName.targetValueBox || recipientName.targetBox || null;
-    const reference = recipientName.referenceValueBox || recipientName.referenceBox || null;
-    if (target && reference) rois.recipientName = { target, reference };
+  const boxFrom = (row) => ({
+    target: row?.targetValueBox || row?.targetValueRegion || row?.targetBox || row?.target?.region || null,
+    reference: row?.referenceValueBox || row?.referenceValueRegion || row?.referenceBox || row?.reference?.region || null,
+  });
+
+  const allRows = [...fields, ...profiles];
+  const findField = (canonical) => {
+    const row = allRows.find(f => canonicalField(f?.field) === canonical &&
+      (boxFrom(f).target || boxFrom(f).reference));
+    if (row) return row;
+    // Character findings are the final fallback because older profiles did not
+    // expose value boxes even though the forensic engine had already computed them.
+    return findings.find(f => canonicalField(f?.field) === canonical &&
+      (f?.targetValueBox || f?.referenceValueBox || f?.targetBox || f?.referenceBox)) || null;
+  };
+
+  // Amount target ROI is intentionally taken from the trusted Amount Forensics
+  // region. Reference amount ROI comes from the semantic reference field.
+  const amountField = findField('amount');
+  if (amountForensics?.region && amountField) {
+    const boxes = boxFrom(amountField);
+    const reference = boxes.reference;
+    if (reference) rois.amount = { target: amountForensics.region, reference };
   }
 
-  const recipientIban = findField(['recipientIban','iban','aliciIban']);
-  if (recipientIban) {
-    const target = recipientIban.targetValueBox || recipientIban.targetBox || null;
-    const reference = recipientIban.referenceValueBox || recipientIban.referenceBox || null;
-    if (target && reference) rois.recipientIban = { target, reference };
+  const recipientName = findField('recipientName');
+  if (recipientName) {
+    const boxes = boxFrom(recipientName);
+    if (boxes.target && boxes.reference) rois.recipientName = { target: boxes.target, reference: boxes.reference };
   }
+
+  const recipientIban = findField('recipientIban');
+  if (recipientIban) {
+    const boxes = boxFrom(recipientIban);
+    if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference };
+  }
+
+  console.log('MATH SEMANTIC ROI RESOLVER V1.2:', JSON.stringify({
+    fields: fields.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
+    profiles: profiles.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
+    resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => [k, {target:Boolean(v?.target), reference:Boolean(v?.reference)}])),
+  }));
 
   return rois;
 }
@@ -197,7 +238,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.1.0-16X16',
+    version: 'MATH-FORENSICS-V1.1.1-16X16',
     engine: 'mathematical-forensics-v1.1-16x16-semantic-roi',
     bank,
     family,
@@ -8364,6 +8405,14 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             referenceLabelXNorm:Number(rp.x.toFixed(5)),referenceLabelYNorm:Number(rp.y.toFixed(5)),
             targetLabelXNorm:Number(tp.x.toFixed(5)),targetLabelYNorm:Number(tp.y.toFixed(5)),
             referenceValueRegionFound:Boolean(refValue),targetValueRegionFound:Boolean(tarValue),
+            // Expose the exact semantic value boxes to downstream mathematical
+            // ROI analysis. Previously these boxes existed only as local
+            // variables inside the reference engine, so MATH-FORENSICS could
+            // see the field name but had no coordinates and returned roi16x16:null.
+            referenceValueBox: refValue?.region ? {...refValue.region} : null,
+            targetValueBox: tarValue?.region ? {...tarValue.region} : null,
+            referenceLabelBox: m.rl?.region ? {...m.rl.region} : null,
+            targetLabelBox: m.tl?.region ? {...m.tl.region} : null,
             labelMatchMethod:m.matchMethod,labelTextDistance:rfLevenshtein(m.rl.labelText,m.tl.labelText),suspicious,
             evidence:suspicious?`Alan bazında bağımsız render/geometri sapması: stil ${styleScore}, değer-stil ${valueStyleScore}, konum ${positionScore}.`:null,
           });
