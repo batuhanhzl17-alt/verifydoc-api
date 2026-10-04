@@ -1,1264 +1,735 @@
-import fs from "fs/promises";
-import path from "path";
-import { inflateSync } from "zlib";
+import fs from 'fs/promises';
+import path from 'path';
+import sharp from 'sharp';
 
-// =====================================================
-// VERIFYDOC FONT FORENSICS v3
-// =====================================================
-// v2 fixes a critical limitation of v1:
-// PDF.js item.fontName can be an internal resource name (for example g_d3_f3)
-// and a simple /BaseFont regex misses names stored inside compressed/object
-// streams. v2 therefore uses four evidence layers:
-//   1) PDF.js text items + commonObjs
-//   2) raw PDF dictionaries
-//   3) FlateDecode/object-stream decompression
-//   4) embedded font binary name tables (TrueType/OpenType/CFF/Type1)
-//
-// The module reports font evidence only. It does not decide authenticity.
+const VERSION = 'MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE';
+const DEFAULT_SIZE = 256;
+const TILE_GRID = 16;
+const ROI_CANVAS_WIDTH = 256;
+const ROI_CANVAS_HEIGHT = 96;
 
-const FONT_STYLE_PATTERNS = [
-  ["black", /(?:black|heavy|ultrablack|900)$/i],
-  ["bold", /(?:bold|semibold|demibold|demi|mediumbold|700)$/i],
-  ["medium", /(?:medium|500)$/i],
-  ["light", /(?:light|thin|300)$/i],
-  ["italic", /(?:italic|oblique)$/i],
-  ["regular", /(?:regular|roman|normal|book|plain)$/i],
+const LUMA_Q50 = [
+  16,11,10,16,24,40,51,61,
+  12,12,14,19,26,58,60,55,
+  14,13,16,24,40,57,69,56,
+  14,17,22,29,51,87,80,62,
+  18,22,37,56,68,109,103,77,
+  24,35,55,64,81,104,113,92,
+  49,64,78,87,103,121,120,101,
+  72,92,95,98,112,100,103,99
+];
+const CHROMA_Q50 = [
+  17,18,24,47,99,99,99,99,
+  18,21,26,66,99,99,99,99,
+  24,26,56,99,99,99,99,99,
+  47,66,99,99,99,99,99,99,
+  99,99,99,99,99,99,99,99,
+  99,99,99,99,99,99,99,99,
+  99,99,99,99,99,99,99,99,
+  99,99,99,99,99,99,99,99
 ];
 
-function clean(value) {
-  return String(value ?? "").trim();
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function mean(a) { return a.length ? a.reduce((s, v) => s + v, 0) / a.length : 0; }
+function variance(a, m = mean(a)) { return a.length ? a.reduce((s, v) => s + (v - m) ** 2, 0) / a.length : 0; }
+function std(a, m = mean(a)) { return Math.sqrt(variance(a, m)); }
+function median(a) {
+  if (!a.length) return 0;
+  const b = [...a].sort((x, y) => x - y);
+  const m = Math.floor(b.length / 2);
+  return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2;
+}
+function mad(a, med = median(a)) { return median(a.map(v => Math.abs(v - med))); }
+function entropyFromHistogram(hist, total) {
+  if (!total) return 0;
+  let e = 0;
+  for (const n of hist) if (n) { const p = n / total; e -= p * Math.log2(p); }
+  return e;
 }
 
-function normalizeFontName(value) {
-  let s = clean(value);
-  if (!s) return null;
-  s = s.replace(/^\//, "");
-  // PDF name hex escapes (e.g. #2B = "+") must be decoded before
-  // removing the six-letter subset prefix.
-  s = s.replace(/#([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
-  // PDF subset prefix: ABCDEF+FontName
-  s = s.replace(/^[A-Z]{3,8}\+/i, "");
-  s = s.replace(/\s+/g, "");
-  if (!s || /^Identity(?:-H|-V)?$/i.test(s)) return null;
-  return s;
-}
-
-function fontFamily(value) {
-  const n = normalizeFontName(value);
-  if (!n) return null;
-  return n
-    .replace(/[-_](?:Bold|Black|Roman|Regular|Book|Medium|Light|Thin|Italic|Oblique|Semibold|DemiBold|Heavy|Normal|Plain)(?:MT|PS|PSMT)?$/i, "")
-    .replace(/(?:Bold|Black|Roman|Regular|Book|Medium|Light|Thin|Italic|Oblique|Semibold|DemiBold|Heavy|Normal|Plain)(?:MT|PS|PSMT)?$/i, "")
-    .replace(/(?:MT|PSMT)$/i, "") || n;
-}
-
-function fontStyle(value) {
-  const n = normalizeFontName(value);
-  if (!n) return "unknown";
-  for (const [style, re] of FONT_STYLE_PATTERNS) {
-    if (re.test(n)) return style;
-  }
-  if (/(?:BoldMT|BoldPSMT)$/i.test(n)) return "bold";
-  if (/(?:Roman|Regular|Book|Normal|Plain)(?:MT|PSMT)?$/i.test(n)) return "regular";
-  if (/PSMT$/i.test(n)) return "regular";
-  return "unknown";
-}
-
-function normalizeLabel(value) {
-  return clean(value)
-    .toLocaleUpperCase("tr-TR")
-    .replace(/[İIı]/g, "I")
-    .replace(/Ğ/g, "G")
-    .replace(/Ü/g, "U")
-    .replace(/Ş/g, "S")
-    .replace(/Ö/g, "O")
-    .replace(/Ç/g, "C")
-    .replace(/[^A-Z0-9]+/g, " ")
-    .trim();
-}
-
-function isUsefulFontName(value) {
-  const n = normalizeFontName(value);
-  if (!n || n.length < 2 || n.length > 180) return false;
-  if (/^(unknown|none|null|undefined|g_d\d+_f\d+|font\d+)$/i.test(n)) return false;
-  if (/^(Identity|ArialMT|TimesNewRomanPSMT|Helvetica|Courier)$/i.test(n)) return true;
-  return /[A-Za-z]/.test(n);
-}
-
-function makeFontRecord(name, source, extra = {}) {
-  const n = normalizeFontName(name);
-  if (!isUsefulFontName(n)) return null;
-  return {
-    key: `${fontFamily(n) || n}|${fontStyle(n)}`,
-    fontName: n,
-    family: fontFamily(n) || n,
-    style: fontStyle(n),
-    rawFontNames: [n],
-    pdfFontFamilies: [fontFamily(n) || n],
-    itemCount: 0,
-    charCount: 0,
-    pages: [],
-    embedded: null,
-    source,
-    ...extra,
-  };
-}
-
-function addName(set, name) {
-  const n = normalizeFontName(name);
-  if (isUsefulFontName(n)) set.add(n);
-}
-
-// -----------------------------------------------------
-// PDF raw + compressed stream extraction
-// -----------------------------------------------------
-function scanFontTokens(text, names) {
-  if (!text) return;
-  const source = String(text);
-  const patterns = [
-    /\/BaseFont\s*\/([A-Za-z0-9._+\-#]+)/g,
-    /\/FontName\s*\/([A-Za-z0-9._+\-#]+)/g,
-    /\/Family\s*\/([A-Za-z0-9._+\-#]+)/g,
-    /\/Substitute\s*\/([A-Za-z0-9._+\-#]+)/g,
-  ];
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(source))) addName(names, m[1]);
-  }
-}
-
-function parsePdfFilterNames(dictionary) {
-  const m = String(dictionary || '').match(/\/Filter\s*(\[[^\]]+\]|\/[A-Za-z0-9]+)/i);
-  if (!m) return [];
-  const raw = m[1];
-  const names = [];
-  // A single PDF filter is captured without its leading slash by the regex
-  // above (e.g. `FlateDecode`), while an array retains slash-prefixed names.
-  // Normalize both forms so compressed content streams can be decoded equally.
-  if (/^[A-Za-z0-9]+$/.test(raw)) return [raw];
-  const re = /\/([A-Za-z0-9]+)/g;
-  let x;
-  while ((x = re.exec(raw))) names.push(x[1]);
-  return names;
-}
-
-function findPdfStreams(buffer) {
-  const streams = [];
-  const ascii = buffer.toString('latin1');
-  let pos = 0;
-  while (true) {
-    const start = ascii.indexOf('stream', pos);
-    if (start < 0) break;
-
-    // Only accept the PDF stream keyword, not occurrences inside arbitrary text.
-    const before = start > 0 ? ascii[start - 1] : '';
-    const afterChar = ascii[start + 6] || '';
-    if ((before && !/[\s\r\n]/.test(before)) || (afterChar && !/[\s\r\n]/.test(afterChar))) {
-      pos = start + 6;
-      continue;
-    }
-
-    const headerStart = Math.max(0, ascii.lastIndexOf('obj', start));
-    const dictStart = ascii.lastIndexOf('<<', start);
-    const dictEnd = ascii.lastIndexOf('>>', start);
-    if (dictStart < headerStart || dictEnd < dictStart) {
-      pos = start + 6;
-      continue;
-    }
-
-    let dataStart = start + 6;
-    if (ascii.startsWith('\r\n', dataStart)) dataStart += 2;
-    else if (ascii.startsWith('\n', dataStart)) dataStart += 1;
-
-    // Prefer /Length when it is a literal integer. This avoids accidentally
-    // stopping at the byte sequence "endstream" inside compressed data.
-    const dictionary = ascii.slice(dictStart, dictEnd + 2);
-    let dataEnd = -1;
-    const lenMatch = dictionary.match(/\/Length\s+(\d+)/i);
-    if (lenMatch) {
-      const length = Number(lenMatch[1]);
-      if (Number.isSafeInteger(length) && length >= 0 && dataStart + length <= buffer.length) {
-        dataEnd = dataStart + length;
-      }
-    }
-    if (dataEnd < 0) {
-      dataEnd = ascii.indexOf('endstream', dataStart);
-      if (dataEnd < 0) break;
-    }
-
-    streams.push({
-      dataStart,
-      dataEnd,
-      dictionary,
-      filters: parsePdfFilterNames(dictionary),
-    });
-    pos = Math.max(dataEnd + 1, start + 6);
-  }
-  return streams;
-}
-
-function asciiHexDecode(data) {
-  const src = Buffer.from(data || []).toString('latin1').replace(/\s+/g, '');
-  const end = src.indexOf('>');
-  const body = (end >= 0 ? src.slice(0, end) : src).replace(/[^0-9A-Fa-f]/g, '');
-  const even = body.length % 2 ? body + '0' : body;
-  try { return Buffer.from(even, 'hex'); } catch { return null; }
-}
-
-function ascii85Decode(data) {
-  const src = Buffer.from(data || []).toString('latin1').replace(/\s+/g, '');
-  let text = src;
-  if (text.startsWith('<~')) text = text.slice(2);
-  const end = text.indexOf('~>');
-  if (end >= 0) text = text.slice(0, end);
-  const out = [];
-  let group = [];
-  const flush = (g, partial = false) => {
-    if (!g.length) return;
-    const originalLen = g.length;
-    while (g.length < 5) g.push('u');
-    let value = 0;
-    for (const ch of g) value = value * 85 + (ch === 'z' ? 0 : ch.charCodeAt(0) - 33);
-    const bytes = [(value >>> 24) & 255, (value >>> 16) & 255, (value >>> 8) & 255, value & 255];
-    const take = partial ? Math.max(0, originalLen - 1) : 4;
-    for (let i = 0; i < take; i++) out.push(bytes[i]);
-  };
-  for (const ch of text) {
-    if (ch === 'z' && group.length === 0) {
-      out.push(0,0,0,0);
-      continue;
-    }
-    const code = ch.charCodeAt(0);
-    if (code < 33 || code > 117) continue;
-    group.push(ch);
-    if (group.length === 5) { flush(group); group = []; }
-  }
-  if (group.length) flush(group, true);
-  return Buffer.from(out);
-}
-
-function decodePdfStream(data, filters = []) {
-  let current = Buffer.from(data || []);
-  for (const filter of filters) {
-    const f = String(filter || '').toLowerCase();
-    try {
-      if (f === 'flatedecode' || f === 'fl') current = inflateSync(current);
-      else if (f === 'asciihexdecode' || f === 'ahx') current = asciiHexDecode(current) || current;
-      else if (f === 'ascii85decode' || f === 'a85') current = ascii85Decode(current);
-      else return null;
-    } catch {
-      return null;
-    }
-  }
-  return current;
-}
-
-async function extractRawPdfFontNames(pdfPath) {
-  const names = new Set();
-  try {
-    const buf = await fs.readFile(pdfPath);
-    if (!buf?.length) return [];
-    const latin = buf.toString('latin1');
-    scanFontTokens(latin, names);
-
-    // Scan every PDF stream using its declared filter chain. This catches
-    // font dictionaries stored inside compressed /ObjStm objects, which a
-    // plain byte regex cannot see.
-    for (const stream of findPdfStreams(buf)) {
-      const raw = buf.subarray(stream.dataStart, stream.dataEnd);
-      const decoded = stream.filters?.length ? decodePdfStream(raw, stream.filters) : raw;
-      if (!decoded) continue;
-      scanFontTokens(decoded.toString('latin1'), names);
-    }
-  } catch (error) {
-    console.warn('RAW PDF FONT EXTRACTION HATASI:', path.basename(pdfPath), error?.message || error);
-  }
-  return [...names];
-}
-
-
-// -----------------------------------------------------
-// PDF indirect-object graph font extraction (v3.1 target stream-length fix)
-// -----------------------------------------------------
-// v3.1 keeps v3's approach intact and adds one narrow layer for PDFs where
-// /Font -> /FontDescriptor -> /FontFile references are indirect objects.
-// This is intentionally deterministic: it does not rasterize the document.
-function pdfIndirectRef(value) {
-  const m = String(value || '').match(/(\d+)\s+(\d+)\s+R/);
-  return m ? `${m[1]} ${m[2]}` : null;
-}
-
-function parsePdfIndirectObjects(buffer) {
-  const objects = new Map();
-  const text = Buffer.from(buffer || []).toString('latin1');
-  const re = /(?:^|\r?\n|\s)(\d+)\s+(\d+)\s+obj\b/g;
-  let m;
-  while ((m = re.exec(text))) {
-    const key = `${m[1]} ${m[2]}`;
-    const bodyStart = re.lastIndex;
-    const end = text.indexOf('endobj', bodyStart);
-    if (end < 0) break;
-    const body = text.slice(bodyStart, end);
-    const streamPos = body.indexOf('stream');
-    let dictionary = body;
-    let stream = null;
-    if (streamPos >= 0) {
-      dictionary = body.slice(0, streamPos);
-      let dataStart = bodyStart + streamPos + 6;
-      if (text.startsWith('\r\n', dataStart)) dataStart += 2;
-      else if (text.startsWith('\n', dataStart)) dataStart += 1;
-      // /Length may itself be an indirect PDF object (e.g. /Length 65 0 R).
-      // Never mistake the referenced object number for the byte length.
-      const indirectLengthMatch = dictionary.match(/\/Length\s+(\d+)\s+(\d+)\s+R\b/i);
-      const directLengthMatch = dictionary.match(/\/Length\s+(\d+)(?!\s+\d+\s+R\b)/i);
-      let dataEnd = -1;
-      if (!indirectLengthMatch && directLengthMatch) {
-        const n = Number(directLengthMatch[1]);
-        if (Number.isSafeInteger(n) && n >= 0 && dataStart + n <= buffer.length) {
-          dataEnd = dataStart + n;
+function jpegQuantizationTables(buf) {
+  const tables = {};
+  if (!buf || buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return tables;
+  let i = 2;
+  while (i + 3 < buf.length) {
+    while (i < buf.length && buf[i] !== 0xff) i++;
+    while (i < buf.length && buf[i] === 0xff) i++;
+    if (i >= buf.length) break;
+    const marker = buf[i++];
+    if (marker === 0xd9 || marker === 0xda) break;
+    if (marker >= 0xd0 && marker <= 0xd7) continue;
+    if (i + 1 >= buf.length) break;
+    const len = buf.readUInt16BE(i);
+    if (len < 2 || i + len > buf.length) break;
+    if (marker === 0xdb) {
+      let p = i + 2;
+      const end = i + len;
+      while (p < end) {
+        const info = buf[p++];
+        const precision = info >> 4;
+        const id = info & 0x0f;
+        const count = precision === 0 ? 64 : 128;
+        const values = [];
+        for (let k = 0; k < count && p < end; k++) {
+          values.push(precision === 0 ? buf[p++] : buf.readUInt16BE(p += 0, true));
+          if (precision !== 0) p += 2;
         }
+        tables[id] = { precision: precision ? 16 : 8, values: values.slice(0, 64) };
       }
-      if (dataEnd < 0) {
-        const localEnd = body.indexOf('endstream', streamPos + 6);
-        if (localEnd >= 0) dataEnd = bodyStart + localEnd;
-      }
-      if (dataEnd >= 0) stream = buffer.subarray(dataStart, dataEnd);
     }
-    objects.set(key, { key, objectNumber:Number(m[1]), generation:Number(m[2]), dictionary, stream });
-    re.lastIndex = end + 6;
+    i += len;
   }
-  return objects;
+  return tables;
 }
 
-function pdfDictRef(dictionary, key) {
-  const re = new RegExp(`\\/${key}\\s+(\\d+)\\s+(\\d+)\\s+R`, 'i');
-  const m = String(dictionary || '').match(re);
-  return m ? `${m[1]} ${m[2]}` : null;
+function jpegQualityEstimate(tables) {
+  const estimates = [];
+  for (const [id, table] of Object.entries(tables || {})) {
+    if (!table?.values?.length) continue;
+    const base = Number(id) === 0 ? LUMA_Q50 : CHROMA_Q50;
+    let bestQ = null;
+    let bestErr = Infinity;
+    for (let q = 1; q <= 100; q++) {
+      const scale = q < 50 ? 5000 / q : 200 - 2 * q;
+      let err = 0;
+      const n = Math.min(64, table.values.length);
+      for (let k = 0; k < n; k++) {
+        const expected = clamp(Math.floor((base[k] * scale + 50) / 100), 1, 255);
+        err += Math.abs(expected - table.values[k]);
+      }
+      err /= n;
+      if (err < bestErr) { bestErr = err; bestQ = q; }
+    }
+    estimates.push({ id: Number(id), quality: bestQ, error: bestErr });
+  }
+  if (!estimates.length) return null;
+  const q = estimates.reduce((s, x) => s + x.quality, 0) / estimates.length;
+  const e = estimates.reduce((s, x) => s + x.error, 0) / estimates.length;
+  return { estimatedQuality: q, fitError: e, tables: estimates };
 }
 
-function pdfDictName(dictionary, key) {
-  const re = new RegExp(`\\/${key}\\s*\\/([A-Za-z0-9._+#-]+)`, 'i');
-  const m = String(dictionary || '').match(re);
-  return m ? m[1] : null;
+function makeDctCos() {
+  const c = Array.from({ length: 8 }, () => Array(8).fill(0));
+  for (let u = 0; u < 8; u++) for (let x = 0; x < 8; x++) c[u][x] = Math.cos(((2 * x + 1) * u * Math.PI) / 16);
+  return c;
 }
-
-function pdfDictRefsInMap(dictionary) {
-  const out = new Map();
-  const re = /\/(F\d+|[A-Za-z][A-Za-z0-9._-]*)\s+(\d+)\s+(\d+)\s+R/g;
-  let m;
-  while ((m = re.exec(String(dictionary || '')))) out.set(m[1], `${m[2]} ${m[3]}`);
+const DCT_COS = makeDctCos();
+function dct8(block) {
+  const out = new Float64Array(64);
+  for (let u = 0; u < 8; u++) {
+    const au = u === 0 ? Math.SQRT1_2 : 1;
+    for (let v = 0; v < 8; v++) {
+      const av = v === 0 ? Math.SQRT1_2 : 1;
+      let s = 0;
+      for (let x = 0; x < 8; x++) for (let y = 0; y < 8; y++) {
+        s += block[x * 8 + y] * DCT_COS[u][x] * DCT_COS[v][y];
+      }
+      out[u * 8 + v] = 0.25 * au * av * s;
+    }
+  }
   return out;
 }
 
-function parsePdfObjectStreams(objects) {
-  const embedded = new Map(objects);
-  for (const obj of objects.values()) {
-    if (!/\/Type\s+\/ObjStm\b/i.test(obj.dictionary) || !obj.stream) continue;
-    const filters = parsePdfFilterNames(obj.dictionary);
-    const decoded = filters.length ? decodePdfStream(obj.stream, filters) : obj.stream;
-    if (!decoded) continue;
-    const nMatch = obj.dictionary.match(/\/N\s+(\d+)/i);
-    const firstMatch = obj.dictionary.match(/\/First\s+(\d+)/i);
-    if (!nMatch || !firstMatch) continue;
-    const n = Number(nMatch[1]);
-    const first = Number(firstMatch[1]);
-    if (!Number.isSafeInteger(n) || !Number.isSafeInteger(first) || n <= 0 || first < 0 || first >= decoded.length) continue;
-    const head = decoded.subarray(0, first).toString('latin1').trim().split(/\s+/);
-    if (head.length < n * 2) continue;
-    for (let i = 0; i < n; i++) {
-      const objNum = Number(head[i * 2]);
-      const offset = Number(head[i * 2 + 1]);
-      const nextOffset = i + 1 < n ? Number(head[(i + 1) * 2 + 1]) : decoded.length - first;
-      if (!Number.isInteger(objNum) || !Number.isInteger(offset) || !Number.isInteger(nextOffset) || offset < 0 || nextOffset <= offset) continue;
-      const a = first + offset;
-      const b = Math.min(decoded.length, first + nextOffset);
-      if (a >= b || a >= decoded.length) continue;
-      embedded.set(`${objNum} 0`, { key:`${objNum} 0`, objectNumber:objNum, generation:0, dictionary:decoded.subarray(a,b).toString('latin1'), stream:null, fromObjectStream:obj.key });
-    }
-  }
-  return embedded;
+function clampBox(box, width, height) {
+  if (!box) return null;
+  const x1 = Number(box.x1 ?? box.x ?? 0);
+  const y1 = Number(box.y1 ?? box.y ?? 0);
+  const x2 = Number(box.x2 ?? (Number(box.x ?? 0) + Number(box.width ?? 0)));
+  const y2 = Number(box.y2 ?? (Number(box.y ?? 0) + Number(box.height ?? 0)));
+  const ax1 = Math.max(0, Math.min(width - 1, Math.round(Math.min(x1, x2))));
+  const ay1 = Math.max(0, Math.min(height - 1, Math.round(Math.min(y1, y2))));
+  const ax2 = Math.max(ax1 + 1, Math.min(width, Math.round(Math.max(x1, x2))));
+  const ay2 = Math.max(ay1 + 1, Math.min(height, Math.round(Math.max(y1, y2))));
+  if (ax2 - ax1 < 2 || ay2 - ay1 < 2) return null;
+  return { x1: ax1, y1: ay1, x2: ax2, y2: ay2 };
 }
 
-function extractPdfObjectGraphFontNamesFromBuffer(buffer) {
-  const names = new Set();
-  const descriptorNames = new Set();
-  const embeddedFontFiles = new Set();
-  const objects = parsePdfObjectStreams(parsePdfIndirectObjects(buffer));
-  const visited = new Set();
-  const add = (value, target = names) => addName(target, value);
+function normalizeRegionBox(box, sourceWidth, sourceHeight) {
+  if (!box) return null;
+  const b = { ...box };
+  const hasNorm = [b.xNorm, b.yNorm, b.widthNorm, b.heightNorm].every(v => Number.isFinite(Number(v)));
+  if (hasNorm) {
+    return clampBox({
+      x1: Number(b.xNorm) * sourceWidth,
+      y1: Number(b.yNorm) * sourceHeight,
+      x2: (Number(b.xNorm) + Number(b.widthNorm)) * sourceWidth,
+      y2: (Number(b.yNorm) + Number(b.heightNorm)) * sourceHeight,
+    }, sourceWidth, sourceHeight);
+  }
+  return clampBox(b, sourceWidth, sourceHeight);
+}
 
-  const inspectFont = (fontRef, depth = 0) => {
-    if (!fontRef || depth > 8 || visited.has(`font:${fontRef}`)) return;
-    visited.add(`font:${fontRef}`);
-    const font = objects.get(fontRef);
-    if (!font) return;
-    add(pdfDictName(font.dictionary, 'BaseFont'));
-    const descRef = pdfDictRef(font.dictionary, 'FontDescriptor');
-    if (descRef) inspectDescriptor(descRef, depth + 1);
-    const descendants = pdfDictRef(font.dictionary, 'DescendantFonts');
-    if (descendants) {
-      const dObj = objects.get(descendants);
-      if (dObj) {
-        const refs = [...dObj.dictionary.matchAll(/(\d+)\s+(\d+)\s+R/g)].map(x => `${x[1]} ${x[2]}`);
-        for (const r of refs.slice(0, 8)) inspectFont(r, depth + 1);
-      }
-    }
-  };
+function cropRaw(data, width, height, box) {
+  const b = clampBox(box, width, height);
+  if (!b) return null;
+  const w = b.x2 - b.x1, h = b.y2 - b.y1;
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const src = (b.y1 + y) * width + b.x1;
+    out.set(data.subarray(src, src + w), y * w);
+  }
+  return { data: Buffer.from(out), width: w, height: h, box: b };
+}
 
-  const inspectDescriptor = (ref, depth = 0) => {
-    if (!ref || depth > 8 || visited.has(`desc:${ref}`)) return;
-    visited.add(`desc:${ref}`);
-    const desc = objects.get(ref);
-    if (!desc) return;
-    const fontName = pdfDictName(desc.dictionary, 'FontName');
-    if (fontName) { add(fontName, names); add(fontName, descriptorNames); }
-    const fileKeys = ['FontFile','FontFile2','FontFile3'];
-    for (const key of fileKeys) {
-      const fileRef = pdfDictRef(desc.dictionary, key);
-      if (!fileRef) continue;
-      embeddedFontFiles.add(fileRef);
-      const fileObj = objects.get(fileRef);
-      if (!fileObj?.stream) continue;
-      const filters = parsePdfFilterNames(fileObj.dictionary);
-      const decoded = filters.length ? decodePdfStream(fileObj.stream, filters) : fileObj.stream;
-      if (!decoded) continue;
-      for (const n of parseSfntNames(decoded)) add(n, names);
-      for (const n of parseCffNames(decoded)) add(n, names);
-      for (const n of parseType1Names(decoded)) add(n, names);
-    }
-  };
-
-  // Inspect page resource dictionaries. Page-tree inheritance is handled by
-  // also examining any object with /Font or /Resources containing /Font refs.
-  for (const obj of objects.values()) {
-    const resourceRef = pdfDictRef(obj.dictionary, 'Resources');
-    const resources = resourceRef && objects.get(resourceRef) ? objects.get(resourceRef) : obj;
-    const fontRef = resources ? pdfDictRef(resources.dictionary, 'Font') : null;
-    if (fontRef) {
-      const fontObj = objects.get(fontRef);
-      if (fontObj) {
-        const refs = pdfDictRefsInMap(fontObj.dictionary);
-        for (const ref of refs.values()) inspectFont(ref);
-      }
-    }
-    if (/\/Type\s+\/Font\b/i.test(obj.dictionary)) {
-      inspectFont(obj.key);
+function resizeGrayRaw(data, width, height, outWidth, outHeight, fill = 255) {
+  const out = new Uint8Array(outWidth * outHeight);
+  out.fill(clamp(Math.round(fill), 0, 255));
+  if (!width || !height || !outWidth || !outHeight) return { data: out, width: outWidth, height: outHeight };
+  for (let y = 0; y < outHeight; y++) {
+    const sy = Math.min(height - 1, Math.floor((y + 0.5) * height / outHeight));
+    for (let x = 0; x < outWidth; x++) {
+      const sx = Math.min(width - 1, Math.floor((x + 0.5) * width / outWidth));
+      out[y * outWidth + x] = data[sy * width + sx];
     }
   }
+  return { data: out, width: outWidth, height: outHeight };
+}
 
+function borderMedian(data, width, height) {
+  const values = [];
+  if (!width || !height) return 255;
+  const stepX = Math.max(1, Math.floor(width / 64));
+  const stepY = Math.max(1, Math.floor(height / 32));
+  for (let x = 0; x < width; x += stepX) {
+    values.push(data[x], data[(height - 1) * width + x]);
+  }
+  for (let y = 0; y < height; y += stepY) {
+    values.push(data[y * width], data[y * width + width - 1]);
+  }
+  return median(values);
+}
+
+function findInkBounds(data, width, height) {
+  if (!width || !height) return null;
+  const bg = borderMedian(data, width, height);
+  const borderDelta = Math.max(8, Math.min(34, std(data.slice(0, Math.min(data.length, Math.max(width, height) * 2)))));
+  const threshold = clamp(bg - Math.max(12, borderDelta * 1.5), 80, 248);
+  let x1 = width, y1 = height, x2 = -1, y2 = -1, count = 0;
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      if (data[row + x] <= threshold) {
+        if (x < x1) x1 = x;
+        if (y < y1) y1 = y;
+        if (x > x2) x2 = x;
+        if (y > y2) y2 = y;
+        count++;
+      }
+    }
+  }
+  // Very sparse boxes can be OCR noise. Keep the original crop in that case.
+  if (count < Math.max(4, Math.floor(width * height * 0.002)) || x2 < x1 || y2 < y1) {
+    return { x1: 0, y1: 0, x2: width, y2: height, background: bg, threshold, detected: false };
+  }
+  const padX = Math.max(1, Math.round((x2 - x1 + 1) * 0.04));
+  const padY = Math.max(1, Math.round((y2 - y1 + 1) * 0.10));
   return {
-    names:[...names],
-    descriptorNames:[...descriptorNames],
-    embeddedFontFiles:[...embeddedFontFiles],
-    objectCount:objects.size,
+    x1: Math.max(0, x1 - padX), y1: Math.max(0, y1 - padY),
+    x2: Math.min(width, x2 + 1 + padX), y2: Math.min(height, y2 + 1 + padY),
+    background: bg, threshold, detected: true, inkPixels: count,
   };
 }
 
-
-function pdfDictRefsForKey(dictionary, key) {
-  const out = [];
-  const src = String(dictionary || '');
-  const re = new RegExp(`\\/${key}\\s+(\\[[\\s\\S]*?\\]|\\d+\\s+\\d+\\s+R)`, 'i');
-  const m = src.match(re);
-  if (!m) return out;
-  const value = m[1];
-  const refRe = /(\d+)\s+(\d+)\s+R/g;
-  let x;
-  while ((x = refRe.exec(value))) out.push(`${x[1]} ${x[2]}`);
-  return out;
+function letterboxGrayRaw(data, width, height, outWidth, outHeight, fill = 255) {
+  const out = new Uint8Array(outWidth * outHeight);
+  out.fill(clamp(Math.round(fill), 0, 255));
+  if (!width || !height) return { data: out, width: outWidth, height: outHeight, scale: 1, offsetX: 0, offsetY: 0 };
+  const scale = Math.min(outWidth / width, outHeight / height);
+  const rw = Math.max(1, Math.min(outWidth, Math.round(width * scale)));
+  const rh = Math.max(1, Math.min(outHeight, Math.round(height * scale)));
+  const resized = resizeGrayRaw(data, width, height, rw, rh, fill);
+  const ox = Math.floor((outWidth - rw) / 2);
+  const oy = Math.floor((outHeight - rh) / 2);
+  for (let y = 0; y < rh; y++) out.set(resized.data.subarray(y * rw, (y + 1) * rw), (oy + y) * outWidth + ox);
+  return { data: out, width: outWidth, height: outHeight, scale, offsetX: ox, offsetY: oy, resizedWidth: rw, resizedHeight: rh };
 }
 
-function extractPdfUsedFontNamesFromBuffer(buffer) {
-  const objects = parsePdfObjectStreams(parsePdfIndirectObjects(buffer));
-  const usedResourceNames = new Set();
-  const usedFontRefs = new Set();
-  const usedFontNames = new Set();
-  const resourceFontMaps = [];
-
-  const getObject = (ref) => ref ? objects.get(ref) : null;
-  const decodeObjectStream = (obj) => {
-    if (!obj?.stream) return null;
-    const filters = parsePdfFilterNames(obj.dictionary);
-    return filters.length ? decodePdfStream(obj.stream, filters) : obj.stream;
-  };
-
-  const inspectFontObject = (ref, depth = 0, visited = new Set()) => {
-    if (!ref || depth > 8 || visited.has(ref)) return;
-    visited.add(ref);
-    const obj = getObject(ref);
-    if (!obj) return;
-    addName(usedFontNames, pdfDictName(obj.dictionary, 'BaseFont'));
-    const descRef = pdfDictRef(obj.dictionary, 'FontDescriptor');
-    if (descRef) {
-      const desc = getObject(descRef);
-      if (desc) addName(usedFontNames, pdfDictName(desc.dictionary, 'FontName'));
-    }
-    const descendantsRef = pdfDictRef(obj.dictionary, 'DescendantFonts');
-    if (descendantsRef) {
-      const arr = getObject(descendantsRef);
-      if (arr) {
-        for (const m of String(arr.dictionary || '').matchAll(/(\d+)\s+(\d+)\s+R/g)) {
-          inspectFontObject(`${m[1]} ${m[2]}`, depth + 1, visited);
-        }
-      }
-    }
-  };
-
-  // Build a global resource-name -> font-object map. This intentionally does
-  // not require the page dictionary itself to be directly visible: some PDFs
-  // keep page/xref structures compressed, while the resource and font objects
-  // remain discoverable in the parsed object/object-stream layer.
-  for (const obj of objects.values()) {
-    const maps = [];
-    const fontRef = pdfDictRef(obj.dictionary, 'Font');
-    if (fontRef) {
-      const fontDict = getObject(fontRef);
-      if (fontDict) maps.push(...pdfDictRefsInMap(fontDict.dictionary));
-    }
-    const direct = obj.dictionary.match(/\/Font\s*<<([\s\S]*?)>>/i);
-    if (direct) {
-      for (const m of direct[1].matchAll(/\/(F\w+)\s+(\d+)\s+(\d+)\s+R/g)) maps.push([m[1], `${m[2]} ${m[3]}`]);
-    }
-    if (maps.length) resourceFontMaps.push({ object: obj.key, maps: new Map(maps) });
-  }
-
-  // Scan the already-parsed PDF indirect objects for actual PDF text-state
-  // font selection. This is deliberately object-based rather than relying on
-  // a global `stream` keyword scan: bank PDFs may contain binary/embedded font
-  // data with misleading `stream`/`endstream` byte sequences, and the previous
-  // scanner could miss otherwise valid content streams.
-  const diagnostics = [];
-  const resourceFontDetails = [];
-  for (const obj of objects.values()) {
-    if (!obj?.stream) continue;
-    const filters = parsePdfFilterNames(obj.dictionary);
-    const decoded = filters.length ? decodePdfStream(obj.stream, filters) : obj.stream;
-    if (!decoded) continue;
-    const text = decoded.toString('latin1');
-    const selected = [...text.matchAll(/\/([A-Za-z0-9._-]+)\s+[-+]?\d*\.?\d+\s+Tf\b/g)].map(m => m[1]);
-    if (!selected.length) continue;
-    for (const resourceName of selected) {
-      usedResourceNames.add(resourceName);
-      let matchedRef = null;
-      for (const entry of resourceFontMaps) {
-        const ref = entry.maps.get(resourceName);
-        if (!ref) continue;
-        matchedRef = ref;
-        usedFontRefs.add(ref);
-        inspectFontObject(ref);
-        const fontObj = getObject(ref);
-        const canonicalNames = [];
-        if (fontObj) {
-          const base = pdfDictName(fontObj.dictionary, 'BaseFont');
-          if (base) canonicalNames.push(normalizeFontName(base));
-          const descRef = pdfDictRef(fontObj.dictionary, 'FontDescriptor');
-          const desc = descRef ? getObject(descRef) : null;
-          const descName = desc ? pdfDictName(desc.dictionary, 'FontName') : null;
-          if (descName) canonicalNames.push(normalizeFontName(descName));
-        }
-        const detail = {
-          object: obj.key,
-          resourceName,
-          fontRef: matchedRef,
-          fontNames: [...new Set(canonicalNames.filter(Boolean))],
-        };
-        resourceFontDetails.push(detail);
-      }
-      diagnostics.push({ object: obj.key, resourceName, fontRef: matchedRef });
-    }
-  }
-
+function roiFingerprintFromRaster(data, width, height) {
+  const inkBox = findInkBounds(data, width, height);
+  const contentCrop = cropRaw(data, width, height, inkBox);
+  const contentData = contentCrop?.data || data;
+  const contentWidth = contentCrop?.width || width;
+  const contentHeight = contentCrop?.height || height;
+  const background = Number(inkBox?.background ?? borderMedian(data, width, height));
+  // Preserve the text's aspect ratio. The old fit-fill normalization stretched
+  // a 65x18 target box into the same 256x96 canvas as a 188x44 reference box,
+  // creating artificial edge/laplacian differences. Letterboxing after ink-box
+  // detection removes that scale/aspect artifact while retaining the glyph shape.
+  const normalized = letterboxGrayRaw(
+    contentData, contentWidth, contentHeight,
+    ROI_CANVAS_WIDTH, ROI_CANVAS_HEIGHT, background
+  );
+  const rawNormalized = resizeGrayRaw(data, width, height, ROI_CANVAS_WIDTH, ROI_CANVAS_HEIGHT, background);
+  const f = rasterFeatures(normalized.data, normalized.width, normalized.height);
+  const raw = rasterFeatures(rawNormalized.data, rawNormalized.width, rawNormalized.height);
   return {
-    names: [...usedFontNames],
-    usedResourceNames: [...usedResourceNames],
-    usedFontRefs: [...usedFontRefs],
-    pages: [{
-      resourceFontMaps: resourceFontMaps.map(x => ({ object:x.object, resources:[...x.maps.keys()] })),
-      selections: diagnostics,
-      resourceFontDetails,
-    }],
-    resourceFontDetails,
-    objectCount: objects.size,
-  };
-}
-
-async function extractPdfUsedFontNames(pdfPath) {
-  try {
-    const buffer = await fs.readFile(pdfPath);
-    return extractPdfUsedFontNamesFromBuffer(buffer);
-  } catch (error) {
-    console.warn('PDF USED FONT EXTRACTION HATASI:', path.basename(pdfPath), error?.message || error);
-    return { names:[], usedResourceNames:[], usedFontRefs:[], pages:[], objectCount:0 };
-  }
-}
-
-async function extractPdfObjectGraphFontNames(pdfPath) {
-  try {
-    const buffer = await fs.readFile(pdfPath);
-    return extractPdfObjectGraphFontNamesFromBuffer(buffer);
-  } catch (error) {
-    console.warn('PDF OBJECT GRAPH FONT EXTRACTION HATASI:', path.basename(pdfPath), error?.message || error);
-    return { names:[], descriptorNames:[], embeddedFontFiles:[], objectCount:0 };
-  }
-}
-
-// -----------------------------------------------------
-// Embedded font binary name extraction
-// -----------------------------------------------------
-function decodeUtf16BE(buf) {
-  if (!buf || buf.length < 2) return "";
-  let out = "";
-  for (let i = 0; i + 1 < buf.length; i += 2) out += String.fromCharCode((buf[i] << 8) | buf[i + 1]);
-  return out.replace(/\0/g, "").trim();
-}
-
-function decodeMacRomanLoose(buf) {
-  // Font names are overwhelmingly ASCII/Latin in bank PDFs. Keep bytes intact
-  // for ASCII and replace unsupported high bytes rather than inventing names.
-  let out = "";
-  for (const b of buf || []) out += b < 128 ? String.fromCharCode(b) : "?";
-  return out.replace(/\0/g, "").trim();
-}
-
-function parseSfntNames(data) {
-  const buf = Buffer.from(data || []);
-  if (buf.length < 12) return [];
-  const tag = buf.toString("ascii", 0, 4);
-  const isSfnt = tag === "\0\x01\0\0" || tag === "OTTO" || tag === "true" || tag === "typ1";
-  if (!isSfnt) return [];
-  const names = new Set();
-  try {
-    const numTables = buf.readUInt16BE(4);
-    for (let i = 0; i < numTables; i++) {
-      const off = 12 + i * 16;
-      if (off + 16 > buf.length) break;
-      const tableTag = buf.toString("ascii", off, off + 4);
-      const tableOffset = buf.readUInt32BE(off + 8);
-      const tableLength = buf.readUInt32BE(off + 12);
-      if (tableTag !== "name" || tableOffset + tableLength > buf.length || tableLength < 6) continue;
-      const p = tableOffset;
-      const count = buf.readUInt16BE(p + 2);
-      const stringOffset = buf.readUInt16BE(p + 4);
-      for (let j = 0; j < count; j++) {
-        const r = p + 6 + j * 12;
-        if (r + 12 > buf.length) break;
-        const platform = buf.readUInt16BE(r);
-        const nameId = buf.readUInt16BE(r + 6);
-        const len = buf.readUInt16BE(r + 8);
-        const rel = buf.readUInt16BE(r + 10);
-        if (![1, 2, 4, 6].includes(nameId)) continue;
-        const s = p + stringOffset + rel;
-        if (s < 0 || s + len > buf.length) continue;
-        const raw = buf.subarray(s, s + len);
-        const decoded = platform === 3 || platform === 0 ? decodeUtf16BE(raw) : decodeMacRomanLoose(raw);
-        if (decoded && decoded.length < 180) addName(names, decoded);
-      }
-    }
-  } catch {}
-  return [...names];
-}
-
-function parseCffNames(data) {
-  const buf = Buffer.from(data || []);
-  if (buf.length < 4 || buf[0] !== 1 || (buf[1] < 0 || buf[1] > 10)) return [];
-  const names = new Set();
-  try {
-    const headerSize = buf[2];
-    let p = headerSize;
-    const count = buf.readUInt16BE(p); p += 2;
-    if (!count) return [];
-    const offSize = buf[p++];
-    if (![1,2,3,4].includes(offSize)) return [];
-    const offsets = [];
-    for (let i = 0; i <= count; i++) {
-      let v = 0;
-      for (let k = 0; k < offSize; k++) v = (v << 8) | buf[p++];
-      offsets.push(v);
-    }
-    const dataStart = p;
-    for (let i = 0; i < count; i++) {
-      const a = dataStart + offsets[i] - 1;
-      const b = dataStart + offsets[i + 1] - 1;
-      if (a >= 0 && b > a && b <= buf.length) addName(names, buf.subarray(a, b).toString("latin1"));
-    }
-  } catch {}
-  return [...names];
-}
-
-function parseType1Names(data) {
-  const text = Buffer.from(data || []).toString("latin1");
-  const names = new Set();
-  const patterns = [
-    /\/FontName\s*\/([A-Za-z0-9._+\-#]+)/g,
-    /\/FullName\s*\(([^)]+)\)/g,
-    /\/FamilyName\s*\(([^)]+)\)/g,
-  ];
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(text))) addName(names, m[1]);
-  }
-  return [...names];
-}
-
-function embeddedFontNamesFromObject(obj) {
-  const names = new Set();
-  const binaries = [];
-  const seen = new Set();
-  const pushBinary = (value) => {
-    if (!value) return;
-    let b = null;
-    if (value instanceof Uint8Array || Buffer.isBuffer(value)) b = Buffer.from(value);
-    else if (value instanceof ArrayBuffer) b = Buffer.from(new Uint8Array(value));
-    else if (ArrayBuffer.isView(value)) b = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-    if (!b || b.length < 16 || b.length > 50 * 1024 * 1024) return;
-    const key = `${b.length}:${b.subarray(0, 16).toString("hex")}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    binaries.push(b);
-  };
-
-  // PDF.js Font objects and their descriptors can expose the embedded bytes
-  // under different properties depending on version/build.
-  pushBinary(obj?.data);
-  pushBinary(obj?.file?.data);
-  pushBinary(obj?.fontData);
-  pushBinary(obj?.properties?.data);
-  pushBinary(obj?.properties?.file?.data);
-  pushBinary(obj?.dict?.data);
-  pushBinary(obj?.dict?.file?.data);
-
-  for (const b of binaries) {
-    for (const n of parseSfntNames(b)) addName(names, n);
-    for (const n of parseCffNames(b)) addName(names, n);
-    for (const n of parseType1Names(b)) addName(names, n);
-  }
-  return [...names];
-}
-
-function getFontObject(page, fontName) {
-  if (!page?.commonObjs || !fontName) return null;
-  try { return page.commonObjs.get(fontName) || null; } catch { return null; }
-}
-
-function collectObjectFontNames(obj) {
-  const names = new Set();
-  const candidates = [
-    obj?.fontFamily, obj?.name, obj?.loadedName, obj?.fallbackName,
-    obj?.properties?.fontFamily, obj?.properties?.name,
-    obj?.properties?.loadedName, obj?.properties?.fallbackName,
-    obj?.properties?.baseFont, obj?.properties?.BaseFont,
-    obj?.properties?.fontName, obj?.properties?.FontName,
-    obj?.dict?.fontName, obj?.dict?.FontName, obj?.dict?.baseFont,
-  ];
-  for (const c of candidates) addName(names, c);
-  for (const c of embeddedFontNamesFromObject(obj)) addName(names, c);
-  return [...names];
-}
-
-function fontDescriptor(item, page) {
-  const raw = clean(item?.fontName);
-  const obj = getFontObject(page, raw);
-  const objectNames = collectObjectFontNames(obj);
-  // Prefer an actual object/embedded name. Never treat g_d3_f3-style resource
-  // names as the canonical font family.
-  const preferred = objectNames.find(n => !/^g_d\d+_f\d+$/i.test(n)) || null;
-  const canonical = preferred || (isUsefulFontName(raw) ? normalizeFontName(raw) : null);
-  return {
-    rawFontName: raw || null,
-    fontName: canonical,
-    family: fontFamily(canonical),
-    style: fontStyle(canonical),
-    pdfFontFamilies: objectNames.map(x => fontFamily(x) || x).slice(0, 12),
-    embedded: typeof obj?.isEmbedded === "boolean" ? obj.isEmbedded : null,
-    type3: Boolean(obj?.isType3Font),
-    vertical: Boolean(obj?.vertical),
-    objectFontNames: objectNames.slice(0, 20),
-  };
-}
-
-const fontProfileCache = new Map();
-
-function mergeFontRecord(map, rec) {
-  if (!rec?.fontName) return;
-  const key = rec.key || `${rec.family || rec.fontName}|${rec.style || "unknown"}`;
-  const current = map.get(key) || {
-    key,
-    fontName: rec.fontName,
-    family: rec.family || fontFamily(rec.fontName) || rec.fontName,
-    style: rec.style || fontStyle(rec.fontName),
-    rawFontNames: new Set(),
-    pdfFontFamilies: new Set(),
-    itemCount: 0,
-    charCount: 0,
-    pages: new Set(),
-    embeddedValues: new Set(),
-    sources: new Set(),
-  };
-  if (rec.rawFontName) current.rawFontNames.add(rec.rawFontName);
-  for (const n of rec.rawFontNames || []) current.rawFontNames.add(n);
-  for (const n of rec.pdfFontFamilies || []) current.pdfFontFamilies.add(n);
-  if (rec.source) current.sources.add(rec.source);
-  if (rec.pageNumber) current.pages.add(rec.pageNumber);
-  current.itemCount += Number(rec.itemCount) || 0;
-  current.charCount += Number(rec.charCount) || 0;
-  if (rec.embedded !== null && rec.embedded !== undefined) current.embeddedValues.add(rec.embedded);
-  map.set(key, current);
-}
-
-async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
-  if (!pdfPath || !pdfjsLib) return null;
-  const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v33-active-font-resource-bridge`;
-  if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
-
-  const buffer = await fs.readFile(pdfPath);
-  if (!buffer?.length) return null;
-  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer), useWorkerFetch: false, isEvalSupported: true }).promise;
-  const maxPages = Math.min(Number(options.maxPages) || 5, pdf.numPages || 1);
-  const fonts = new Map();
-  const items = [];
-  const pages = [];
-  const pdfObjectNames = new Set();
-
-  try {
-    for (let pageNumber = 1; pageNumber <= maxPages; pageNumber++) {
-      const page = await pdf.getPage(pageNumber);
-      const viewport = page.getViewport({ scale: 1 });
-      const content = await page.getTextContent({ disableCombineTextItems: false });
-      const pageItems = [];
-
-      for (const item of content.items || []) {
-        const text = clean(item?.str);
-        if (!text || !item?.fontName) continue;
-        const font = fontDescriptor(item, page);
-        for (const n of font.objectFontNames || []) addName(pdfObjectNames, n);
-
-        // If canonical name is unavailable, keep the resource name as an
-        // internal observation but do NOT expose it as a reference font family.
-        if (font.fontName) {
-          mergeFontRecord(fonts, {
-            ...font,
-            source: font.objectFontNames?.length ? "pdfjs-font-object" : "pdfjs-text-layer",
-            pageNumber,
-            itemCount: 1,
-            charCount: text.length,
-          });
-        }
-
-        const tr = Array.isArray(item.transform) ? item.transform : [];
-        const x = Number(tr[4]);
-        const y = Number(tr[5]);
-        const width = Number(item.width) || 0;
-        const height = Math.abs(Number(tr[3])) || Number(item.height) || 0;
-        const row = { pageNumber, text, x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0, width, height, font };
-        pageItems.push(row);
-        items.push(row);
-      }
-      pages.push({ pageNumber, width: viewport.width, height: viewport.height, itemCount: pageItems.length });
-    }
-  } finally {
-    try { if (typeof pdf.destroy === "function") await pdf.destroy(); } catch {}
-  }
-
-  // Add names found in dictionaries and decompressed object streams.
-  const rawFontNames = await extractRawPdfFontNames(pdfPath);
-  for (const n of rawFontNames) addName(pdfObjectNames, n);
-
-  // v3.1: resolve indirect /Font -> /FontDescriptor -> /FontFile references.
-  const objectGraph = await extractPdfObjectGraphFontNames(pdfPath);
-  for (const n of objectGraph.names || []) addName(pdfObjectNames, n);
-  for (const n of objectGraph.descriptorNames || []) addName(pdfObjectNames, n);
-
-  // Only fonts selected by a real PDF content-stream `Tf` operator are treated
-  // as actively used. This prevents incidental resource fonts such as
-  // Helvetica/ZapfDingbats from becoming target-only mismatches merely because
-  // they are present in the PDF resource graph.
-  const usedFontGraph = await extractPdfUsedFontNames(pdfPath);
-  const activeNames = new Set((usedFontGraph.names || []).map(normalizeFontName).filter(Boolean));
-  for (const n of activeNames) addName(pdfObjectNames, n);
-
-  const candidateNames = [...new Set([...(rawFontNames || []), ...(objectGraph.names || []), ...(objectGraph.descriptorNames || [])])];
-  for (const n of candidateNames) {
-    if (activeNames.size && !activeNames.has(normalizeFontName(n))) continue;
-    if (!fontsHasCanonical(fonts, n)) {
-      const rec = makeFontRecord(n, "pdf-dictionary-or-object-stream");
-      if (rec) mergeFontRecord(fonts, rec);
-    }
-  }
-
-  const fontList = [...fonts.values()].map(x => ({
-    key: x.key,
-    fontName: x.fontName,
-    family: x.family,
-    style: x.style,
-    rawFontNames: [...x.rawFontNames].slice(0, 20),
-    pdfFontFamilies: [...x.pdfFontFamilies].slice(0, 20),
-    itemCount: x.itemCount,
-    charCount: x.charCount,
-    pages: [...x.pages].sort((a,b) => a-b),
-    embedded: x.embeddedValues.size === 1 ? [...x.embeddedValues][0] : null,
-    sources: [...x.sources],
-  })).filter(x => isUsefulFontName(x.fontName)).sort((a,b) => b.charCount - a.charCount);
-
-  // Map each PDF.js font to the actual visible text items that use it.
-  // This lets downstream logic distinguish a font that is merely declared
-  // from a font that is actually attached to meaningful text on the page.
-  const activeFontUsagesMap = new Map();
-  for (const item of items) {
-    // Keep the PDF.js internal resource name even when it cannot yet be
-    // resolved to a canonical font. This is essential: an unresolved
-    // g_d6_f3-style name still tells us which visible text items share the
-    // same actual PDF.js font resource.
-    const canonicalFontName = item?.font?.fontName || null;
-    const rawFontName = item?.font?.rawFontName || null;
-    const key = normalizeFontName(canonicalFontName || rawFontName) || canonicalFontName || rawFontName;
-    if (!key) continue;
-    const rec = activeFontUsagesMap.get(key) || {
-      fontName: canonicalFontName || null,
-      rawFontName: rawFontName || null,
-      family: item?.font?.family || (canonicalFontName ? fontFamily(canonicalFontName) : null),
-      style: item?.font?.style || (canonicalFontName ? fontStyle(canonicalFontName) : 'unknown'),
-      pages: new Set(),
-      textSnippets: [],
-      boxes: [],
-      charCount: 0,
-      itemCount: 0,
-    };
-    rec.pages.add(Number(item.pageNumber) || 0);
-    rec.itemCount += 1;
-    rec.charCount += String(item.text || '').length;
-    if (rec.textSnippets.length < 30 && item.text) rec.textSnippets.push(String(item.text).slice(0, 160));
-    if (rec.boxes.length < 30) {
-      rec.boxes.push({
-        pageNumber: Number(item.pageNumber) || 0,
-        x: Number(item.x) || 0,
-        y: Number(item.y) || 0,
-        width: Number(item.width) || 0,
-        height: Number(item.height) || 0,
-        text: String(item.text || '').slice(0, 120),
-      });
-    }
-    activeFontUsagesMap.set(key, rec);
-  }
-  const activeFontUsages = [...activeFontUsagesMap.values()]
-    .map(x => ({
-      ...x,
-      // A usage with no canonical name is still useful evidence; downstream
-      // code can decide whether the raw resource is resolvable.
-      fontName: x.fontName || x.rawFontName || null,
-      pages: [...x.pages].sort((a,b) => a-b),
-    }))
-    .sort((a,b) => b.charCount - a.charCount);
-
-  // Bridge PDF.js internal names such as g_d3_f3 to the actual PDF resource
-  // selected by Tf (F3) when the document exposes that resource mapping.
-  // The suffix is intentionally used only as a conservative bridge: it must
-  // match an actually selected F<number> resource, otherwise no inference is
-  // made. This turns the raw usage into a canonical family without changing
-  // the forensic score.
-  const resourceDetails = Array.isArray(usedFontGraph.resourceFontDetails)
-    ? usedFontGraph.resourceFontDetails
-    : [];
-  const selectedResourceMap = new Map();
-  for (const d of resourceDetails) {
-    const rn = clean(d?.resourceName);
-    if (!rn || !/^F\d+$/i.test(rn)) continue;
-    const names = [...new Set((d?.fontNames || []).map(normalizeFontName).filter(Boolean))];
-    if (!names.length) continue;
-    selectedResourceMap.set(rn.toUpperCase(), {
-      resourceName: rn,
-      fontRef: d?.fontRef || null,
-      fontNames: names,
-      family: fontFamily(names[0]),
-      style: fontStyle(names[0]),
-    });
-  }
-
-  for (const usage of activeFontUsages) {
-    const raw = clean(usage.rawFontName || usage.fontName);
-    const m = raw.match(/_f(\d+)$/i);
-    if (!m) continue;
-    const resource = selectedResourceMap.get(`F${m[1]}`);
-    if (!resource) continue;
-    usage.pdfResourceName = resource.resourceName;
-    usage.pdfFontRef = resource.fontRef;
-    usage.resolvedFontNames = resource.fontNames;
-    usage.resolvedFamily = resource.family || null;
-    usage.resolvedStyle = resource.style || 'unknown';
-  }
-
-  const result = {
-    available: true,
-    fileName: path.basename(pdfPath),
-    pageCount: pdf.numPages,
-    scannedPages: maxPages,
-    fonts: fontList,
-    fontCount: fontList.length,
-    rawPdfFontNames: rawFontNames,
-    pdfObjectFontNames: [...pdfObjectNames],
-    pdfObjectGraph: {
-      objectCount: objectGraph.objectCount || 0,
-      descriptorFonts: objectGraph.descriptorNames || [],
-      embeddedFontFiles: objectGraph.embeddedFontFiles || [],
-      activeFontNames: usedFontGraph.names || [],
-      activeFontResources: usedFontGraph.usedResourceNames || [],
-      activeFontRefs: usedFontGraph.usedFontRefs || [],
-      activeFontPages: usedFontGraph.pages || [],
-      activeFontResourceDetails: usedFontGraph.resourceFontDetails || [],
+    canvas: { width: ROI_CANVAS_WIDTH, height: ROI_CANVAS_HEIGHT },
+    normalization: 'content-ink-bbox-letterbox-v2',
+    alignment: {
+      sourceWidth: width, sourceHeight: height,
+      sourceAspect: Number((width / Math.max(1, height)).toFixed(4)),
+      contentBox: inkBox,
+      contentWidth, contentHeight,
+      contentAspect: Number((contentWidth / Math.max(1, contentHeight)).toFixed(4)),
+      scale: Number((normalized.scale || 1).toFixed(5)),
+      resizedWidth: normalized.resizedWidth || ROI_CANVAS_WIDTH,
+      resizedHeight: normalized.resizedHeight || ROI_CANVAS_HEIGHT,
     },
-    // Actual PDF.js text usage, grouped by canonical font.
-    activeFontUsages,
-    textItemCount: items.length,
-    pages,
-    items,
+    metrics: {
+      luminanceMean: f.luminanceMean,
+      luminanceStd: f.luminanceStd,
+      entropy: f.entropy,
+      edgeDensity: f.edgeDensity,
+      meanGradient: f.meanGradient,
+      laplacianVariance: f.laplacianVariance,
+      dctLowEnergy: f.dctLowEnergy,
+      dctMidEnergy: f.dctMidEnergy,
+      dctHighEnergy: f.dctHighEnergy,
+      dctHighRatio: f.dctHighRatio,
+      blockinessHorizontal: f.blockinessHorizontal,
+      blockinessVertical: f.blockinessVertical,
+    },
+    rawMetrics: {
+      luminanceMean: raw.luminanceMean, luminanceStd: raw.luminanceStd, entropy: raw.entropy,
+      edgeDensity: raw.edgeDensity, meanGradient: raw.meanGradient, laplacianVariance: raw.laplacianVariance,
+      dctLowEnergy: raw.dctLowEnergy, dctMidEnergy: raw.dctMidEnergy, dctHighEnergy: raw.dctHighEnergy,
+      dctHighRatio: raw.dctHighRatio, blockinessHorizontal: raw.blockinessHorizontal, blockinessVertical: raw.blockinessVertical,
+    },
+    tiles16x16: f.tiles,
   };
-  fontProfileCache.set(cacheKey, result);
+}
+
+function buildSemanticRois(regions = {}) {
+  const aliases = {
+    amount: ['amount', 'tutar', 'transactionAmount'],
+    recipientName: ['recipientName', 'recipient_name', 'aliciUnvani', 'aliciAdi', 'alıcıÜnvanı', 'alıcıAdı'],
+    recipientIban: ['recipientIban', 'recipient_iban', 'iban', 'aliciIban', 'alıcıIban'],
+  };
+  const out = {};
+  for (const [canonical, keys] of Object.entries(aliases)) {
+    for (const key of keys) {
+      if (regions?.[key]) { out[canonical] = regions[key]; break; }
+    }
+  }
+  return out;
+}
+
+function rasterFeatures(data, width, height) {
+  const n = width * height;
+  const hist = new Array(256).fill(0);
+  let sum = 0;
+  for (let i = 0; i < n; i++) { const v = data[i]; hist[v]++; sum += v; }
+  const m = sum / Math.max(1, n);
+  let s2 = 0;
+  for (let i = 0; i < n; i++) s2 += (data[i] - m) ** 2;
+
+  let edgeCount = 0;
+  let gradSum = 0;
+  let lapSum = 0;
+  let lapSq = 0;
+  const grads = [];
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const p = y * width + x;
+      const gx = -data[p-width-1] + data[p-width+1] - 2*data[p-1] + 2*data[p+1] - data[p+width-1] + data[p+width+1];
+      const gy = -data[p-width-1] - 2*data[p-width] - data[p-width+1] + data[p+width-1] + 2*data[p+width] + data[p+width+1];
+      const g = Math.hypot(gx, gy) / 8;
+      grads.push(g);
+      gradSum += g;
+      if (g > 18) edgeCount++;
+      const lap = data[p-1] + data[p+1] + data[p-width] + data[p+width] - 4*data[p];
+      lapSum += lap; lapSq += lap * lap;
+    }
+  }
+  const gradN = Math.max(1, grads.length);
+  const lapMean = lapSum / gradN;
+  const lapVar = Math.max(0, lapSq / gradN - lapMean * lapMean);
+
+  let dark = 0, bright = 0;
+  for (let i = 0; i < n; i++) { if (data[i] < 64) dark++; if (data[i] > 240) bright++; }
+
+  let dctLow = 0, dctMid = 0, dctHigh = 0, dctCount = 0;
+  const step = 16;
+  for (let y = 0; y + 8 <= height; y += step) {
+    for (let x = 0; x + 8 <= width; x += step) {
+      const block = new Float64Array(64);
+      let bm = 0;
+      for (let yy = 0; yy < 8; yy++) for (let xx = 0; xx < 8; xx++) bm += data[(y+yy)*width + x+xx];
+      bm /= 64;
+      for (let yy = 0; yy < 8; yy++) for (let xx = 0; xx < 8; xx++) block[yy*8+xx] = data[(y+yy)*width+x+xx] - bm;
+      const d = dct8(block);
+      for (let u = 0; u < 8; u++) for (let v = 0; v < 8; v++) {
+        if (u === 0 && v === 0) continue;
+        const e = d[u*8+v] ** 2;
+        if (u+v <= 2) dctLow += e;
+        else if (u+v <= 5) dctMid += e;
+        else dctHigh += e;
+      }
+      dctCount++;
+    }
+  }
+  const dctTotal = dctLow + dctMid + dctHigh || 1;
+
+  let blockH = 0, blockV = 0, nonH = 0, nonV = 0;
+  for (let y = 0; y < height; y++) for (let x = 1; x < width; x++) {
+    const d = Math.abs(data[y*width+x] - data[y*width+x-1]);
+    if (x % 8 === 0) { blockH += d; } else nonH += d;
+  }
+  for (let y = 1; y < height; y++) for (let x = 0; x < width; x++) {
+    const d = Math.abs(data[y*width+x] - data[(y-1)*width+x]);
+    if (y % 8 === 0) blockV += d; else nonV += d;
+  }
+  const hCount = Math.max(1, height * Math.floor((width-1)/8));
+  const vCount = Math.max(1, width * Math.floor((height-1)/8));
+  const nhCount = Math.max(1, height * (width-1) - hCount);
+  const nvCount = Math.max(1, width * (height-1) - vCount);
+
+  const tiles = [];
+  for (let ty = 0; ty < TILE_GRID; ty++) for (let tx = 0; tx < TILE_GRID; tx++) {
+    const x0 = Math.floor(tx * width / TILE_GRID), x1 = Math.floor((tx+1) * width / TILE_GRID);
+    const y0 = Math.floor(ty * height / TILE_GRID), y1 = Math.floor((ty+1) * height / TILE_GRID);
+    const vals = [];
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) vals.push(data[y*width+x]);
+    let te = 0, tl = 0, tl2 = 0, cnt = 0;
+    for (let y = Math.max(y0+1,1); y < Math.min(y1-1,height-1); y++) for (let x = Math.max(x0+1,1); x < Math.min(x1-1,width-1); x++) {
+      const p=y*width+x;
+      const gx=-data[p-width-1]+data[p-width+1]-2*data[p-1]+2*data[p+1]-data[p+width-1]+data[p+width+1];
+      const gy=-data[p-width-1]-2*data[p-width]-data[p-width+1]+data[p+width-1]+2*data[p+width]+data[p+width+1];
+      if (Math.hypot(gx,gy)/8 > 18) te++;
+      const lap=data[p-1]+data[p+1]+data[p-width]+data[p+width]-4*data[p];
+      tl+=lap; tl2+=lap*lap; cnt++;
+    }
+    const lmean=tl/Math.max(1,cnt);
+    tiles.push({mean:mean(vals), std:std(vals), edgeDensity:te/Math.max(1,cnt), lapVar:Math.max(0,tl2/Math.max(1,cnt)-lmean*lmean)});
+  }
+
+  return {
+    luminanceMean: m,
+    luminanceStd: Math.sqrt(s2 / Math.max(1,n)),
+    entropy: entropyFromHistogram(hist,n),
+    edgeDensity: edgeCount / gradN,
+    meanGradient: gradSum / gradN,
+    laplacianVariance: lapVar,
+    darkPixelRatio: dark / Math.max(1,n),
+    brightPixelRatio: bright / Math.max(1,n),
+    dctLowEnergy: dctLow / Math.max(1,dctCount),
+    dctMidEnergy: dctMid / Math.max(1,dctCount),
+    dctHighEnergy: dctHigh / Math.max(1,dctCount),
+    dctHighRatio: dctHigh / dctTotal,
+    blockinessHorizontal: (blockH / hCount) / Math.max(0.0001, nonH / nhCount),
+    blockinessVertical: (blockV / vCount) / Math.max(0.0001, nonV / nvCount),
+    tiles,
+  };
+}
+
+export async function extractMathematicalFingerprint(input, options = {}) {
+  const buffer = Buffer.isBuffer(input) ? input : await fs.readFile(input);
+  const meta = await sharp(buffer).metadata();
+  const rendered = await sharp(buffer)
+    .rotate()
+    .resize({ width: options.size || DEFAULT_SIZE, height: options.size || DEFAULT_SIZE, fit: 'fill' })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const raster = rasterFeatures(rendered.data, rendered.info.width, rendered.info.height);
+  const semanticRois = buildSemanticRois(options.regions || {});
+  const roi16x16 = {};
+  let roiBuffer = null;
+  if (Object.keys(semanticRois).length) {
+    try {
+      roiBuffer = await sharp(buffer).rotate().grayscale().raw().toBuffer({ resolveWithObject: true });
+    } catch (e) {
+      roiBuffer = null;
+    }
+  }
+  for (const [name, region] of Object.entries(semanticRois)) {
+    const box = normalizeRegionBox(region, meta.width || 0, meta.height || 0);
+    if (!box || !roiBuffer) continue;
+    // Crop the semantic ROI from the native raster, then normalize that ROI to a
+    // fixed canvas before its 16x16 grid is computed. This keeps ROI geometry
+    // independent from the document's native resolution.
+    try {
+      const crop = cropRaw(roiBuffer.data, roiBuffer.info.width, roiBuffer.info.height, {
+        x1: box.x1 * roiBuffer.info.width / Math.max(1, meta.width || roiBuffer.info.width),
+        y1: box.y1 * roiBuffer.info.height / Math.max(1, meta.height || roiBuffer.info.height),
+        x2: box.x2 * roiBuffer.info.width / Math.max(1, meta.width || roiBuffer.info.width),
+        y2: box.y2 * roiBuffer.info.height / Math.max(1, meta.height || roiBuffer.info.height),
+      });
+      if (crop) roi16x16[name] = { sourceBox: box, ...roiFingerprintFromRaster(crop.data, crop.width, crop.height) };
+    } catch (e) {
+      roi16x16[name] = { sourceBox: box, error: e?.message || String(e) };
+    }
+  }
+  const qTables = meta.format === 'jpeg' ? jpegQuantizationTables(buffer) : {};
+  const jpeg = meta.format === 'jpeg' ? jpegQualityEstimate(qTables) : null;
+  return {
+    version: VERSION,
+    source: { format: meta.format || null, width: meta.width || null, height: meta.height || null, channels: meta.channels || null, space: meta.space || null, chromaSubsampling: meta.chromaSubsampling || null, isProgressive: meta.isProgressive ?? null },
+    jpeg: { available: meta.format === 'jpeg', estimatedQuality: jpeg?.estimatedQuality ?? null, quantizationFitError: jpeg?.fitError ?? null, tableCount: Object.keys(qTables).length, quantizationMeans: Object.values(qTables).map(t => mean(t.values)), quantizationStds: Object.values(qTables).map(t => std(t.values)) },
+    // V1.1.1: expose the semantic ROI fingerprints to the caller. The ROI
+    // extraction loop above was running correctly, but this object was omitted
+    // from the returned fingerprint, so analyze.js always saw roi16x16 as null.
+    roi16x16,
+    raster,
+  };
+}
+
+const FEATURE_KEYS = [
+  'luminanceMean','luminanceStd','entropy','edgeDensity','meanGradient','laplacianVariance','darkPixelRatio','brightPixelRatio',
+  'dctLowEnergy','dctMidEnergy','dctHighEnergy','dctHighRatio','blockinessHorizontal','blockinessVertical',
+];
+
+function flattenFingerprint(fp) {
+  const r = fp?.raster || {};
+  return FEATURE_KEYS.map(k => Number(r[k]) || 0).concat([
+    Number(fp?.jpeg?.estimatedQuality) || 0,
+    Number(fp?.jpeg?.quantizationFitError) || 0,
+    mean(fp?.jpeg?.quantizationMeans || []),
+    mean(fp?.jpeg?.quantizationStds || []),
+    Number(fp?.source?.width) || 0,
+    Number(fp?.source?.height) || 0,
+  ]);
+}
+
+function summarize(values) {
+  const med = median(values), m = mean(values), s = std(values, m), md = mad(values, med);
+  return { mean:m, std:s, median:med, mad:md, min:Math.min(...values), max:Math.max(...values) };
+}
+
+export function buildBaseline(samples) {
+  const byKey = new Map();
+  for (const sample of samples) {
+    const bank = sample.bank || 'unknown';
+    const family = sample.family || 'unknown';
+    const key = `${bank}::${family}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(sample);
+  }
+  const profiles = {};
+  for (const [key, rows] of byKey) {
+    const bank = rows[0].bank, family = rows[0].family;
+    const featureStats = {};
+    for (const fk of FEATURE_KEYS) featureStats[fk] = summarize(rows.map(x => Number(x.fingerprint.raster?.[fk]) || 0));
+    const jpegQuality = rows.map(x => x.fingerprint.jpeg?.estimatedQuality).filter(Number.isFinite);
+    const qMean = rows.map(x => mean(x.fingerprint.jpeg?.quantizationMeans || [])).filter(Number.isFinite);
+    const qStd = rows.map(x => mean(x.fingerprint.jpeg?.quantizationStds || [])).filter(Number.isFinite);
+    profiles[key] = {
+      bank, family, sampleCount: rows.length,
+      sourceFormats: [...new Set(rows.map(x => x.fingerprint.source?.format).filter(Boolean))],
+      featureStats,
+      jpeg: {
+        sampleCount: jpegQuality.length,
+        estimatedQuality: jpegQuality.length ? summarize(jpegQuality) : null,
+        quantizationMean: qMean.length ? summarize(qMean) : null,
+        quantizationStd: qStd.length ? summarize(qStd) : null,
+      },
+      samples: rows.map(x => ({ id:x.id, source:x.source, sourceFormat:x.fingerprint.source?.format || null })),
+    };
+  }
+  return { version:VERSION, generatedAt:new Date().toISOString(), featureKeys:FEATURE_KEYS, profiles };
+}
+
+function robustDistance(value, stat) {
+  if (!stat) return 0;
+  const relativeFloor = Math.max(0.5, Math.abs(Number(stat.median) || 0) * 0.05);
+  const scale = Math.max(1e-6, Number(stat.mad) * 1.4826, Number(stat.std) || 0, relativeFloor);
+  return Math.abs(value - Number(stat.median)) / scale;
+}
+
+export function compareFingerprint(fingerprint, profile) {
+  if (!fingerprint || !profile) return { available:false, reason:'missing-input' };
+  const featureDistances = {};
+  let total = 0, count = 0;
+  for (const fk of FEATURE_KEYS) {
+    const v = Number(fingerprint.raster?.[fk]) || 0;
+    const d = robustDistance(v, profile.featureStats?.[fk]);
+    featureDistances[fk] = Number(d.toFixed(3));
+    total += Math.min(d, 8); count++;
+  }
+  const q = fingerprint.jpeg?.estimatedQuality;
+  if (Number.isFinite(q) && profile.jpeg?.estimatedQuality) { total += Math.min(robustDistance(q, profile.jpeg.estimatedQuality), 8); count++; }
+  const qmean = mean(fingerprint.jpeg?.quantizationMeans || []);
+  if (qmean && profile.jpeg?.quantizationMean) { total += Math.min(robustDistance(qmean, profile.jpeg.quantizationMean), 8); count++; }
+  const score = 100 * Math.exp(-((total / Math.max(1,count)) / 2.2));
+  const anomalies = Object.entries(featureDistances).filter(([,d]) => d >= 3).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([feature,distance])=>({feature,distance}));
+  const sampleCount = Number(profile.sampleCount) || 0;
+  const reliability = sampleCount >= 5 ? 'high' : sampleCount >= 3 ? 'medium' : sampleCount >= 1 ? 'low' : 'insufficient';
+  return { available:true, profile:{bank:profile.bank,family:profile.family,sampleCount,reliability}, similarityScore:Number(score.toFixed(2)), robustDistance:Number((total/Math.max(1,count)).toFixed(3)), featureDistances, anomalies };
+}
+
+function compareMetricObjects(target, reference) {
+  const keys = ['luminanceMean','luminanceStd','entropy','edgeDensity','meanGradient','laplacianVariance','dctLowEnergy','dctMidEnergy','dctHighEnergy','dctHighRatio','blockinessHorizontal','blockinessVertical'];
+  const out = {};
+  let sum = 0, n = 0;
+  for (const key of keys) {
+    const a = Number(target?.[key]), b = Number(reference?.[key]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    const scale = Math.max(Math.abs(b) * 0.05, 0.5);
+    const d = Math.abs(a - b) / scale;
+    out[key] = Number(d.toFixed(3));
+    sum += Math.min(d, 10); n++;
+  }
+  return { metricDistances: out, meanDistance: Number((sum / Math.max(1,n)).toFixed(3)) };
+}
+
+
+function normalizedBox(box, width, height) {
+  if (!box || !Number.isFinite(Number(width)) || !Number.isFinite(Number(height)) || width <= 0 || height <= 0) return null;
+  const x1 = clamp(Number(box.x1), 0, width);
+  const y1 = clamp(Number(box.y1), 0, height);
+  const x2 = clamp(Number(box.x2), 0, width);
+  const y2 = clamp(Number(box.y2), 0, height);
+  if (!(x2 > x1 && y2 > y1)) return null;
+  return { x1: x1 / width, y1: y1 / height, x2: x2 / width, y2: y2 / height };
+}
+
+function cellOverlapRatio(cell, box, grid = 16) {
+  if (!cell || !box) return 0;
+  const x1 = (cell.col - 1) / grid, y1 = (cell.row - 1) / grid;
+  const x2 = cell.col / grid, y2 = cell.row / grid;
+  const ix1 = Math.max(x1, box.x1), iy1 = Math.max(y1, box.y1);
+  const ix2 = Math.min(x2, box.x2), iy2 = Math.min(y2, box.y2);
+  const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+  const area = Math.max(1e-9, (x2 - x1) * (y2 - y1));
+  return inter / area;
+}
+
+export function compareGlobal16x16(targetFingerprint, referenceFingerprint, criticalRois = {}, options = {}) {
+  const targetTiles = Array.isArray(targetFingerprint?.raster?.tiles) ? targetFingerprint.raster.tiles : [];
+  const referenceTiles = Array.isArray(referenceFingerprint?.raster?.tiles) ? referenceFingerprint.raster.tiles : [];
+  const count = Math.min(targetTiles.length, referenceTiles.length, 256);
+  if (!count) return { available:false, reason:'global-tiles-missing', grid:'16x16', cellCount:0 };
+
+  const grid = 16;
+  const differentThreshold = Number.isFinite(Number(options.differentThreshold)) ? Number(options.differentThreshold) : 3.5;
+  const strongThreshold = Number.isFinite(Number(options.strongThreshold)) ? Number(options.strongThreshold) : 5;
+  const minOverlap = Number.isFinite(Number(options.minOverlap)) ? Number(options.minOverlap) : 0.20;
+  const cells = [];
+  for (let i = 0; i < count; i++) {
+    const a = targetTiles[i], b = referenceTiles[i];
+    const lapScale = Math.max(Math.abs(Number(b?.lapVar) || 0) * 0.05, 0.5);
+    const edgeScale = Math.max(Math.abs(Number(b?.edgeDensity) || 0) * 0.05, 0.005);
+    const stdScale = Math.max(Math.abs(Number(b?.std) || 0) * 0.05, 0.5);
+    const lap = Math.abs((Number(a?.lapVar)||0)-(Number(b?.lapVar)||0))/lapScale;
+    const edge = Math.abs((Number(a?.edgeDensity)||0)-(Number(b?.edgeDensity)||0))/edgeScale;
+    const sd = Math.abs((Number(a?.std)||0)-(Number(b?.std)||0))/stdScale;
+    const distance = (Math.min(lap,10)+Math.min(edge,10)+Math.min(sd,10))/3;
+    cells.push({ index:i, row:Math.floor(i/grid)+1, col:(i%grid)+1, laplacianDistance:Number(lap.toFixed(3)), edgeDistance:Number(edge.toFixed(3)), stdDistance:Number(sd.toFixed(3)), distance:Number(distance.toFixed(3)), different:distance >= differentThreshold, strong:distance >= strongThreshold });
+  }
+
+  const differentCells = cells.filter(c => c.different);
+  const strongCells = cells.filter(c => c.strong);
+  const roiHits = {};
+  for (const [field, roi] of Object.entries(criticalRois || {})) {
+    const targetBox = roi?.target || roi?.targetSourceBox || roi;
+    const normalized = normalizedBox(targetBox, targetFingerprint?.source?.width, targetFingerprint?.source?.height);
+    if (!normalized) { roiHits[field] = { available:false, reason:'target-roi-box-missing' }; continue; }
+    const hits = cells.filter(cell => cellOverlapRatio(cell, normalized, grid) >= minOverlap);
+    const diffHits = hits.filter(c => c.different);
+    const strongHits = hits.filter(c => c.strong);
+    roiHits[field] = {
+      available:true,
+      normalizedBox: normalized,
+      overlappingCells: hits.map(c=>c.index),
+      differentCells: diffHits.map(c=>c.index),
+      strongDifferentCells: strongHits.map(c=>c.index),
+      overlapCount:hits.length,
+      differentCount:diffHits.length,
+      strongDifferentCount:strongHits.length,
+      maxDistance: hits.length ? Number(Math.max(...hits.map(c=>c.distance)).toFixed(3)) : 0,
+      meanDistance: hits.length ? Number((hits.reduce((s,c)=>s+c.distance,0)/hits.length).toFixed(3)) : 0,
+    };
+  }
+
+  return {
+    available:true,
+    grid:'16x16',
+    cellCount:count,
+    thresholds:{differentThreshold,strongThreshold,minOverlap},
+    similarCount: count - differentCells.length,
+    differentCount: differentCells.length,
+    strongDifferentCount: strongCells.length,
+    similarityRatio: Number(((count - differentCells.length) / count).toFixed(4)),
+    cells,
+    topDifferentCells:[...differentCells].sort((a,b)=>b.distance-a.distance).slice(0,12),
+    criticalRoiHits: roiHits,
+  };
+}
+
+export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNames = ['amount','recipientName','recipientIban']) {
+  const result = {};
+  for (const name of roiNames) {
+    const t = targetFingerprint?.roi16x16?.[name];
+    const r = referenceFingerprint?.roi16x16?.[name];
+    if (!t?.metrics || !r?.metrics) {
+      result[name] = { available: false, reason: 'roi-missing-on-one-side' };
+      continue;
+    }
+    const metric = compareMetricObjects(t.metrics, r.metrics);
+    const targetTiles = Array.isArray(t.tiles16x16) ? t.tiles16x16 : [];
+    const referenceTiles = Array.isArray(r.tiles16x16) ? r.tiles16x16 : [];
+    const cells = [];
+    const count = Math.min(targetTiles.length, referenceTiles.length, 256);
+    for (let i = 0; i < count; i++) {
+      const a = targetTiles[i], b = referenceTiles[i];
+      const lapScale = Math.max(Math.abs(Number(b?.lapVar) || 0) * 0.05, 0.5);
+      const edgeScale = Math.max(Math.abs(Number(b?.edgeDensity) || 0) * 0.05, 0.005);
+      const stdScale = Math.max(Math.abs(Number(b?.std) || 0) * 0.05, 0.5);
+      const lap = Math.abs((Number(a?.lapVar)||0)-(Number(b?.lapVar)||0))/lapScale;
+      const edge = Math.abs((Number(a?.edgeDensity)||0)-(Number(b?.edgeDensity)||0))/edgeScale;
+      const sd = Math.abs((Number(a?.std)||0)-(Number(b?.std)||0))/stdScale;
+      const distance = (Math.min(lap,10)+Math.min(edge,10)+Math.min(sd,10))/3;
+      cells.push({ index:i, row:Math.floor(i/16)+1, col:(i%16)+1, laplacianDistance:Number(lap.toFixed(3)), edgeDistance:Number(edge.toFixed(3)), stdDistance:Number(sd.toFixed(3)), distance:Number(distance.toFixed(3)) });
+    }
+    cells.sort((a,b)=>b.distance-a.distance);
+    const ta = t.alignment || {};
+    const ra = r.alignment || {};
+    const safeLogRatio = (a, b) => {
+      const x = Number(a), y = Number(b);
+      return Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0 ? Math.abs(Math.log(x / y)) : null;
+    };
+    result[name] = {
+      available: true,
+      meanDistance: metric.meanDistance,
+      metricDistances: metric.metricDistances,
+      maxCellDistance: cells[0]?.distance || 0,
+      topCells: cells.slice(0, 8),
+      targetSourceBox: t.sourceBox || null,
+      referenceSourceBox: r.sourceBox || null,
+      normalization: t.normalization || r.normalization || null,
+      alignment: {
+        target: ta,
+        reference: ra,
+        contentAspectDistance: safeLogRatio(ta.contentAspect, ra.contentAspect),
+        contentScaleRelation: safeLogRatio(ta.scale, ra.scale),
+      },
+      rawMetricDistances: compareMetricObjects(t.rawMetrics, r.rawMetrics).metricDistances,
+      grid: '16x16',
+      cellCount: cells.length,
+    };
+  }
   return result;
 }
 
-function fontsHasCanonical(map, name) {
-  const n = normalizeFontName(name);
-  if (!n) return true;
-  return [...map.values()].some(x => normalizeFontName(x.fontName) === n || normalizeFontName(x.family) === n);
+export function compareAgainstBaseline(fingerprint, baseline, bank, family='unknown') {
+  if (!baseline?.profiles) return { available:false, reason:'baseline-missing' };
+  const candidates = Object.values(baseline.profiles).filter(p => p.bank === bank);
+  if (!candidates.length) return { available:false, reason:'bank-profile-missing', bank };
+  const exact = candidates.find(p => p.family === family);
+  const pool = exact ? [exact, ...candidates.filter(p => p !== exact)] : candidates;
+  const comparisons = pool.map(p => ({...compareFingerprint(fingerprint,p), family:p.family})).filter(x=>x.available);
+  comparisons.sort((a,b)=>b.similarityScore-a.similarityScore);
+  const best = comparisons[0] || null;
+  return { available:Boolean(best), bank, requestedFamily:family, bestMatch:best, candidates:comparisons.slice(0,8), profileCount:candidates.length };
 }
 
-function isLikelyLabel(text) {
-  const t = normalizeLabel(text);
-  if (!t || t.length > 45) return false;
-  return /(?:GONDEREN|GONDERICI|ALICI|HESAP|IBAN|TUTAR|ISLEM|TARIH|SAAT|ACIKLAMA|SUBE|VERGI|TCKN|VKN|SORGU|REFERANS|ETTN|DOKUMAN|MESAJ|BANKA|ADRES|VALOR)/.test(t);
+export function inferDocumentFamily(name='', text='') {
+  const s = `${name} ${text}`.toLocaleLowerCase('tr-TR');
+  if (/hesap[-_ ]?hareket|hesap[-_ ]?ozeti/.test(s)) return 'ACCOUNT_STATEMENT';
+  if (/nakit avans|kk1|kredi kart/.test(s)) return 'CREDIT_CARD';
+  if (/havale|hvl/.test(s)) return 'HAVALE';
+  if (/fast/.test(s)) return 'FAST';
+  if (/eft/.test(s)) return 'EFT';
+  if (/e[- ]?dekont|dekont/.test(s)) return 'DEKONT';
+  return 'UNKNOWN';
 }
-
-function sameRow(a, b) {
-  const ay = Number(a?.y) || 0;
-  const by = Number(b?.y) || 0;
-  const ah = Math.max(5, Number(a?.height) || 10);
-  return Math.abs(ay - by) <= Math.max(8, ah * 1.5);
-}
-
-function activeFontFamilyMap(profile) {
-  const map = new Map();
-  for (const usage of profile?.activeFontUsages || []) {
-    const raw = clean(usage?.rawFontName || usage?.fontName);
-    const family = clean(usage?.resolvedFamily || usage?.family);
-    if (raw && family) map.set(raw, family);
-  }
-  return map;
-}
-
-function activeFontFamilies(profile) {
-  const out = new Set();
-  for (const usage of profile?.activeFontUsages || []) {
-    const family = clean(usage?.resolvedFamily || usage?.family);
-    if (family) out.add(family);
-  }
-  return out;
-}
-
-function fieldValueFontProfiles(profile) {
-  const labels = profile.items.filter(x => isLikelyLabel(x.text));
-  const activeMap = activeFontFamilyMap(profile);
-  const rows = [];
-  for (const label of labels) {
-    const candidates = profile.items
-      .filter(x => x.pageNumber === label.pageNumber && x !== label && sameRow(label, x) && x.x >= label.x + label.width - 2)
-      .sort((a,b) => a.x - b.x);
-    if (!candidates.length) continue;
-    const values = candidates.slice(0, 12).filter(x => !isLikelyLabel(x.text));
-    if (!values.length) continue;
-    const fontKeys = [...new Set(values.map(x => {
-      const raw = clean(x?.font?.rawFontName || x?.font?.fontName);
-      return activeMap.get(raw) || x?.font?.family || x?.font?.fontName || null;
-    }).filter(Boolean))];
-    if (!fontKeys.length) continue;
-    rows.push({
-      pageNumber: label.pageNumber,
-      field: normalizeLabel(label.text),
-      labelText: label.text,
-      valueFonts: fontKeys,
-      valueStyles: [...new Set(values.map(x => x.font.style).filter(Boolean))],
-      valueItemCount: values.length,
-    });
-  }
-  return rows;
-}
-
-function compareFontProfiles(reference, target) {
-  const refFonts = Array.isArray(reference?.fonts) ? reference.fonts : [];
-  const tarFonts = Array.isArray(target?.fonts) ? target.fonts : [];
-  // Compare families actually attached to visible PDF.js text items when the
-  // active resource bridge resolved them. Fall back to discovered font
-  // dictionaries only when active usage data is unavailable. This prevents a
-  // declared-but-unused Helvetica resource from becoming a false mismatch.
-  const refActiveFamilies = activeFontFamilies(reference);
-  const tarActiveFamilies = activeFontFamilies(target);
-  const refFamilies = refActiveFamilies.size
-    ? refActiveFamilies
-    : new Set(refFonts.map(x => x.family || x.fontName).filter(Boolean));
-  const tarFamilies = tarActiveFamilies.size
-    ? tarActiveFamilies
-    : new Set(tarFonts.map(x => x.family || x.fontName).filter(Boolean));
-  const refStyles = new Set((reference?.activeFontUsages || []).map(x => x.resolvedStyle || x.style).filter(x => x && x !== "unknown"));
-  const tarStyles = new Set((target?.activeFontUsages || []).map(x => x.resolvedStyle || x.style).filter(x => x && x !== "unknown"));
-  if (!refStyles.size) for (const x of refFonts) if (x.style && x.style !== "unknown") refStyles.add(x.style);
-  if (!tarStyles.size) for (const x of tarFonts) if (x.style && x.style !== "unknown") tarStyles.add(x.style);
-  const familyOnlyTarget = [...tarFamilies].filter(x => !refFamilies.has(x));
-  const familyOnlyReference = [...refFamilies].filter(x => !tarFamilies.has(x));
-  const sharedFamilies = [...tarFamilies].filter(x => refFamilies.has(x));
-  const styleOnlyTarget = [...tarStyles].filter(x => !refStyles.has(x));
-  const familyDenom = Math.max(1, new Set([...refFamilies, ...tarFamilies]).size);
-  const familySimilarity = Math.round((sharedFamilies.length / familyDenom) * 100);
-
-  const refField = fieldValueFontProfiles(reference);
-  const tarField = fieldValueFontProfiles(target);
-  const targetByField = new Map(tarField.map(x => [x.field, x]));
-  const fieldMismatches = [];
-  for (const r of refField) {
-    const t = targetByField.get(r.field);
-    if (!t) continue;
-    const rf = new Set(r.valueFonts);
-    const tf = new Set(t.valueFonts);
-    const mismatch = [...tf].filter(x => !rf.has(x));
-    if (mismatch.length) fieldMismatches.push({
-      field: r.field,
-      labelText: r.labelText,
-      referenceFonts: [...rf],
-      targetFonts: [...tf],
-      targetOnlyFonts: mismatch,
-      referenceStyles: r.valueStyles,
-      targetStyles: t.valueStyles,
-    });
-  }
-
-  let score = 0;
-  const evidence = [];
-  if (!refFonts.length) {
-    return {
-      available: false,
-      score: 0,
-      severity: "unknown",
-      referenceFamilies: [],
-      targetFamilies: [...tarFamilies],
-      sharedFamilies: [],
-      targetOnlyFamilies: [],
-      referenceOnlyFamilies: [],
-      referenceStyles: [],
-      targetStyles: [...tarStyles],
-      targetOnlyStyles: [],
-      familySimilarity: null,
-      fieldMismatches: [],
-      evidence: ["Referans PDF'den güvenilir font profili çıkarılamadı; font farkı skoru üretilmedi."],
-    };
-  }
-
-  if (familyOnlyTarget.length) {
-    score += Math.min(45, familyOnlyTarget.length * 15);
-    evidence.push(`Referansta bulunmayan ${familyOnlyTarget.length} font ailesi hedef PDF'de görüldü.`);
-  }
-  if (styleOnlyTarget.length) {
-    score += Math.min(20, styleOnlyTarget.length * 7);
-    evidence.push(`Hedef PDF'de referansta olmayan ${styleOnlyTarget.length} font stili görüldü.`);
-  }
-  if (fieldMismatches.length) {
-    score += Math.min(45, fieldMismatches.length * 15);
-    evidence.push(`${fieldMismatches.length} semantic alanda referans-hedef font farkı bulundu.`);
-  }
-  score = Math.min(100, score);
-  return {
-    available: true,
-    score,
-    severity: score >= 70 ? "strong" : score >= 40 ? "medium" : score >= 18 ? "low" : "none",
-    referenceFamilies: [...refFamilies],
-    targetFamilies: [...tarFamilies],
-    sharedFamilies,
-    targetOnlyFamilies: familyOnlyTarget,
-    referenceOnlyFamilies: familyOnlyReference,
-    referenceStyles: [...refStyles],
-    targetStyles: [...tarStyles],
-    targetOnlyStyles: styleOnlyTarget,
-    familySimilarity,
-    fieldMismatches: fieldMismatches.slice(0, 30),
-    evidence,
-  };
-}
-
-export async function analyzeFontForensics({ targetPath, referencePath, referencePaths = [], pdfjsLib, maxPages = 5 }) {
-  if (!targetPath || !pdfjsLib) return { available: false, reason: "missing-target-or-pdf-engine" };
-  if (path.extname(targetPath).toLowerCase() !== ".pdf") {
-    return { available: false, status: "unsupported", reason: "font-metadata-analysis-requires-pdf", evidence: "JPG/PNG gibi raster belgelerde gerçek embedded PDF font adı çıkarılamaz; görsel tipografi motoru ayrı çalışır." };
-  }
-  const refs = [...new Set([referencePath, ...referencePaths].filter(Boolean))]
-    .filter(p => path.extname(String(p)).toLowerCase() === ".pdf");
-  if (!refs.length) return { available: false, status: "no-reference" };
-
-  let targetProfile;
-  try { targetProfile = await extractPdfFontProfile(targetPath, pdfjsLib, { maxPages }); }
-  catch (error) { return { available: false, status: "error", error: error?.message || String(error) }; }
-  if (!targetProfile) return { available: false, status: "no-target-profile" };
-
-  const referenceProfiles = [];
-  for (const refPath of refs) {
-    try {
-      const p = await extractPdfFontProfile(refPath, pdfjsLib, { maxPages });
-      if (p && p.fonts?.length) {
-        referenceProfiles.push(p);
-        console.log("FONT REFERENCE PROFILE READY:", path.basename(refPath), { fonts:p.fonts.map(x => x.fontName), graph:p.pdfObjectGraph || null });
-      } else console.warn("FONT REFERENCE PROFILE EMPTY:", path.basename(refPath));
-    } catch (error) {
-      console.warn("FONT REFERENCE EXTRACTION HATASI:", path.basename(refPath), error?.message || error);
-    }
-  }
-
-  if (!referenceProfiles.length) {
-    return {
-      available: true,
-      engine: "verifydoc-pdf-font-forensics-v3.4-active-family-comparison",
-      status: "reference-font-profile-unavailable",
-      targetFile: targetProfile.fileName,
-      targetFonts: targetProfile.fonts,
-      targetFontCount: targetProfile.fontCount,
-      referenceFiles: refs.map(x => path.basename(x)),
-      referenceFontProfiles: [],
-      targetActiveFontUsages: targetProfile.activeFontUsages || [],
-      score: 0,
-      severity: "unknown",
-      familySimilarity: null,
-      comparisons: [],
-      evidence: ["Referans PDF mevcut ancak güvenilir gerçek font profili çıkarılamadı. Hedef fontları referanssız karşılaştırmak yerine font skoru devre dışı bırakıldı."],
-    };
-  }
-
-  const comparisons = referenceProfiles.map(ref => ({ referenceFile: ref.fileName, comparison: compareFontProfiles(ref, targetProfile) }));
-  comparisons.sort((a,b) => Number(a.comparison.score) - Number(b.comparison.score));
-  const best = comparisons[0];
-  const allReferenceFamilies = new Set(referenceProfiles.flatMap(p => {
-    const active = activeFontFamilies(p);
-    return [...(active.size ? active : new Set(p.fonts.map(x => x.family || x.fontName).filter(Boolean)))];
-  }));
-  const targetActiveFamilies = activeFontFamilies(targetProfile);
-  const allTargetFamilies = targetActiveFamilies.size
-    ? targetActiveFamilies
-    : new Set(targetProfile.fonts.map(x => x.family || x.fontName).filter(Boolean));
-  const ensembleTargetOnlyFamilies = [...allTargetFamilies].filter(x => !allReferenceFamilies.has(x));
-
-  return {
-    available: true,
-    engine: "verifydoc-pdf-font-forensics-v3.4-active-family-comparison",
-    status: "ok",
-    targetFile: targetProfile.fileName,
-    targetFonts: targetProfile.fonts,
-    targetFontCount: targetProfile.fontCount,
-    referenceFiles: referenceProfiles.map(x => x.fileName),
-    referenceFontProfiles: referenceProfiles.map(x => ({ fileName: x.fileName, fonts: x.fonts, fontCount: x.fontCount, rawPdfFontNames: x.rawPdfFontNames, activeFontUsages: x.activeFontUsages || [] })),
-    targetActiveFontUsages: targetProfile.activeFontUsages || [],
-    targetOnlyFamiliesAcrossReferences: ensembleTargetOnlyFamilies,
-    bestReference: best?.referenceFile || null,
-    score: best?.comparison?.score || 0,
-    severity: best?.comparison?.severity || "none",
-    familySimilarity: best?.comparison?.familySimilarity ?? null,
-    comparisons,
-    evidence: best?.comparison?.evidence || [],
-  };
-}
-
-export { extractPdfFontProfile, compareFontProfiles, normalizeFontName, fontFamily, fontStyle, extractPdfUsedFontNames };
-export default analyzeFontForensics;
