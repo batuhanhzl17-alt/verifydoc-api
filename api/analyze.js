@@ -10,6 +10,7 @@ import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics.js";
+import { recipientNameLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -116,8 +117,9 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   // generic:IBAN/KART NO -> recipientIban.
   const canonicalField = (value) => {
     const raw = String(value || '').replace(/:value$/i, '');
+    if (recipientNameLabel(raw.replace(/^generic:/i, ''))) return 'recipientName';
     const n = normalizeField(raw);
-    if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani') || n.includes('aliciisimunvan')) return 'recipientName';
+    if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani') || n.includes('aliciisimunvan') || n.includes('beneficiaryname') || n.includes('payeename') || n.includes('lehdar')) return 'recipientName';
     if (n.includes('aliciiban') || n.includes('iban') || n.includes('ibankartno')) return 'recipientIban';
     if (n.includes('recipientname') || n.includes('aliciunvan') || n.includes('aliciadi')) return 'recipientName';
     if (n.includes('recipientiban')) return 'recipientIban';
@@ -132,7 +134,10 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
 
   const allRows = [...fields, ...profiles];
   const findField = (canonical) => {
-    const row = allRows.find(f => canonicalField(f?.field) === canonical &&
+    const matchesSemantic = f => canonicalField(f?.field) === canonical;
+    const completeRow = allRows.find(f => matchesSemantic(f) && boxFrom(f).target && boxFrom(f).reference);
+    if (completeRow) return completeRow;
+    const row = allRows.find(f => matchesSemantic(f) &&
       (boxFrom(f).target || boxFrom(f).reference));
     if (row) return row;
     // Character findings are the final fallback because older profiles did not
@@ -189,6 +194,9 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
   if (!baseline) return { available: false, status: "baseline-unavailable" };
 
   const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, bank });
+  const ibanProfile = (Array.isArray(referenceForensics?.typographyFieldProfiles) ? referenceForensics.typographyFieldProfiles : [])
+    .find(profile => /iban/i.test(String(profile?.field || '')));
+  const sameLogicalRecipientIban = Boolean(ibanProfile && sameTurkishIban(ibanProfile.valueReference, ibanProfile.valueTarget));
   const targetRegions = {};
   const referenceRegions = {};
   for (const [name, pair] of Object.entries(semanticRois)) {
@@ -258,6 +266,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
       const roi = roiForensics?.[field];
       const roiMean = Number(roi?.meanDistance || 0);
       const roiStrong = roiMean >= 3 || Number(roi?.maxCellDistance || 0) >= 6;
+      const sameIbanLayoutOnly = shouldSuppressIbanLayoutMismatch(field, ibanProfile?.valueReference, ibanProfile?.valueTarget);
       return {
         field,
         globalDifferentCount: hit.differentCount,
@@ -266,7 +275,9 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
         globalMeanDistance: hit.meanDistance,
         roiMeanDistance: roiMean,
         roiMaxCellDistance: Number(roi?.maxCellDistance || 0),
-        strong: Boolean(hit.strongDifferentCount > 0 && roiStrong),
+        strong: Boolean(!sameIbanLayoutOnly && hit.strongDifferentCount > 0 && roiStrong),
+        suppressed: sameIbanLayoutOnly,
+        suppressionReason: sameIbanLayoutOnly ? 'same-logical-iban-format-or-line-wrap' : null,
       };
     });
 
@@ -281,6 +292,14 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
     });
   }
   const strongestRoi = roiRows.sort((a,b)=>Number(b.meanDistance)-Number(a.meanDistance))[0] || null;
+
+  if (sameLogicalRecipientIban) {
+    console.log('MATH IBAN ROI LAYOUT NORMALIZATION:', JSON.stringify({
+      sameCanonicalValue: true,
+      action: 'preserve-pixel-diagnostics; suppress-recipientIban-critical-gate',
+      reason: 'spaces-or-line-breaks-do-not-change-logical-IBAN',
+    }));
+  }
 
   return {
     available: true,
@@ -6028,6 +6047,7 @@ function referenceFieldRuleForText(text) {
   // Match rules against the same canonical alphabet used by the forensic
   // matcher so labels such as İŞLEM TARİHİ are not silently lost.
   const value = normalizeFieldTextForMatch(String(text || ""));
+  if (recipientNameLabel(text)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'recipientName') || null;
   for (const rule of REFERENCE_FIELD_RULES) {
     if (rule.patterns.some((pattern) => {
       try {
@@ -6822,7 +6842,7 @@ function rfInferSemanticFieldKey(field, labelText = '') {
   // generic-text, so rfFindValueRegion() could legally attach an unrelated
   // nearby text box. That is the wrong-place ROI bug we are fixing here.
   if (/alici\s+iban|alici\s+hesap\s+no.*iban|iban\s*\/?\s*kart\s*no|iban/.test(n)) return 'iban';
-  if (/alici\s+(?:ad\s+soyad|unvan|ünvan)|alici\s*unvani|alici\s*adi/.test(n)) return 'recipientName';
+  if (recipientNameLabel(labelText || rawField.slice(8))) return 'recipientName';
   if (/gonderen\s+ad\s+soyad|gonderici\s+ad\s+soyad|musteri\s+unvani|musteri\s+adi|giden\s+fast\s+eft/.test(n)) return 'senderName';
   if (/eft\s+tutari|giden\s+eft\s+tutari|giden\s+fast\s+tutari|islem\s+tutari|masraf\s+tutari|tutar/.test(n)) return 'amount';
   if (/islem\s+tarihi|tarih/.test(n)) return 'date';
@@ -6891,7 +6911,7 @@ function rfCriticalSemanticKeyV126(field,labelText=''){
   if(/iban|iban\s*\/?\s*kart\s*no/i.test(n))return 'iban';
   if(/eft\s+tutari|giden\s+fast\s+tutari|giden\s+eft\s+tutari|islem\s+tutari|tutar/i.test(n))return 'amount';
   if(/musteri\s+unvani|musteri\s+adi|gonderen\s+(?:ad|adi|unvani)|gonderici\s+(?:ad|adi|unvani)|giden\s+fast\s+eft/i.test(n))return 'senderName';
-  if(/alici\s+(?:ad|adi|unvani|unvan)/i.test(n))return 'recipientName';
+  if(recipientNameLabel(labelText||raw.replace(/^generic:/i,'')))return 'recipientName';
   if(/sira\s+no|fis\s+no|islem\s+no|sorgu\s+no|referans\s+no/i.test(n))return 'transactionNo';
   if(/esentepe|adres|address/i.test(n))return 'address';
   if(/^generic:IBAN\/KART NO$/i.test(raw))return 'iban';
@@ -6943,7 +6963,7 @@ function rfCriticalCandidateScoreV126(label,candidate,semanticKey){
 }
 function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
   const semanticKey=rfCriticalSemanticKeyV126(field,label?.labelText||label?.text||'');
-  const labelText=String(label?.labelText||label?.text||'').trim();
+  const labelText=String(label?.text && /[:：]/.test(label.text) ? label.text : (label?.labelText||label?.text||'')).trim();
 
   // V1.2.7: OCR can return LABEL:VALUE in one region. Split it semantically
   // before searching nearby regions. This is especially important for
@@ -6986,6 +7006,13 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
         resolver:options.source||'explicit-trusted-roi-v127'
       };
     }
+  }
+
+  // OCR can split a logical IBAN across adjacent lines. Join only fragments
+  // whose normalized value is a complete Turkish IBAN, and compare both lines.
+  if(semanticKey==='iban'){
+    const joined=resolveSplitTurkishIban(regions,label);
+    if(joined)return joined;
   }
 
   const candidates=(Array.isArray(regions)?regions:[])
@@ -7798,6 +7825,7 @@ function rfCanonicalLabelScore(field, text) {
       return new RegExp(normalizeFieldTextForMatch(re.source), flags).test(label);
     } catch { return re.test(label); }
   })) score += 100;
+  if (field === 'recipientName' && recipientNameLabel(label)) score = Math.max(score, 100);
   else if (label.length <= 42) score += 25;
   if (/[:：]/.test(s)) score += 30;
   // A field label followed by a value is more useful than a generic word
@@ -8627,7 +8655,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const tpCriticalKeyAlias=(key)=>{
           const k=String(key||'');
           if(/^generic:ESENTEPE/i.test(k) || /^generic:.*\bADRES\b/i.test(k)) return 'address';
-          if(/^generic:ALICI\s+UNVANI/i.test(k)) return 'recipientName';
+          if(recipientNameLabel(k.replace(/^generic:/i,''))) return 'recipientName';
           if(/^generic:ALICI\s+IBAN/i.test(k)) return 'iban';
           return tpSemanticField(k);
         };
@@ -8683,7 +8711,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             amount:[/^(giden\s+fast|giden\s+eft|islem|eft|transfer|ana)\s+tutari$/i,/^tutar$/i],
             iban:[/^iban(?:\s+no)?$/i,/^iban\/kart\s+no$/i,/^(gonderen|alici|alacakli)\s+iban$/i],
             senderName:[/^gonderen(?:\s+adi)?$/i,/^gonderici(?:\s+adi)?$/i],
-            recipientName:[/^(alici|alacakli)(?:\s+adi|\s+unvani)?$/i],
+            recipientName:[/^(alici|alacakli)(?:\s+adi|\s+ad\s+soyadi|\s+unvani|\s+unvan|\s+ismi|\s+isim)?$/i,/^(beneficiary|payee|receiver)(?:\s+name)?$/i,/^lehdar(?:\s+(adi|unvani))?$/i],
             senderAddress:[/^(gonderen|gonderici)\s+adres$/i],
             recipientAddress:[/^(alici|alacakli)\s+adres$/i],
             address:[/^adres$/i],
