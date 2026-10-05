@@ -10,7 +10,7 @@ import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics.js";
-import { recipientNameLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban } from "./semantic_roi.js";
+import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -91,7 +91,7 @@ async function loadMathematicalBaseline() {
   }
 }
 
-async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, bank = null } = {}) {
+async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, bank = null, referencePath = null } = {}) {
   const rois = {};
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
@@ -113,16 +113,18 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
 
   // The reference engine keeps some bank-specific labels as generic keys.
   // Canonicalize those keys before looking for the three semantic ROIs.
-  // Example: generic:ALICI UNVANI -> recipientName,
-  // generic:IBAN/KART NO -> recipientIban.
+  // Only explicitly beneficiary-labelled IBANs qualify for recipientIban.
+  // A generic IBAN can be the sender's own account and must not be paired.
   const canonicalField = (value) => {
     const raw = String(value || '').replace(/:value$/i, '');
-    if (recipientNameLabel(raw.replace(/^generic:/i, ''))) return 'recipientName';
+    const label = raw.replace(/^generic:/i, '');
+    if (recipientNameLabel(label)) return 'recipientName';
+    if (recipientIbanLabel(label)) return 'recipientIban';
+    if (senderIbanLabel(label)) return 'senderIban';
     const n = normalizeField(raw);
     if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani') || n.includes('aliciisimunvan') || n.includes('beneficiaryname') || n.includes('payeename') || n.includes('lehdar')) return 'recipientName';
-    if (n.includes('aliciiban') || n.includes('iban') || n.includes('ibankartno')) return 'recipientIban';
+    if (n.includes('aliciiban') || n.includes('alici hesap') || n.includes('alacakliiban') || n.includes('lehdariban') || n.includes('beneficiaryiban') || n.includes('payeeiban') || n.includes('receiveriban') || n.includes('recipientiban')) return 'recipientIban';
     if (n.includes('recipientname') || n.includes('aliciunvan') || n.includes('aliciadi')) return 'recipientName';
-    if (n.includes('recipientiban')) return 'recipientIban';
     if (n === 'amount' || n === 'totalamount' || n.includes('efttutari') || n.includes('fasttutari') || n.includes('islemtutari')) return 'amount';
     return n;
   };
@@ -135,10 +137,17 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   const allRows = [...fields, ...profiles];
   const findField = (canonical) => {
     const matchesSemantic = f => canonicalField(f?.field) === canonical;
-    const completeRow = allRows.find(f => matchesSemantic(f) && boxFrom(f).target && boxFrom(f).reference);
+    let candidates = allRows.filter(matchesSemantic);
+    if (canonical === 'amount') {
+      candidates = candidates.filter(f => {
+        const label = normalizeField([f?.referenceLabel, f?.targetLabel, f?.labelReference, f?.field].filter(Boolean).join(' '));
+        return f?.templateRole !== 'secondaryAmount' &&
+          !/(masraf|komisyon|ucret|vergi|toplamtahsilat|toplamislem|bs?mv)/.test(label);
+      }).sort((a, b) => Number(b?.templateRole === 'primaryAmount') - Number(a?.templateRole === 'primaryAmount'));
+    }
+    const completeRow = candidates.find(f => boxFrom(f).target && boxFrom(f).reference);
     if (completeRow) return completeRow;
-    const row = allRows.find(f => matchesSemantic(f) &&
-      (boxFrom(f).target || boxFrom(f).reference));
+    const row = candidates.find(f => boxFrom(f).target || boxFrom(f).reference);
     if (row) return row;
     // Character findings are the final fallback because older profiles did not
     // expose value boxes even though the forensic engine had already computed them.
@@ -146,23 +155,41 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       (f?.targetValueBox || f?.referenceValueBox || f?.targetBox || f?.referenceBox)) || null;
   };
 
-  // Amount target ROI is intentionally taken from the trusted Amount Forensics
-  // region. The reference side has two valid sources: the semantic field box,
-  // or the same trusted raster amount anchor used by Amount Forensics itself.
-  // The anchor fallback is important because some reference-field variants do
-  // not expose a value box even though the bank-specific amount geometry is known.
+  // Prefer Amount Forensics' validated target ROI. If that selector cannot
+  // promote a value, use only the typed amount label's adjacent OCR value box.
+  // A reference amount label/value box is preferred; the normalized trusted
+  // anchor is converted to that reference raster's pixel coordinates as fallback.
   const amountField = findField('amount');
   let amountReferenceBox = boxFrom(amountField).reference;
   if (!amountReferenceBox && bank) {
     try {
       const anchor = await getReferenceAmountAnchor(bank);
-      if (anchor) amountReferenceBox = anchor;
+      if (anchor && referencePath) {
+        let meta;
+        if (path.extname(referencePath).toLowerCase() === '.pdf') {
+          const raw = await fs.readFile(referencePath);
+          const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+          const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+          meta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
+        } else {
+          meta = await sharp(referencePath).metadata();
+        }
+        if (meta?.width && meta?.height) {
+          amountReferenceBox = {
+            x1: Number(anchor.xNorm) * Number(meta.width),
+            y1: Number(anchor.yNorm) * Number(meta.height),
+            x2: (Number(anchor.xNorm) + Number(anchor.widthNorm)) * Number(meta.width),
+            y2: (Number(anchor.yNorm) + Number(anchor.heightNorm)) * Number(meta.height),
+          };
+        }
+      }
     } catch (error) {
       console.warn('MATH AMOUNT ANCHOR FALLBACK HATASI:', error?.message || error);
     }
   }
-  if (amountForensics?.region && amountReferenceBox) {
-    rois.amount = { target: amountForensics.region, reference: amountReferenceBox, source: amountField ? 'semantic-reference-field' : 'trusted-reference-amount-anchor' };
+  const amountTargetBox = amountForensics?.region || boxFrom(amountField).target;
+  if (amountTargetBox && amountReferenceBox) {
+    rois.amount = { target: amountTargetBox, reference: amountReferenceBox, source: amountForensics?.region ? 'trusted-amount-forensics' : amountField ? 'semantic-label-neighbor' : 'trusted-reference-anchor' };
   }
 
   const recipientName = findField('recipientName');
@@ -177,7 +204,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference };
   }
 
-  console.log('MATH SEMANTIC ROI RESOLVER V1.3:', JSON.stringify({
+  console.log('MATH SEMANTIC ROI RESOLVER V1.4:', JSON.stringify({
     fields: fields.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     profiles: profiles.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => [k, {target:Boolean(v?.target), reference:Boolean(v?.reference), source:v?.source || 'semantic-field'}])),
@@ -193,9 +220,12 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
   const baseline = await loadMathematicalBaseline();
   if (!baseline) return { available: false, status: "baseline-unavailable" };
 
-  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, bank });
+  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, bank, referencePath });
   const ibanProfile = (Array.isArray(referenceForensics?.typographyFieldProfiles) ? referenceForensics.typographyFieldProfiles : [])
-    .find(profile => /iban/i.test(String(profile?.field || '')));
+    .find(profile => {
+      const field = String(profile?.field || '').replace(/:value$/i, '');
+      return /^recipientIban$/i.test(field) || recipientIbanLabel(field.replace(/^generic:/i, '')) || recipientIbanLabel(profile?.labelReference);
+    });
   const sameLogicalRecipientIban = Boolean(ibanProfile && sameTurkishIban(ibanProfile.valueReference, ibanProfile.valueTarget));
   const targetRegions = {};
   const referenceRegions = {};
@@ -2079,48 +2109,31 @@ return value
 // Bunlar gercek referans degildir. Yalnizca daha once manipule edilmis
 // orneklerde gorulen lokal izlerle benzerlik aramak icin kullanilir.
 const NEGATIVE_SAMPLE_MAP = {
-  vakifbank: ["vakifbank/sahte-1.jpg"],
-  ziraat: ["ziraat/sahte-1.jpg", "ziraat/sahte-2.jpg"],
-  yapikredi: ["yapikredi/sahte-1.jpg"],
-  garanti: ["garanti/sahte-hesap-ozeti-1.pdf"],
-  isbankasi: ["isbankasi/sahte-hesap-ozeti-1.pdf"],
-  // Enpara bilinen sahte örnekleri.
-  // Bunlar yalnızca known-fake calibration/evidence için kullanılır;
-  // trusted reference değildir.
-
   garanti: [
-  "garanti/sahte-hesap-ozeti-1.pdf",
-  "garanti/fake.amount-1000.jpg",
-  "garanti/fake.iban.change.jpg",
-],
-halkbank: [
-  "halkbank/fake2000.jpg",
-  "halkbank/fakeibanhalk.jpg",
-],
-isbankasi: [
-  "isbankasi/sahte-hesap-ozeti-1.pdf",
-  "isbankasi/fake.iban-change.jpg",
-  "isbankasi/fake200000.jpg",
-],
-qnb: [
-  "qnb/qnb5000.jpg",
-  "qnb/qnbfakeiban.jpg",
-],
-vakifbank: [
-  "vakifbank/sahte-1.jpg",
-  "vakifbank/vakif3500fake.jpg",
-],
-yapikredi: [
-  "yapikredi/sahte-1.jpg",
-  "yapikredi/fakeyapi10000.jpg",
-  "yapikredi/yapifakeiban.jpg",
-],
-ziraat: [
-  "ziraat/sahte-1.jpg",
-  "ziraat/sahte-2.jpg",
-  "ziraat/ziraat7000fake.jpg",
-  "ziraat/ziraatfakeiban.jpg",
-],
+    "garanti/sahte-hesap-ozeti-1.pdf",
+    "garanti/fake.amount-1000.jpg",
+    "garanti/fake.iban.change.jpg",
+  ],
+  halkbank: ["halkbank/fake2000.jpg", "halkbank/fakeibanhalk.jpg"],
+  isbankasi: [
+    "isbankasi/sahte-hesap-ozeti-1.pdf",
+    "isbankasi/fake.iban-change.jpg",
+    "isbankasi/fake200000.jpg",
+  ],
+  qnb: ["qnb/qnb5000.jpg", "qnb/qnbfakeiban.jpg"],
+  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vakıf3500fake.jpg"],
+  yapikredi: [
+    "yapıkredi/sahte-1.jpg",
+    "yapıkredi/fakeyapi10000.jpg",
+    "yapıkredi/yapifakeiban.jpg",
+  ],
+  ziraat: [
+    "ziraat/sahte-1.jpg",
+    "ziraat/sahte-2.jpg",
+    "ziraat/ziraat7000fake.jpg",
+    "ziraat/ziraatfakeiban.jpg",
+  ],
+  // Enpara known-fake samples are calibration evidence, never trusted references.
   enpara: [
     "enpara/fake.3000.jpg",
     "enpara/fake.8000.jpg",
@@ -6050,8 +6063,10 @@ const referenceTemplateProfileCache = new Map();
 const referenceRasterOcrCache = new Map();
 
 const REFERENCE_FIELD_RULES = [
-  { key: "senderName", patterns: [/gönderen\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /gönderici\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /gonderen\s*(?:adi|ad[ıi]\s*soyad[ıi]?)/i] },
-  { key: "recipientName", patterns: [/alıcı\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /alici\s*(?:adi|ad[ıi]\s*soyadi)/i, /alacaklı\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i] },
+  { key: "senderName", patterns: [/gönderen\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı)/i, /gönderici\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı)/i, /gonderen\s*(?:adi|ad[ıi]\s*soyad[ıi]?|unvani)/i] },
+  { key: "recipientName", patterns: [/^alıcı(?:\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı|ismi|adi soyadi))?$/i, /^alacaklı(?:\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı|ismi))?$/i, /^beneficiary(?:\s*name)?$/i, /^payee(?:\s*name)?$/i, /^receiver(?:\s*name)?$/i, /^lehdar(?:\s*(?:adı|unvanı))?$/i] },
+  { key: "senderIban", patterns: [/^gönderen\s*(?:hesap\s*)?iban$/i, /^gönderici\s*(?:hesap\s*)?iban$/i, /^gonderen\s*(?:hesap\s*)?iban$/i, /^sender\s*(?:account\s*)?iban$/i, /^originator\s*(?:account\s*)?iban$/i] },
+  { key: "recipientIban", patterns: [/^alıcı\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^alacaklı\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^lehdar\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^beneficiary\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i, /^payee\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i, /^receiver\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i] },
   { key: "senderAddress", patterns: [/gönderen\s*adres/i, /gönderici\s*adres/i, /gonderen\s*adres/i, /gonderici\s*adres/i] },
   { key: "recipientAddress", patterns: [/alıcı\s*adres/i, /alici\s*adres/i, /alacaklı\s*adres/i, /alacakli\s*adres/i] },
   { key: "address", patterns: [/\badres\b/i] },
@@ -6080,8 +6095,14 @@ function referenceFieldRuleForText(text) {
   // OCR can mix Turkish dotted/dotless I (İ/I/ı), especially in JPEG input.
   // Match rules against the same canonical alphabet used by the forensic
   // matcher so labels such as İŞLEM TARİHİ are not silently lost.
-  const value = normalizeFieldTextForMatch(String(text || ""));
+  const label = rfLabelPart(String(text || ""));
+  const value = normalizeFieldTextForMatch(label);
   if (recipientNameLabel(text)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'recipientName') || null;
+  if (recipientIbanLabel(label)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'recipientIban') || null;
+  if (senderIbanLabel(label)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'senderIban') || null;
+  // Paddle commonly reads the final R in TUTAR as N on compact bank fonts.
+  const valueWithoutAmount = value.replace(/\s*[:=\-]?\s*[-+]?\s*\d[\d.,\s]*(?:TL|TRY|EUR|USD|GBP)?$/i, '').trim();
+  if (/(?:^|\s)(?:ISLEM|FAST|GIDEN|GONDERILEN|TRANSFER|HAVALE)\s+TUTAN$/.test(valueWithoutAmount)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'amount') || null;
   for (const rule of REFERENCE_FIELD_RULES) {
     if (rule.patterns.some((pattern) => {
       try {
@@ -6094,6 +6115,37 @@ function referenceFieldRuleForText(text) {
     })) return rule;
   }
   return null;
+}
+
+function rfSplitInlineLabelValue(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  if (/[:：]/.test(raw)) {
+    const label = rfLabelPart(raw);
+    const rule = referenceFieldRuleForText(label);
+    const value = raw.split(/[:：]/).slice(1).join(':').trim();
+    if (rule && value && rfValueTypeForField(rule.key, value, label) !== 'other') return { label, value, rule };
+    return null;
+  }
+
+  // OCR may put a complete field on one line without punctuation. Find the
+  // longest known semantic label prefix whose remaining text has the right
+  // value type; this avoids treating MUSTERI UNVANI as recipientName.
+  const words = raw.split(/\s+/).filter(Boolean);
+  const candidates = [];
+  for (let count = 1; count < words.length; count++) {
+    const label = words.slice(0, count).join(' ');
+    const value = words.slice(count).join(' ');
+    const rule = referenceFieldRuleForText(label);
+    if (!rule || !value) continue;
+    const firstValueToken = normalizeFieldTextForMatch(value.split(/\s+/)[0] || '');
+    if (['BANKA','HESAP','IBAN','HESABI','NO','NUMARASI'].includes(firstValueToken)) continue;
+    const type = rfValueTypeForField(rule.key, value, label);
+    if (type === 'other' || type === 'empty' || type === 'known-static-value') continue;
+    candidates.push({ label, value, rule, prefixWords: count });
+  }
+  candidates.sort((a, b) => b.prefixWords - a.prefixWords);
+  return candidates[0] || null;
 }
 
 function groupPdfTextLines(items, viewport) {
@@ -6870,12 +6922,16 @@ function rfInferSemanticFieldKey(field, labelText = '') {
   const rawField = String(field || '');
   if (!rawField.startsWith('generic:')) return rawField;
   const n = normalizeFieldTextForMatch(labelText || rawField.slice(8)).replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
+  const label = labelText || rawField.slice(8);
+  if (recipientIbanLabel(label)) return 'iban';
+  if (senderIbanLabel(label)) return 'iban';
   // V1.2.5 CRITICAL ROI: bank-specific Enpara labels must resolve to the
   // same semantic value type used by the critical typography gate. Without
   // these aliases, labels such as GİDEN FAST EFT and MÜŞTERİ ÜNVANI became
   // generic-text, so rfFindValueRegion() could legally attach an unrelated
   // nearby text box. That is the wrong-place ROI bug we are fixing here.
-  if (/alici\s+iban|alici\s+hesap\s+no.*iban|iban\s*\/?\s*kart\s*no|iban/.test(n)) return 'iban';
+  if (/iban\s*\/?\s*kart\s*no/.test(n)) return 'generic-text';
+  if (/\biban\b/.test(n)) return 'generic-text';
   if (recipientNameLabel(labelText || rawField.slice(8))) return 'recipientName';
   if (/gonderen\s+ad\s+soyad|gonderici\s+ad\s+soyad|musteri\s+unvani|musteri\s+adi|giden\s+fast\s+eft/.test(n)) return 'senderName';
   if (/eft\s+tutari|giden\s+eft\s+tutari|giden\s+fast\s+tutari|islem\s+tutari|masraf\s+tutari|tutar/.test(n)) return 'amount';
@@ -6942,7 +6998,10 @@ function rfLooksLikeLabelRegion(region) {
 function rfCriticalSemanticKeyV126(field,labelText=''){
   const raw=String(field||'');
   const n=normalizeFieldTextForMatch(labelText||raw.replace(/^generic:/i,'')).replace(/[:：]/g,' ').replace(/\s+/g,' ').trim();
-  if(/iban|iban\s*\/?\s*kart\s*no/i.test(n))return 'iban';
+  const label=labelText||raw.replace(/^generic:/i,'');
+  if(recipientIbanLabel(label))return 'recipientIban';
+  if(senderIbanLabel(label))return 'senderIban';
+  if(/iban|iban\s*\/?\s*kart\s*no/i.test(n))return 'genericIban';
   if(/eft\s+tutari|giden\s+fast\s+tutari|giden\s+eft\s+tutari|islem\s+tutari|tutar/i.test(n))return 'amount';
   if(/musteri\s+unvani|musteri\s+adi|gonderen\s+(?:ad|adi|unvani)|gonderici\s+(?:ad|adi|unvani)|giden\s+fast\s+eft/i.test(n))return 'senderName';
   if(recipientNameLabel(labelText||raw.replace(/^generic:/i,'')))return 'recipientName';
@@ -6952,7 +7011,7 @@ function rfCriticalSemanticKeyV126(field,labelText=''){
   if(/^generic:EFT TUTARI$/i.test(raw))return 'amount';
   if(/^generic:MUSTERI UNVANI$/i.test(raw)||/^generic:GIDEN FAST EFT$/i.test(raw))return 'senderName';
   if(/^generic:ALICI UNVANI$/i.test(raw))return 'recipientName';
-  if(/^generic:ALICI IBAN$/i.test(raw))return 'iban';
+  if(/^generic:ALICI IBAN$/i.test(raw))return 'recipientIban';
   if(/^generic:(?:SIRA NO|FIS NO)$/i.test(raw))return 'transactionNo';
   if(/^generic:(?:ESENTEPE|ADRES)/i.test(raw))return 'address';
   return rfInferSemanticFieldKey(field,labelText);
@@ -7010,7 +7069,7 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
     const sameSemantic=leftKey===semanticKey;
     let valid=false;
     if(sameSemantic){
-      if(semanticKey==='iban') valid=rfCriticalLooksIbanV126(inlineValue);
+      if(semanticKey==='iban'||semanticKey==='recipientIban'||semanticKey==='senderIban') valid=rfCriticalLooksIbanV126(inlineValue);
       else if(semanticKey==='amount') valid=rfCriticalLooksAmountV126(inlineValue);
       else if(semanticKey==='transactionNo') valid=rfCriticalLooksNumericIdV126(inlineValue);
       else if(semanticKey==='senderName'||semanticKey==='recipientName') valid=rfCriticalLooksNameV126(inlineValue);
@@ -7044,7 +7103,7 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
 
   // OCR can split a logical IBAN across adjacent lines. Join only fragments
   // whose normalized value is a complete Turkish IBAN, and compare both lines.
-  if(semanticKey==='iban'){
+  if(semanticKey==='iban'||semanticKey==='recipientIban'||semanticKey==='senderIban'){
     const joined=resolveSplitTurkishIban(regions,label);
     if(joined)return joined;
   }
@@ -7054,7 +7113,7 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
     .map(v=>{
       const text=String(v.text||'').trim();
       let ok=false;
-      if(semanticKey==='iban')ok=rfCriticalLooksIbanV126(text);
+      if(semanticKey==='iban'||semanticKey==='recipientIban'||semanticKey==='senderIban')ok=rfCriticalLooksIbanV126(text);
       else if(semanticKey==='amount')ok=rfCriticalLooksAmountV126(text);
       else if(semanticKey==='transactionNo')ok=rfCriticalLooksNumericIdV126(text);
       else if(semanticKey==='senderName'||semanticKey==='recipientName')ok=rfCriticalLooksNameV126(text);
@@ -7069,7 +7128,7 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
       if(!ok||rfLooksLikeLabelRegion(v))return null;
       const cost=rfCriticalCandidateScoreV126(label,v,semanticKey);
       if(!Number.isFinite(cost))return null;
-      const limit=semanticKey==='address'?16:semanticKey==='iban'?14:
+      const limit=semanticKey==='address'?16:(semanticKey==='iban'||semanticKey==='recipientIban'||semanticKey==='senderIban')?14:
         (semanticKey==='transactionNo'||semanticKey==='amount')?10:14;
       if(cost>limit)return null;
       return {...v,criticalROI:true,resolver:'semantic-typed-relative-v127',_cost:cost};
@@ -7084,6 +7143,16 @@ function rfFindValueRegion(regions, label, expectedField = null) {
   if (!label?.region) return null;
   const rawField = String(expectedField || label?.rule?.key || '');
   const field = rfInferSemanticFieldKey(rawField, label?.labelText || label?.text || '');
+
+  if (label?.inlineSemanticValue && label?.inlineSemanticValueRegion) {
+    return {
+      text: label.inlineSemanticValue,
+      region: rfFocusValueRegion(label.inlineSemanticValueRegion, label.text || '', field, label.labelText, label.inlineSemanticValue),
+      score: 100,
+      criticalROI: true,
+      resolver: 'inline-label-neighbor-semantic-v1',
+    };
+  }
 
   // OCR frequently returns `LABEL : VALUE` as one region. Only accept it if
   // the text before the colon is actually the same semantic field.
@@ -7813,14 +7882,13 @@ function rfFocusLabelRegion(region, fullText) {
   };
 }
 
-function rfFocusValueRegion(region, fullText, field) {
+function rfFocusValueRegion(region, fullText, field, inlineLabel = null, inlineValue = null) {
   if (!region) return null;
   const s = String(fullText || '');
-  if (!/[:：]/.test(s)) return region;
-  const parts = s.split(/[:：]/);
-  const left = String(parts[0] || '').trim();
-  const total = s.replace(/[:：]/g, '').trim();
-  const ratio = total.length ? left.length / total.length : 0.45;
+  if (!/[:：]/.test(s) && !(inlineLabel && inlineValue)) return region;
+  const left = String(inlineLabel || s.split(/[:：]/)[0] || '').trim();
+  const value = String(inlineValue || s.split(/[:：]/).slice(1).join(':') || '').trim();
+  const ratio = (left.length + value.length) ? left.length / (left.length + value.length) : 0.45;
   // OCR kutusu etiket+değeri birlikte tuttuğunda sağdaki bölüm değer için
   // yaklaşık bir ROI'dir. Aşırı küçük/büyük kesimleri engelliyoruz.
   const startRatio = Math.max(0.22, Math.min(0.72, ratio + 0.06));
@@ -8266,8 +8334,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       for (const r of regions) {
         const raw = String(r.text || '').trim();
         if (!raw) continue;
-        const canonical = referenceFieldRuleForText(raw);
-        const label = rfLabelPart(raw);
+        const inline = rfSplitInlineLabelValue(raw);
+        const canonical = inline?.rule || referenceFieldRuleForText(raw);
+        const label = inline?.label || rfLabelPart(raw);
         const key = canonical?.key || rfGenericFieldKey(label);
         if (!key) continue;
         // V12: A generic OCR string is not a field label merely because it is
@@ -8279,6 +8348,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           ...r,
           rule: canonical || { key, patterns: [] },
           labelText: label,
+          inlineSemanticValue: inline?.value || null,
+          inlineSemanticValueRegion: inline ? r.region : null,
           canonicalScore: canonical ? rfCanonicalLabelScore(key, raw) : 35,
           templateRole: role,
         });
@@ -11163,8 +11234,8 @@ function reconstructedAmountLabelEvidence(group) {
         .replace(/\s+/g, " ")
         .trim();
 
-      const strong = /giden fast tutar|gönderilen fast tutar|giden tutar|gönderim tutar/.test(normalized);
-      const medium = /işlem tutar|transfer tutar|ana tutar|tutar/.test(normalized);
+      const strong = /GIDEN FAST TUTAR|GONDERILEN FAST TUTAR|GIDEN TUTAR|GONDERIM TUTAR/.test(normalized);
+      const medium = /ISLEM TUTAR|TRANSFER TUTAR|ANA TUTAR|\bTUTAR\b/.test(normalized);
       if (!strong && !medium) continue;
 
       const gap = gx1 - last.x2;
@@ -11182,15 +11253,15 @@ function reconstructedAmountLabelEvidence(group) {
 }
 
 function extractStrongAmountFromText(text) {
-  const raw = cleanAmountText(text || "");
+  const raw = normalizePrimaryAmountOCRText(text || "");
   if (!raw) return null;
   const patterns = [
-    /giden\s*fast\s*tutar[ıi]?\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /gönderilen\s*(?:fast\s*)?tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /transfer\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /işlem\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /ana\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /giden\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /GIDEN\s*FAST\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /GONDERILEN\s*(?:FAST\s*)?TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /TRANSFER\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /ISLEM\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /ANA\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /GIDEN\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
   ];
   for (const re of patterns) {
     const m = raw.match(re);
@@ -11203,6 +11274,11 @@ function normalizePrimaryAmountOCRText(text) {
   return cleanAmountText(text || "")
     .toLocaleUpperCase("tr-TR")
     .replace(/[İIı]/g, "I")
+    .replace(/Ğ/g, "G")
+    .replace(/Ü/g, "U")
+    .replace(/Ş/g, "S")
+    .replace(/Ö/g, "O")
+    .replace(/Ç/g, "C")
     // PaddleOCR bazı fontlarda T harfini I/J/L gibi okuyabiliyor.
     .replace(/GIDEN\s+FAST\s+IUTARI/g, "GIDEN FAST TUTARI")
     .replace(/GIDEN\s+FAST\s+TUTARL/g, "GIDEN FAST TUTARI")
@@ -11210,6 +11286,10 @@ function normalizePrimaryAmountOCRText(text) {
     .replace(/GONDERILEN\s+FAST\s+IUTARI/g, "GONDERILEN FAST TUTARI")
     .replace(/GONDERILEN\s+FAST\s+TUTARL/g, "GONDERILEN FAST TUTARI")
     .replace(/GONDERIM\s+IUTARI/g, "GONDERIM TUTARI")
+    // Compact receipt fonts often make the final R in TUTAR look like N.
+    .replace(/\bTUTAN(?=\b|\s)/g, "TUTAR")
+    .replace(/\bTUTARL(?=\b|\s)/g, "TUTARI")
+    .replace(/\bTUTAR1(?=\b|\s)/g, "TUTARI")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -11320,17 +11400,18 @@ function buildDeterministicAmountLabelCandidates() {
     }))
     .sort((a,b) => a.y1 - b.y1 || a.x1 - b.x1);
 
-  const strong = /giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar|b\s*\/\s*a\s*para\s*cinsi\s*tutar/i;
-  const medium = /(?:para\s*cinsi\s*tutar|\btutar\b|amount)/i;
+  const strong = /GIDEN\s*FAST\s*TUTAR|GONDERILEN\s*(?:FAST\s*)?TUTAR|TRANSFER\s*TUTAR|ISLEM\s*TUTAR|ANA\s*TUTAR|GONDERIM\s*TUTAR|GIDEN\s*TUTAR|B\s*\/\s*A\s*PARA\s*CINSI\s*TUTAR/;
+  const medium = /(?:PARA\s*CINSI\s*TUTAR|\bTUTAR\b|AMOUNT)/;
   const negative = /müşteri\s*no|musteri\s*no|sorgu\s*no|fiş\s*no|fis\s*no|işlem\s*no|islem\s*no|referans|ettn|iban|hesap\s*no|vergi\s*no|sıra\s*no|sira\s*no/i;
   const numeric = /^[-+]?\s*(?:₺|€|\$|£)?\s*(?:(?:\d{1,3}(?:[.,]\d{3})+)|\d+)(?:[.,]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
   const candidates = [];
 
   for (let i=0; i<regions.length; i++) {
     const label = regions[i];
-    if (negative.test(label.text)) continue;
-    const labelIsStrong = strong.test(label.text);
-    const labelIsMedium = medium.test(label.text);
+    const labelText = normalizePrimaryAmountOCRText(label.text);
+    if (negative.test(labelText)) continue;
+    const labelIsStrong = strong.test(labelText);
+    const labelIsMedium = medium.test(labelText);
     if (!labelIsStrong && !labelIsMedium) continue;
 
     const lh = Math.max(8, label.y2-label.y1);
@@ -11367,10 +11448,10 @@ function buildDeterministicAmountLabelCandidates() {
       labelDerivedScore: score,
       amountCandidateScore: score,
       referencePositionScore: 0,
-      directLabelEvidence: { score, label: label.text, distance: best.cost, hard: labelIsStrong },
-      reconstructedLabelEvidence: { score, label: label.text, distance: best.cost, hard: labelIsStrong },
-      labelEvidence: { score, positive: [label.text], negative: [] },
-      context: { score: 0, positive: [label.text], negative: [] },
+      directLabelEvidence: { score, label: labelText, distance: best.cost, hard: labelIsStrong },
+      reconstructedLabelEvidence: { score, label: labelText, distance: best.cost, hard: labelIsStrong },
+      labelEvidence: { score, positive: [labelText], negative: [] },
+      context: { score: 0, positive: [labelText], negative: [] },
       anchor: { score: 0, anchors: [] },
       templateScore: 0,
       signal: 1,
@@ -11415,8 +11496,8 @@ function buildInlineAmountCandidates() {
   // Öncelik özellikle "GİDEN FAST TUTARI" gibi ana işlem tutarı
   // etiketlerindedir. "TOPLAM TAHSİLAT TUTARI" komisyon dahil toplamdır;
   // ana tutar yerine otomatik seçilmemelidir.
-  const primaryLabel = /(?:giden\s*fast\s*tutar[ıi]?|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|havale\s*tutar|işlem\s*tutar[ıi]?|giden\s*tutar[ıi]?|ana\s*tutar[ıi]?)/i;
-  const totalLabel = /(?:toplam\s*(?:tahsilat|işlem|ödeme)\s*tutar[ıi]?|toplam\s*tutar[ıi]?)/i;
+  const primaryLabel = /(?:GIDEN\s*FAST\s*TUTARI?|GONDERILEN\s*(?:FAST\s*)?TUTARI?|TRANSFER\s*TUTARI?|HAVALE\s*TUTARI?|ISLEM\s*TUTARI?|GIDEN\s*TUTARI?|ANA\s*TUTARI?)/;
+  const totalLabel = /(?:TOPLAM\s*(?:TAHSILAT|ISLEM|ODEME)\s*TUTARI?|TOPLAM\s*TUTARI?)/;
   const amountToken = /[-+]?\s*(?:(?:\d{1,3}(?:[.,]\d{3})+)|\d+)(?:[.,]\d{1,2})?/;
   const excluded = /(?:müşteri\s*no|musteri\s*no|işlem\s*ref|işlem\s*no|islem\s*no|sorgu\s*no|referans|seri\s*no|sıra\s*no|sira\s*no|hesap\s*no|iban|tckn|vergi\s*no|ettn|belge\s*(?:no|numarası|numarasi))/i;
 
