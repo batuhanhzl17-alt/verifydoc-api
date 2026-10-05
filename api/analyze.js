@@ -10,7 +10,7 @@ import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics.js";
-import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban } from "./semantic_roi.js";
+import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -138,6 +138,32 @@ function resolveMathSemanticValueBox(regions, field) {
     if (recipientIbanLabel(item?.text)) return true;
     try { return referenceFieldRuleForText(item?.text)?.key === 'recipientIban'; } catch { return false; }
   };
+  // V1.5.4: PaddleOCR may return the whole Enpara beneficiary block as one
+  // region, e.g. `ALICI UNVANI: Sudenaz Özel ALICI IBAN: TR...`. Resolve the
+  // embedded semantic segments before falling back to label-neighbor geometry.
+  const inlineSemanticRows = [];
+  for (const row of rows) {
+    const segments = resolveRecipientInlineSegments(row);
+    for (const segment of segments) {
+      if (segment.field === field) {
+        inlineSemanticRows.push(segment);
+      }
+    }
+  }
+  if (inlineSemanticRows.length) {
+    inlineSemanticRows.sort((a,b)=>Number(b.score||0)-Number(a.score||0));
+    const bestInline = inlineSemanticRows[0];
+    return {
+      text: bestInline.text,
+      region: bestInline.region,
+      score: bestInline.score,
+      resolver: bestInline.resolver,
+      criticalROI: true,
+      labelText: bestInline.labelText,
+      parentRegion: bestInline.parentRegion,
+    };
+  }
+
   const labels=rows.filter(isLabel);
   if(!labels.length) return null;
   const solutions=[];
@@ -325,13 +351,19 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   }
 
   let recipientName = findField('recipientName');
-  if (!recipientName && (targetSemanticRegions.recipientName || referenceSemanticRegions.recipientName)) {
+  const semanticNameHasBothSides = Boolean(targetSemanticRegions.recipientName?.region && referenceSemanticRegions.recipientName?.region);
+  const fieldNameHasBothSides = Boolean(boxFrom(recipientName).target && boxFrom(recipientName).reference);
+  // V1.5.4: an older reference-forensic field row may exist with only one
+  // side populated. Never let that incomplete row mask the new geometry-first
+  // semantic ROI, which has independently resolved both target/reference boxes.
+  if ((!fieldNameHasBothSides && semanticNameHasBothSides) || (!recipientName && semanticNameHasBothSides)) {
     recipientName = {
       field:'recipientName',
-      referenceLabel:'ALICI', targetLabel:'ALICI',
+      referenceLabel: referenceSemanticRegions.recipientName?.labelText || 'ALICI',
+      targetLabel: targetSemanticRegions.recipientName?.labelText || 'ALICI',
       referenceValueBox: referenceSemanticRegions.recipientName?.region || null,
       targetValueBox: targetSemanticRegions.recipientName?.region || null,
-      semanticResolver: referenceSemanticRegions.recipientName?.resolver || targetSemanticRegions.recipientName?.resolver || 'semantic-label-neighbor'
+      semanticResolver: referenceSemanticRegions.recipientName?.resolver || targetSemanticRegions.recipientName?.resolver || 'semantic-inline-multi-label-v154'
     };
   }
   if (recipientName) {
@@ -352,13 +384,16 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   }
 
   let recipientIban = findField('recipientIban');
-  if (!recipientIban && (targetSemanticRegions.recipientIban || referenceSemanticRegions.recipientIban)) {
+  const semanticIbanHasBothSides = Boolean(targetSemanticRegions.recipientIban?.region && referenceSemanticRegions.recipientIban?.region);
+  const fieldIbanHasBothSides = Boolean(boxFrom(recipientIban).target && boxFrom(recipientIban).reference);
+  if ((!fieldIbanHasBothSides && semanticIbanHasBothSides) || (!recipientIban && semanticIbanHasBothSides)) {
     recipientIban = {
       field:'recipientIban',
-      referenceLabel:'ALICI IBAN', targetLabel:'ALICI IBAN',
+      referenceLabel: referenceSemanticRegions.recipientIban?.labelText || 'ALICI IBAN',
+      targetLabel: targetSemanticRegions.recipientIban?.labelText || 'ALICI IBAN',
       referenceValueBox: referenceSemanticRegions.recipientIban?.region || null,
       targetValueBox: targetSemanticRegions.recipientIban?.region || null,
-      semanticResolver: referenceSemanticRegions.recipientIban?.resolver || targetSemanticRegions.recipientIban?.resolver || 'semantic-field'
+      semanticResolver: referenceSemanticRegions.recipientIban?.resolver || targetSemanticRegions.recipientIban?.resolver || 'semantic-inline-multi-label-v154'
     };
   }
   if (recipientIban) {
@@ -366,7 +401,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference };
   }
 
-  console.log('MATH SEMANTIC ROI RESOLVER V1.5.3:', JSON.stringify({
+  console.log('MATH SEMANTIC ROI RESOLVER V1.5.4:', JSON.stringify({
     fields: fields.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     profiles: profiles.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => [k, {target:Boolean(v?.target), reference:Boolean(v?.reference), source:v?.source || 'semantic-field'}])),
@@ -9742,7 +9777,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           recipientName: resolveMathSemanticValueBox(refRegions, 'recipientName'),
           recipientIban: resolveMathSemanticValueBox(refRegions, 'recipientIban'),
         };
-        console.log('MATH REFERENCE SEMANTIC VALUE RESOLVER V1.5.3:', JSON.stringify({
+        console.log('MATH REFERENCE SEMANTIC VALUE RESOLVER V1.5.4:', JSON.stringify({
           reference:path.basename(referencePath),
           recipientName:semanticValueRegions.recipientName ? {box:semanticValueRegions.recipientName.region,resolver:semanticValueRegions.recipientName.resolver} : null,
           recipientIban:semanticValueRegions.recipientIban ? {box:semanticValueRegions.recipientIban.region,resolver:semanticValueRegions.recipientIban.resolver} : null,
