@@ -126,7 +126,18 @@ function resolveMathSemanticValueBox(regions, field) {
     return upper.filter(w=>/^[A-ZÇĞİÖŞÜ]{2,}$/.test(w)).length>=2;
   };
   const ibanLike = (v) => /^TR\s*\d{2}(?:[\s-]*[0-9A-Z]){22,}$/i.test(String(v||'')) || /^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
-  const isLabel = (item) => field==='recipientName' ? Boolean(recipientNameLabel(item?.text)) : Boolean(recipientIbanLabel(item?.text));
+  const isLabel = (item) => {
+    if (!item) return false;
+    if (field === 'recipientName') {
+      if (recipientNameLabel(item?.text)) return true;
+      // Reuse the bank/reference field grammar as a second semantic gate.
+      // This catches OCR variants such as "Alıcı İsim/Unvan" without
+      // reopening the old broad name-neighbor heuristic.
+      try { return referenceFieldRuleForText(item?.text)?.key === 'recipientName'; } catch { return false; }
+    }
+    if (recipientIbanLabel(item?.text)) return true;
+    try { return referenceFieldRuleForText(item?.text)?.key === 'recipientIban'; } catch { return false; }
+  };
   const labels=rows.filter(isLabel);
   if(!labels.length) return null;
   const solutions=[];
@@ -135,8 +146,11 @@ function resolveMathSemanticValueBox(regions, field) {
     const raw=String(label.text||'');
     const colon=raw.search(/[:：]/);
     const inline=colon>=0 ? raw.slice(colon+1).trim() : '';
-    if(field==='recipientName' && nameLike(inline)) solutions.push({value:inline,region:lb,score:140,resolver:'semantic-inline-label-v1'});
-    if(field==='recipientIban' && inline && ibanLike(inline)) solutions.push({value:inline,region:lb,score:150,resolver:'semantic-inline-iban-v1'});
+    const semanticLabelKey = field==='recipientName'
+      ? (recipientNameLabel(raw) ? 'recipientName' : (()=>{ try { return referenceFieldRuleForText(raw)?.key || null; } catch { return null; } })())
+      : (recipientIbanLabel(raw) ? 'recipientIban' : (()=>{ try { return referenceFieldRuleForText(raw)?.key || null; } catch { return null; } })());
+    if(field==='recipientName' && semanticLabelKey==='recipientName' && nameLike(inline)) solutions.push({value:inline,region:lb,score:150,resolver:'semantic-inline-label-v152'});
+    if(field==='recipientIban' && semanticLabelKey==='recipientIban' && inline && ibanLike(inline)) solutions.push({value:inline,region:lb,score:160,resolver:'semantic-inline-iban-v152'});
     const lh=Math.max(6,lb.y2-lb.y1);
     for(const row of rows){
       if(row===label) continue; const rb=box(row); if(!rb) continue;
@@ -352,7 +366,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference };
   }
 
-  console.log('MATH SEMANTIC ROI RESOLVER V1.4:', JSON.stringify({
+  console.log('MATH SEMANTIC ROI RESOLVER V1.5.3:', JSON.stringify({
     fields: fields.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     profiles: profiles.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => [k, {target:Boolean(v?.target), reference:Boolean(v?.reference), source:v?.source || 'semantic-field'}])),
@@ -9728,7 +9742,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           recipientName: resolveMathSemanticValueBox(refRegions, 'recipientName'),
           recipientIban: resolveMathSemanticValueBox(refRegions, 'recipientIban'),
         };
-        console.log('MATH REFERENCE SEMANTIC VALUE RESOLVER V1.5.1:', JSON.stringify({
+        console.log('MATH REFERENCE SEMANTIC VALUE RESOLVER V1.5.3:', JSON.stringify({
           reference:path.basename(referencePath),
           recipientName:semanticValueRegions.recipientName ? {box:semanticValueRegions.recipientName.region,resolver:semanticValueRegions.recipientName.resolver} : null,
           recipientIban:semanticValueRegions.recipientIban ? {box:semanticValueRegions.recipientIban.region,resolver:semanticValueRegions.recipientIban.resolver} : null,
