@@ -2087,6 +2087,40 @@ const NEGATIVE_SAMPLE_MAP = {
   // Enpara bilinen sahte örnekleri.
   // Bunlar yalnızca known-fake calibration/evidence için kullanılır;
   // trusted reference değildir.
+
+  garanti: [
+  "garanti/sahte-hesap-ozeti-1.pdf",
+  "garanti/fake.amount-1000.jpg",
+  "garanti/fake.iban.change.jpg",
+],
+halkbank: [
+  "halkbank/fake2000.jpg",
+  "halkbank/fakeibanhalk.jpg",
+],
+isbankasi: [
+  "isbankasi/sahte-hesap-ozeti-1.pdf",
+  "isbankasi/fake.iban-change.jpg",
+  "isbankasi/fake200000.jpg",
+],
+qnb: [
+  "qnb/qnb5000.jpg",
+  "qnb/qnbfakeiban.jpg",
+],
+vakifbank: [
+  "vakifbank/sahte-1.jpg",
+  "vakifbank/vakif3500fake.jpg",
+],
+yapikredi: [
+  "yapikredi/sahte-1.jpg",
+  "yapikredi/fakeyapi10000.jpg",
+  "yapikredi/yapifakeiban.jpg",
+],
+ziraat: [
+  "ziraat/sahte-1.jpg",
+  "ziraat/sahte-2.jpg",
+  "ziraat/ziraat7000fake.jpg",
+  "ziraat/ziraatfakeiban.jpg",
+],
   enpara: [
     "enpara/fake.3000.jpg",
     "enpara/fake.8000.jpg",
