@@ -6093,7 +6093,120 @@ async function getReferenceAmountAnchor(bank) {
           return { candidate, score, primaryHits, negativeHits };
         }).sort((a,b) => b.score - a.score);
 
-        const best = scored.find(x => x.primaryHits > 0 && x.negativeHits === 0 && x.score >= 40) || null;
+        let best = scored.find(x => x.primaryHits > 0 && x.negativeHits === 0 && x.score >= 40) || null;
+
+        // V1.4.2: PaddleOCR bazen referans rasterında tutar rakamlarını
+        // bölge olarak döndürmüyor; metin/şablon alanları bulunmasına rağmen
+        // gerçek tutar kutusu bu nedenle anchor olamıyordu. Bu durumda aynı
+        // referans görselini Tesseract'ın word/bbox çıktısıyla ikinci kez
+        // değerlendiriyoruz. Bu fallback yalnızca anchor çözülemediğinde
+        // çalışır ve sonuç yine aynı label->value geometri kurallarından geçer.
+        if (!best) {
+          try {
+            const worker = await getOCRWorker();
+            const { data } = await worker.recognize(referencePath);
+            const tessWords = Array.isArray(data?.words) ? data.words : [];
+            const tessRegions = tessWords
+              .map(w => ({
+                text: String(w?.text || '').trim(),
+                region: {
+                  x1: Number(w?.bbox?.x0) || 0,
+                  y1: Number(w?.bbox?.y0) || 0,
+                  x2: Number(w?.bbox?.x1) || 0,
+                  y2: Number(w?.bbox?.y1) || 0,
+                }
+              }))
+              .filter(x => x.text && x.region.x2 > x.region.x1 && x.region.y2 > x.region.y1);
+
+            const tessText = tessRegions.map(x => x.text).join(' ');
+            const tessMoneyCandidates = tessRegions.filter(r =>
+              /\d/.test(r.text) && (strictMoneyRe.test(r.text) || integerMoneyRe.test(String(r.text).trim()))
+            );
+            const tessAmountLabels = tessRegions.filter(r => explicitAmountLabelRe.test(String(r.text || '')));
+
+            // Tesseract word-level OCR often splits labels such as
+            // "ISLEM TUTARI (TL)" into several words. Reconstruct adjacent
+            // words into a synthetic label region so geometry remains local.
+            const syntheticLabels = [];
+            for (let i = 0; i < tessRegions.length; i++) {
+              for (let span = 2; span <= 5 && i + span <= tessRegions.length; span++) {
+                const chunk = tessRegions.slice(i, i + span);
+                const text = chunk.map(x => x.text).join(' ');
+                if (!explicitAmountLabelRe.test(text)) continue;
+                const x1 = Math.min(...chunk.map(x => x.region.x1));
+                const y1 = Math.min(...chunk.map(x => x.region.y1));
+                const x2 = Math.max(...chunk.map(x => x.region.x2));
+                const y2 = Math.max(...chunk.map(x => x.region.y2));
+                syntheticLabels.push({ text, region: { x1, y1, x2, y2 } });
+              }
+            }
+            const allTessLabels = [...tessAmountLabels, ...syntheticLabels];
+
+            const tessScored = tessMoneyCandidates.map(candidate => {
+              const cr = candidate.region;
+              const ccx = (cr.x1 + cr.x2) / 2;
+              const ccy = (cr.y1 + cr.y2) / 2;
+              let score = 0;
+              let primaryHits = 0;
+              let negativeHits = 0;
+              for (const other of tessRegions) {
+                if (other === candidate) continue;
+                const t = other.text;
+                const or = other.region;
+                const oh = Math.max(8, or.y2 - or.y1);
+                const horizontal = cr.x1 - or.x2;
+                const verticalGap = Math.abs(ccy - ((or.y1 + or.y2) / 2));
+                const near = verticalGap <= Math.max(oh * 1.8, 45) && horizontal >= -oh * 1.0 && horizontal <= Math.max(280, oh * 14);
+                const belowOrAbove = Math.abs(cr.y1 - or.y2) <= Math.max(oh * 2.0, 70) && Math.abs(ccx - ((or.x1 + or.x2) / 2)) <= Math.max(320, oh * 14);
+                if (near || belowOrAbove) {
+                  if (primaryLabelRe.test(t)) { score += 120; primaryHits++; }
+                  if (negativeLabelRe.test(t)) { score -= 45; negativeHits++; }
+                }
+              }
+              const yNorm = cr.y1 / height;
+              if (yNorm > 0.12 && yNorm < 0.65) score += 8;
+              const candidateText = String(candidate.text || '').trim();
+              const integerOnly = /^[-+]?\d{1,6}$/.test(candidateText);
+              for (const label of allTessLabels) {
+                const lr = label.region;
+                const lh = Math.max(8, lr.y2 - lr.y1);
+                const lcY = (lr.y1 + lr.y2) / 2;
+                const ccY = (cr.y1 + cr.y2) / 2;
+                const sameLine = Math.abs(ccY - lcY) <= Math.max(lh * 1.8, 36);
+                const rightOfLabel = cr.x1 >= lr.x1 - lh * 0.75;
+                const horizontalGap = cr.x1 - lr.x2;
+                const closeRight = horizontalGap >= -lh && horizontalGap <= Math.max(500, lh * 22);
+                const verticalClose = Math.abs(cr.y1 - lr.y1) <= Math.max(lh * 2.5, 70);
+                const below = cr.y1 >= lr.y2 && (cr.y1 - lr.y2) <= Math.max(lh * 3.0, 90);
+                if ((sameLine && rightOfLabel && closeRight) || (below && verticalClose)) {
+                  score += 220;
+                  primaryHits++;
+                  break;
+                }
+              }
+              if (integerOnly && primaryHits === 0) score -= 180;
+              if (/[-/]\d|\b(?:IBAN|NO|NUMARASI|REFERANS|HESAP|FIS|SIRA)\b/i.test(candidateText)) score -= 220;
+              return { candidate, score, primaryHits, negativeHits };
+            }).sort((a,b) => b.score - a.score);
+
+            best = tessScored.find(x => x.primaryHits > 0 && x.negativeHits === 0 && x.score >= 40) || null;
+            if (best) {
+              console.log('REFERENCE AMOUNT ANCHOR V1.4.2 TESSERACT FALLBACK:', JSON.stringify({
+                bank: normalizedBank,
+                referenceFile: path.basename(referencePath),
+                selectedText: best.candidate.text,
+                score: best.score,
+                primaryHits: best.primaryHits,
+                negativeHits: best.negativeHits,
+                tesseractWordCount: tessRegions.length,
+                tessTextSample: tessText.slice(0, 300),
+              }));
+            }
+          } catch (fallbackError) {
+            console.warn('REFERENCE AMOUNT ANCHOR V1.4.2 TESSERACT FALLBACK HATASI:', fallbackError?.message || fallbackError);
+          }
+        }
+
         if (!best || best.score < 20) continue;
         const r = best.candidate.region;
         entries.push({
