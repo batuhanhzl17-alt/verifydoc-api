@@ -6095,115 +6095,124 @@ async function getReferenceAmountAnchor(bank) {
 
         let best = scored.find(x => x.primaryHits > 0 && x.negativeHits === 0 && x.score >= 40) || null;
 
-        // V1.4.2: PaddleOCR bazen referans rasterında tutar rakamlarını
-        // bölge olarak döndürmüyor; metin/şablon alanları bulunmasına rağmen
-        // gerçek tutar kutusu bu nedenle anchor olamıyordu. Bu durumda aynı
-        // referans görselini Tesseract'ın word/bbox çıktısıyla ikinci kez
-        // değerlendiriyoruz. Bu fallback yalnızca anchor çözülemediğinde
-        // çalışır ve sonuç yine aynı label->value geometri kurallarından geçer.
-        if (!best) {
+        // V1.4.2.1: Do not invoke Tesseract in the Vercel reference-anchor path.
+        // Vercel deployments may not contain tesseract.js-core's WASM asset,
+        // which can abort the whole Node runtime before the Promise rejection
+        // is safely contained. PaddleOCR is already available here, so when
+        // its word segmentation misses the numeric value we use a raster
+        // projection fallback on the SAME reference image instead.
+        if (!best && amountLabels.length) {
           try {
-            const worker = await getOCRWorker();
-            const { data } = await worker.recognize(referencePath);
-            const tessWords = Array.isArray(data?.words) ? data.words : [];
-            const tessRegions = tessWords
-              .map(w => ({
-                text: String(w?.text || '').trim(),
-                region: {
-                  x1: Number(w?.bbox?.x0) || 0,
-                  y1: Number(w?.bbox?.y0) || 0,
-                  x2: Number(w?.bbox?.x1) || 0,
-                  y2: Number(w?.bbox?.y1) || 0,
+            const buffer = await fs.readFile(referencePath);
+            const raw = await sharp(buffer).greyscale().raw().toBuffer({ resolveWithObject: true });
+            const imgW = Number(raw.info?.width) || width;
+            const imgH = Number(raw.info?.height) || height;
+            const pixels = raw.data;
+
+            const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+            const isInk = v => Number(v) < 185;
+            const projectionRuns = (values, minCount = 1, mergeGap = 6) => {
+              const runs = [];
+              let start = -1;
+              let last = -1;
+              for (let i = 0; i < values.length; i++) {
+                if (values[i] >= minCount) {
+                  if (start < 0) start = i;
+                  last = i;
+                } else if (start >= 0 && i - last > mergeGap) {
+                  runs.push({ start, end: last });
+                  start = -1;
+                  last = -1;
                 }
-              }))
-              .filter(x => x.text && x.region.x2 > x.region.x1 && x.region.y2 > x.region.y1);
+              }
+              if (start >= 0) runs.push({ start, end: last });
+              return runs;
+            };
 
-            const tessText = tessRegions.map(x => x.text).join(' ');
-            const tessMoneyCandidates = tessRegions.filter(r =>
-              /\d/.test(r.text) && (strictMoneyRe.test(r.text) || integerMoneyRe.test(String(r.text).trim()))
-            );
-            const tessAmountLabels = tessRegions.filter(r => explicitAmountLabelRe.test(String(r.text || '')));
+            const rasterCandidates = [];
+            for (const label of amountLabels) {
+              const lr = label.region;
+              const lh = Math.max(8, lr.y2 - lr.y1);
+              const cy = (lr.y1 + lr.y2) / 2;
+              const y1 = clamp(Math.floor(cy - Math.max(lh * 1.8, 28)), 0, imgH - 1);
+              const y2 = clamp(Math.ceil(cy + Math.max(lh * 1.8, 28)), y1 + 1, imgH);
+              const xStart = clamp(Math.floor(lr.x2 + Math.max(lh * 0.5, 8)), 0, imgW - 1);
+              const xEnd = imgW;
+              const columnInk = new Array(Math.max(0, xEnd - xStart)).fill(0);
+              let totalInk = 0;
 
-            // Tesseract word-level OCR often splits labels such as
-            // "ISLEM TUTARI (TL)" into several words. Reconstruct adjacent
-            // words into a synthetic label region so geometry remains local.
-            const syntheticLabels = [];
-            for (let i = 0; i < tessRegions.length; i++) {
-              for (let span = 2; span <= 5 && i + span <= tessRegions.length; span++) {
-                const chunk = tessRegions.slice(i, i + span);
-                const text = chunk.map(x => x.text).join(' ');
-                if (!explicitAmountLabelRe.test(text)) continue;
-                const x1 = Math.min(...chunk.map(x => x.region.x1));
-                const y1 = Math.min(...chunk.map(x => x.region.y1));
-                const x2 = Math.max(...chunk.map(x => x.region.x2));
-                const y2 = Math.max(...chunk.map(x => x.region.y2));
-                syntheticLabels.push({ text, region: { x1, y1, x2, y2 } });
+              for (let y = y1; y < y2; y++) {
+                const row = y * imgW;
+                for (let x = xStart; x < xEnd; x++) {
+                  if (isInk(pixels[row + x])) {
+                    columnInk[x - xStart]++;
+                    totalInk++;
+                  }
+                }
+              }
+              if (totalInk < 20) continue;
+
+              const runs = projectionRuns(columnInk, 1, Math.max(5, Math.round(lh * 0.55)));
+              for (const run of runs) {
+                const rx1 = xStart + run.start;
+                const rx2 = xStart + run.end + 1;
+                const rw = rx2 - rx1;
+                if (rw < Math.max(12, lh * 1.2) || rw > Math.min(500, imgW * 0.45)) continue;
+
+                let minY = y2, maxY = y1;
+                let inkCount = 0;
+                for (let y = y1; y < y2; y++) {
+                  const row = y * imgW;
+                  for (let x = rx1; x < rx2; x++) {
+                    if (isInk(pixels[row + x])) {
+                      minY = Math.min(minY, y);
+                      maxY = Math.max(maxY, y);
+                      inkCount++;
+                    }
+                  }
+                }
+                if (inkCount < 20 || maxY <= minY) continue;
+
+                // Prefer a compact text-like run close to the label and toward
+                // the right edge of the transaction row. Penalize very wide
+                // regions, which are more likely to be prose/table borders.
+                const gap = rx1 - lr.x2;
+                const compactness = Math.min(1, rw / Math.max(1, lh * 12));
+                const score =
+                  1000 -
+                  Math.abs(gap - lh * 2.5) * 2 -
+                  compactness * 250 +
+                  (rx1 / imgW) * 120 +
+                  Math.min(80, inkCount / 10);
+                rasterCandidates.push({
+                  score,
+                  box: { x1: rx1, y1: minY, x2: rx2, y2: maxY + 1 },
+                  label: String(label.text || ''),
+                });
               }
             }
-            const allTessLabels = [...tessAmountLabels, ...syntheticLabels];
 
-            const tessScored = tessMoneyCandidates.map(candidate => {
-              const cr = candidate.region;
-              const ccx = (cr.x1 + cr.x2) / 2;
-              const ccy = (cr.y1 + cr.y2) / 2;
-              let score = 0;
-              let primaryHits = 0;
-              let negativeHits = 0;
-              for (const other of tessRegions) {
-                if (other === candidate) continue;
-                const t = other.text;
-                const or = other.region;
-                const oh = Math.max(8, or.y2 - or.y1);
-                const horizontal = cr.x1 - or.x2;
-                const verticalGap = Math.abs(ccy - ((or.y1 + or.y2) / 2));
-                const near = verticalGap <= Math.max(oh * 1.8, 45) && horizontal >= -oh * 1.0 && horizontal <= Math.max(280, oh * 14);
-                const belowOrAbove = Math.abs(cr.y1 - or.y2) <= Math.max(oh * 2.0, 70) && Math.abs(ccx - ((or.x1 + or.x2) / 2)) <= Math.max(320, oh * 14);
-                if (near || belowOrAbove) {
-                  if (primaryLabelRe.test(t)) { score += 120; primaryHits++; }
-                  if (negativeLabelRe.test(t)) { score -= 45; negativeHits++; }
-                }
-              }
-              const yNorm = cr.y1 / height;
-              if (yNorm > 0.12 && yNorm < 0.65) score += 8;
-              const candidateText = String(candidate.text || '').trim();
-              const integerOnly = /^[-+]?\d{1,6}$/.test(candidateText);
-              for (const label of allTessLabels) {
-                const lr = label.region;
-                const lh = Math.max(8, lr.y2 - lr.y1);
-                const lcY = (lr.y1 + lr.y2) / 2;
-                const ccY = (cr.y1 + cr.y2) / 2;
-                const sameLine = Math.abs(ccY - lcY) <= Math.max(lh * 1.8, 36);
-                const rightOfLabel = cr.x1 >= lr.x1 - lh * 0.75;
-                const horizontalGap = cr.x1 - lr.x2;
-                const closeRight = horizontalGap >= -lh && horizontalGap <= Math.max(500, lh * 22);
-                const verticalClose = Math.abs(cr.y1 - lr.y1) <= Math.max(lh * 2.5, 70);
-                const below = cr.y1 >= lr.y2 && (cr.y1 - lr.y2) <= Math.max(lh * 3.0, 90);
-                if ((sameLine && rightOfLabel && closeRight) || (below && verticalClose)) {
-                  score += 220;
-                  primaryHits++;
-                  break;
-                }
-              }
-              if (integerOnly && primaryHits === 0) score -= 180;
-              if (/[-/]\d|\b(?:IBAN|NO|NUMARASI|REFERANS|HESAP|FIS|SIRA)\b/i.test(candidateText)) score -= 220;
-              return { candidate, score, primaryHits, negativeHits };
-            }).sort((a,b) => b.score - a.score);
-
-            best = tessScored.find(x => x.primaryHits > 0 && x.negativeHits === 0 && x.score >= 40) || null;
-            if (best) {
-              console.log('REFERENCE AMOUNT ANCHOR V1.4.2 TESSERACT FALLBACK:', JSON.stringify({
+            rasterCandidates.sort((a, b) => b.score - a.score);
+            const rasterBest = rasterCandidates[0] || null;
+            if (rasterBest) {
+              const r = rasterBest.box;
+              best = {
+                candidate: { text: '__RASTER_AMOUNT_BOX__', region: r },
+                score: 45,
+                primaryHits: 1,
+                negativeHits: 0,
+                source: 'raster-label-adjacent-projection',
+              };
+              console.log('REFERENCE AMOUNT ANCHOR V1.4.2.1 RASTER FALLBACK:', JSON.stringify({
                 bank: normalizedBank,
                 referenceFile: path.basename(referencePath),
-                selectedText: best.candidate.text,
-                score: best.score,
-                primaryHits: best.primaryHits,
-                negativeHits: best.negativeHits,
-                tesseractWordCount: tessRegions.length,
-                tessTextSample: tessText.slice(0, 300),
+                selectedBox: r,
+                label: rasterBest.label,
+                score: rasterBest.score,
               }));
             }
           } catch (fallbackError) {
-            console.warn('REFERENCE AMOUNT ANCHOR V1.4.2 TESSERACT FALLBACK HATASI:', fallbackError?.message || fallbackError);
+            console.warn('REFERENCE AMOUNT ANCHOR V1.4.2.1 RASTER FALLBACK HATASI:', fallbackError?.message || fallbackError);
           }
         }
 
