@@ -20,7 +20,7 @@ export function recipientNameLabel(value) {
   if (/^(MUSTERI|GONDEREN|GONDERICI)(?: |$)/.test(label)) return null;
 
   const compact = label.replace(/\s+/g, '');
-  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADISOYAD|ADISOYADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI))?$/.test(compact)) return 'recipientName';
+  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADISOYAD|ADISOYADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI|ADIUNVANI|ADIUNVAN|ISIMUNVANI|ISIMUNVAN|ADIISIM|ADIISIMUNVANI|ADIISIMUNVAN|ADISOYADUNVANI))?$/.test(compact)) return 'recipientName';
   if (/^(?:BENEFICIARY|BENEFICIARYNAME|PAYEE|PAYEENAME|RECEIVER|RECEIVERNAME|LEHDAR|LEHDARADI|LEHDARUNVANI)$/.test(compact)) return 'recipientName';
   return null;
 }
@@ -61,6 +61,90 @@ function boxOf(item) {
   return [x1, y1, x2, y2].every(Number.isFinite) && x2 > x1 && y2 > y1
     ? { x1, y1, x2, y2 }
     : null;
+}
+
+/** Resolve a multi-line recipient name/title from OCR regions.
+ *  Only regions immediately to the right of, or directly below, an explicit
+ *  recipient label are joined. This prevents unrelated customer/sender text
+ *  from becoming the recipient ROI.
+ */
+export function resolveSplitRecipientName(regions, label) {
+  const rows = Array.isArray(regions) ? regions : [];
+  const labelBox = boxOf(label);
+  if (!labelBox) return null;
+  const labelText = String(label?.text && /[:：]/.test(label.text) ? label.text : (label?.labelText || label?.text || ''));
+  const inlineParts = labelText.split(/[:：]/);
+  const inline = inlineParts.length > 1 ? inlineParts.slice(1).join(' ').trim() : '';
+  const isName = (text) => {
+    const s = String(text || '').trim();
+    if (!s || s.length < 2 || s.length > 120) return false;
+    if (/^TR\d{2}/i.test(s) || /\d{4,}/.test(s)) return false;
+    if (/(?:müşterinin yaptığı işlemlere ilişkin|dekont asıllarının|işlemlere ilişkin)/i.test(s)) return false;
+    const letters = (s.match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g) || []).length;
+    return letters >= 3;
+  };
+  if (inline && isName(inline)) {
+    return { text: inline, region: labelBox, score: 100, criticalROI: true, resolver: 'semantic-recipient-inline-v1' };
+  }
+
+  const pool = rows
+    .filter(item => item && item !== label && String(item.text || '').trim())
+    .map(item => ({ item, box: boxOf(item), text: String(item.text || '').trim() }))
+    .filter(x => x.box && isName(x.text));
+  const labelH = Math.max(6, labelBox.y2 - labelBox.y1);
+  const candidates = [];
+
+  for (const first of pool) {
+    const vertical = Math.min(first.box.y2, labelBox.y2) - Math.max(first.box.y1, labelBox.y1);
+    const rightGap = first.box.x1 - labelBox.x2;
+    const belowGap = first.box.y1 - labelBox.y2;
+    const centerDelta = Math.abs((first.box.x1 + first.box.x2) / 2 - (labelBox.x1 + labelBox.x2) / 2);
+    const sameLine = vertical >= -labelH * 0.45 && rightGap >= -labelH * 0.25 && rightGap < Math.max(420, labelH * 18);
+    const below = belowGap >= -labelH * 0.3 && belowGap < Math.max(150, labelH * 5) && centerDelta < Math.max(420, labelH * 18);
+    if (!sameLine && !below) continue;
+
+    const baseCost = sameLine
+      ? Math.abs(rightGap) / labelH + Math.abs((first.box.y1 + first.box.y2 - labelBox.y1 - labelBox.y2) / 2) / labelH * 0.7
+      : 3 + Math.max(0, belowGap) / labelH + centerDelta / labelH * 0.12;
+    candidates.push({ first, sameLine, cost: baseCost });
+  }
+
+  const joined = [];
+  for (const c of candidates) {
+    const parts = [c.first];
+    let current = c.first;
+    // Join at most two additional lines, only when the next line is vertically
+    // close and horizontally aligned with the current text block.
+    for (let depth = 0; depth < 2; depth++) {
+      const next = pool
+        .filter(x => !parts.includes(x))
+        .map(x => {
+          const gap = x.box.y1 - current.box.y2;
+          const overlap = Math.min(x.box.x2, current.box.x2) - Math.max(x.box.x1, current.box.x1);
+          const overlapRatio = overlap / Math.max(1, Math.min(x.box.x2 - x.box.x1, current.box.x2 - current.box.x1));
+          const center = Math.abs((x.box.x1 + x.box.x2) / 2 - (current.box.x1 + current.box.x2) / 2);
+          return { x, gap, overlapRatio, center };
+        })
+        .filter(x => x.gap >= -labelH * 0.3 && x.gap <= labelH * 2.8 && (x.overlapRatio >= 0.15 || x.center <= labelH * 5))
+        .sort((a, b) => (a.gap + a.center * 0.08) - (b.gap + b.center * 0.08))[0];
+      if (!next) break;
+      parts.push(next.x);
+      current = next.x;
+    }
+    const text = parts.map(x => x.text).join(' ').replace(/\s+/g, ' ').trim();
+    const box = {
+      x1: Math.min(...parts.map(x => x.box.x1)),
+      y1: Math.min(...parts.map(x => x.box.y1)),
+      x2: Math.max(...parts.map(x => x.box.x2)),
+      y2: Math.max(...parts.map(x => x.box.y2)),
+    };
+    joined.push({ text, region: box, score: Math.max(0, 100 - c.cost * 8), criticalROI: true, resolver: 'semantic-recipient-line-join-v1', _cost: c.cost });
+  }
+  joined.sort((a, b) => a._cost - b._cost);
+  const best = joined[0];
+  if (!best) return null;
+  delete best._cost;
+  return best;
 }
 
 /** Resolve a line-wrapped Turkish IBAN into one logical value and union ROI. */
