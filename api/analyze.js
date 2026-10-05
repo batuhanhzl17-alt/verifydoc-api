@@ -91,13 +91,68 @@ async function loadMathematicalBaseline() {
   }
 }
 
-async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, bank = null, referencePath = null } = {}) {
+
+function resolveMathSemanticValueBox(regions, field) {
+  const rows = Array.isArray(regions) ? regions.filter(x => x?.region && String(x.text || '').trim()) : [];
+  if (!rows.length) return null;
+  const box = (x) => {
+    const r=x?.region||x;
+    const x1=Number(r?.x1),y1=Number(r?.y1),x2=Number(r?.x2),y2=Number(r?.y2);
+    return [x1,y1,x2,y2].every(Number.isFinite)&&x2>x1&&y2>y1 ? {x1,y1,x2,y2}:null;
+  };
+  const norm = (v) => String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğışöüıİ]/g,c=>({ç:'c',ğ:'g',ı:'i',İ:'i',ş:'s',ö:'o',ü:'u'}[c]||c));
+  const nameLike = (v) => {
+    const t=String(v||'').trim(); if(!t || /\d/.test(t)) return false;
+    if(/^(ALICI|ALACAKLI|GONDEREN|GONDERICI|BANKA|SUBE|IBAN|HESAP|TUTAR|ACIKLAMA|TARIH|ISLEM|ETTN|SORGU|SIRA)/i.test(norm(t).replace(/\s+/g,' '))) return false;
+    const words=t.split(/\s+/).filter(Boolean);
+    return words.length>=2 && words.every(w=>/[A-Za-zÇĞİÖŞÜçğıöşü]{2,}/.test(w));
+  };
+  const ibanLike = (v) => /^TR\s*\d{2}(?:[\s-]*[0-9A-Z]){22,}$/i.test(String(v||'')) || /^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
+  const isLabel = (item) => field==='recipientName' ? Boolean(recipientNameLabel(item?.text)) : Boolean(recipientIbanLabel(item?.text));
+  const labels=rows.filter(isLabel);
+  if(!labels.length) return null;
+  const solutions=[];
+  for(const label of labels){
+    const lb=box(label); if(!lb) continue;
+    const raw=String(label.text||'');
+    const colon=raw.search(/[:：]/);
+    const inline=colon>=0 ? raw.slice(colon+1).trim() : '';
+    if(field==='recipientName' && nameLike(inline)) solutions.push({value:inline,region:lb,score:140,resolver:'semantic-inline-label-v1'});
+    if(field==='recipientIban' && inline && ibanLike(inline)) solutions.push({value:inline,region:lb,score:150,resolver:'semantic-inline-iban-v1'});
+    const lh=Math.max(6,lb.y2-lb.y1);
+    for(const row of rows){
+      if(row===label) continue; const rb=box(row); if(!rb) continue;
+      const text=String(row.text||'').trim();
+      const valid=field==='recipientName'?nameLike(text):ibanLike(text);
+      if(!valid) continue;
+      const overlapY=Math.min(lb.y2,rb.y2)-Math.max(lb.y1,rb.y1);
+      const sameLine=overlapY>=-lh*.45 && rb.x1>=lb.x1-lh*.5 && rb.x1-lb.x2<Math.max(420,lh*18);
+      const belowGap=rb.y1-lb.y2;
+      const below=belowGap>=-lh*.35 && belowGap<Math.max(170,lh*6) && Math.abs(((rb.x1+rb.x2)/2)-((lb.x1+lb.x2)/2))<Math.max(500,lh*18);
+      if(!sameLine&&!below) continue;
+      const cost=(sameLine?Math.max(0,rb.x1-lb.x2)/lh:4+Math.max(0,belowGap)/lh) + Math.abs(((rb.y1+rb.y2)/2)-((lb.y1+lb.y2)/2))/lh*.25;
+      const score=120-cost*8+(sameLine?25:0);
+      solutions.push({value:text,region:rb,score,resolver:field==='recipientIban'?'semantic-label-neighbor-iban-v1':'semantic-label-neighbor-name-v1'});
+    }
+    if(field==='recipientIban'){
+      const joined=resolveSplitTurkishIban(rows,label);
+      if(joined) solutions.push({value:joined.text,region:joined.region,score:joined.score+30,resolver:joined.resolver});
+    }
+  }
+  solutions.sort((a,b)=>Number(b.score)-Number(a.score));
+  const best=solutions[0];
+  return best ? {text:best.value,region:best.region,score:best.score,resolver:best.resolver} : null;
+}
+
+async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, bank = null, referencePath = null } = {}) {
   const rois = {};
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
     ? referenceForensics.typographyFieldProfiles : [];
   const findings = Array.isArray(referenceForensics?.characterFindings)
     ? referenceForensics.characterFindings : [];
+  const targetSemanticRegions = referenceForensics?.targetSemanticRegions || {};
+  const referenceSemanticRegions = referenceForensics?.referenceSemanticRegions || {};
 
   const normalizeField = (v) => String(v || '')
     .toLocaleLowerCase('tr-TR')
@@ -207,7 +262,16 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     console.warn('MATH AMOUNT ROI SKIPPED: NO VALID TYPED REFERENCE AMOUNT BOX');
   }
 
-  const recipientName = findField('recipientName');
+  let recipientName = findField('recipientName');
+  if (!recipientName && (targetSemanticRegions.recipientName || referenceSemanticRegions.recipientName)) {
+    recipientName = {
+      field:'recipientName',
+      referenceLabel:'ALICI', targetLabel:'ALICI',
+      referenceValueBox: referenceSemanticRegions.recipientName?.region || null,
+      targetValueBox: targetSemanticRegions.recipientName?.region || null,
+      semanticResolver: referenceSemanticRegions.recipientName?.resolver || targetSemanticRegions.recipientName?.resolver || 'semantic-label-neighbor'
+    };
+  }
   if (recipientName) {
     const boxes = boxFrom(recipientName);
     const labelText = String(recipientName?.referenceLabel || recipientName?.targetLabel || recipientName?.labelReference || recipientName?.field || '');
@@ -225,7 +289,16 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     }
   }
 
-  const recipientIban = findField('recipientIban');
+  let recipientIban = findField('recipientIban');
+  if (!recipientIban && (targetSemanticRegions.recipientIban || referenceSemanticRegions.recipientIban)) {
+    recipientIban = {
+      field:'recipientIban',
+      referenceLabel:'ALICI IBAN', targetLabel:'ALICI IBAN',
+      referenceValueBox: referenceSemanticRegions.recipientIban?.region || null,
+      targetValueBox: targetSemanticRegions.recipientIban?.region || null,
+      semanticResolver: referenceSemanticRegions.recipientIban?.resolver || targetSemanticRegions.recipientIban?.resolver || 'semantic-field'
+    };
+  }
   if (recipientIban) {
     const boxes = boxFrom(recipientIban);
     if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference };
@@ -240,14 +313,14 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   return rois;
 }
 
-async function runMathematicalForensics({ targetPath, targetText = "", bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
+async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
   if (!targetPath || !bank) {
     return { available: false, status: "missing-target-or-bank" };
   }
   const baseline = await loadMathematicalBaseline();
   if (!baseline) return { available: false, status: "baseline-unavailable" };
 
-  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, bank, referencePath });
+  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, targetOCR, bank, referencePath });
   const ibanProfile = (Array.isArray(referenceForensics?.typographyFieldProfiles) ? referenceForensics.typographyFieldProfiles : [])
     .find(profile => {
       const field = String(profile?.field || '').replace(/:value$/i, '');
@@ -9587,6 +9660,16 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           }
         }
 
+        const semanticValueRegions = {
+          recipientName: resolveMathSemanticValueBox(refRegions, 'recipientName'),
+          recipientIban: resolveMathSemanticValueBox(refRegions, 'recipientIban'),
+        };
+        console.log('MATH REFERENCE SEMANTIC VALUE RESOLVER V1.5.1:', JSON.stringify({
+          reference:path.basename(referencePath),
+          recipientName:semanticValueRegions.recipientName ? {box:semanticValueRegions.recipientName.region,resolver:semanticValueRegions.recipientName.resolver} : null,
+          recipientIban:semanticValueRegions.recipientIban ? {box:semanticValueRegions.recipientIban.region,resolver:semanticValueRegions.recipientIban.resolver} : null,
+        }));
+
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
         const typographyMedium=typographyFindings.filter(x=>x.severity==='medium');
         const typographyComparableCount=typographyFieldProfiles.length;
@@ -9616,7 +9699,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           characterFindingCount:typographyFindings.length,
           characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
-          fields:fieldResults,referenceQuality,
+          fields:fieldResults,referenceQuality,semanticValueRegions,
         });
       }catch(error){
         console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:',path.basename(referencePath),error?.message||error);
@@ -9753,6 +9836,16 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       if(keep)spacingAnomalies.push({...rows.sort((a,b)=>b.score-a.score)[0],ensembleMedianScore:rfClamp100(med),referenceCountForPair:rows.length});
     }
 
+    const semanticValueRegions = {};
+    for (const key of ['recipientName','recipientIban']) {
+      const candidates = referenceResults.map(r=>r?.semanticValueRegions?.[key]).filter(Boolean);
+      if (candidates.length) semanticValueRegions[key] = candidates[0];
+    }
+    const targetSemanticRegions = {
+      recipientName: resolveMathSemanticValueBox(targetOCR?.regions || [], 'recipientName'),
+      recipientIban: resolveMathSemanticValueBox(targetOCR?.regions || [], 'recipientIban'),
+    };
+
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
     const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
     const maxSpacingScore=spacingAnomalies.length?Math.max(...spacingAnomalies.map(x=>Number(x.score)||0)):0;
@@ -9786,6 +9879,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       score,severity,
       independentSignals:[suspicious.length>=1,strongSpacing.length>=1,referenceResults.length>=2,suspicious.length>=2].filter(Boolean).length,
       references:referenceResults.map(x=>({file:x.file,fieldCount:x.fieldCount,styleScore:x.styleScore,localAnomalyScore:x.localAnomalyScore,suspiciousFieldCount:x.suspiciousFieldCount,suspiciousFields:x.suspiciousFields,spacingAnomalyCount:x.spacingAnomalyCount,spacingAnomalies:x.spacingAnomalies,referenceQuality:x.referenceQuality})),
+      referenceSemanticRegions:semanticValueRegions,
+      targetSemanticRegions,
       fields,fieldObservations,
       evidence:localized.length
         ? `Referans ensemble + semantik occurrence eşleştirme + affine hizalama sonrasında ${suspicious.length} alan ve ${spacingAnomalies.length} yerel yapısal aralık anomalisi bulundu: ${localized.join(', ')}.`
@@ -15706,6 +15801,7 @@ if (type === "image" || type === "pdf") {
       bank,
       fileName,
       referencePath: reference?.path || null,
+      targetOCR: paddleImageOCR,
       amountForensics,
       referenceForensics
     });
