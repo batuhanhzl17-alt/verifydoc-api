@@ -10,7 +10,7 @@ import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics.js";
-import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban } from "./semantic_roi.js";
+import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveSplitRecipientName } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -2121,11 +2121,11 @@ const NEGATIVE_SAMPLE_MAP = {
     "isbankasi/fake200000.jpg",
   ],
   qnb: ["qnb/qnb5000.jpg", "qnb/qnbfakeiban.jpg"],
-  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vakıf3500fake.jpg"],
+  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vakif3500fake.jpg"],
   yapikredi: [
-    "yapıkredi/sahte-1.jpg",
-    "yapıkredi/fakeyapi10000.jpg",
-    "yapıkredi/yapifakeiban.jpg",
+    "yapikredi/sahte-1.jpg",
+    "yapikredi/fakeyapi10000.jpg",
+    "yapikredi/yapifakeiban.jpg",
   ],
   ziraat: [
     "ziraat/sahte-1.jpg",
@@ -7108,6 +7108,14 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
     if(joined)return joined;
   }
 
+  // Long company/person names can also wrap onto the next OCR line. Resolve
+  // the complete recipient block before falling back to a single neighboring
+  // token. This is label-driven and therefore does not promote MÜŞTERİ/GÖNDEREN.
+  if(semanticKey==='recipientName'){
+    const joined=resolveSplitRecipientName(regions,label);
+    if(joined)return joined;
+  }
+
   const candidates=(Array.isArray(regions)?regions:[])
     .filter(v=>v&&v!==label&&v.region&&String(v.text||'').trim())
     .map(v=>{
@@ -8554,7 +8562,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const tarStyle=tarLabelRegion?await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize):null;
           const rawStyle=rfStyleResidual(refStyle,tarStyle);
           const styleResidual=rfStyleResidual(refStyle,tarStyle,globalStyleBaseline);
-          const refValue=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
+          const refCriticalValue=rfResolveCriticalValueRegionV127(refRegions,m.rl,m.rl.rule.key,{source:'semantic-critical-roi-v127'});
+          const tarCriticalValue=rfResolveCriticalValueRegionV127(targetRegions,m.tl,m.tl.rule.key,{source:'semantic-critical-roi-v127'});
+          const refValue=refCriticalValue || rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=tarCriticalValue || rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
           let valueRenderResidual=null;
           let valueGeometryResidual=null;
           if(refValue&&tarValue){
