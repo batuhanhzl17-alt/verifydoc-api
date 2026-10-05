@@ -101,11 +101,29 @@ function resolveMathSemanticValueBox(regions, field) {
     return [x1,y1,x2,y2].every(Number.isFinite)&&x2>x1&&y2>y1 ? {x1,y1,x2,y2}:null;
   };
   const norm = (v) => String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğışöüıİ]/g,c=>({ç:'c',ğ:'g',ı:'i',İ:'i',ş:'s',ö:'o',ü:'u'}[c]||c));
+  const NAME_STOPWORDS = new Set([
+    'ALICI','ALACAKLI','GONDEREN','GONDERICI','GIDEN','GONDERILEN','BANKA','SUBE','IBAN','HESAP','TUTAR',
+    'ACIKLAMA','TARIH','ISLEM','ISLEM TARIHI','ETTN','SORGU','SIRA','NO','NUMARA','NUMARASI','KART',
+    'FAST','EFT','HAVALE','TRANSFER','ODEME','ODEME','ISLEM TUTARI','GIDEN FAST','GIDEN FAST EFT',
+    'PARA','CINSI','TL','TRY','USD','EUR','GBP','FIS','FIS NO','REFERANS','REFERANS NO','MUSTERI','MUSTERI NO',
+    'VERGI','VERGI NO','MERSIS','TICARET','TICARET SICIL','KOMISYON','MASRAF','UCRET','TOPLAM','CEP SUBE'
+  ]);
   const nameLike = (v) => {
-    const t=String(v||'').trim(); if(!t || /\d/.test(t)) return false;
-    if(/^(ALICI|ALACAKLI|GONDEREN|GONDERICI|BANKA|SUBE|IBAN|HESAP|TUTAR|ACIKLAMA|TARIH|ISLEM|ETTN|SORGU|SIRA)/i.test(norm(t).replace(/\s+/g,' '))) return false;
+    const t=String(v||'').trim();
+    if(!t || /\d/.test(t)) return false;
+    const canonical=norm(t).replace(/[^a-z0-9çğıöşü\s]/gi,' ').replace(/\s+/g,' ').trim();
+    if(!canonical || NAME_STOPWORDS.has(canonical)) return false;
     const words=t.split(/\s+/).filter(Boolean);
-    return words.length>=2 && words.every(w=>/[A-Za-zÇĞİÖŞÜçğıöşü]{2,}/.test(w));
+    if(words.length<2 || words.length>6) return false;
+    if(words.some(w=>w.length<2 || !/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]+$/.test(w))) return false;
+    // A semantic name must contain at least two plausible alphabetic tokens and
+    // must not be composed only of transaction/action vocabulary. This blocks
+    // false positives such as "GIDEN FAST EFT" while preserving names like
+    // "Sudenaz Özel" and multi-word company/person names.
+    const actionWords=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
+    const upper=words.map(w=>norm(w).toUpperCase());
+    if(upper.filter(w=>actionWords.has(w)).length>=1) return false;
+    return upper.filter(w=>/^[A-ZÇĞİÖŞÜ]{2,}$/.test(w)).length>=2;
   };
   const ibanLike = (v) => /^TR\s*\d{2}(?:[\s-]*[0-9A-Z]){22,}$/i.test(String(v||'')) || /^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
   const isLabel = (item) => field==='recipientName' ? Boolean(recipientNameLabel(item?.text)) : Boolean(recipientIbanLabel(item?.text));
@@ -153,6 +171,36 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     ? referenceForensics.characterFindings : [];
   const targetSemanticRegions = referenceForensics?.targetSemanticRegions || {};
   const referenceSemanticRegions = referenceForensics?.referenceSemanticRegions || {};
+
+  const normalizedBox = (b, width, height) => {
+    if (!b) return null;
+    const x1=Number(b.x1),y1=Number(b.y1),x2=Number(b.x2),y2=Number(b.y2);
+    if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1 || !width || !height) return null;
+    return {x:(x1+x2)/(2*width), y:(y1+y2)/(2*height), w:(x2-x1)/width, h:(y2-y1)/height};
+  };
+  const inferRasterSize = (rows) => {
+    const xs=rows.flatMap(r=>[Number(r?.region?.x1),Number(r?.region?.x2)]).filter(Number.isFinite);
+    const ys=rows.flatMap(r=>[Number(r?.region?.y1),Number(r?.region?.y2)]).filter(Number.isFinite);
+    return {width:xs.length?Math.max(...xs):0,height:ys.length?Math.max(...ys):0};
+  };
+  const geometryFallback = (field, referenceCandidate, targetRows, referenceRows) => {
+    if (!referenceCandidate || !Array.isArray(targetRows) || !targetRows.length) return null;
+    const refSize=inferRasterSize(referenceRows), tarSize=inferRasterSize(targetRows);
+    const refNorm=normalizedBox(referenceCandidate.region,refSize.width,refSize.height);
+    if (!refNorm || !tarSize.width || !tarSize.height) return null;
+    const valid = field==='recipientName' ? nameLike : ibanLike;
+    const candidates=targetRows.filter(r=>r?.region && valid(String(r.text||'').trim()));
+    const scored=candidates.map(r=>{
+      const n=normalizedBox(r.region,tarSize.width,tarSize.height);
+      if(!n) return null;
+      const d=Math.hypot((n.x-refNorm.x), (n.y-refNorm.y));
+      const sizeD=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,refNorm.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,refNorm.h)));
+      return {row:r,d,sizeD,score:100-d*180-sizeD*18};
+    }).filter(Boolean).sort((a,b)=>b.score-a.score);
+    const best=scored[0];
+    if(!best || best.score<55) return null;
+    return {text:String(best.row.text).trim(),region:best.row.region,score:Number(best.score.toFixed(2)),resolver:`reference-geometry-${field}-v1`};
+  };
 
   const normalizeField = (v) => String(v || '')
     .toLocaleLowerCase('tr-TR')
@@ -8720,6 +8768,22 @@ function rfFieldLabelText(label){
 // - Customer/recipient names = semantic inline/relative value ROI only.
 // - Dynamic transaction IDs are never treated as literal-value mismatches.
 // - V15.2, Amount Forensics and Known-Fake layers remain untouched.
+function resolveSemanticGeometryFallbackV152(field, referenceCandidate, targetRows, referenceRows) {
+  if (!referenceCandidate || !Array.isArray(targetRows) || !targetRows.length) return null;
+  const boxOf=(b)=>{const r=b?.region||b;if(!r)return null;const x1=Number(r.x1),y1=Number(r.y1),x2=Number(r.x2),y2=Number(r.y2);return [x1,y1,x2,y2].every(Number.isFinite)&&x2>x1&&y2>y1?{x1,y1,x2,y2}:null};
+  const size=(rows)=>{const xs=rows.flatMap(r=>[Number(r?.region?.x1),Number(r?.region?.x2)]).filter(Number.isFinite);const ys=rows.flatMap(r=>[Number(r?.region?.y1),Number(r?.region?.y2)]).filter(Number.isFinite);return {w:xs.length?Math.max(...xs):0,h:ys.length?Math.max(...ys):0};};
+  const refBox=boxOf(referenceCandidate); if(!refBox)return null;
+  const rs=size(referenceRows||[]),ts=size(targetRows||[]); if(!rs.w||!rs.h||!ts.w||!ts.h)return null;
+  const rn={x:(refBox.x1+refBox.x2)/(2*rs.w),y:(refBox.y1+refBox.y2)/(2*rs.h),w:(refBox.x2-refBox.x1)/rs.w,h:(refBox.y2-refBox.y1)/rs.h};
+  const norm=v=>String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğışöüıİ]/g,c=>({ç:'c',ğ:'g',ı:'i',İ:'i',ş:'s',ö:'o',ü:'u'}[c]||c));
+  const stop=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
+  const nameLike=v=>{const t=String(v||'').trim();if(!t||/\d/.test(t))return false;const ws=t.split(/\s+/).filter(Boolean);if(ws.length<2||ws.length>6)return false;const up=ws.map(w=>norm(w).toUpperCase());if(up.some(w=>stop.has(w)))return false;return ws.every(w=>/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]{2,}$/.test(w));};
+  const ibanLike=v=>/^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
+  const valid=field==='recipientName'?nameLike:ibanLike;
+  const scored=targetRows.filter(r=>r?.region&&valid(r.text)).map(r=>{const b=boxOf(r),n={x:(b.x1+b.x2)/(2*ts.w),y:(b.y1+b.y2)/(2*ts.h),w:(b.x2-b.x1)/ts.w,h:(b.y2-b.y1)/ts.h};const d=Math.hypot(n.x-rn.x,n.y-rn.y),sd=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,rn.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,rn.h)));return {r,d,sd,score:100-d*180-sd*18};}).sort((a,b)=>b.score-a.score);
+  const best=scored[0];return best&&best.score>=55?{text:String(best.r.text).trim(),region:best.r.region,score:Number(best.score.toFixed(2)),resolver:`reference-geometry-${field}-v152`}:null;
+}
+
 async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null, amountForensics = null, referenceAmountFieldArg = null) {
   const referenceAmountField = referenceAmountFieldArg || null;
   const normalizedBank = normalizeBank(bank);
@@ -9845,6 +9909,17 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       recipientName: resolveMathSemanticValueBox(targetOCR?.regions || [], 'recipientName'),
       recipientIban: resolveMathSemanticValueBox(targetOCR?.regions || [], 'recipientIban'),
     };
+    // V1.5.2: Enpara can expose the beneficiary value without a clean OCR
+    // "ALICI" label on the target. If the trusted reference semantic ROI is
+    // known, resolve the target by normalized geometry, but ONLY among strict
+    // name/IBAN candidates. Never use an arbitrary numeric/text box.
+    for (const field of ['recipientName','recipientIban']) {
+      if (targetSemanticRegions[field]) continue;
+      const refCandidate=semanticValueRegions[field];
+      if (!refCandidate) continue;
+      const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],refOCR?.regions||[]);
+      if (fallback) targetSemanticRegions[field]=fallback;
+    }
 
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
     const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
@@ -12478,7 +12553,25 @@ return String(a.text).localeCompare(String(b.text));
 // The ranked list is the single source of truth for the selected amount.
 // Analyze 30 accidentally referenced `candidate` without defining it, which
 // caused a Vercel ReferenceError before the amount result could be returned.
-const candidate = rankedCandidates[0] || null;
+// V1.5.2: money-format gate. A reference-guided amount candidate must either
+// carry an explicit currency/decimal money form or be explicitly tied to a
+// primary amount label. Plain IDs (Fiş No / Referans No / Sıra No) are not
+// allowed to win merely because they are numeric.
+const moneyFormatV152 = /^(?:[-+]?\s*(?:₺|TL|TRY|EUR|USD|GBP)\s*)?[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{2})(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?$/i;
+const explicitAmountRoleV152 = (c) => Boolean(
+  c?.inlineAmountLabel || c?.directLabelEvidence?.hard || c?.reconstructedLabelEvidence?.hard ||
+  /(?:giden\s*fast|gönderilen\s*(?:fast\s*)?tutar|işlem\s*tutar|transfer\s*tutar|ana\s*tutar|giden\s*tutar|tutar)/i.test(String(c?.directLabelEvidence?.label || c?.reconstructedLabelEvidence?.label || ''))
+);
+const gatedRankedCandidatesV152 = rankedCandidates.filter(c => {
+  const text=String(c?.text||'').replace(/\s+/g,' ').trim();
+  const money=moneyFormatV152.test(text);
+  const explicit=explicitAmountRoleV152(c);
+  const idLike=/^(?:\d{7,}|20\d{6,}|\d{1,6})$/.test(text);
+  if (money) return true;
+  if (explicit && !/(?:IBAN|REFERANS|FIS|SIRA|HESAP|MÜŞTERİ|MUSTERI|SORGU)/i.test(text)) return true;
+  return !idLike && explicit;
+});
+const candidate = gatedRankedCandidatesV152[0] || null;
 
 if (!candidate) {
   console.warn(
@@ -13235,6 +13328,8 @@ directAmountLabelScore: Number(candidate.directLabelEvidence?.score || 0),
 directAmountLabel: candidate.directLabelEvidence?.label || null,
 },
 selectionMethod,
+selectionGate: 'money-format-or-explicit-primary-amount-v1.5.2',
+gatedCandidateCount: gatedRankedCandidatesV152.length,
 selectedAmountText: normalizeOCRAmountLiteral(candidate.text),
 referenceAmountText: null,
 segmentFeatures: features.map((feature, index) => ({
