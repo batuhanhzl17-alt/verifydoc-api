@@ -20,9 +20,22 @@ export function recipientNameLabel(value) {
   if (/^(MUSTERI|GONDEREN|GONDERICI)(?: |$)/.test(label)) return null;
 
   const compact = label.replace(/\s+/g, '');
-  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI))?$/.test(compact)) return 'recipientName';
+  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADISOYAD|ADISOYADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI))?$/.test(compact)) return 'recipientName';
   if (/^(?:BENEFICIARY|BENEFICIARYNAME|PAYEE|PAYEENAME|RECEIVER|RECEIVERNAME|LEHDAR|LEHDARADI|LEHDARUNVANI)$/.test(compact)) return 'recipientName';
   return null;
+}
+
+/** Only labels that explicitly identify the beneficiary/payee may own its IBAN ROI. */
+export function recipientIbanLabel(value) {
+  const compact = normalizeSemanticLabel(String(value ?? '').split(/[:：]/, 1)[0]).replace(/\s+/g, '');
+  return /^(?:ALICI|ALACAKLI|LEHDAR)(?:(?:HESAP|BANKA)(?:IBAN|NO|NUMARASI)?|IBAN(?:NO|NUMARASI)?|HESAPNO|HESAPNUMARASI|HESABI)$/.test(compact) ||
+    /^(?:BENEFICIARY|PAYEE|RECEIVER)(?:(?:ACCOUNT|BANK))?(?:IBAN|IBANNO|ACCOUNT|ACCOUNTNUMBER)$/.test(compact);
+}
+
+/** Sender and unqualified IBAN labels must never be promoted to recipientIban. */
+export function senderIbanLabel(value) {
+  const compact = normalizeSemanticLabel(String(value ?? '').split(/[:：]/, 1)[0]).replace(/\s+/g, '');
+  return /^(?:GONDEREN|GONDERICI|SENDER|ORIGINATOR)(?:(?:HESAP|ACCOUNT))?(?:IBAN|HESAPNO|ACCOUNTNUMBER)$/.test(compact);
 }
 
 export function normalizeTurkishIban(value) {
