@@ -20,7 +20,11 @@ export function recipientNameLabel(value) {
   if (/^(MUSTERI|GONDEREN|GONDERICI)(?: |$)/.test(label)) return null;
 
   const compact = label.replace(/\s+/g, '');
-  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADISOYAD|ADISOYADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI|ADIUNVANI|ADIUNVAN|ISIMUNVANI|ISIMUNVAN|ADIISIM|ADIISIMUNVANI|ADIISIMUNVAN|ADISOYADUNVANI))?$/.test(compact)) return 'recipientName';
+  // Enpara/FAST variants can render the beneficiary label as "Alıcı",
+  // "Alıcı Adı", "Alıcı Adı Soyadı", "Alıcı İsim/Unvan" or
+  // "Alıcı Ünvanı". Do not accept "Alıcı Banka/Hesap/IBAN" here.
+  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADISOYAD|ADISOYADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI|ISIMUNVAN|ISIMUNVANI))?$/.test(compact)) return 'recipientName';
+  if (/^(?:ALICI|ALACAKLI)(?:ADI|ADISOYAD|ADSOYAD|UNVAN|ISIM|ISIMUNVAN)(?:UNVANI|SOYADI)?$/.test(compact)) return 'recipientName';
   if (/^(?:BENEFICIARY|BENEFICIARYNAME|PAYEE|PAYEENAME|RECEIVER|RECEIVERNAME|LEHDAR|LEHDARADI|LEHDARUNVANI)$/.test(compact)) return 'recipientName';
   return null;
 }
@@ -63,88 +67,100 @@ function boxOf(item) {
     : null;
 }
 
-/** Resolve a multi-line recipient name/title from OCR regions.
- *  Only regions immediately to the right of, or directly below, an explicit
- *  recipient label are joined. This prevents unrelated customer/sender text
- *  from becoming the recipient ROI.
+
+
+/**
+ * V1.5.4: Enpara often returns the entire beneficiary block as one OCR region,
+ * e.g. `ALICI UNVANI: Sudenaz Özel ALICI IBAN: TR...`.
+ * A resolver that only looks at the first colon cannot recover either value.
+ * Split known recipient labels inside the same OCR region and derive a tight
+ * sub-box from the character span. This is geometry-first: OCR label matching
+ * is used only to locate semantic anchors; the ROI itself is the value span.
  */
-export function resolveSplitRecipientName(regions, label) {
-  const rows = Array.isArray(regions) ? regions : [];
-  const labelBox = boxOf(label);
-  if (!labelBox) return null;
-  const labelText = String(label?.text && /[:：]/.test(label.text) ? label.text : (label?.labelText || label?.text || ''));
-  const inlineParts = labelText.split(/[:：]/);
-  const inline = inlineParts.length > 1 ? inlineParts.slice(1).join(' ').trim() : '';
-  const isName = (text) => {
-    const s = String(text || '').trim();
-    if (!s || s.length < 2 || s.length > 120) return false;
-    if (/^TR\d{2}/i.test(s) || /\d{4,}/.test(s)) return false;
-    if (/(?:müşterinin yaptığı işlemlere ilişkin|dekont asıllarının|işlemlere ilişkin)/i.test(s)) return false;
-    const letters = (s.match(/[A-Za-zÇĞİÖŞÜçğıöşü]/g) || []).length;
-    return letters >= 3;
+export function resolveRecipientInlineSegments(item) {
+  const raw = String(item?.text || '').trim();
+  const parent = boxOf(item);
+  if (!raw || !parent) return [];
+
+  const labelAlternatives = [
+    'ALICI\\s+(?:UNVANI|UNVAN|ADI\\s+SOYADI|ADI|ISMI|ISIM\\s*[/]\\s*UNVAN)',
+    'ALACAKLI\\s+(?:UNVANI|UNVAN|ADI\\s+SOYADI|ADI|ISMI|ISIM\\s*[/]\\s*UNVAN)',
+    'BENEFICIARY\\s+NAME', 'PAYEE\\s+NAME', 'RECEIVER\\s+NAME',
+    'ALICI\\s+(?:IBAN|HESAP(?:\\s+(?:NO|NUMARASI|IBAN))?|BANKA(?:\\s+(?:IBAN|NO|NUMARASI))?)',
+    'ALACAKLI\\s+(?:IBAN|HESAP(?:\\s+(?:NO|NUMARASI|IBAN))?|BANKA(?:\\s+(?:IBAN|NO|NUMARASI))?)',
+    'BENEFICIARY\\s+(?:IBAN|ACCOUNT(?:\\s+NUMBER)?|BANK(?:\\s+IBAN)?)',
+    'PAYEE\\s+(?:IBAN|ACCOUNT(?:\\s+NUMBER)?|BANK(?:\\s+IBAN)?)',
+    'RECEIVER\\s+(?:IBAN|ACCOUNT(?:\\s+NUMBER)?|BANK(?:\\s+IBAN)?)',
+  ];
+  const re = new RegExp(`(?:^|(?<=\\s))(${labelAlternatives.join('|')})(?=\\s*[:：]?)`, 'giu');
+  const matches = [];
+  let m;
+  while ((m = re.exec(raw))) {
+    const labelText = String(m[1] || '').trim();
+    const normalized = normalizeSemanticLabel(labelText);
+    const field = recipientIbanLabel(normalized) ? 'recipientIban'
+      : recipientNameLabel(normalized) ? 'recipientName' : null;
+    if (!field) continue;
+    matches.push({ start: m.index + (m[0].length - m[1].length), end: re.lastIndex, labelText, field });
+  }
+  if (!matches.length) return [];
+
+  const makeSubBox = (start, end) => {
+    const totalW = Math.max(1, parent.x2 - parent.x1);
+    const n = Math.max(1, raw.length);
+    const x1 = parent.x1 + totalW * Math.max(0, Math.min(1, start / n));
+    const x2 = parent.x1 + totalW * Math.max(0, Math.min(1, end / n));
+    return { x1, y1: parent.y1, x2: Math.max(x1 + 2, x2), y2: parent.y2 };
   };
-  if (inline && isName(inline)) {
-    return { text: inline, region: labelBox, score: 100, criticalROI: true, resolver: 'semantic-recipient-inline-v1' };
-  }
 
-  const pool = rows
-    .filter(item => item && item !== label && String(item.text || '').trim())
-    .map(item => ({ item, box: boxOf(item), text: String(item.text || '').trim() }))
-    .filter(x => x.box && isName(x.text));
-  const labelH = Math.max(6, labelBox.y2 - labelBox.y1);
-  const candidates = [];
+  const out = [];
+  for (let i = 0; i < matches.length; i++) {
+    const current = matches[i];
+    const next = matches[i + 1];
+    let valueStart = current.end;
+    while (valueStart < raw.length && /[\s:：]/u.test(raw[valueStart])) valueStart++;
+    let valueEnd = next ? next.start : raw.length;
+    while (valueEnd > valueStart && /[\s:：,;]+/u.test(raw[valueEnd - 1])) valueEnd--;
+    const value = raw.slice(valueStart, valueEnd).trim();
+    if (!value) continue;
 
-  for (const first of pool) {
-    const vertical = Math.min(first.box.y2, labelBox.y2) - Math.max(first.box.y1, labelBox.y1);
-    const rightGap = first.box.x1 - labelBox.x2;
-    const belowGap = first.box.y1 - labelBox.y2;
-    const centerDelta = Math.abs((first.box.x1 + first.box.x2) / 2 - (labelBox.x1 + labelBox.x2) / 2);
-    const sameLine = vertical >= -labelH * 0.45 && rightGap >= -labelH * 0.25 && rightGap < Math.max(420, labelH * 18);
-    const below = belowGap >= -labelH * 0.3 && belowGap < Math.max(150, labelH * 5) && centerDelta < Math.max(420, labelH * 18);
-    if (!sameLine && !below) continue;
-
-    const baseCost = sameLine
-      ? Math.abs(rightGap) / labelH + Math.abs((first.box.y1 + first.box.y2 - labelBox.y1 - labelBox.y2) / 2) / labelH * 0.7
-      : 3 + Math.max(0, belowGap) / labelH + centerDelta / labelH * 0.12;
-    candidates.push({ first, sameLine, cost: baseCost });
-  }
-
-  const joined = [];
-  for (const c of candidates) {
-    const parts = [c.first];
-    let current = c.first;
-    // Join at most two additional lines, only when the next line is vertically
-    // close and horizontally aligned with the current text block.
-    for (let depth = 0; depth < 2; depth++) {
-      const next = pool
-        .filter(x => !parts.includes(x))
-        .map(x => {
-          const gap = x.box.y1 - current.box.y2;
-          const overlap = Math.min(x.box.x2, current.box.x2) - Math.max(x.box.x1, current.box.x1);
-          const overlapRatio = overlap / Math.max(1, Math.min(x.box.x2 - x.box.x1, current.box.x2 - current.box.x1));
-          const center = Math.abs((x.box.x1 + x.box.x2) / 2 - (current.box.x1 + current.box.x2) / 2);
-          return { x, gap, overlapRatio, center };
-        })
-        .filter(x => x.gap >= -labelH * 0.3 && x.gap <= labelH * 2.8 && (x.overlapRatio >= 0.15 || x.center <= labelH * 5))
-        .sort((a, b) => (a.gap + a.center * 0.08) - (b.gap + b.center * 0.08))[0];
-      if (!next) break;
-      parts.push(next.x);
-      current = next.x;
+    let valueText = value;
+    if (current.field === 'recipientIban') {
+      const normalizedIban = normalizeTurkishIban(value);
+      if (!hasTurkishIbanShape(normalizedIban)) continue;
+      valueText = normalizedIban;
+    } else {
+      // Reject transaction vocabulary or a second label accidentally absorbed
+      // into the value. Names must remain human/company-name shaped.
+      const words = value.split(/\s+/).filter(Boolean);
+      const canonical = normalizeSemanticLabel(value);
+      const action = /(?:^|\s)(?:GIDEN|FAST|EFT|HAVALE|TRANSFER|ISLEM|TUTAR|PARA|CINSI|IBAN|HESAP|BANKA|SORGU|NO)(?:$|\s)/u.test(canonical);
+      const alphaTokenCount = words.filter(w => w.replace(/[^A-ZÇĞİÖŞÜa-zçğıöşü]/giu, '').length >= 2).length;
+      // OCR can turn a glyph into a digit (e.g. Gök -> G6k). Once the
+      // semantic label is trusted, do not reject the ROI solely because one
+      // character is misrecognized. Reject only numeric/action-like content.
+      if (action || alphaTokenCount < 2 || words.length < 2 || words.length > 6) continue;
     }
-    const text = parts.map(x => x.text).join(' ').replace(/\s+/g, ' ').trim();
-    const box = {
-      x1: Math.min(...parts.map(x => x.box.x1)),
-      y1: Math.min(...parts.map(x => x.box.y1)),
-      x2: Math.max(...parts.map(x => x.box.x2)),
-      y2: Math.max(...parts.map(x => x.box.y2)),
-    };
-    joined.push({ text, region: box, score: Math.max(0, 100 - c.cost * 8), criticalROI: true, resolver: 'semantic-recipient-line-join-v1', _cost: c.cost });
+
+    // Tighten the ROI to the value characters, not the whole parent OCR line.
+    // Keep a tiny horizontal padding so glyph edges are not clipped.
+    const valueBox = makeSubBox(valueStart, valueEnd);
+    const pad = Math.min(6, Math.max(1, (valueBox.x2 - valueBox.x1) * 0.025));
+    valueBox.x1 = Math.max(parent.x1, valueBox.x1 - pad);
+    valueBox.x2 = Math.min(parent.x2, valueBox.x2 + pad);
+    out.push({
+      text: valueText,
+      valueText,
+      field: current.field,
+      labelText: current.labelText,
+      region: valueBox,
+      parentRegion: { ...parent },
+      score: 180,
+      criticalROI: true,
+      resolver: 'semantic-inline-multi-label-v154',
+    });
   }
-  joined.sort((a, b) => a._cost - b._cost);
-  const best = joined[0];
-  if (!best) return null;
-  delete best._cost;
-  return best;
+  return out;
 }
 
 /** Resolve a line-wrapped Turkish IBAN into one logical value and union ROI. */
