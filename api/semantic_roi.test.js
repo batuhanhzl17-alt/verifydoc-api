@@ -4,11 +4,13 @@ import {
   recipientNameLabel,
   recipientIbanLabel,
   senderIbanLabel,
+  resolveSplitRecipientName,
+  resolveSplitTurkishIban,
 } from '../api/semantic_roi.js';
 
 test('recipient name aliases include common Turkish and English bank labels', () => {
   for (const label of [
-    'ALICI', 'ALICI ADI', 'ALICI ADI SOYADI', 'ALICI ÜNVANI', 'ALACAKLI ADI', 'ALACAKLI ÜNVANI',
+    'ALICI', 'ALICI ADI', 'ALICI ADI SOYADI', 'ALICI ÜNVANI', 'ALICI ADI / ÜNVANI', 'ALICI İSİM / ÜNVAN', 'ALACAKLI ADI', 'ALACAKLI ÜNVANI', 'ALACAKLI İSİM / ÜNVANI',
     'BENEFICIARY NAME', 'PAYEE NAME', 'RECEIVER NAME', 'LEHDAR',
   ]) assert.equal(recipientNameLabel(label), 'recipientName', label);
 });
@@ -33,4 +35,33 @@ test('sender IBAN labels remain distinct from recipient IBAN labels', () => {
     assert.equal(senderIbanLabel(label), true, label);
     assert.equal(recipientIbanLabel(label), false, label);
   }
+});
+
+test('recipient name resolver joins a wrapped company/person value next to an explicit recipient label', () => {
+  const label = { text: 'ALICI ÜNVANI', region: { x1: 10, y1: 10, x2: 80, y2: 24 } };
+  const rows = [
+    label,
+    { text: 'ÖZ FASHION HAZIR GİYİM TEKSTİL', region: { x1: 90, y1: 10, x2: 290, y2: 24 } },
+    { text: 'ÜRÜNLERİ SANAYİ VE TİCARET LTD ŞTİ', region: { x1: 90, y1: 26, x2: 300, y2: 40 } },
+  ];
+  const resolved = resolveSplitRecipientName(rows, label);
+  assert.equal(resolved?.resolver, 'semantic-recipient-line-join-v1');
+  assert.match(resolved.text, /ÖZ FASHION/);
+  assert.match(resolved.text, /ÜRÜNLERİ SANAYİ/);
+  assert.equal(resolved.region.y1, 10);
+  assert.equal(resolved.region.y2, 40);
+});
+
+test('recipient IBAN resolver joins a line-wrapped Turkish IBAN and returns the union ROI', () => {
+  const label = { text: 'ALICI IBAN', region: { x1: 10, y1: 10, x2: 80, y2: 24 } };
+  const rows = [
+    label,
+    { text: 'TR34 0006 2000', region: { x1: 90, y1: 10, x2: 180, y2: 24 } },
+    { text: '3270 0006 2897 00', region: { x1: 90, y1: 26, x2: 200, y2: 40 } },
+  ];
+  const resolved = resolveSplitTurkishIban(rows, label);
+  assert.equal(resolved?.text, 'TR340006200032700006289700');
+  assert.equal(resolved?.resolver, 'semantic-iban-line-join-v1');
+  assert.equal(resolved.region.y1, 10);
+  assert.equal(resolved.region.y2, 40);
 });
