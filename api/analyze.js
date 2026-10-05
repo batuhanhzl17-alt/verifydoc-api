@@ -6022,9 +6022,22 @@ async function getReferenceAmountAnchor(bank) {
           : [];
         if (!width || !height || !regions.length) continue;
 
+        // V1.4.1: Some bank OCR layouts split an amount into integer/decimal
+        // fragments (for example `758` + `37`) or return a plain integer
+        // (`750`) without the currency token. The old resolver discarded those
+        // candidates before the label relation was evaluated, which is why
+        // Halkbank `ISLEM TUTARI (TL)` could produce no reference anchor.
         const strictMoneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)\s*[-+]?\s*\d|[-+]?\d{1,3}(?:[. ]\d{3})*[,.]\d{1,2}\b|[-+]?\d{1,3}(?:[. ]\d{3})+(?:\b|\s)/i;
-        const moneyCandidates = regions.filter(r => strictMoneyRe.test(r.text) && /\d/.test(r.text));
+        const integerMoneyRe = /^[-+]?\d{1,6}$/;
+        const explicitAmountLabelRe = /(?:b\s*\/\s*a\s*para\s*cinsi\s*tutar|işlem\s*tutar(?:ı|i)?(?:\s*\(\s*(?:tl|try)\s*\))?|islem\s*tutar(?:i|ı)?(?:\s*\(\s*(?:tl|try)\s*\))?|giden\s*fast(?:\s*eft)?\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|ana\s*tutar|giden\s*tutar)/i;
+        const moneyCandidates = regions.filter(r =>
+          /\d/.test(r.text) && (strictMoneyRe.test(r.text) || integerMoneyRe.test(String(r.text).trim()))
+        );
         if (!moneyCandidates.length) continue;
+
+        // Identify explicit amount labels once so a plain integer can be
+        // accepted only when it is geometrically tied to a real amount label.
+        const amountLabels = regions.filter(r => explicitAmountLabelRe.test(String(r.text || '')));
 
         const scored = moneyCandidates.map(candidate => {
           const cr = candidate.region;
@@ -6053,12 +6066,34 @@ async function getReferenceAmountAnchor(bank) {
           if (yNorm > 0.12 && yNorm < 0.65) score += 8;
           const candidateText = String(candidate.text || '').trim();
           const integerOnly = /^[-+]?\d{1,6}$/.test(candidateText);
+
+          // Explicit-label proximity is a stronger signal than the generic
+          // `primaryLabelRe` match. It also permits OCR-split/plain-integer
+          // amounts, but only inside the amount row/field neighborhood.
+          for (const label of amountLabels) {
+            const lr = label.region;
+            const lh = Math.max(8, lr.y2 - lr.y1);
+            const lcY = (lr.y1 + lr.y2) / 2;
+            const ccY = (cr.y1 + cr.y2) / 2;
+            const sameLine = Math.abs(ccY - lcY) <= Math.max(lh * 1.5, 32);
+            const rightOfLabel = cr.x1 >= lr.x1 - lh * 0.5;
+            const horizontalGap = cr.x1 - lr.x2;
+            const closeRight = horizontalGap >= -lh && horizontalGap <= Math.max(420, lh * 18);
+            const verticalClose = Math.abs(cr.y1 - lr.y1) <= Math.max(lh * 2.0, 55);
+            const below = cr.y1 >= lr.y2 && (cr.y1 - lr.y2) <= Math.max(lh * 2.5, 80);
+            if ((sameLine && rightOfLabel && closeRight) || (below && verticalClose)) {
+              score += 170;
+              primaryHits++;
+              break;
+            }
+          }
+
           if (integerOnly && primaryHits === 0) score -= 180;
           if (/[-/]\d|\b(?:IBAN|NO|NUMARASI|REFERANS|HESAP|FIS|SIRA)\b/i.test(candidateText)) score -= 220;
           return { candidate, score, primaryHits, negativeHits };
         }).sort((a,b) => b.score - a.score);
 
-        const best = scored.find(x => x.primaryHits > 0 && x.negativeHits === 0 && (x.score >= 40 || !/^[-+]?\d{1,6}$/.test(String(x.candidate?.text || '').trim()))) || null;
+        const best = scored.find(x => x.primaryHits > 0 && x.negativeHits === 0 && x.score >= 40) || null;
         if (!best || best.score < 20) continue;
         const r = best.candidate.region;
         entries.push({
@@ -6075,7 +6110,7 @@ async function getReferenceAmountAnchor(bank) {
 
     if (!entries.length) {
       referenceAmountAnchorCache.set(cacheKey, null);
-      console.warn('REFERENCE AMOUNT ANCHOR V16: UYGUN TUTAR ALANI BULUNAMADI');
+      console.warn('REFERENCE AMOUNT ANCHOR V16.1: UYGUN TUTAR ALANI BULUNAMADI');
       return null;
     }
 
@@ -6093,10 +6128,10 @@ async function getReferenceAmountAnchor(bank) {
         width: Math.max(...entries.map(x => x.widthNorm)) - Math.min(...entries.map(x => x.widthNorm)),
         height: Math.max(...entries.map(x => x.heightNorm)) - Math.min(...entries.map(x => x.heightNorm)),
       },
-      source: 'trusted-telegram-raster-ensemble-v16',
+      source: 'trusted-telegram-raster-ensemble-v16.1-explicit-amount-label-fallback',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
-    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE V16:', JSON.stringify({
+    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE V16.1:', JSON.stringify({
       bank: anchor.bank, pageNumber: anchor.pageNumber,
       xNorm: anchor.xNorm, yNorm: anchor.yNorm,
       widthNorm: anchor.widthNorm, heightNorm: anchor.heightNorm,
