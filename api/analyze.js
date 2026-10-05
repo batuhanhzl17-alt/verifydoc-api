@@ -271,11 +271,58 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
   const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
 
   let roiForensics = null;
+  let semanticReferenceMeasurements = null;
   let global16x16 = { available: false, reason: 'reference-unavailable' };
   if (referencePath && Object.keys(referenceRegions).length) {
     try {
       const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
+
+      // V1.5: expose the actual mathematical measurements extracted from the
+      // SAME semantic ROIs on both sides. This is deliberately a compact
+      // diagnostic object: the full 16x16 cells remain available through
+      // roi16x16, while this block makes it explicit which reference ROI was
+      // found and which mathematical fingerprint was measured.
+      semanticReferenceMeasurements = {};
+      for (const field of ['amount', 'recipientName', 'recipientIban']) {
+        const t = fingerprint?.roi16x16?.[field] || null;
+        const r = referenceFingerprint?.roi16x16?.[field] || null;
+        const c = roiForensics?.[field] || null;
+        semanticReferenceMeasurements[field] = {
+          available: Boolean(t?.metrics && r?.metrics),
+          targetSourceBox: t?.sourceBox || null,
+          referenceSourceBox: r?.sourceBox || null,
+          targetMetrics: t?.metrics || null,
+          referenceMetrics: r?.metrics || null,
+          targetRawMetrics: t?.rawMetrics || null,
+          referenceRawMetrics: r?.rawMetrics || null,
+          targetNormalization: t?.normalization || null,
+          referenceNormalization: r?.normalization || null,
+          targetAlignment: t?.alignment || null,
+          referenceAlignment: r?.alignment || null,
+          comparison: c ? {
+            meanDistance: c.meanDistance,
+            maxCellDistance: c.maxCellDistance,
+            metricDistances: c.metricDistances,
+            rawMetricDistances: c.rawMetricDistances,
+            topCells: c.topCells,
+            grid: c.grid,
+            cellCount: c.cellCount,
+          } : null,
+        };
+      }
+
+      console.log('MATH SEMANTIC REFERENCE FINGERPRINT V1.5:', JSON.stringify(
+        Object.fromEntries(Object.entries(semanticReferenceMeasurements).map(([field, v]) => [field, {
+          available: v.available,
+          referenceSourceBox: v.referenceSourceBox,
+          targetSourceBox: v.targetSourceBox,
+          meanDistance: v.comparison?.meanDistance ?? null,
+          maxCellDistance: v.comparison?.maxCellDistance ?? null,
+          grid: v.comparison?.grid || '16x16',
+          cellCount: v.comparison?.cellCount || 0,
+        }]))
+      ));
       const criticalRoiBoxes = Object.fromEntries(Object.entries(semanticRois).map(([field, pair]) => [field, { target: pair?.target, reference: pair?.reference }]));
       global16x16 = compareGlobal16x16(fingerprint, referenceFingerprint, criticalRoiBoxes, {
         differentThreshold: 3.5,
@@ -377,8 +424,8 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.4.0-16X16-CRITICAL-ROI-GUARDED',
-    engine: 'mathematical-forensics-v1.4-16x16-critical-roi-guarded',
+    version: 'MATH-FORENSICS-V1.5.0-SEMANTIC-REFERENCE-ROI',
+    engine: 'mathematical-forensics-v1.5-semantic-reference-roi',
     bank,
     family,
     reference,
@@ -398,6 +445,10 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
       }
     },
     criticalRoiMismatches,
+    // Compact semantic measurement view. This explicitly proves that the
+    // reference-side recipientName / recipientIban / amount ROIs were
+    // measured mathematically when their boxes were available.
+    semanticReferenceMeasurements,
     roi16x16: roiForensics,
     roiSummary: {
       available: roiRows.length > 0,
@@ -5965,7 +6016,7 @@ count,
 async function getReferenceAmountAnchor(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
-  const cacheKey = `amount-anchor:v16:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}`;
+  const cacheKey = `amount-anchor:v17:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
   const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
@@ -6037,7 +6088,59 @@ async function getReferenceAmountAnchor(bank) {
 
         // Identify explicit amount labels once so a plain integer can be
         // accepted only when it is geometrically tied to a real amount label.
-        const amountLabels = regions.filter(r => explicitAmountLabelRe.test(String(r.text || '')));
+        // PaddleOCR can split headers such as `B/A` + `Para Cinsi` + `Tutar`
+        // into separate regions. Build synthetic label regions from adjacent
+        // same-line tokens as well; otherwise the raster fallback has no
+        // reliable anchor to work from.
+        const amountLabels = [];
+        const pushAmountLabel = (text, region, source = 'ocr') => {
+          if (!region || !Number.isFinite(region.x1) || !Number.isFinite(region.y1)) return;
+          if (!String(text || '').trim()) return;
+          amountLabels.push({ text: String(text).trim(), region, source });
+        };
+        for (const r of regions) {
+          if (explicitAmountLabelRe.test(String(r.text || '')) || /\btutar(?:ı|i)?\b/i.test(String(r.text || ''))) {
+            pushAmountLabel(r.text, r.region, 'ocr-token');
+          }
+        }
+        const labelTokens = regions
+          .filter(r => /(?:b\s*\/?\s*a|para|cinsi|tutar(?:ı|i)?|islem|işlem|tl|try)/i.test(String(r.text || '')))
+          .sort((a,b) => a.region.y1 - b.region.y1 || a.region.x1 - b.region.x1);
+        for (let i = 0; i < labelTokens.length; i++) {
+          const base = labelTokens[i];
+          const br = base.region;
+          const bh = Math.max(8, br.y2 - br.y1);
+          const line = labelTokens.filter(other => {
+            if (other === base) return false;
+            const or = other.region;
+            const oh = Math.max(8, or.y2 - or.y1);
+            const cy = (br.y1 + br.y2) / 2;
+            const oy = (or.y1 + or.y2) / 2;
+            return Math.abs(cy - oy) <= Math.max(bh, oh) * 1.15 &&
+              or.x1 >= br.x1 - Math.max(bh, oh) * 1.5 &&
+              or.x1 <= br.x2 + Math.max(bh, oh) * 14;
+          });
+          if (line.length) {
+            const group = [base, ...line].sort((a,b) => a.region.x1 - b.region.x1);
+            const joined = group.map(x => String(x.text || '').trim()).filter(Boolean).join(' ');
+            if (explicitAmountLabelRe.test(joined) || /(?:para|cinsi|tutar|islem|işlem)/i.test(joined)) {
+              const x1 = Math.min(...group.map(x => x.region.x1));
+              const y1 = Math.min(...group.map(x => x.region.y1));
+              const x2 = Math.max(...group.map(x => x.region.x2));
+              const y2 = Math.max(...group.map(x => x.region.y2));
+              pushAmountLabel(joined, { x1, y1, x2, y2 }, 'ocr-reconstructed');
+            }
+          }
+        }
+        // De-duplicate identical boxes/text so scoring remains deterministic.
+        const seenAmountLabels = new Set();
+        const uniqueAmountLabels = amountLabels.filter(label => {
+          const r = label.region;
+          const key = `${label.text.toLowerCase()}|${Math.round(r.x1)}|${Math.round(r.y1)}|${Math.round(r.x2)}|${Math.round(r.y2)}`;
+          if (seenAmountLabels.has(key)) return false;
+          seenAmountLabels.add(key);
+          return true;
+        });
 
         const scored = moneyCandidates.map(candidate => {
           const cr = candidate.region;
@@ -6108,88 +6211,118 @@ async function getReferenceAmountAnchor(bank) {
             const imgW = Number(raw.info?.width) || width;
             const imgH = Number(raw.info?.height) || height;
             const pixels = raw.data;
-
             const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
             const isInk = v => Number(v) < 185;
-            const projectionRuns = (values, minCount = 1, mergeGap = 6) => {
+            const makeRuns = (values, minCount = 1, mergeGap = 6) => {
               const runs = [];
-              let start = -1;
+              let startRun = -1;
               let last = -1;
               for (let i = 0; i < values.length; i++) {
                 if (values[i] >= minCount) {
-                  if (start < 0) start = i;
+                  if (startRun < 0) startRun = i;
                   last = i;
-                } else if (start >= 0 && i - last > mergeGap) {
-                  runs.push({ start, end: last });
-                  start = -1;
+                } else if (startRun >= 0 && i - last > mergeGap) {
+                  runs.push({ start: startRun, end: last });
+                  startRun = -1;
                   last = -1;
                 }
               }
-              if (start >= 0) runs.push({ start, end: last });
+              if (startRun >= 0) runs.push({ start: startRun, end: last });
               return runs;
             };
-
             const rasterCandidates = [];
+
+            const inspectBand = (label, mode, x1, x2, y1, y2) => {
+              const lr = label.region;
+              const lh = Math.max(8, lr.y2 - lr.y1);
+              const bx1 = clamp(Math.floor(x1), 0, imgW - 1);
+              const bx2 = clamp(Math.ceil(x2), bx1 + 1, imgW);
+              const by1 = clamp(Math.floor(y1), 0, imgH - 1);
+              const by2 = clamp(Math.ceil(y2), by1 + 1, imgH);
+
+              // First isolate horizontal text bands. This prevents an Enpara
+              // header-over-value search from merging the value with the
+              // horizontal table border below it.
+              const rowInk = new Array(by2 - by1).fill(0);
+              for (let y = by1; y < by2; y++) {
+                const row = y * imgW;
+                for (let x = bx1; x < bx2; x++) if (isInk(pixels[row + x])) rowInk[y - by1]++;
+              }
+              const rowRuns = makeRuns(rowInk, Math.max(2, Math.floor(lh * 0.18)), 2);
+
+              for (const rowRun of rowRuns) {
+                const bandY1 = by1 + rowRun.start;
+                const bandY2 = by1 + rowRun.end + 1;
+                const bandH = bandY2 - bandY1;
+                if (bandH < Math.max(3, lh * 0.35) || bandH > Math.max(70, lh * 2.8)) continue;
+
+                const columnInk = new Array(bx2 - bx1).fill(0);
+                for (let y = bandY1; y < bandY2; y++) {
+                  const row = y * imgW;
+                  for (let x = bx1; x < bx2; x++) if (isInk(pixels[row + x])) columnInk[x - bx1]++;
+                }
+                const runs = makeRuns(columnInk, Math.max(1, Math.floor(bandH * 0.15)), Math.max(5, Math.round(lh * 0.7)));
+                for (const run of runs) {
+                  const rx1 = bx1 + run.start;
+                  const rx2 = bx1 + run.end + 1;
+                  const rw = rx2 - rx1;
+                  if (rw < Math.max(18, lh * 1.5) || rw > Math.min(420, imgW * 0.42)) continue;
+
+                  let minY = bandY2, maxY = bandY1, inkCount = 0;
+                  for (let y = bandY1; y < bandY2; y++) {
+                    const row = y * imgW;
+                    for (let x = rx1; x < rx2; x++) {
+                      if (isInk(pixels[row + x])) {
+                        minY = Math.min(minY, y);
+                        maxY = Math.max(maxY, y);
+                        inkCount++;
+                      }
+                    }
+                  }
+                  if (inkCount < 18 || maxY <= minY) continue;
+                  const rh = maxY - minY + 1;
+                  if (rh < Math.max(3, lh * 0.45) || rh > Math.max(70, lh * 2.5)) continue;
+
+                  const gapRight = rx1 - lr.x2;
+                  const centerX = (rx1 + rx2) / 2;
+                  const labelCenterX = (lr.x1 + lr.x2) / 2;
+                  const horizontalRelation = Math.abs(centerX - labelCenterX) / Math.max(1, imgW);
+                  const compactness = Math.min(1, rw / Math.max(1, lh * 10));
+                  const inkDensity = inkCount / Math.max(1, rw * rh);
+                  let score = 0;
+                  if (mode === 'right') {
+                    score = 1200 - Math.abs(gapRight - lh * 2) * 2 - compactness * 220 + (rx1 / imgW) * 120 + Math.min(120, inkDensity * 1000);
+                  } else {
+                    const verticalGap = minY - lr.y2;
+                    score = 1150 - Math.abs(verticalGap - lh * 2.2) * 3 - horizontalRelation * 500 - compactness * 180 + Math.min(120, inkDensity * 1000);
+                  }
+                  rasterCandidates.push({ score, mode, box: { x1: rx1, y1: minY, x2: rx2, y2: maxY + 1 }, label: String(label.text || '') });
+                }
+              }
+            };
+
             for (const label of amountLabels) {
               const lr = label.region;
               const lh = Math.max(8, lr.y2 - lr.y1);
+              const lw = Math.max(lh * 3, lr.x2 - lr.x1);
               const cy = (lr.y1 + lr.y2) / 2;
-              const y1 = clamp(Math.floor(cy - Math.max(lh * 1.8, 28)), 0, imgH - 1);
-              const y2 = clamp(Math.ceil(cy + Math.max(lh * 1.8, 28)), y1 + 1, imgH);
-              const xStart = clamp(Math.floor(lr.x2 + Math.max(lh * 0.5, 8)), 0, imgW - 1);
-              const xEnd = imgW;
-              const columnInk = new Array(Math.max(0, xEnd - xStart)).fill(0);
-              let totalInk = 0;
 
-              for (let y = y1; y < y2; y++) {
-                const row = y * imgW;
-                for (let x = xStart; x < xEnd; x++) {
-                  if (isInk(pixels[row + x])) {
-                    columnInk[x - xStart]++;
-                    totalInk++;
-                  }
-                }
-              }
-              if (totalInk < 20) continue;
+              // Same-line/right-side layout: Halkbank and many bank forms.
+              inspectBand(
+                label, 'right',
+                lr.x2 + Math.max(2, lh * 0.3), imgW,
+                cy - Math.max(lh * 1.6, 24), cy + Math.max(lh * 1.6, 24)
+              );
 
-              const runs = projectionRuns(columnInk, 1, Math.max(5, Math.round(lh * 0.55)));
-              for (const run of runs) {
-                const rx1 = xStart + run.start;
-                const rx2 = xStart + run.end + 1;
-                const rw = rx2 - rx1;
-                if (rw < Math.max(12, lh * 1.2) || rw > Math.min(500, imgW * 0.45)) continue;
-
-                let minY = y2, maxY = y1;
-                let inkCount = 0;
-                for (let y = y1; y < y2; y++) {
-                  const row = y * imgW;
-                  for (let x = rx1; x < rx2; x++) {
-                    if (isInk(pixels[row + x])) {
-                      minY = Math.min(minY, y);
-                      maxY = Math.max(maxY, y);
-                      inkCount++;
-                    }
-                  }
-                }
-                if (inkCount < 20 || maxY <= minY) continue;
-
-                // Prefer a compact text-like run close to the label and toward
-                // the right edge of the transaction row. Penalize very wide
-                // regions, which are more likely to be prose/table borders.
-                const gap = rx1 - lr.x2;
-                const compactness = Math.min(1, rw / Math.max(1, lh * 12));
-                const score =
-                  1000 -
-                  Math.abs(gap - lh * 2.5) * 2 -
-                  compactness * 250 +
-                  (rx1 / imgW) * 120 +
-                  Math.min(80, inkCount / 10);
-                rasterCandidates.push({
-                  score,
-                  box: { x1: rx1, y1: minY, x2: rx2, y2: maxY + 1 },
-                  label: String(label.text || ''),
-                });
-              }
+              // Header-over-value layout: Enpara's `B/A Para Cinsi Tutar`
+              // header sits above the actual numeric value. Search below the
+              // label while keeping the candidate horizontally aligned with
+              // the `Tutar` portion of the header.
+              inspectBand(
+                label, 'below',
+                Math.max(0, lr.x2 - lw * 0.45), Math.min(imgW, lr.x2 + lw * 0.55),
+                lr.y2 + Math.max(2, lh * 0.4), lr.y2 + Math.max(lh * 7, 150)
+              );
             }
 
             rasterCandidates.sort((a, b) => b.score - a.score);
@@ -6201,18 +6334,19 @@ async function getReferenceAmountAnchor(bank) {
                 score: 45,
                 primaryHits: 1,
                 negativeHits: 0,
-                source: 'raster-label-adjacent-projection',
+                source: `raster-label-${rasterBest.mode}-projection`,
               };
-              console.log('REFERENCE AMOUNT ANCHOR V1.4.2.1 RASTER FALLBACK:', JSON.stringify({
+              console.log('REFERENCE AMOUNT ANCHOR V1.4.2.2 RASTER FALLBACK:', JSON.stringify({
                 bank: normalizedBank,
                 referenceFile: path.basename(referencePath),
                 selectedBox: r,
                 label: rasterBest.label,
+                mode: rasterBest.mode,
                 score: rasterBest.score,
               }));
             }
           } catch (fallbackError) {
-            console.warn('REFERENCE AMOUNT ANCHOR V1.4.2.1 RASTER FALLBACK HATASI:', fallbackError?.message || fallbackError);
+            console.warn('REFERENCE AMOUNT ANCHOR V1.4.2.2 RASTER FALLBACK HATASI:', fallbackError?.message || fallbackError);
           }
         }
 
