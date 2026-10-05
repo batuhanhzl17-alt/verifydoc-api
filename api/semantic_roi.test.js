@@ -8,6 +8,15 @@ import {
   resolveSplitTurkishIban,
 } from '../api/semantic_roi.js';
 
+import { recipientNameLabel, recipientIbanLabel, resolveSplitTurkishIban } from './api/semantic_roi.js';
+const regions=[
+ {text:'ALICI',region:{x1:100,y1:200,x2:150,y2:220}},
+ {text:'BATUHAN HIZLI',region:{x1:160,y1:200,x2:300,y2:220}},
+ {text:'ALICI IBAN',region:{x1:100,y1:240,x2:180,y2:260}},
+ {text:'TR12 3456 7890 1234 5678',region:{x1:190,y1:240,x2:420,y2:260}},
+];
+console.log(JSON.stringify({nameLabel:recipientNameLabel('ALICI'),ibanLabel:recipientIbanLabel('ALICI IBAN'),joined:resolveSplitTurkishIban(regions,regions[2])},null,2));
+
 test('recipient name aliases include common Turkish and English bank labels', () => {
   for (const label of [
     'ALICI', 'ALICI ADI', 'ALICI ADI SOYADI', 'ALICI ÜNVANI', 'ALICI ADI / ÜNVANI', 'ALICI İSİM / ÜNVAN', 'ALACAKLI ADI', 'ALACAKLI ÜNVANI', 'ALACAKLI İSİM / ÜNVANI',
@@ -65,3 +74,5 @@ test('recipient IBAN resolver joins a line-wrapped Turkish IBAN and returns the 
   assert.equal(resolved.region.y1, 10);
   assert.equal(resolved.region.y2, 40);
 });
+
+
