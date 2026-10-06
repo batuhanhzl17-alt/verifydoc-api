@@ -394,7 +394,25 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   // generic numeric fallback: secondary identifiers are explicitly rejected.
   if (!validBox(amountTargetBox) && targetOCR?.regions && validBox(amountReferenceBox)) {
     const targetRows = targetOCR.regions.filter(r => validBox(r?.region) && String(r?.text || '').trim());
-    const refSize = inferRasterSize(referenceRows);
+    // FIX: `referenceRows` was never defined in this scope. The amount
+    // reference box is already expressed in the trusted reference raster's
+    // native coordinates, so derive the reference raster size directly from
+    // the selected reference file instead of depending on OCR rows.
+    let refSize = { width: 0, height: 0 };
+    try {
+      if (referencePath && path.extname(referencePath).toLowerCase() !== '.pdf') {
+        const refMeta = await sharp(referencePath).metadata();
+        refSize = { width: Number(refMeta?.width) || 0, height: Number(refMeta?.height) || 0 };
+      } else if (referencePath && path.extname(referencePath).toLowerCase() === '.pdf') {
+        const raw = await fs.readFile(referencePath);
+        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+        const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+        const refMeta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
+        refSize = { width: Number(refMeta?.width) || 0, height: Number(refMeta?.height) || 0 };
+      }
+    } catch (error) {
+      console.warn('MATH AMOUNT TARGET PROJECTION REFERENCE SIZE HATASI:', error?.message || error);
+    }
     const tarSize = inferRasterSize(targetRows);
     if (tarSize.width && tarSize.height && refSize.width && refSize.height) {
       const refNorm = normalizedBox(amountReferenceBox, refSize.width, refSize.height);
