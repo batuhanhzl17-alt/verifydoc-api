@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
+import { extractMathematicalFingerprint, compare16x16Rois, compareSemanticRoiToNegativePopulation, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -268,7 +268,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani') || n.includes('aliciisimunvan') || n.includes('beneficiaryname') || n.includes('payeename') || n.includes('lehdar')) return 'recipientName';
     if (n.includes('aliciiban') || n.includes('alici hesap') || n.includes('alacakliiban') || n.includes('lehdariban') || n.includes('beneficiaryiban') || n.includes('payeeiban') || n.includes('receiveriban') || n.includes('recipientiban')) return 'recipientIban';
     if (n.includes('recipientname') || n.includes('aliciunvan') || n.includes('aliciadi')) return 'recipientName';
-    if (n === 'amount' || n === 'totalamount' || n.includes('efttutari') || n.includes('fasttutari') || n.includes('islemtutari')) return 'amount';
+    if (n === 'amount' || n === 'totalamount' || n.includes('efttutari') || n.includes('fasttutari') || n.includes('islemtutari') || n.includes('toplamtahsilattutari') || n.includes('toplamtahsilat') || n.includes('toplamislemtutari')) return 'amount';
     return n;
   };
 
@@ -285,7 +285,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       candidates = candidates.filter(f => {
         const label = normalizeField([f?.referenceLabel, f?.targetLabel, f?.labelReference, f?.field].filter(Boolean).join(' '));
         return f?.templateRole !== 'secondaryAmount' &&
-          !/(masraf|komisyon|ucret|vergi|toplamtahsilat|toplamislem|bs?mv)/.test(label);
+          !/(masraf|komisyon|ucret|vergi|bs?mv)/.test(label);
       }).sort((a, b) => Number(b?.templateRole === 'primaryAmount') - Number(a?.templateRole === 'primaryAmount'));
     }
     const completeRow = candidates.find(f => boxFrom(f).target && boxFrom(f).reference);
@@ -520,13 +520,10 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   return rois;
 }
 
-async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
+async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null, negativeSamples = [] }) {
   if (!targetPath || !bank) {
     return { available: false, status: "missing-target-or-bank" };
   }
-  const baseline = await loadMathematicalBaseline();
-  if (!baseline) return { available: false, status: "baseline-unavailable" };
-
   const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, targetOCR, bank, referencePath });
   const ibanProfile = (Array.isArray(referenceForensics?.typographyFieldProfiles) ? referenceForensics.typographyFieldProfiles : [])
     .find(profile => {
@@ -547,12 +544,15 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   const fingerprint = await extractMathematicalFingerprint(targetPath, { regions: targetRegions });
   const family = inferDocumentFamily(fileName, targetText);
-  const reference = compareAgainstBaseline(fingerprint, baseline.reference, bank, family);
-  const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
+
+  // V2: global whole-document baseline comparison is intentionally disabled.
+  // Authenticity math is driven only by the validated AMOUNT + recipient IBAN
+  // semantic ROIs. The fingerprint object is still used as the ROI extractor.
+  const reference = { available: false, disabled: true, reason: 'global-baseline-disabled' };
+  const negative = { available: false, disabled: true, reason: 'global-baseline-disabled' };
 
   let roiForensics = null;
   let semanticReferenceMeasurements = null;
-  let global16x16 = { available: false, reason: 'reference-unavailable' };
   if (referencePath && Object.keys(referenceRegions).length) {
     try {
       const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
@@ -603,12 +603,8 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
           cellCount: v.comparison?.cellCount || 0,
         }]))
       ));
-      const criticalRoiBoxes = Object.fromEntries(Object.entries(semanticRois).map(([field, pair]) => [field, { target: pair?.target, reference: pair?.reference }]));
-      global16x16 = compareGlobal16x16(fingerprint, referenceFingerprint, criticalRoiBoxes, {
-        differentThreshold: 3.5,
-        strongThreshold: 5,
-        minOverlap: 0.20,
-      });
+      // Global 16x16 localization was the source of false global/layout-driven
+      // signals. It is deliberately not computed or used in V2 authenticity math.
     } catch (error) {
       roiForensics = { available: false, status: 'roi-error', error: error?.message || String(error) };
     }
@@ -635,90 +631,27 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     : null;
 
   const flags = [];
-  // GLOBAL WHOLE-DOCUMENT FINGERPRINT GUARD:
-  // This comparison can encode page geometry, density, rasterization, compression
-  // and delivery history. It is diagnostic only. It MUST NOT be promoted as a
-  // negative-authenticity finding unless semantic ROI population evidence also
-  // corroborates it later in the pipeline.
-  if (referenceAvailable && negativeAvailable && Number.isFinite(affinityDelta)) {
-    const negReliability = String(negative?.bestMatch?.profile?.reliability || 'insufficient');
-    const refReliability = String(reference?.bestMatch?.profile?.reliability || 'insufficient');
-    const classification =
-      affinityDelta >= 20 ? 'negative-leaning' :
-      affinityDelta <= -20 ? 'reference-leaning' :
-      'indeterminate';
-
-    const detail =
-      classification === 'negative-leaning'
-        ? `Global raster fingerprint bilinen negatif örneklerle daha fazla benzerlik gösteriyor (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}; delta ${affinityDelta.toFixed(1)}). Bu yalnızca tanısal bir sinyaldir; semantic ROI kanıtı olmadan sahtecilik kararı oluşturmaz.`
-        : classification === 'reference-leaning'
-          ? `Global raster fingerprint referans örneklerle daha fazla benzerlik gösteriyor (reference ${refScore.toFixed(1)} / negative ${negScore.toFixed(1)}; delta ${affinityDelta.toFixed(1)}). Bu yalnızca tanısal bir sinyaldir.`
-          : `Global raster fingerprint: referans ve negatif örnekler arasında anlamlı bir ayrım oluşmadı (reference ${refScore.toFixed(1)} / negative ${negScore.toFixed(1)}; delta ${affinityDelta.toFixed(1)}). Bu sinyal karar verici değildir.`;
-
-    flags.push({
-      code: "GLOBAL_MATH_AFFINITY_ADVISORY",
-      severity: classification === 'negative-leaning' ? "info" : "low",
-      reliability: negReliability === 'low' ? 'low-sample' : 'diagnostic',
-      detail,
-      policy: "diagnostic-only",
-      classification,
-      referenceReliability: refReliability,
-      negativeReliability: negReliability,
-    });
-  }
+  // Global fingerprint/differential is intentionally absent from user-facing
+  // forensic evidence. Only critical semantic ROI evidence is retained.
 
   const roiRows = Object.entries(roiForensics || {})
     .filter(([, v]) => v?.available)
     .map(([field, v]) => ({ field, meanDistance: v.meanDistance, maxCellDistance: v.maxCellDistance, topCells: v.topCells }));
 
-  const globalDifferentRatio = global16x16?.available && global16x16.cellCount
-    ? Number(global16x16.differentCount || 0) / Number(global16x16.cellCount) : 0;
-  const globalStrongRatio = global16x16?.available && global16x16.cellCount
-    ? Number(global16x16.strongDifferentCount || 0) / Number(global16x16.cellCount) : 0;
-  const globalAlignmentConflict = globalDifferentRatio >= 0.65 && globalStrongRatio >= 0.60;
-
-  const criticalRoiMismatches = Object.entries(global16x16?.criticalRoiHits || {})
-    .filter(([, hit]) => hit?.available && hit.differentCount > 0)
-    .map(([field, hit]) => {
-      const roi = roiForensics?.[field];
-      const roiMean = Number(roi?.meanDistance || 0);
-      const roiStrong = roiMean >= 3 || Number(roi?.maxCellDistance || 0) >= 6;
-      const sameIbanLayoutOnly = shouldSuppressIbanLayoutMismatch(field, ibanProfile?.valueReference, ibanProfile?.valueTarget);
-      const ibanValuesKnown = field === 'recipientIban' && Boolean(ibanProfile?.valueReference && ibanProfile?.valueTarget);
-      const ibanValuesDiffer = ibanValuesKnown && !sameTurkishIban(ibanProfile.valueReference, ibanProfile.valueTarget);
-      const roiValidated = field === 'amount'
-        ? Boolean(semanticRois?.amount?.validated !== false && semanticRois?.amount?.target && semanticRois?.amount?.reference)
-        : field === 'recipientName'
-          ? Boolean(semanticRois?.recipientName?.validated)
-          : field === 'recipientIban'
-            ? Boolean(ibanValuesDiffer)
-            : true;
-      const globalConflictNeedsGuard = globalAlignmentConflict && field !== 'amount';
-      return {
-        field,
-        globalDifferentCount: hit.differentCount,
-        globalStrongDifferentCount: hit.strongDifferentCount,
-        globalMaxDistance: hit.maxDistance,
-        globalMeanDistance: hit.meanDistance,
-        roiMeanDistance: roiMean,
-        roiMaxCellDistance: Number(roi?.maxCellDistance || 0),
-        strong: Boolean(!sameIbanLayoutOnly && roiValidated && !globalConflictNeedsGuard && hit.strongDifferentCount > 0 && roiStrong),
-        suppressed: Boolean(sameIbanLayoutOnly || !roiValidated || globalConflictNeedsGuard),
-        validation: { roiValidated, ibanValuesKnown, ibanValuesDiffer, globalAlignmentConflict },
-        suppressionReason: sameIbanLayoutOnly ? 'same-logical-iban-format-or-line-wrap' : null,
-      };
-    });
-
-  const strongCriticalRoiMismatches = criticalRoiMismatches.filter(x => x.strong);
-  if (strongCriticalRoiMismatches.length) {
-    flags.push({
-      code: 'CRITICAL_ROI_MISMATCH',
-      severity: 'high',
-      reliability: 'forensic-signal',
-      fields: strongCriticalRoiMismatches.map(x => x.field),
-      detail: `Global 16x16 karşılaştırmada referanstan güçlü ayrışan hücre(ler) kritik ROI ile örtüşüyor: ${strongCriticalRoiMismatches.map(x => x.field).join(', ')}. Bu sinyal tek başına kesin sahtecilik hükmü değildir; kritik alan uyumsuzluğu olarak değerlendirilmelidir.`,
-    });
-  }
+  const criticalRoiMismatches = Object.entries(criticalRoiCalibration)
+    .filter(([, row]) => row?.available)
+    .map(([field, row]) => ({
+      field, strong: Boolean(row.strongNegativeAffinity),
+      globalDifferentCount: 0, globalStrongDifferentCount: 0, globalMaxDistance: 0, globalMeanDistance: 0,
+      roiMeanDistance: row.referenceDistance || 0,
+      roiMaxCellDistance: Number(roiForensics?.[field]?.maxCellDistance || 0),
+      negativeAffinityDelta: row.negativeAffinityDelta,
+      negativeMedianDistance: row.negativeMedianDistance,
+      negativeSampleCount: row.sampleCount,
+      suppressed: !row.strongNegativeAffinity,
+      validation: { roiValidated: Boolean(semanticRois?.[field]?.target && semanticRois?.[field]?.reference) },
+      suppressionReason: row.strongNegativeAffinity ? null : 'critical-roi-threshold-not-met',
+    }));
   const strongestRoi = roiRows.sort((a,b)=>Number(b.meanDistance)-Number(a.meanDistance))[0] || null;
 
   if (sameLogicalRecipientIban) {
@@ -731,12 +664,13 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.6.3-SCALE-INVARIANT-GLOBAL-BASELINE-GUARD',
+    version: 'MATH-FORENSICS-V2-CRITICAL-ROI-AMOUNT-IBAN',
     engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
     reference,
     negative,
+    semanticNegativeAffinity,
     differential: {
       negativeMinusReference: affinityDelta,
       referenceSimilarity: Number.isFinite(refScore) ? refScore : null,
@@ -748,15 +682,8 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         ? (negative?.reason || 'negative-baseline-unavailable')
         : null,
     },
-    global16x16: {
-      ...global16x16,
-      alignmentGuard: {
-        conflict: globalAlignmentConflict,
-        differentRatio: Number(globalDifferentRatio.toFixed(4)),
-        strongRatio: Number(globalStrongRatio.toFixed(4)),
-        policy: 'global-map-is-localization-layer; critical ROI requires semantic validation'
-      }
-    },
+    global16x16: { available: false, disabled: true, reason: 'global-authenticity-math-disabled-in-v2' },
+    criticalRoiCalibration,
     criticalRoiMismatches,
     // Compact semantic measurement view. This explicitly proves that the
     // reference-side recipientName / recipientIban / amount ROIs were
@@ -16092,7 +16019,8 @@ if (type === "image" || type === "pdf") {
       referencePath: reference?.path || null,
       targetOCR: paddleImageOCR,
       amountForensics,
-      referenceForensics
+      referenceForensics,
+      negativeSamples
     });
     console.log("MATHEMATICAL FORENSICS V1.2:", JSON.stringify(mathematicalForensics));
   } catch (error) {
@@ -17993,7 +17921,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   // however, the reference section MUST NOT say "Belirgin bir fark yok".
   // Keep the signal deterministic, localized and conservative.
   const buildCriticalRoiReferenceReport = (math) => {
-    const fusionFields = math?.semanticMathCalibration?.fields || {};
+    const fusionFields = math?.criticalRoiCalibration || math?.semanticMathCalibration?.fields || {};
     const rows = Array.isArray(math?.criticalRoiMismatches)
       ? math.criticalRoiMismatches.filter(x => {
           if (!x?.strong) return false;
@@ -18108,8 +18036,8 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     if (!unique.length && !infoUnique.length) lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
     if (fusion?.referenceLike) lines.push('', '🟢 Matematiksel değerlendirme: semantic ROI kanıtı referansla uyumlu.');
     else if (fusion?.negativeLike) lines.push('', '🔴 Matematiksel değerlendirme: semantic ROI kanıtı negatif örneklerle uyumlu.');
-    else if (fusion?.differential != null) lines.push('', `🟡 Genel raster fingerprint: negatif popülasyonuna daha yakın görünüyor (delta ${Number(fusion.differential).toFixed(1)}); bu sinyal tek başına sahtecilik kanıtı değildir.`);
-    else lines.push('', '🟡 Matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
+    else if (fusion?.criticalRoiEvidence?.length) lines.push('', '🟡 Matematiksel değerlendirme: kritik ROI ölçümleri ek kanıt üretiyor.');
+    else lines.push('', '🟡 Matematiksel değerlendirme: kritik ROI kanıtı yetersiz / ek kanıt gerekli.');
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
       available: true,
@@ -19712,7 +19640,8 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   const referenceLikeByDifferential = false;
   const negativeLikeByDifferential = false;
 
-  const semanticFields = math?.semanticMathCalibration?.fields || {};
+  const semanticFields = {};
+  const criticalCalibration = math?.criticalRoiCalibration || {};
   const fieldRows = Array.isArray(forensic?.fields) ? forensic.fields : [];
   const geometryByField = {};
   for (const row of fieldRows) {
@@ -19733,6 +19662,9 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   const criticalRows = Array.isArray(math?.criticalRoiMismatches)
     ? math.criticalRoiMismatches.filter(x => x?.strong)
     : [];
+  const criticalRoiEvidence = Object.entries(criticalCalibration)
+    .filter(([, row]) => row?.available)
+    .map(([field, row]) => ({ field, ...row }));
   const criticalByField = {};
   for (const row of criticalRows) criticalByField[String(row.field || '')] = row;
 
@@ -19758,6 +19690,27 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
       roiMeanDistance: roiMean,
       independentlyCorroborated: independent,
       material: level === 'strong-mismatch' || (level === 'elevated-mismatch' && (geometryStrong || independent)),
+    };
+  }
+
+  for (const [field, cal] of Object.entries(criticalCalibration)) {
+    const existing = fieldFusion[field] || {};
+    const geometry = geometryByField[field] || {};
+    const strong = Boolean(cal?.strongNegativeAffinity);
+    fieldFusion[field] = {
+      ...existing,
+      level: strong ? 'strong-mismatch' : 'reference-near',
+      combinedScore: Number(existing.combinedScore || 0),
+      meanDistance: Number(cal?.referenceDistance || 0),
+      strongDifferentRatio: 0,
+      geometryScore: Math.max(Number(geometry.positionScore || 0), Number(geometry.combinedScore || 0)),
+      geometryStrong: Number(geometry.positionScore || 0) >= 70 || Number(geometry.combinedScore || 0) >= 70,
+      roiStrongCells: Number(existing.roiStrongCells || 0),
+      roiMeanDistance: Number(cal?.referenceDistance || 0),
+      negativeAffinityDelta: Number(cal?.negativeAffinityDelta || 0),
+      negativeSampleCount: Number(cal?.sampleCount || 0),
+      independentlyCorroborated: strong,
+      material: strong,
     };
   }
 
@@ -19794,11 +19747,9 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   // calibration case showed that a high local score can also capture generic
   // bank/template/raster similarity. It therefore cannot independently create
   // a negative-like verdict.
+  const criticalRoiStrongCount = criticalRoiEvidence.filter(x => x?.strongNegativeAffinity).length;
   const independentNegativeCorroboration = Boolean(
-    knownNegativeStrong && (
-      strongLayout ||
-      Number(math?.semanticMathCalibration?.fields?.amount?.amountForensicsScore || 0) >= 80
-    )
+    criticalRoiStrongCount > 0 || (knownNegativeStrong && strongLayout)
   );
   const knownNegativeCorroborated =
     knownNegativeStrong && independentNegativeCorroboration;
@@ -19807,19 +19758,10 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   let referenceLike = false;
   let negativeLike = false;
 
-  if (referenceLikeByDifferential) {
-    referenceLike = true;
-    className = 'reference-like';
-    // A strong known-negative match blocks an unconditional reference-like
-    // result; keep it indeterminate until an independent adjudicator resolves it.
-    if (knownNegativeStrong && !differentialAvailable) {
-      referenceLike = false;
-      className = 'indeterminate';
-    }
-  } else if (negativeLikeByDifferential) {
+  if (criticalRoiStrongCount > 0) {
     negativeLike = true;
     className = 'negative-like';
-  } else if (knownNegativeCorroborated && differentialAvailable && differential >= 0) {
+  } else if (knownNegativeCorroborated) {
     negativeLike = true;
     className = 'negative-like';
   }
@@ -19848,11 +19790,13 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
       policy: 'advisory-only; high local similarity cannot independently declare a document fake'
     },
     evidence: {
-      criticalRoiStrongCount: criticalRows.length,
+      criticalRoiStrongCount,
+      criticalRoiEvidence,
       independentNegativeCorroboration,
-      differentialAvailable
+      differentialAvailable: false
     },
-    policy: 'V1.6.2: missing baselines remain unavailable/null; final class is reference-vs-negative differential first, with layout/semantic/known-negative signals as corroboration rather than single-signal verdicts'
+    policy: 'V2: authenticity math is critical-ROI-only (AMOUNT + recipient IBAN); whole-document/global fingerprint and global differential are disabled'
+
   };
 }
 
@@ -19891,8 +19835,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   // SAFE SCOPE: the human-readable report must never read a free variable
   // named `differential`. The mathematical fusion object is the single source
   // of truth for the global reference-vs-negative diagnostic value.
-  const differentialValue = Number(mathFusion?.differential);
-  const differential = Number.isFinite(differentialValue) ? differentialValue : null;
+  const differential = null;
   const fieldFusion = mathFusion.fields || {};
   const isMaterialFinding = (row) => {
     const field = String(row?.evidenceField || row?.field || '').replace(/:value$/i, '');
@@ -20255,7 +20198,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   }
   if (referenceLike) userLines.push('', '🟢 Matematiksel değerlendirme: semantic ROI kanıtı referansla uyumlu.');
   else if (negativeLike) userLines.push('', '🔴 Matematiksel değerlendirme: semantic ROI kanıtı negatif örneklerle uyumlu.');
-  else if (differential != null) userLines.push('', `🟡 Genel raster fingerprint: negatif popülasyonuna daha yakın görünüyor (delta ${Number(differential).toFixed(1)}); bu global/layout-raster sinyalidir ve tek başına sahtecilik kanıtı değildir.`);
+  else if (Array.isArray(mathFusion?.criticalRoiEvidence) && mathFusion.criticalRoiEvidence.length) userLines.push('', '🟡 Kritik ROI matematiksel ölçümleri alındı; eşik aşan bir negatif-affinity bulgusu oluşmadı.');
   else userLines.push('', '🟡 Matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
 
   return {
@@ -20944,32 +20887,32 @@ if (!controlledAmountCorroborated) {
   result.categories = finalDeterministicRisk.categories;
 }
 
-// Mathematical fingerprint is intentionally a corroborating signal, not an
-// automatic authenticity verdict. Global whole-document affinity is diagnostic
-// only. Final negative affinity requires semantic ROI population evidence.
-// GLOBAL mathematical fingerprint is diagnostic-only.
-// Do not promote final risk from whole-document similarity, even when the
-// target looks like the negative population or is an outlier from reference.
-// Final mathematical promotion is intentionally reserved for semantic ROI
-// population evidence produced by a dedicated V2 semantic engine.
-const semanticNegativeAffinity = result?.mathematicalForensics?.semanticNegativePopulation;
-const semanticNegativeEvidence = Array.isArray(semanticNegativeAffinity?.fields)
-  ? semanticNegativeAffinity.fields.filter(x => x?.available && x?.negativeAffinity)
-  : [];
-const semanticNegativeStrongCount = semanticNegativeEvidence.filter(x =>
-  Number(x?.negativeAffinityDelta || 0) >= 2.5 &&
-  Number(x?.negativeSampleCount || 0) >= 3 &&
-  ['medium','high'].includes(String(x?.negativeReliability || ''))
-).length;
-
-// IMPORTANT: without semantic population corroboration, mathematical forensics
-// cannot change the final deterministic risk score.
-if (semanticNegativeStrongCount >= 1) {
+// V2 CRITICAL ROI MATHEMATICAL PROMOTION
+// Only AMOUNT / recipient IBAN semantic ROI population evidence can affect
+// authenticity risk. Whole-document/global fingerprint is completely excluded.
+const criticalMathFields = Object.entries(result?.mathematicalForensics?.criticalRoiCalibration || {})
+  .filter(([, row]) => row?.strongNegativeAffinity === true);
+if (criticalMathFields.length) {
+  result.criticalRoiSignal = {
+    ...(result.criticalRoiSignal || {}),
+    available: true,
+    active: true,
+    independentlyCorroborated: true,
+    fields: criticalMathFields.map(([field]) => field),
+    source: 'mathematical-critical-roi-v2'
+  };
   finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 60)
   };
+  console.log('V2 CRITICAL ROI MATHEMATICAL FLOOR:', JSON.stringify({
+    fields: criticalMathFields.map(([field, row]) => ({
+      field, sampleCount: row.sampleCount, referenceDistance: row.referenceDistance,
+      negativeMedianDistance: row.negativeMedianDistance, negativeAffinityDelta: row.negativeAffinityDelta
+    })),
+    appliedFloor: 46
+  }));
 }
 
 // AI'ın overallRisk değerini kullanma.
