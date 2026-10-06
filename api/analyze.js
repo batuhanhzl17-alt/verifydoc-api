@@ -314,40 +314,132 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   const amountFieldIsTyped = Boolean(amountField) &&
     (amountFieldRole === 'primaryAmount' || canonicalField(amountField?.field) === 'amount') &&
     !/(sirano|fisno|islemno|referans|hesapno|musterino|iban|kartno|vergino)/.test(amountFieldLabel);
+  // AMOUNT ROI V2.0
+  // The old gate required an explicitly typed referenceValueBox. That is too
+  // brittle for image/JPG references: the reference-template engine can know
+  // the amount anchor even when it cannot expose a typed field row.
+  // The anchor is already derived from an explicit amount label + money token,
+  // so it is safe to use as the reference ROI geometry.
   let amountReferenceBox = amountFieldIsTyped ? boxFrom(amountField).reference : null;
-  if (!amountReferenceBox && bank) {
+  let amountReferenceSource = amountReferenceBox ? 'typed-reference-amount-box' : null;
+
+  const validBox = (b) => {
+    if (!b) return false;
+    const x1=Number(b.x1), y1=Number(b.y1), x2=Number(b.x2), y2=Number(b.y2);
+    return [x1,y1,x2,y2].every(Number.isFinite) && x2>x1 && y2>y1;
+  };
+
+  // First use an independently resolved semantic amount region if the
+  // reference-forensic engine already produced one.
+  if (!validBox(amountReferenceBox) && validBox(referenceSemanticRegions?.amount?.region)) {
+    amountReferenceBox = referenceSemanticRegions.amount.region;
+    amountReferenceSource = 'semantic-reference-amount-v1';
+  }
+
+  // Then use the trusted normalized bank anchor. Do NOT require the anchor
+  // source string to contain a particular version/name: the anchor contract
+  // itself is the validation boundary.
+  if (!validBox(amountReferenceBox) && bank) {
     try {
       const anchor = await getReferenceAmountAnchor(bank);
-      // Trusted anchor is allowed only as a last resort, after the typed
-      // anchor builder has already rejected non-money numeric fields.
-      if (anchor && referencePath && String(anchor.source || '').includes('amount')) {
-        let meta;
+      const anchorValid = anchor &&
+        [anchor.xNorm, anchor.yNorm, anchor.widthNorm, anchor.heightNorm]
+          .every(v => Number.isFinite(Number(v))) &&
+        Number(anchor.widthNorm) > 0 &&
+        Number(anchor.heightNorm) > 0;
+
+      if (anchorValid && referencePath) {
+        let meta = null;
         if (path.extname(referencePath).toLowerCase() === '.pdf') {
           const raw = await fs.readFile(referencePath);
           const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
-          const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+          const rendered = await renderPdfPagePng(pdf, Number(anchor.pageNumber || 1), 1.8);
           meta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
         } else {
           meta = await sharp(referencePath).metadata();
         }
+
         if (meta?.width && meta?.height) {
-          amountReferenceBox = {
+          const candidate = {
             x1: Number(anchor.xNorm) * Number(meta.width),
             y1: Number(anchor.yNorm) * Number(meta.height),
             x2: (Number(anchor.xNorm) + Number(anchor.widthNorm)) * Number(meta.width),
             y2: (Number(anchor.yNorm) + Number(anchor.heightNorm)) * Number(meta.height),
           };
+          if (validBox(candidate)) {
+            amountReferenceBox = candidate;
+            amountReferenceSource = 'trusted-reference-amount-anchor';
+          }
         }
       }
     } catch (error) {
       console.warn('MATH AMOUNT ANCHOR FALLBACK HATASI:', error?.message || error);
     }
   }
-  const amountTargetBox = amountForensics?.region || (amountFieldIsTyped ? boxFrom(amountField).target : null);
-  if (amountTargetBox && amountReferenceBox) {
-    rois.amount = { target: amountTargetBox, reference: amountReferenceBox, source: amountForensics?.region ? 'trusted-amount-forensics' : amountFieldIsTyped ? 'semantic-label-neighbor' : 'trusted-reference-anchor' };
+
+  // Target side: Amount Forensics is preferred. If it did not produce a
+  // region, use the typed field, then semantic target ROI.
+  let amountTargetBox =
+    (validBox(amountForensics?.region) ? amountForensics.region : null) ||
+    (amountFieldIsTyped && validBox(boxFrom(amountField).target) ? boxFrom(amountField).target : null) ||
+    (validBox(targetSemanticRegions?.amount?.region) ? targetSemanticRegions.amount.region : null);
+
+  let amountTargetSource =
+    validBox(amountForensics?.region) ? 'trusted-amount-forensics' :
+    (amountFieldIsTyped && validBox(boxFrom(amountField).target)) ? 'typed-target-amount-box' :
+    validBox(targetSemanticRegions?.amount?.region) ? 'semantic-target-amount-v1' : null;
+
+  // Last-resort target resolver: project the trusted reference anchor into the
+  // target raster and select the nearest OCR money candidate. This is not a
+  // generic numeric fallback: secondary identifiers are explicitly rejected.
+  if (!validBox(amountTargetBox) && targetOCR?.regions && validBox(amountReferenceBox)) {
+    const targetRows = targetOCR.regions.filter(r => validBox(r?.region) && String(r?.text || '').trim());
+    const refSize = inferRasterSize(referenceRows);
+    const tarSize = inferRasterSize(targetRows);
+    if (tarSize.width && tarSize.height && refSize.width && refSize.height) {
+      const refNorm = normalizedBox(amountReferenceBox, refSize.width, refSize.height);
+      const amountLike = (text) => {
+        const t = String(text || '').trim();
+        if (!/\d/.test(t)) return false;
+        if (/(sorgu|sorgulama|işlem\s*no|islem\s*no|referans|fiş\s*no|fis\s*no|sıra\s*no|sira\s*no|iban|hesap\s*no|müşteri\s*no|musteri\s*no)/i.test(t)) return false;
+        return /(?:₺|TL|TRY|EUR|USD|GBP)\s*[-+]?\d|[-+]?\d{1,3}(?:[. ]\d{3})*[,.]\d{1,2}\b|[-+]?\d+(?:[,.]\d{1,2})?/.test(t);
+      };
+      const candidates = targetRows.filter(r => amountLike(r.text)).map(r => {
+        const n = normalizedBox(r.region, tarSize.width, tarSize.height);
+        if (!n) return null;
+        const d = Math.hypot(n.x-refNorm.x, n.y-refNorm.y);
+        const sizeD = Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,refNorm.w))) +
+          Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,refNorm.h)));
+        return { row:r, score:100-d*180-sizeD*18 };
+      }).filter(Boolean).sort((a,b)=>b.score-a.score);
+      if (candidates[0] && candidates[0].score >= 45) {
+        amountTargetBox = candidates[0].row.region;
+        amountTargetSource = 'reference-geometry-amount-v2';
+      }
+    }
+  }
+
+  if (validBox(amountTargetBox) && validBox(amountReferenceBox)) {
+    rois.amount = {
+      target: amountTargetBox,
+      reference: amountReferenceBox,
+      source: amountTargetSource || amountReferenceSource || 'amount-roi-v2',
+      validated: true,
+      referenceSource: amountReferenceSource,
+    };
+    console.log('MATH AMOUNT ROI RESOLVED V2:', JSON.stringify({
+      targetSource: amountTargetSource,
+      referenceSource: amountReferenceSource,
+      target: amountTargetBox,
+      reference: amountReferenceBox,
+    }));
   } else {
-    console.warn('MATH AMOUNT ROI SKIPPED: NO VALID TYPED REFERENCE AMOUNT BOX');
+    console.warn('MATH AMOUNT ROI SKIPPED V2:', JSON.stringify({
+      targetAvailable: validBox(amountTargetBox),
+      referenceAvailable: validBox(amountReferenceBox),
+      targetSource: amountTargetSource,
+      referenceSource: amountReferenceSource,
+    }));
   }
 
   let recipientName = findField('recipientName');
@@ -533,12 +625,25 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   if (referenceAvailable && negativeAvailable && Number.isFinite(affinityDelta)) {
     const negReliability = String(negative?.bestMatch?.profile?.reliability || 'insufficient');
     const refReliability = String(reference?.bestMatch?.profile?.reliability || 'insufficient');
+    const classification =
+      affinityDelta >= 20 ? 'negative-leaning' :
+      affinityDelta <= -20 ? 'reference-leaning' :
+      'indeterminate';
+
+    const detail =
+      classification === 'negative-leaning'
+        ? `Global raster fingerprint bilinen negatif örneklerle daha fazla benzerlik gösteriyor (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}; delta ${affinityDelta.toFixed(1)}). Bu yalnızca tanısal bir sinyaldir; semantic ROI kanıtı olmadan sahtecilik kararı oluşturmaz.`
+        : classification === 'reference-leaning'
+          ? `Global raster fingerprint referans örneklerle daha fazla benzerlik gösteriyor (reference ${refScore.toFixed(1)} / negative ${negScore.toFixed(1)}; delta ${affinityDelta.toFixed(1)}). Bu yalnızca tanısal bir sinyaldir.`
+          : `Global raster fingerprint: referans ve negatif örnekler arasında anlamlı bir ayrım oluşmadı (reference ${refScore.toFixed(1)} / negative ${negScore.toFixed(1)}; delta ${affinityDelta.toFixed(1)}). Bu sinyal karar verici değildir.`;
+
     flags.push({
-      code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
-      severity: affinityDelta >= 20 ? "info" : "low",
+      code: "GLOBAL_MATH_AFFINITY_ADVISORY",
+      severity: classification === 'negative-leaning' ? "info" : "low",
       reliability: negReliability === 'low' ? 'low-sample' : 'diagnostic',
-      detail: `Global raster fingerprint known-negative popülasyonuna daha yakın (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}; delta ${affinityDelta.toFixed(1)}). Bu sinyal tek başına sahtecilik kanıtı değildir.`,
+      detail,
       policy: "diagnostic-only",
+      classification,
       referenceReliability: refReliability,
       negativeReliability: negReliability,
     });
