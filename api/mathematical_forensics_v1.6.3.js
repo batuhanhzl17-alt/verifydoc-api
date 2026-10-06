@@ -296,6 +296,24 @@ function roiFingerprintFromRaster(data, width, height) {
       dctHighRatio: raw.dctHighRatio, blockinessHorizontal: raw.blockinessHorizontal, blockinessVertical: raw.blockinessVertical,
     },
     tiles16x16: f.tiles,
+    validation: {
+      sourceWidth: width,
+      sourceHeight: height,
+      background: Number(background),
+      threshold: Number(inkBox?.threshold ?? 0),
+      detected: Boolean(inkBox?.detected),
+      inkPixels: Number(inkBox?.inkPixels || 0),
+      inkRatio: Number((Number(inkBox?.inkPixels || 0) / Math.max(1, width * height)).toFixed(6)),
+      contentWidth,
+      contentHeight,
+      contentAspect: Number((contentWidth / Math.max(1, contentHeight)).toFixed(4)),
+      mean: Number(f.luminanceMean.toFixed(4)),
+      std: Number(f.luminanceStd.toFixed(4)),
+      edgeDensity: Number(f.edgeDensity.toFixed(6)),
+      laplacianVariance: Number(f.laplacianVariance.toFixed(4)),
+      validInk: Boolean(inkBox?.detected) && Number(inkBox?.inkPixels || 0) >= Math.max(8, Math.floor(width * height * 0.003)),
+      validTexture: Number(f.luminanceStd) >= 1.25 || Number(f.edgeDensity) >= 0.001 || Number(f.laplacianVariance) >= 1,
+    },
   };
 }
 
