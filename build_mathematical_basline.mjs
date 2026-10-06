@@ -31,16 +31,7 @@ function inferBank(p) {
   for (const [needle, bank] of bankAliases) if (s.includes(needle)) return bank;
   return path.basename(path.dirname(p)).toLocaleLowerCase('tr-TR').replace(/[^a-z0-9]/g,'') || 'unknown';
 }
-function inferFamilyFromPath(p) {
-  const base = path.basename(p).toLocaleLowerCase('tr-TR').replace(/[ıİ]/g, 'i');
-  if (/^yapikredi\.jpe?g$/.test(base) || /^yapikredi\.pdf$/.test(base)) return 'FAST';
-  if (/^yapikredi-havale\.(?:jpe?g|pdf)$/.test(base)) return 'HAVALE';
-  if (/^yapikredi-kk1\.(?:jpe?g|pdf)$/.test(base)) return 'CREDIT_CARD';
-  if (/^yapikredi-hesap-hareketi/i.test(base)) return 'ACCOUNT_STATEMENT';
-  const rel = path.relative(NEG, p).replaceAll(path.sep, '/').toLocaleLowerCase('tr-TR').replace(/[ıİ]/g,'i');
-  if (rel.startsWith('yapikredi/')) return 'FAST';
-  return inferDocumentFamily(base, '');
-}
+function inferFamilyFromPath(p) { return inferDocumentFamily(path.basename(p), ''); }
 
 async function walk(dir) {
   const out = [];
