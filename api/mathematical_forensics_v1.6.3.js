@@ -804,6 +804,81 @@ export function compareSemanticRoiToNegativePopulation(targetFingerprint, negati
   return result;
 }
 
+
+
+// =====================================================
+// TELEGRAM DEGRADATION CALIBRATION V1
+// =====================================================
+// Reference JPG'leri ve negative JPG'leri Telegram'dan geçmiş örneklerdir.
+// Bu katman Telegram/JPEG transport etkisini authenticity sinyali olarak
+// değil, doğal görüntü bozulması kalibrasyonu olarak kullanır.
+export function compareTelegramDegradation(targetFingerprint, referenceFingerprint, transportPairs = []) {
+  if (!targetFingerprint?.available || !referenceFingerprint?.available) {
+    return { available:false, reason:'fingerprint-unavailable' };
+  }
+
+  const featureKeys = [
+    'luminanceMean','luminanceStd','entropy','edgeDensity','meanGradient',
+    'laplacianVariance','darkPixelRatio','brightPixelRatio',
+    'dctLowEnergy','dctMidEnergy','dctHighEnergy','dctHighRatio',
+    'blockinessHorizontal','blockinessVertical'
+  ];
+  const safe = (v) => Number.isFinite(Number(v)) ? Number(v) : null;
+  const rel = (a,b) => {
+    const x=safe(a), y=safe(b);
+    if (x==null || y==null) return null;
+    return Math.abs(x-y) / Math.max(1e-6, Math.abs(y), 1);
+  };
+  const targetMetrics = targetFingerprint.metrics || {};
+  const referenceMetrics = referenceFingerprint.metrics || {};
+  const targetReference = {};
+  for (const key of featureKeys) targetReference[key] = rel(targetMetrics[key], referenceMetrics[key]);
+
+  const pairRows = [];
+  for (const pair of Array.isArray(transportPairs) ? transportPairs : []) {
+    const original = pair?.original?.metrics || pair?.original?.fingerprint?.metrics || null;
+    const telegram = pair?.telegram?.metrics || pair?.telegram?.fingerprint?.metrics || null;
+    if (!original || !telegram) continue;
+    const row = {};
+    for (const key of featureKeys) row[key] = rel(telegram[key], original[key]);
+    pairRows.push(row);
+  }
+
+  const values = (key) => pairRows.map(r=>r[key]).filter(Number.isFinite).sort((a,b)=>a-b);
+  const percentile = (arr,p) => {
+    if (!arr.length) return null;
+    const idx=(arr.length-1)*p; const lo=Math.floor(idx), hi=Math.ceil(idx);
+    return lo===hi ? arr[lo] : arr[lo] + (arr[hi]-arr[lo])*(idx-lo);
+  };
+  const profile = {};
+  for (const key of featureKeys) {
+    const vals=values(key);
+    profile[key]={ sampleCount:vals.length, median:percentile(vals,.5), p90:percentile(vals,.9), p95:percentile(vals,.95) };
+  }
+
+  // Target/reference is a transport-consistency diagnostic. It does NOT
+  // decide authenticity and is intentionally capped at informational severity.
+  const ratios=[];
+  for (const key of featureKeys) {
+    const v=targetReference[key];
+    const p90=profile[key]?.p90;
+    if (Number.isFinite(v) && Number.isFinite(p90) && p90>0) ratios.push(v/p90);
+  }
+  const medianRatio = ratios.length ? [...ratios].sort((a,b)=>a-b)[Math.floor(ratios.length/2)] : null;
+  const status = medianRatio==null ? 'INSUFFICIENT_DATA' : medianRatio <= 1.25 ? 'NORMAL' : medianRatio <= 2.5 ? 'ABOVE_NORMAL' : 'STRONGLY_ABOVE_NORMAL';
+
+  return {
+    available:true,
+    version:'TELEGRAM-DEGRADATION-V1',
+    transportPairCount:pairRows.length,
+    targetReferenceRelativeChanges:targetReference,
+    profile,
+    medianP90Ratio:medianRatio==null?null:Number(medianRatio.toFixed(3)),
+    status,
+    policy:'diagnostic-only; never promotes final authenticity risk',
+  };
+}
+
 export function compareAgainstBaseline(fingerprint, baseline, bank, family='unknown') {
   if (!baseline?.profiles) return { available:false, reason:'baseline-missing' };
   const candidates = Object.values(baseline.profiles).filter(p => p.bank === bank);
