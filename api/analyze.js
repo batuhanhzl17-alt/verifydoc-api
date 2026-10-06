@@ -583,6 +583,62 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     });
   }
   const strongestRoi = roiRows.sort((a,b)=>Number(b.meanDistance)-Number(a.meanDistance))[0] || null;
+  // V1.6: semantic mathematical calibration. The goal is not to declare
+  // a document fake from one number, but to translate the three intended
+  // signals (meanDistance, strong-cell ratio, Amount Forensics) into one
+  // conservative field-level forensic score. Thresholds are deliberately
+  // broad because the current calibration set is still small.
+  const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
+  const scoreMeanDistance = (d) => {
+    const x = Number(d);
+    if (!Number.isFinite(x)) return null;
+    if (x <= 4.5) return 0;
+    if (x <= 5.0) return 20;
+    if (x <= 5.5) return 40;
+    if (x <= 6.0) return 65;
+    if (x <= 6.5) return 82;
+    return 95;
+  };
+  const scoreStrongRatio = (r) => {
+    const x = clamp01(r);
+    if (x < 0.10) return 0;
+    if (x < 0.20) return 20;
+    if (x < 0.35) return 45;
+    if (x < 0.50) return 70;
+    return 90;
+  };
+  const semanticMathCalibration = {};
+  for (const [field, roi] of Object.entries(roiForensics || {})) {
+    if (!roi?.available) continue;
+    const meanScore = scoreMeanDistance(roi.meanDistance);
+    const strongScore = scoreStrongRatio(roi.strongDifferentRatio);
+    const amountScore = field === 'amount' && Number.isFinite(Number(amountForensics?.score))
+      ? Number(amountForensics.score) : null;
+    const combined = field === 'amount' && amountScore !== null
+      ? (meanScore * 0.45) + (strongScore * 0.25) + (amountScore * 0.30)
+      : (meanScore * 0.65) + (strongScore * 0.35);
+    const level = combined >= 65 ? 'strong-mismatch' : combined >= 45 ? 'elevated-mismatch' : combined >= 25 ? 'watch' : 'reference-near';
+    semanticMathCalibration[field] = {
+      available: true,
+      meanDistance: Number(roi.meanDistance),
+      meanDistanceScore: meanScore,
+      differentRatio: Number(roi.differentRatio || 0),
+      strongDifferentRatio: Number(roi.strongDifferentRatio || 0),
+      strongCellScore: strongScore,
+      amountForensicsScore: amountScore,
+      combinedScore: Number(combined.toFixed(1)),
+      level,
+      interpretation: level === 'reference-near'
+        ? 'Kritik ROI referans matematiksel parmak izine yakın.'
+        : level === 'watch'
+          ? 'ROI referanstan ölçülebilir biçimde ayrışıyor; tek başına sahtecilik hükmü değildir.'
+          : level === 'elevated-mismatch'
+            ? 'ROI referanstan belirgin ayrışıyor; bağımsız forensic sinyallerle birlikte değerlendirilmelidir.'
+            : 'ROI referanstan güçlü biçimde ayrışıyor; özellikle bağımsız Amount Forensics desteği varsa oynama şüphesi güçlenir.'
+    };
+  }
+  const semanticMathStrongFields = Object.entries(semanticMathCalibration).filter(([,v]) => v.level === 'strong-mismatch').map(([f]) => f);
+  const semanticMathElevatedFields = Object.entries(semanticMathCalibration).filter(([,v]) => v.level === 'elevated-mismatch').map(([f]) => f);
 
   if (sameLogicalRecipientIban) {
     console.log('MATH IBAN ROI LAYOUT NORMALIZATION:', JSON.stringify({
@@ -615,6 +671,13 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
       }
     },
     criticalRoiMismatches,
+    semanticMathCalibration: {
+      version: 'V1.6.0',
+      fields: semanticMathCalibration,
+      strongFields: semanticMathStrongFields,
+      elevatedFields: semanticMathElevatedFields,
+      policy: 'meanDistance + strongDifferentRatio + Amount Forensics; no single metric declares authenticity'
+    },
     // Compact semantic measurement view. This explicitly proves that the
     // reference-side recipientName / recipientIban / amount ROIs were
     // measured mathematically when their boxes were available.
@@ -20479,6 +20542,38 @@ if (strongCriticalRoiRows.length) {
       independentSupport: criticalRoiIndependentSupport,
     }));
   }
+}
+
+// V1.6: semantic mathematical calibration is now allowed to influence the
+// deterministic decision, but only through a conservative corroboration floor.
+// A strong ROI mismatch by itself never becomes a definitive fake verdict.
+const semanticMathCal = result?.mathematicalForensics?.semanticMathCalibration?.fields || {};
+const mathStrongAmount = semanticMathCal?.amount?.level === 'strong-mismatch';
+const mathStrongIban = semanticMathCal?.recipientIban?.level === 'strong-mismatch';
+const mathStrongFieldCount = [mathStrongAmount, mathStrongIban].filter(Boolean).length;
+if (mathStrongAmount && strongAmountSignal) {
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 55)
+  };
+  console.log('V1.6 SEMANTIC MATH AMOUNT CORROBORATION:', JSON.stringify({
+    combinedScore: semanticMathCal.amount?.combinedScore,
+    meanDistance: semanticMathCal.amount?.meanDistance,
+    strongDifferentRatio: semanticMathCal.amount?.strongDifferentRatio,
+    amountForensicsScore: semanticMathCal.amount?.amountForensicsScore,
+    appliedFloor: 46
+  }));
+} else if (mathStrongFieldCount >= 2 && (strongAzureSignal || meaningfulPixelReferenceSignal || Number(negativeSampleForensics?.bestMatchScore || 0) >= 70)) {
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 55)
+  };
+  console.log('V1.6 SEMANTIC MATH MULTI-ROI CORROBORATION:', JSON.stringify({
+    strongFields: Object.entries(semanticMathCal).filter(([,v]) => v?.level === 'strong-mismatch').map(([f]) => f),
+    appliedFloor: 46
+  }));
 }
 
 if (controlledAmountCorroborated) {
