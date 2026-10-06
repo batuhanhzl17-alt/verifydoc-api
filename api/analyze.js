@@ -504,9 +504,20 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     }
   }
 
-  const refScore = Number(reference?.bestMatch?.similarityScore || 0);
-  const negScore = Number(negative?.bestMatch?.similarityScore || 0);
-  const affinityDelta = Number((negScore - refScore).toFixed(2));
+  // V1.6.2.1: an unavailable baseline is NOT similarity=0.
+  // In particular, QNB currently has trusted references but no mathematical
+  // negative profile. Using 0 here manufactures a false reference advantage.
+  const referenceAvailable = Boolean(reference?.available && reference?.bestMatch?.available);
+  const negativeAvailable = Boolean(negative?.available && negative?.bestMatch?.available);
+  const refScore = referenceAvailable
+    ? Number(reference.bestMatch.similarityScore)
+    : null;
+  const negScore = negativeAvailable
+    ? Number(negative.bestMatch.similarityScore)
+    : null;
+  const affinityDelta = (Number.isFinite(refScore) && Number.isFinite(negScore))
+    ? Number((negScore - refScore).toFixed(2))
+    : null;
 
   const flags = [];
   if (reference?.available && negative?.available) {
@@ -594,16 +605,21 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.5.0-SEMANTIC-REFERENCE-ROI',
-    engine: 'mathematical-forensics-v1.5-semantic-reference-roi',
+    version: 'MATH-FORENSICS-V1.6.2.1-BASELINE-AVAILABILITY-GUARD',
+    engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
     reference,
     negative,
     differential: {
       negativeMinusReference: affinityDelta,
-      referenceSimilarity: refScore,
-      negativeSimilarity: negScore,
+      referenceSimilarity: Number.isFinite(refScore) ? refScore : null,
+      negativeSimilarity: Number.isFinite(negScore) ? negScore : null,
+      referenceBaselineAvailable: referenceAvailable,
+      negativeBaselineAvailable: negativeAvailable,
+      availabilityReason: !negativeAvailable
+        ? (negative?.reason || 'negative-baseline-unavailable')
+        : null,
     },
     global16x16: {
       ...global16x16,
