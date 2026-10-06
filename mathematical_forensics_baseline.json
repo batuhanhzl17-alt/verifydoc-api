@@ -1,7 +1,7 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 2,
   "generatedAt": "2026-10-06T16:31:31.512Z",
-  "algorithm": "VerifyDoc Mathematical Forensics V1.6.3 + family-guarded semantic ROI population",
+  "algorithm": "VerifyDoc Mathematical Forensics V1",
   "reference": {
     "version": "MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE",
     "generatedAt": "2026-10-06T16:31:31.513Z",
@@ -3392,6 +3392,168 @@
           }
         ]
       },
+      "yapikredi::UNKNOWN": {
+        "bank": "yapikredi",
+        "family": "UNKNOWN",
+        "sampleCount": 2,
+        "sourceFormats": [
+          "jpeg",
+          "png"
+        ],
+        "featureStats": {
+          "luminanceMean": {
+            "mean": 249.8481674194336,
+            "std": 0.6655502319335938,
+            "median": 249.8481674194336,
+            "mad": 0.6655502319335938,
+            "min": 249.1826171875,
+            "max": 250.5137176513672
+          },
+          "luminanceStd": {
+            "mean": 28.92343644457691,
+            "std": 2.209838831719132,
+            "median": 28.92343644457691,
+            "mad": 2.209838831719132,
+            "min": 26.71359761285778,
+            "max": 31.133275276296043
+          },
+          "entropy": {
+            "mean": 0.7192962112492447,
+            "std": 0.12464126432455824,
+            "median": 0.7192962112492447,
+            "mad": 0.12464126432455824,
+            "min": 0.5946549469246865,
+            "max": 0.8439374755738029
+          },
+          "edgeDensity": {
+            "mean": 0.09869644739289479,
+            "std": 0.006006262012524029,
+            "median": 0.09869644739289479,
+            "mad": 0.006006262012524029,
+            "min": 0.09269018538037076,
+            "max": 0.10470270940541881
+          },
+          "meanGradient": {
+            "mean": 5.339869037815114,
+            "std": 0.684902152933665,
+            "median": 5.339869037815114,
+            "mad": 0.684902152933665,
+            "min": 4.654966884881449,
+            "max": 6.024771190748779
+          },
+          "laplacianVariance": {
+            "mean": 7512.057753115507,
+            "std": 1352.4715419430836,
+            "median": 7512.057753115507,
+            "mad": 1352.4715419430836,
+            "min": 6159.586211172423,
+            "max": 8864.52929505859
+          },
+          "darkPixelRatio": {
+            "mean": 0.00827789306640625,
+            "std": 0.00074005126953125,
+            "median": 0.00827789306640625,
+            "mad": 0.00074005126953125,
+            "min": 0.007537841796875,
+            "max": 0.0090179443359375
+          },
+          "brightPixelRatio": {
+            "mean": 0.9604568481445312,
+            "std": 0.00165557861328125,
+            "median": 0.9604568481445312,
+            "mad": 0.00165557861328125,
+            "min": 0.95880126953125,
+            "max": 0.9621124267578125
+          },
+          "dctLowEnergy": {
+            "mean": 9457.652970959727,
+            "std": 4678.67234840172,
+            "median": 9457.652970959727,
+            "mad": 4678.67234840172,
+            "min": 4778.980622558007,
+            "max": 14136.325319361447
+          },
+          "dctMidEnergy": {
+            "mean": 13254.885637843105,
+            "std": 5675.834859460273,
+            "median": 13254.885637843105,
+            "mad": 5675.834859460273,
+            "min": 7579.050778382831,
+            "max": 18930.720497303377
+          },
+          "dctHighEnergy": {
+            "mean": 17658.91451619717,
+            "std": 6578.209894188805,
+            "median": 17658.91451619717,
+            "mad": 6578.209894188805,
+            "min": 11080.704622008361,
+            "max": 24237.12441038597
+          },
+          "dctHighRatio": {
+            "mean": 0.44785374061076,
+            "std": 0.02489805842648704,
+            "median": 0.44785374061076,
+            "mad": 0.02489805842648704,
+            "min": 0.42295568218427293,
+            "max": 0.472751799037247
+          },
+          "blockinessHorizontal": {
+            "mean": 1.060132832791304,
+            "std": 0.03644683976502616,
+            "median": 1.060132832791304,
+            "mad": 0.03644683976502616,
+            "min": 1.0236859930262778,
+            "max": 1.0965796725563302
+          },
+          "blockinessVertical": {
+            "mean": 1.4387570347990386,
+            "std": 0.4556844249504025,
+            "median": 1.4387570347990386,
+            "mad": 0.4556844249504025,
+            "min": 0.9830726098486362,
+            "max": 1.8944414597494412
+          }
+        },
+        "jpeg": {
+          "sampleCount": 1,
+          "estimatedQuality": {
+            "mean": 95,
+            "std": 0,
+            "median": 95,
+            "mad": 0,
+            "min": 95,
+            "max": 95
+          },
+          "quantizationMean": {
+            "mean": 3.62109375,
+            "std": 3.62109375,
+            "median": 3.62109375,
+            "mad": 3.62109375,
+            "min": 0,
+            "max": 7.2421875
+          },
+          "quantizationStd": {
+            "mean": 1.5298603458456717,
+            "std": 1.5298603458456717,
+            "median": 1.5298603458456717,
+            "mad": 1.5298603458456717,
+            "min": 0,
+            "max": 3.0597206916913433
+          }
+        },
+        "samples": [
+          {
+            "id": "reference:references/jpg/yapikredi.jpg",
+            "source": "references/jpg/yapikredi.jpg",
+            "sourceFormat": "jpeg"
+          },
+          {
+            "id": "reference:references/yapikredi.pdf",
+            "source": "references/yapikredi.pdf",
+            "sourceFormat": "png"
+          }
+        ]
+      },
       "ziraat::FAST": {
         "bank": "ziraat",
         "family": "FAST",
@@ -4467,168 +4629,6 @@
           {
             "id": "reference:references/ziraat-hesap-hareketleri.pdf",
             "source": "references/ziraat-hesap-hareketleri.pdf",
-            "sourceFormat": "png"
-          }
-        ]
-      },
-      "yapikredi::FAST": {
-        "bank": "yapikredi",
-        "family": "FAST",
-        "sampleCount": 2,
-        "sourceFormats": [
-          "jpeg",
-          "png"
-        ],
-        "featureStats": {
-          "luminanceMean": {
-            "mean": 249.8481674194336,
-            "std": 0.6655502319335938,
-            "median": 249.8481674194336,
-            "mad": 0.6655502319335938,
-            "min": 249.1826171875,
-            "max": 250.5137176513672
-          },
-          "luminanceStd": {
-            "mean": 28.92343644457691,
-            "std": 2.209838831719132,
-            "median": 28.92343644457691,
-            "mad": 2.209838831719132,
-            "min": 26.71359761285778,
-            "max": 31.133275276296043
-          },
-          "entropy": {
-            "mean": 0.7192962112492447,
-            "std": 0.12464126432455824,
-            "median": 0.7192962112492447,
-            "mad": 0.12464126432455824,
-            "min": 0.5946549469246865,
-            "max": 0.8439374755738029
-          },
-          "edgeDensity": {
-            "mean": 0.09869644739289479,
-            "std": 0.006006262012524029,
-            "median": 0.09869644739289479,
-            "mad": 0.006006262012524029,
-            "min": 0.09269018538037076,
-            "max": 0.10470270940541881
-          },
-          "meanGradient": {
-            "mean": 5.339869037815114,
-            "std": 0.684902152933665,
-            "median": 5.339869037815114,
-            "mad": 0.684902152933665,
-            "min": 4.654966884881449,
-            "max": 6.024771190748779
-          },
-          "laplacianVariance": {
-            "mean": 7512.057753115507,
-            "std": 1352.4715419430836,
-            "median": 7512.057753115507,
-            "mad": 1352.4715419430836,
-            "min": 6159.586211172423,
-            "max": 8864.52929505859
-          },
-          "darkPixelRatio": {
-            "mean": 0.00827789306640625,
-            "std": 0.00074005126953125,
-            "median": 0.00827789306640625,
-            "mad": 0.00074005126953125,
-            "min": 0.007537841796875,
-            "max": 0.0090179443359375
-          },
-          "brightPixelRatio": {
-            "mean": 0.9604568481445312,
-            "std": 0.00165557861328125,
-            "median": 0.9604568481445312,
-            "mad": 0.00165557861328125,
-            "min": 0.95880126953125,
-            "max": 0.9621124267578125
-          },
-          "dctLowEnergy": {
-            "mean": 9457.652970959727,
-            "std": 4678.67234840172,
-            "median": 9457.652970959727,
-            "mad": 4678.67234840172,
-            "min": 4778.980622558007,
-            "max": 14136.325319361447
-          },
-          "dctMidEnergy": {
-            "mean": 13254.885637843105,
-            "std": 5675.834859460273,
-            "median": 13254.885637843105,
-            "mad": 5675.834859460273,
-            "min": 7579.050778382831,
-            "max": 18930.720497303377
-          },
-          "dctHighEnergy": {
-            "mean": 17658.91451619717,
-            "std": 6578.209894188805,
-            "median": 17658.91451619717,
-            "mad": 6578.209894188805,
-            "min": 11080.704622008361,
-            "max": 24237.12441038597
-          },
-          "dctHighRatio": {
-            "mean": 0.44785374061076,
-            "std": 0.02489805842648704,
-            "median": 0.44785374061076,
-            "mad": 0.02489805842648704,
-            "min": 0.42295568218427293,
-            "max": 0.472751799037247
-          },
-          "blockinessHorizontal": {
-            "mean": 1.060132832791304,
-            "std": 0.03644683976502616,
-            "median": 1.060132832791304,
-            "mad": 0.03644683976502616,
-            "min": 1.0236859930262778,
-            "max": 1.0965796725563302
-          },
-          "blockinessVertical": {
-            "mean": 1.4387570347990386,
-            "std": 0.4556844249504025,
-            "median": 1.4387570347990386,
-            "mad": 0.4556844249504025,
-            "min": 0.9830726098486362,
-            "max": 1.8944414597494412
-          }
-        },
-        "jpeg": {
-          "sampleCount": 1,
-          "estimatedQuality": {
-            "mean": 95,
-            "std": 0,
-            "median": 95,
-            "mad": 0,
-            "min": 95,
-            "max": 95
-          },
-          "quantizationMean": {
-            "mean": 3.62109375,
-            "std": 3.62109375,
-            "median": 3.62109375,
-            "mad": 3.62109375,
-            "min": 0,
-            "max": 7.2421875
-          },
-          "quantizationStd": {
-            "mean": 1.5298603458456717,
-            "std": 1.5298603458456717,
-            "median": 1.5298603458456717,
-            "mad": 1.5298603458456717,
-            "min": 0,
-            "max": 3.0597206916913433
-          }
-        },
-        "samples": [
-          {
-            "id": "reference:references/jpg/yapikredi.jpg",
-            "source": "references/jpg/yapikredi.jpg",
-            "sourceFormat": "jpeg"
-          },
-          {
-            "id": "reference:references/yapikredi.pdf",
-            "source": "references/yapikredi.pdf",
             "sourceFormat": "png"
           }
         ]
@@ -5929,6 +5929,172 @@
           }
         ]
       },
+      "yapikredi::UNKNOWN": {
+        "bank": "yapikredi",
+        "family": "UNKNOWN",
+        "sampleCount": 3,
+        "sourceFormats": [
+          "jpeg"
+        ],
+        "featureStats": {
+          "luminanceMean": {
+            "mean": 234.97708638509116,
+            "std": 19.083431676805688,
+            "median": 246.39083862304688,
+            "mad": 4.058624267578125,
+            "min": 208.09095764160156,
+            "max": 250.449462890625
+          },
+          "luminanceStd": {
+            "mean": 40.95095721156684,
+            "std": 14.636755823828267,
+            "median": 34.24331200104431,
+            "mad": 6.897528421224806,
+            "min": 27.345783579819503,
+            "max": 61.26377605383669
+          },
+          "entropy": {
+            "mean": 1.600836377277442,
+            "std": 0.560576508000668,
+            "median": 1.6529826026486285,
+            "mad": 0.6068570156206681,
+            "min": 0.889686910914401,
+            "max": 2.2598396182692966
+          },
+          "edgeDensity": {
+            "mean": 0.12161840990348649,
+            "std": 0.028163032640526244,
+            "median": 0.1400737801475603,
+            "mad": 0.002883005766011526,
+            "min": 0.08182466364932729,
+            "max": 0.14295678591357183
+          },
+          "meanGradient": {
+            "mean": 6.795305816606299,
+            "std": 1.6151211860645123,
+            "median": 7.823896544193587,
+            "mad": 0.22330345248256567,
+            "min": 4.514820908949159,
+            "max": 8.047199996676152
+          },
+          "laplacianVariance": {
+            "mean": 7771.579579437935,
+            "std": 1504.4817341174194,
+            "median": 7938.750251825291,
+            "mad": 1586.154007494768,
+            "min": 5851.084227168454,
+            "max": 9524.90425932006
+          },
+          "darkPixelRatio": {
+            "mean": 0.0095367431640625,
+            "std": 0.0005570328875174759,
+            "median": 0.009613037109375,
+            "mad": 0.0005645751953125,
+            "min": 0.008819580078125,
+            "max": 0.0101776123046875
+          },
+          "brightPixelRatio": {
+            "mean": 0.8318023681640625,
+            "std": 0.15849098803353912,
+            "median": 0.922210693359375,
+            "mad": 0.0420074462890625,
+            "min": 0.608978271484375,
+            "max": 0.9642181396484375
+          },
+          "dctLowEnergy": {
+            "mean": 23405.159904158514,
+            "std": 11483.69960394786,
+            "median": 15330.104555149537,
+            "mad": 90.20951440176214,
+            "min": 15239.895040747775,
+            "max": 39645.48011657823
+          },
+          "dctMidEnergy": {
+            "mean": 23217.025097519134,
+            "std": 3970.852846692534,
+            "median": 23847.654385435486,
+            "mad": 3886.5749269656444,
+            "min": 18069.191594720793,
+            "max": 27734.22931240113
+          },
+          "dctHighEnergy": {
+            "mean": 18272.173478140085,
+            "std": 5483.839566142741,
+            "median": 21870.54246311044,
+            "mad": 552.0305472298423,
+            "min": 10523.404960969527,
+            "max": 22422.573010340282
+          },
+          "dctHighRatio": {
+            "mean": 0.28305709661427875,
+            "std": 0.05765642983682095,
+            "median": 0.24504740322249796,
+            "mad": 0.0054582000354377325,
+            "min": 0.23958920318706023,
+            "max": 0.364534683433278
+          },
+          "blockinessHorizontal": {
+            "mean": 0.9705154460118403,
+            "std": 0.18157565989476773,
+            "median": 0.8448844064009596,
+            "mad": 0.005505011379193792,
+            "min": 0.8393793950217658,
+            "max": 1.2272825366127953
+          },
+          "blockinessVertical": {
+            "mean": 1.4239212956644856,
+            "std": 0.7053129455428577,
+            "median": 1.381989153074577,
+            "mad": 0.8001665567371794,
+            "min": 0.5818225963373975,
+            "max": 2.3079521375814815
+          }
+        },
+        "jpeg": {
+          "sampleCount": 3,
+          "estimatedQuality": {
+            "mean": 75.66666666666667,
+            "std": 8.013876853447538,
+            "median": 70,
+            "mad": 0,
+            "min": 70,
+            "max": 87
+          },
+          "quantizationMean": {
+            "mean": 34.8828125,
+            "std": 11.379999759720999,
+            "median": 42.9296875,
+            "mad": 0,
+            "min": 18.7890625,
+            "max": 42.9296875
+          },
+          "quantizationStd": {
+            "mean": 14.880785535321971,
+            "std": 4.854135182758146,
+            "median": 18.31317743984646,
+            "mad": 0,
+            "min": 8.016001726273,
+            "max": 18.31317743984646
+          }
+        },
+        "samples": [
+          {
+            "id": "negative:negative_samples/yap#U0131kredi/fakeyapi10000.jpg",
+            "source": "negative_samples/yap#U0131kredi/fakeyapi10000.jpg",
+            "sourceFormat": "jpeg"
+          },
+          {
+            "id": "negative:negative_samples/yap#U0131kredi/sahte-1.jpg",
+            "source": "negative_samples/yap#U0131kredi/sahte-1.jpg",
+            "sourceFormat": "jpeg"
+          },
+          {
+            "id": "negative:negative_samples/yap#U0131kredi/yapifakeiban.jpg",
+            "source": "negative_samples/yap#U0131kredi/yapifakeiban.jpg",
+            "sourceFormat": "jpeg"
+          }
+        ]
+      },
       "ziraat::UNKNOWN": {
         "bank": "ziraat",
         "family": "UNKNOWN",
@@ -6096,172 +6262,6 @@
           {
             "id": "negative:negative_samples/ziraat/ziraatfakeiban.jpg",
             "source": "negative_samples/ziraat/ziraatfakeiban.jpg",
-            "sourceFormat": "jpeg"
-          }
-        ]
-      },
-      "yapikredi::FAST": {
-        "bank": "yapikredi",
-        "family": "FAST",
-        "sampleCount": 3,
-        "sourceFormats": [
-          "jpeg"
-        ],
-        "featureStats": {
-          "luminanceMean": {
-            "mean": 234.97708638509116,
-            "std": 19.083431676805688,
-            "median": 246.39083862304688,
-            "mad": 4.058624267578125,
-            "min": 208.09095764160156,
-            "max": 250.449462890625
-          },
-          "luminanceStd": {
-            "mean": 40.95095721156684,
-            "std": 14.636755823828267,
-            "median": 34.24331200104431,
-            "mad": 6.897528421224806,
-            "min": 27.345783579819503,
-            "max": 61.26377605383669
-          },
-          "entropy": {
-            "mean": 1.600836377277442,
-            "std": 0.560576508000668,
-            "median": 1.6529826026486285,
-            "mad": 0.6068570156206681,
-            "min": 0.889686910914401,
-            "max": 2.2598396182692966
-          },
-          "edgeDensity": {
-            "mean": 0.12161840990348649,
-            "std": 0.028163032640526244,
-            "median": 0.1400737801475603,
-            "mad": 0.002883005766011526,
-            "min": 0.08182466364932729,
-            "max": 0.14295678591357183
-          },
-          "meanGradient": {
-            "mean": 6.795305816606299,
-            "std": 1.6151211860645123,
-            "median": 7.823896544193587,
-            "mad": 0.22330345248256567,
-            "min": 4.514820908949159,
-            "max": 8.047199996676152
-          },
-          "laplacianVariance": {
-            "mean": 7771.579579437935,
-            "std": 1504.4817341174194,
-            "median": 7938.750251825291,
-            "mad": 1586.154007494768,
-            "min": 5851.084227168454,
-            "max": 9524.90425932006
-          },
-          "darkPixelRatio": {
-            "mean": 0.0095367431640625,
-            "std": 0.0005570328875174759,
-            "median": 0.009613037109375,
-            "mad": 0.0005645751953125,
-            "min": 0.008819580078125,
-            "max": 0.0101776123046875
-          },
-          "brightPixelRatio": {
-            "mean": 0.8318023681640625,
-            "std": 0.15849098803353912,
-            "median": 0.922210693359375,
-            "mad": 0.0420074462890625,
-            "min": 0.608978271484375,
-            "max": 0.9642181396484375
-          },
-          "dctLowEnergy": {
-            "mean": 23405.159904158514,
-            "std": 11483.69960394786,
-            "median": 15330.104555149537,
-            "mad": 90.20951440176214,
-            "min": 15239.895040747775,
-            "max": 39645.48011657823
-          },
-          "dctMidEnergy": {
-            "mean": 23217.025097519134,
-            "std": 3970.852846692534,
-            "median": 23847.654385435486,
-            "mad": 3886.5749269656444,
-            "min": 18069.191594720793,
-            "max": 27734.22931240113
-          },
-          "dctHighEnergy": {
-            "mean": 18272.173478140085,
-            "std": 5483.839566142741,
-            "median": 21870.54246311044,
-            "mad": 552.0305472298423,
-            "min": 10523.404960969527,
-            "max": 22422.573010340282
-          },
-          "dctHighRatio": {
-            "mean": 0.28305709661427875,
-            "std": 0.05765642983682095,
-            "median": 0.24504740322249796,
-            "mad": 0.0054582000354377325,
-            "min": 0.23958920318706023,
-            "max": 0.364534683433278
-          },
-          "blockinessHorizontal": {
-            "mean": 0.9705154460118403,
-            "std": 0.18157565989476773,
-            "median": 0.8448844064009596,
-            "mad": 0.005505011379193792,
-            "min": 0.8393793950217658,
-            "max": 1.2272825366127953
-          },
-          "blockinessVertical": {
-            "mean": 1.4239212956644856,
-            "std": 0.7053129455428577,
-            "median": 1.381989153074577,
-            "mad": 0.8001665567371794,
-            "min": 0.5818225963373975,
-            "max": 2.3079521375814815
-          }
-        },
-        "jpeg": {
-          "sampleCount": 3,
-          "estimatedQuality": {
-            "mean": 75.66666666666667,
-            "std": 8.013876853447538,
-            "median": 70,
-            "mad": 0,
-            "min": 70,
-            "max": 87
-          },
-          "quantizationMean": {
-            "mean": 34.8828125,
-            "std": 11.379999759720999,
-            "median": 42.9296875,
-            "mad": 0,
-            "min": 18.7890625,
-            "max": 42.9296875
-          },
-          "quantizationStd": {
-            "mean": 14.880785535321971,
-            "std": 4.854135182758146,
-            "median": 18.31317743984646,
-            "mad": 0,
-            "min": 8.016001726273,
-            "max": 18.31317743984646
-          }
-        },
-        "samples": [
-          {
-            "id": "negative:negative_samples/yapikredi/fakeyapi10000.jpg",
-            "source": "negative_samples/yapikredi/fakeyapi10000.jpg",
-            "sourceFormat": "jpeg"
-          },
-          {
-            "id": "negative:negative_samples/yapikredi/sahte-1.jpg",
-            "source": "negative_samples/yapikredi/sahte-1.jpg",
-            "sourceFormat": "jpeg"
-          },
-          {
-            "id": "negative:negative_samples/yapikredi/yapifakeiban.jpg",
-            "source": "negative_samples/yapikredi/yapifakeiban.jpg",
             "sourceFormat": "jpeg"
           }
         ]
@@ -6577,7 +6577,7 @@
       "id": "reference:references/jpg/yapikredi.jpg",
       "label": "reference",
       "bank": "yapikredi",
-      "family": "FAST",
+      "family": "UNKNOWN",
       "source": "references/jpg/yapikredi.jpg",
       "renderedFromPdf": false
     },
@@ -6721,7 +6721,7 @@
       "id": "reference:references/yapikredi.pdf",
       "label": "reference",
       "bank": "yapikredi",
-      "family": "FAST",
+      "family": "UNKNOWN",
       "source": "references/yapikredi.pdf",
       "renderedFromPdf": true
     },
@@ -6878,27 +6878,27 @@
       "renderedFromPdf": false
     },
     {
-      "id": "negative:negative_samples/yapikredi/fakeyapi10000.jpg",
+      "id": "negative:negative_samples/yap#U0131kredi/fakeyapi10000.jpg",
       "label": "negative",
       "bank": "yapikredi",
-      "family": "FAST",
-      "source": "negative_samples/yapikredi/fakeyapi10000.jpg",
+      "family": "UNKNOWN",
+      "source": "negative_samples/yap#U0131kredi/fakeyapi10000.jpg",
       "renderedFromPdf": false
     },
     {
-      "id": "negative:negative_samples/yapikredi/sahte-1.jpg",
+      "id": "negative:negative_samples/yap#U0131kredi/sahte-1.jpg",
       "label": "negative",
       "bank": "yapikredi",
-      "family": "FAST",
-      "source": "negative_samples/yapikredi/sahte-1.jpg",
+      "family": "UNKNOWN",
+      "source": "negative_samples/yap#U0131kredi/sahte-1.jpg",
       "renderedFromPdf": false
     },
     {
-      "id": "negative:negative_samples/yapikredi/yapifakeiban.jpg",
+      "id": "negative:negative_samples/yap#U0131kredi/yapifakeiban.jpg",
       "label": "negative",
       "bank": "yapikredi",
-      "family": "FAST",
-      "source": "negative_samples/yapikredi/yapifakeiban.jpg",
+      "family": "UNKNOWN",
+      "source": "negative_samples/yap#U0131kredi/yapifakeiban.jpg",
       "renderedFromPdf": false
     },
     {
