@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily, compareTelegramDegradation } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -429,6 +429,66 @@ async function extractMathFingerprintForFile(input, regions = {}) {
   }
 }
 
+
+
+async function buildTelegramTransportPairs(bank, family, selectedReferencePath) {
+  const normalizedBank = normalizeBank(bank);
+  if (!normalizedBank) return [];
+
+  // All trusted reference JPG/JPEG files in this project are Telegram-delivered
+  // genuine samples. Where a same-basename PDF exists, it gives us an
+  // original -> Telegram transport pair. We collect all same-bank pairs so the
+  // profile is not tied to one document variant.
+  const roots = [
+    REFERENCE_DIR,
+    path.join(REFERENCE_DIR, 'jpg'),
+  ];
+  const jpgs = new Set();
+  for (const root of roots) {
+    try {
+      const entries = await fs.readdir(root, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile() || !/\.(?:jpe?g)$/i.test(entry.name)) continue;
+        const stem = normalizeTurkishText(path.basename(entry.name, path.extname(entry.name))).replace(/[^a-z0-9]/g,'');
+        if (stem.includes(normalizedBank)) jpgs.add(path.join(root, entry.name));
+      }
+    } catch {}
+  }
+
+  const pairs = [];
+  for (const telegramPath of jpgs) {
+    const base = path.basename(telegramPath, path.extname(telegramPath));
+    const candidates = [
+      path.join(REFERENCE_DIR, `${base}.pdf`),
+      path.join(REFERENCE_DIR, `${base}.PDF`),
+    ];
+    let originalPath = null;
+    for (const candidate of candidates) {
+      try {
+        const st = await fs.stat(candidate);
+        if (st.isFile() && st.size > 0) { originalPath = candidate; break; }
+      } catch {}
+    }
+    if (!originalPath) continue;
+    try {
+      const originalFp = await extractMathFingerprintForFile(originalPath, {});
+      const telegramFp = await extractMathFingerprintForFile(telegramPath, {});
+      if (originalFp && telegramFp) {
+        pairs.push({
+          bank: normalizedBank,
+          family: inferDocumentFamily(base, base),
+          original: { path: originalPath, fingerprint: originalFp },
+          telegram: { path: telegramPath, fingerprint: telegramFp },
+        });
+      }
+    } catch (error) {
+      console.warn('TELEGRAM TRANSPORT PAIR HATASI:', path.basename(telegramPath), error?.message || error);
+    }
+    if (pairs.length >= 12) break;
+  }
+  return pairs;
+}
+
 async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null, negativeSamples = [] }) {
   if (!targetPath || !bank) {
     return { available: false, status: "missing-target-or-bank" };
@@ -457,17 +517,26 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   const fingerprint = await extractMathFingerprintForFile(targetPath, targetRegions);
   if (!fingerprint) return { available:false, status:"target-fingerprint-unavailable", bank };
   const family = inferDocumentFamily(fileName, targetText);
+  const selectedReferencePath = Array.isArray(referencePath) ? referencePath[0] : referencePath;
   const reference = compareAgainstBaseline(fingerprint, baseline.reference, bank, family);
   const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
 
   let roiForensics = null;
   let semanticNegativeAffinity = null;
   let semanticReferenceMeasurements = null;
+  let telegramDegradation = null;
   let global16x16 = { available: false, reason: 'reference-unavailable' };
-  if (referencePath && Object.keys(referenceRegions).length) {
+  if (selectedReferencePath && Object.keys(referenceRegions).length) {
     try {
-      const referenceFingerprint = await extractMathFingerprintForFile(referencePath, referenceRegions);
+      const referenceFingerprint = await extractMathFingerprintForFile(selectedReferencePath, referenceRegions);
       if (!referenceFingerprint) throw new Error("reference-fingerprint-unavailable");
+      try {
+        const transportPairs = await buildTelegramTransportPairs(bank, family, selectedReferencePath);
+        telegramDegradation = compareTelegramDegradation(fingerprint, referenceFingerprint, transportPairs);
+        console.log('TELEGRAM DEGRADATION FORENSICS V1:', JSON.stringify(telegramDegradation));
+      } catch (e) {
+        telegramDegradation = { available:false, reason:'telegram-calibration-error', error:e?.message || String(e) };
+      }
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
 
       // V1.5: expose the actual mathematical measurements extracted from the
@@ -724,6 +793,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         ? (negative?.reason || 'negative-baseline-unavailable')
         : null,
     },
+    telegramDegradation,
     global16x16: {
       ...global16x16,
       alignmentGuard: {
@@ -10400,12 +10470,12 @@ async function getReferenceFiles(bank) {
   // karıştırma. Kullanıcının gerçek hedefi Telegram üzerinden geldiği için
   // karşılaştırmanın referans tarafı da aynı transport/render zincirinden gelmeli.
   if (requestedFormat === 'jpg') {
-    const telegramFiles = uniqueFiles.filter(p => /telegram/i.test(path.basename(p)));
+    const telegramFiles = uniqueFiles.filter(p => /\.(?:jpe?g)$/i.test(p));
     if (telegramFiles.length) {
       uniqueFiles = telegramFiles;
-      console.log('REFERENCE TELEGRAM JPG PRIORITY V13:', JSON.stringify({
+      console.log('REFERENCE TELEGRAM JPG PRIORITY V14:', JSON.stringify({
         selected: uniqueFiles.map(p => path.basename(p)),
-        excludedNonTelegramJpg: files.filter(p => !telegramFiles.includes(p) && /\.(?:jpe?g)$/i.test(p)).map(p => path.basename(p))
+        policy: 'all reference JPG/JPEG files are trusted genuine Telegram samples'
       }));
     }
   }
@@ -20958,6 +21028,12 @@ if (veryStrongSemanticNegativeForRisk.length >= 2) {
     fields: veryStrongSemanticNegativeForRisk.map(x => x.field),
     appliedFloor: 60
   }));
+}
+
+// Telegram degradation is a transport/noise calibration layer only.
+// It must never independently promote authenticity risk.
+if (result?.mathematicalForensics?.telegramDegradation) {
+  result.telegramDegradation = result.mathematicalForensics.telegramDegradation;
 }
 
 // AI'ın overallRisk değerini kullanma.
