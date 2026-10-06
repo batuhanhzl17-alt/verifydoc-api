@@ -3,7 +3,7 @@ import path from 'path';
 import { createRequire } from 'module';
 import * as pdfjsLib from 'pdfjs-dist/build/pdf.mjs';
 import { pathToFileURL } from 'url';
-import { extractMathematicalFingerprint, buildBaseline, inferDocumentFamily } from './api/mathematical_forensics.js';
+import { extractMathematicalFingerprint, buildBaseline, inferDocumentFamily } from './api/mathematical_forensics_v1.6.3.js';
 
 const require = createRequire(import.meta.url);
 const canvasMod = require('@napi-rs/canvas');
