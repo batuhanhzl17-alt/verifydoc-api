@@ -755,6 +755,55 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
   return result;
 }
 
+
+export function compareSemanticRoiToNegativePopulation(targetFingerprint, negativeFingerprints, roiNames = ['amount','recipientName','recipientIban']) {
+  const result = {};
+  for (const name of roiNames) {
+    const target = targetFingerprint?.roi16x16?.[name];
+    if (!target?.metrics) {
+      result[name] = { available:false, reason:'target-roi-missing' };
+      continue;
+    }
+    const rows = [];
+    for (const item of (Array.isArray(negativeFingerprints) ? negativeFingerprints : [])) {
+      const fp = item?.fingerprint || item;
+      const neg = fp?.roi16x16?.[name];
+      if (!neg?.metrics) continue;
+      const compared = compare16x16Rois(targetFingerprint, fp, [name])[name];
+      if (!compared?.available) continue;
+      rows.push({
+        sample: item?.fileName || item?.source || item?.path || null,
+        meanDistance: Number(compared.meanDistance || 0),
+        maxCellDistance: Number(compared.maxCellDistance || 0),
+        metricDistances: compared.metricDistances || {},
+        rawMetricDistances: compared.rawMetricDistances || {},
+      });
+    }
+    if (!rows.length) {
+      result[name] = { available:false, reason:'negative-roi-unavailable', sampleCount:0 };
+      continue;
+    }
+    const distances = rows.map(x => x.meanDistance).filter(Number.isFinite).sort((a,b)=>a-b);
+    const medianDistance = median(distances);
+    const meanDistance = mean(distances);
+    const best = rows.slice().sort((a,b)=>a.meanDistance-b.meanDistance)[0];
+    result[name] = {
+      available:true,
+      sampleCount:rows.length,
+      meanDistance:Number(meanDistance.toFixed(3)),
+      medianDistance:Number(medianDistance.toFixed(3)),
+      bestDistance:Number(best.meanDistance.toFixed(3)),
+      bestSample:best.sample,
+      samples:rows,
+      // Positive means the target is mathematically closer to the negative
+      // population than to the trusted reference ROI.
+      referenceDistance:null,
+      negativeAffinityDelta:null,
+    };
+  }
+  return result;
+}
+
 export function compareAgainstBaseline(fingerprint, baseline, bank, family='unknown') {
   if (!baseline?.profiles) return { available:false, reason:'baseline-missing' };
   const candidates = Object.values(baseline.profiles).filter(p => p.bank === bank);
