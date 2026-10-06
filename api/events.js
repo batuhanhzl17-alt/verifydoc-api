@@ -265,23 +265,80 @@ async function handleEvent(payload) {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
-  if (!SLACK_BOT_TOKEN || !SLACK_SIGNING_SECRET) return res.status(500).json({ ok: false, error: "Slack environment variables eksik." });
-
-  const rawBody = await readRawBody(req);
-  const timestamp = req.headers["x-slack-request-timestamp"];
-  const signature = req.headers["x-slack-signature"];
-  if (!verifySlackSignature(rawBody, timestamp, signature)) return res.status(401).json({ ok: false, error: "Invalid Slack signature" });
-
-  let payload;
-  try { payload = JSON.parse(rawBody.toString("utf8")); }
-  catch { return res.status(400).json({ ok: false, error: "Invalid JSON" }); }
-
-  if (payload?.type === "url_verification") return res.status(200).json({ challenge: payload.challenge });
-
-  if (payload?.type === "event_callback") {
-    waitUntil(handleEvent(payload).catch(error => console.error("SLACK EVENT ERROR", error?.stack || error)));
+  if (req.method !== "POST") {
+    return res.status(405).json({
+      ok: false,
+      error: "Method not allowed",
+    });
   }
 
-  return res.status(200).json({ ok: true });
+  const rawBody = await readRawBody(req);
+
+  let payload;
+
+  try {
+    payload = JSON.parse(rawBody.toString("utf8"));
+  } catch (error) {
+    console.error("SLACK JSON PARSE ERROR", error);
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid JSON",
+    });
+  }
+
+  // Slack Event Subscriptions URL verification.
+  // Challenge isteğini normal event kontrollerinden önce cevaplıyoruz.
+  if (payload?.type === "url_verification") {
+    if (!payload.challenge) {
+      return res.status(400).json({
+        ok: false,
+        error: "Slack challenge bulunamadı.",
+      });
+    }
+
+    return res.status(200).json({
+      challenge: payload.challenge,
+    });
+  }
+
+  // Normal Slack event'leri için gerekli environment variables.
+  if (!SLACK_BOT_TOKEN || !SLACK_SIGNING_SECRET) {
+    console.error("Slack environment variables eksik.");
+    return res.status(500).json({
+      ok: false,
+      error: "Slack environment variables eksik.",
+    });
+  }
+
+  // Slack signature verification.
+  const timestamp = req.headers["x-slack-request-timestamp"];
+  const signature = req.headers["x-slack-signature"];
+
+  if (!verifySlackSignature(rawBody, timestamp, signature)) {
+    console.error("Invalid Slack signature.");
+    return res.status(401).json({
+      ok: false,
+      error: "Invalid Slack signature",
+    });
+  }
+
+  // Normal Slack event callback.
+  if (payload?.type === "event_callback") {
+    waitUntil(
+      handleEvent(payload).catch((error) => {
+        console.error(
+          "SLACK EVENT ERROR",
+          error?.stack || error?.message || error
+        );
+      })
+    );
+
+    return res.status(200).json({
+      ok: true,
+    });
+  }
+
+  return res.status(200).json({
+    ok: true,
+  });
 }
