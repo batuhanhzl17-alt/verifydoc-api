@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily, compareTelegramDegradation } from "./mathematical_forensics_v1.6.3.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -320,7 +320,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       const anchor = await getReferenceAmountAnchor(bank);
       // Trusted anchor is allowed only as a last resort, after the typed
       // anchor builder has already rejected non-money numeric fields.
-      if (anchor && referencePath && String(anchor.source || '').trim()) {
+      if (anchor && referencePath && String(anchor.source || '').includes('amount')) {
         let meta;
         if (path.extname(referencePath).toLowerCase() === '.pdf') {
           const raw = await fs.readFile(referencePath);
@@ -410,86 +410,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   return rois;
 }
 
-
-async function extractMathFingerprintForFile(input, regions = {}) {
-  if (!input) return null;
-  try {
-    const isPath = typeof input === 'string';
-    const sourcePath = isPath ? input : null;
-    const ext = sourcePath ? path.extname(sourcePath).toLowerCase() : '';
-    if (ext === '.pdf') {
-      const rendered = await renderPdfPagePng(sourcePath, 1, 2.8);
-      if (!rendered?.buffer) return null;
-      return await extractMathematicalFingerprint(rendered.buffer, { regions });
-    }
-    return await extractMathematicalFingerprint(input, { regions });
-  } catch (error) {
-    console.warn('MATH FINGERPRINT FILE HATASI:', error?.message || error);
-    return null;
-  }
-}
-
-
-
-async function buildTelegramTransportPairs(bank, family, selectedReferencePath) {
-  const normalizedBank = normalizeBank(bank);
-  if (!normalizedBank) return [];
-
-  // All trusted reference JPG/JPEG files in this project are Telegram-delivered
-  // genuine samples. Where a same-basename PDF exists, it gives us an
-  // original -> Telegram transport pair. We collect all same-bank pairs so the
-  // profile is not tied to one document variant.
-  const roots = [
-    REFERENCE_DIR,
-    path.join(REFERENCE_DIR, 'jpg'),
-  ];
-  const jpgs = new Set();
-  for (const root of roots) {
-    try {
-      const entries = await fs.readdir(root, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isFile() || !/\.(?:jpe?g)$/i.test(entry.name)) continue;
-        const stem = normalizeTurkishText(path.basename(entry.name, path.extname(entry.name))).replace(/[^a-z0-9]/g,'');
-        if (stem.includes(normalizedBank)) jpgs.add(path.join(root, entry.name));
-      }
-    } catch {}
-  }
-
-  const pairs = [];
-  for (const telegramPath of jpgs) {
-    const base = path.basename(telegramPath, path.extname(telegramPath));
-    const candidates = [
-      path.join(REFERENCE_DIR, `${base}.pdf`),
-      path.join(REFERENCE_DIR, `${base}.PDF`),
-    ];
-    let originalPath = null;
-    for (const candidate of candidates) {
-      try {
-        const st = await fs.stat(candidate);
-        if (st.isFile() && st.size > 0) { originalPath = candidate; break; }
-      } catch {}
-    }
-    if (!originalPath) continue;
-    try {
-      const originalFp = await extractMathFingerprintForFile(originalPath, {});
-      const telegramFp = await extractMathFingerprintForFile(telegramPath, {});
-      if (originalFp && telegramFp) {
-        pairs.push({
-          bank: normalizedBank,
-          family: inferDocumentFamily(base, base),
-          original: { path: originalPath, fingerprint: originalFp },
-          telegram: { path: telegramPath, fingerprint: telegramFp },
-        });
-      }
-    } catch (error) {
-      console.warn('TELEGRAM TRANSPORT PAIR HATASI:', path.basename(telegramPath), error?.message || error);
-    }
-    if (pairs.length >= 12) break;
-  }
-  return pairs;
-}
-
-async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null, negativeSamples = [] }) {
+async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
   if (!targetPath || !bank) {
     return { available: false, status: "missing-target-or-bank" };
   }
@@ -514,29 +435,17 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     }
   }
 
-  const fingerprint = await extractMathFingerprintForFile(targetPath, targetRegions);
-  if (!fingerprint) return { available:false, status:"target-fingerprint-unavailable", bank };
+  const fingerprint = await extractMathematicalFingerprint(targetPath, { regions: targetRegions });
   const family = inferDocumentFamily(fileName, targetText);
-  const selectedReferencePath = Array.isArray(referencePath) ? referencePath[0] : referencePath;
   const reference = compareAgainstBaseline(fingerprint, baseline.reference, bank, family);
   const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
 
   let roiForensics = null;
-  let semanticNegativeAffinity = null;
   let semanticReferenceMeasurements = null;
-  let telegramDegradation = null;
   let global16x16 = { available: false, reason: 'reference-unavailable' };
-  if (selectedReferencePath && Object.keys(referenceRegions).length) {
+  if (referencePath && Object.keys(referenceRegions).length) {
     try {
-      const referenceFingerprint = await extractMathFingerprintForFile(selectedReferencePath, referenceRegions);
-      if (!referenceFingerprint) throw new Error("reference-fingerprint-unavailable");
-      try {
-        const transportPairs = await buildTelegramTransportPairs(bank, family, selectedReferencePath);
-        telegramDegradation = compareTelegramDegradation(fingerprint, referenceFingerprint, transportPairs);
-        console.log('TELEGRAM DEGRADATION FORENSICS V1:', JSON.stringify(telegramDegradation));
-      } catch (e) {
-        telegramDegradation = { available:false, reason:'telegram-calibration-error', error:e?.message || String(e) };
-      }
+      const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
 
       // V1.5: expose the actual mathematical measurements extracted from the
@@ -590,47 +499,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         strongThreshold: 5,
         minOverlap: 0.20,
       });
-
-      // Resolution-independent negative population: apply the trusted
-      // reference ROI geometry as normalized coordinates to every known fake.
-      // The negative sample's native resolution is therefore irrelevant.
-      if (Array.isArray(negativeSamples) && negativeSamples.length) {
-        const refW = Number(referenceFingerprint?.source?.width || 0);
-        const refH = Number(referenceFingerprint?.source?.height || 0);
-        const negativeFingerprints = [];
-        for (const sample of negativeSamples.slice(0, 12)) {
-          try {
-            if (!sample?.path || !refW || !refH) continue;
-            const normalizedNegativeRegions = {};
-            for (const [field, box] of Object.entries(referenceRegions)) {
-              const x1=Number(box?.x1), y1=Number(box?.y1), x2=Number(box?.x2), y2=Number(box?.y2);
-              if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1) continue;
-              normalizedNegativeRegions[field] = {
-                xNorm:x1/refW,
-                yNorm:y1/refH,
-                widthNorm:(x2-x1)/refW,
-                heightNorm:(y2-y1)/refH,
-              };
-            }
-            const negFp = await extractMathFingerprintForFile(sample.path, normalizedNegativeRegions);
-            if (negFp) negativeFingerprints.push({ fileName:sample.fileName, path:sample.path, fingerprint:negFp });
-          } catch (e) {
-            console.warn('MATH NEGATIVE ROI SKIP:', sample?.fileName || sample?.path, e?.message || e);
-          }
-        }
-        semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(fingerprint, negativeFingerprints, ['amount','recipientName','recipientIban']);
-        for (const field of Object.keys(semanticNegativeAffinity || {})) {
-          const row = semanticNegativeAffinity[field];
-          const refDistance = Number(roiForensics?.[field]?.meanDistance);
-          if (row?.available && Number.isFinite(refDistance)) {
-            row.referenceDistance = Number(refDistance.toFixed(3));
-            row.negativeAffinityDelta = Number((refDistance - Number(row.medianDistance || row.meanDistance || 0)).toFixed(3));
-            row.referenceCloser = row.negativeAffinityDelta < 0;
-            row.negativeCloser = row.negativeAffinityDelta > 0;
-          }
-        }
-        console.log('MATH SEMANTIC NEGATIVE POPULATION V1:', JSON.stringify(semanticNegativeAffinity));
-      }
     } catch (error) {
       roiForensics = { available: false, status: 'roi-error', error: error?.message || String(error) };
     }
@@ -657,57 +525,22 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     : null;
 
   const flags = [];
+  // GLOBAL WHOLE-DOCUMENT FINGERPRINT GUARD:
+  // This comparison can encode page geometry, density, rasterization, compression
+  // and delivery history. It is diagnostic only. It MUST NOT be promoted as a
+  // negative-authenticity finding unless semantic ROI population evidence also
+  // corroborates it later in the pipeline.
   if (referenceAvailable && negativeAvailable && Number.isFinite(affinityDelta)) {
     const negReliability = String(negative?.bestMatch?.profile?.reliability || 'insufficient');
     const refReliability = String(reference?.bestMatch?.profile?.reliability || 'insufficient');
-    const reliabilityPenalty = negReliability === 'low' ? 'low-sample' : 'population';
-    if (negScore >= 70 && affinityDelta >= 10 && negReliability !== 'low') {
-      flags.push({
-        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
-        severity: "high",
-        reliability: reliabilityPenalty,
-        detail: `Matematiksel fingerprint known-negative dağılımına reference dağılımından daha yakın (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
-      });
-    } else if (negScore >= 60 && affinityDelta >= 5) {
-      flags.push({
-        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
-        severity: negReliability === 'low' ? "low" : "medium",
-        reliability: reliabilityPenalty,
-        detail: `Known-negative matematiksel affinity sinyali var (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
-      });
-    }
-  }
-
-  // Semantic negative affinity is the intended mathematical forensic signal:
-  // target ROI must be closer to the known-fake population than to the trusted
-  // reference ROI. It is independent of document resolution and global layout.
-  const semanticNegativeRows = Object.entries(semanticNegativeAffinity || {})
-    .map(([field, row]) => ({ field, ...row }))
-    .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
-  const strongSemanticNegativeRows = semanticNegativeRows.filter(row =>
-    Number(row.sampleCount || 0) >= 2 &&
-    Number(row.negativeAffinityDelta || 0) >= 1.25 &&
-    Number(row.medianDistance || 99) <= 5.5
-  );
-  const moderateSemanticNegativeRows = semanticNegativeRows.filter(row =>
-    Number(row.sampleCount || 0) >= 1 &&
-    Number(row.negativeAffinityDelta || 0) >= 0.75
-  );
-  if (strongSemanticNegativeRows.length) {
     flags.push({
-      code:'SEMANTIC_NEGATIVE_ROI_AFFINITY',
-      severity:'high',
-      reliability:'forensic-signal',
-      fields:strongSemanticNegativeRows.map(x=>x.field),
-      detail:`Kritik ROI matematiksel profili known-negative dağılımına trusted reference ROI'dan belirgin biçimde daha yakın: ${strongSemanticNegativeRows.map(x=>`${x.field} Δ${Number(x.negativeAffinityDelta).toFixed(2)}`).join(', ')}. Bu sinyal çözünürlükten bağımsızdır ve tek başına kesin sahtecilik hükmü değildir.`
-    });
-  } else if (moderateSemanticNegativeRows.length) {
-    flags.push({
-      code:'SEMANTIC_NEGATIVE_ROI_AFFINITY',
-      severity:'medium',
-      reliability:'forensic-signal',
-      fields:moderateSemanticNegativeRows.map(x=>x.field),
-      detail:`Kritik ROI matematiksel profilinde known-negative yönünde yakınlık görüldü: ${moderateSemanticNegativeRows.map(x=>`${x.field} Δ${Number(x.negativeAffinityDelta).toFixed(2)}`).join(', ')}.`
+      code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
+      severity: affinityDelta >= 20 ? "info" : "low",
+      reliability: negReliability === 'low' ? 'low-sample' : 'diagnostic',
+      detail: `Global raster fingerprint known-negative popülasyonuna daha yakın (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}; delta ${affinityDelta.toFixed(1)}). Bu sinyal tek başına sahtecilik kanıtı değildir.`,
+      policy: "diagnostic-only",
+      referenceReliability: refReliability,
+      negativeReliability: negReliability,
     });
   }
 
@@ -776,7 +609,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   return {
     available: true,
     version: 'MATH-FORENSICS-V1.6.3-SCALE-INVARIANT-GLOBAL-BASELINE-GUARD',
-    semanticNegativeVersion: 'MATH-FORENSICS-V2.0.0-SEMANTIC-ROI-POPULATION',
     engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
@@ -793,7 +625,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         ? (negative?.reason || 'negative-baseline-unavailable')
         : null,
     },
-    telegramDegradation,
     global16x16: {
       ...global16x16,
       alignmentGuard: {
@@ -809,7 +640,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     // measured mathematically when their boxes were available.
     semanticReferenceMeasurements,
     roi16x16: roiForensics,
-    semanticNegativeAffinity,
     roiSummary: {
       available: roiRows.length > 0,
       fieldsCompared: roiRows.map(x=>x.field),
@@ -2584,11 +2414,11 @@ const NEGATIVE_SAMPLE_MAP = {
     "isbankasi/fake200000.jpg",
   ],
   qnb: ["qnb/qnb5000.jpg", "qnb/qnbfakeiban.jpg"],
-  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vak#U0131f3500fake.jpg"],
+  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vakıf3500fake.jpg"],
   yapikredi: [
-    "yapikredi/sahte-1.jpg",
-    "yapikredi/fakeyapi10000.jpg",
-    "yapikredi/yapifakeiban.jpg",
+    "yapıkredi/sahte-1.jpg",
+    "yapıkredi/fakeyapi10000.jpg",
+    "yapıkredi/yapifakeiban.jpg",
   ],
   ziraat: [
     "ziraat/sahte-1.jpg",
@@ -10470,12 +10300,12 @@ async function getReferenceFiles(bank) {
   // karıştırma. Kullanıcının gerçek hedefi Telegram üzerinden geldiği için
   // karşılaştırmanın referans tarafı da aynı transport/render zincirinden gelmeli.
   if (requestedFormat === 'jpg') {
-    const telegramFiles = uniqueFiles.filter(p => /\.(?:jpe?g)$/i.test(p));
+    const telegramFiles = uniqueFiles.filter(p => /telegram/i.test(path.basename(p)));
     if (telegramFiles.length) {
       uniqueFiles = telegramFiles;
-      console.log('REFERENCE TELEGRAM JPG PRIORITY V14:', JSON.stringify({
+      console.log('REFERENCE TELEGRAM JPG PRIORITY V13:', JSON.stringify({
         selected: uniqueFiles.map(p => path.basename(p)),
-        policy: 'all reference JPG/JPEG files are trusted genuine Telegram samples'
+        excludedNonTelegramJpg: files.filter(p => !telegramFiles.includes(p) && /\.(?:jpe?g)$/i.test(p)).map(p => path.basename(p))
       }));
     }
   }
@@ -16131,8 +15961,6 @@ if (type === "image" || type === "pdf") {
       paddleOcrText,
       paddleImageOCR?.text || ""
     ].filter(Boolean).join("\n");
-    let mathematicalNegativeSamples = [];
-    try { mathematicalNegativeSamples = await loadNegativeSampleFiles(bank); } catch {}
     mathematicalForensics = await runMathematicalForensics({
       targetPath: forensicTargetPath,
       targetText: mathText,
@@ -16141,8 +15969,7 @@ if (type === "image" || type === "pdf") {
       referencePath: reference?.path || null,
       targetOCR: paddleImageOCR,
       amountForensics,
-      referenceForensics,
-      negativeSamples: mathematicalNegativeSamples
+      referenceForensics
     });
     console.log("MATHEMATICAL FORENSICS V1.2:", JSON.stringify(mathematicalForensics));
   } catch (error) {
@@ -18156,9 +17983,10 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     if (unique.length) lines.push('', '🔴 FARKLAR', ...unique.map(x => `• ${x.title}: ${x.detail}`));
     if (infoUnique.length) lines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
     if (!unique.length && !infoUnique.length) lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
-    if (fusion?.referenceLike) lines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
-    else if (fusion?.negativeLike) lines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
-    else lines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
+    if (fusion?.referenceLike) lines.push('', '🟢 Matematiksel değerlendirme: semantic ROI kanıtı referansla uyumlu.');
+    else if (fusion?.negativeLike) lines.push('', '🔴 Matematiksel değerlendirme: semantic ROI kanıtı negatif örneklerle uyumlu.');
+    else if (fusion?.differential != null) lines.push('', `🟡 Genel raster fingerprint: negatif popülasyonuna daha yakın görünüyor (delta ${Number(fusion.differential).toFixed(1)}); bu sinyal tek başına sahtecilik kanıtı değildir.`);
+    else lines.push('', '🟡 Matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
       available: true,
@@ -19755,8 +19583,11 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
     (Number.isFinite(rawDifferential) && negativeBaselineAvailable && referenceAvailable);
   const differential = differentialAvailable ? rawDifferential : null;
 
-  const referenceLikeByDifferential = differentialAvailable && differential <= -20;
-  const negativeLikeByDifferential = differentialAvailable && differential >= 20;
+  // Global differential is diagnostic-only. It may reflect layout/raster/delivery
+  // variant rather than authenticity, so it cannot create reference-like or
+  // negative-like adjudication by itself.
+  const referenceLikeByDifferential = false;
+  const negativeLikeByDifferential = false;
 
   const semanticFields = math?.semanticMathCalibration?.fields || {};
   const fieldRows = Array.isArray(forensic?.fields) ? forensic.fields : [];
@@ -20294,9 +20125,10 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   if (!unique.length && !infoUnique.length) {
     userLines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
-  if (referenceLike) userLines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
-  else if (negativeLike) userLines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
-  else userLines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
+  if (referenceLike) userLines.push('', '🟢 Matematiksel değerlendirme: semantic ROI kanıtı referansla uyumlu.');
+  else if (negativeLike) userLines.push('', '🔴 Matematiksel değerlendirme: semantic ROI kanıtı negatif örneklerle uyumlu.');
+  else if (differential != null) userLines.push('', `🟡 Genel raster fingerprint: negatif popülasyonuna daha yakın görünüyor (delta ${Number(differential).toFixed(1)}); bu sinyal tek başına sahtecilik kanıtı değildir.`);
+  else userLines.push('', '🟡 Matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
 
   return {
     headline: unique.length
@@ -20984,56 +20816,32 @@ if (!controlledAmountCorroborated) {
   result.categories = finalDeterministicRisk.categories;
 }
 
-// Mathematical fingerprint policy V2:
-// Whole-document/global reference-vs-negative similarity is diagnostic only.
-// It must never promote the final risk by itself because page resolution,
-// aspect ratio, crop and delivery history can legitimately move global raster
-// statistics. Final mathematical promotion is driven by semantic ROI population
-// evidence below: target ROI vs trusted reference ROI vs known-fake ROI set.
-const semanticNegativeRowsForRisk = Object.entries(result?.mathematicalForensics?.semanticNegativeAffinity || {})
-  .map(([field, row]) => ({ field, ...row }))
-  .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
-const strongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
-  Number(row.sampleCount || 0) >= 2 &&
-  Number(row.negativeAffinityDelta || 0) >= 1.25 &&
-  Number(row.medianDistance || 99) <= 5.5
-);
-const veryStrongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
-  Number(row.sampleCount || 0) >= 2 &&
-  Number(row.negativeAffinityDelta || 0) >= 2.25 &&
-  Number(row.medianDistance || 99) <= 5.5
-);
-const mathSemanticNegativeAffinity = strongSemanticNegativeForRisk.length > 0;
+// Mathematical fingerprint is intentionally a corroborating signal, not an
+// automatic authenticity verdict. Global whole-document affinity is diagnostic
+// only. Final negative affinity requires semantic ROI population evidence.
+// GLOBAL mathematical fingerprint is diagnostic-only.
+// Do not promote final risk from whole-document similarity, even when the
+// target looks like the negative population or is an outlier from reference.
+// Final mathematical promotion is intentionally reserved for semantic ROI
+// population evidence produced by a dedicated V2 semantic engine.
+const semanticNegativeAffinity = result?.mathematicalForensics?.semanticNegativePopulation;
+const semanticNegativeEvidence = Array.isArray(semanticNegativeAffinity?.fields)
+  ? semanticNegativeAffinity.fields.filter(x => x?.available && x?.negativeAffinity)
+  : [];
+const semanticNegativeStrongCount = semanticNegativeEvidence.filter(x =>
+  Number(x?.negativeAffinityDelta || 0) >= 2.5 &&
+  Number(x?.negativeSampleCount || 0) >= 3 &&
+  ['medium','high'].includes(String(x?.negativeReliability || ''))
+).length;
 
-if (mathSemanticNegativeAffinity) {
+// IMPORTANT: without semantic population corroboration, mathematical forensics
+// cannot change the final deterministic risk score.
+if (semanticNegativeStrongCount >= 1) {
   finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 60)
   };
-  console.log('SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
-    fields: strongSemanticNegativeForRisk.map(x => x.field),
-    deltas: strongSemanticNegativeForRisk.map(x => ({field:x.field, delta:x.negativeAffinityDelta, samples:x.sampleCount})),
-    appliedFloor: 46
-  }));
-}
-
-if (veryStrongSemanticNegativeForRisk.length >= 2) {
-  finalRiskScore = Math.max(finalRiskScore, 60);
-  result.categories = {
-    ...(result.categories || {}),
-    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 65)
-  };
-  console.log('VERY STRONG SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
-    fields: veryStrongSemanticNegativeForRisk.map(x => x.field),
-    appliedFloor: 60
-  }));
-}
-
-// Telegram degradation is a transport/noise calibration layer only.
-// It must never independently promote authenticity risk.
-if (result?.mathematicalForensics?.telegramDegradation) {
-  result.telegramDegradation = result.mathematicalForensics.telegramDegradation;
 }
 
 // AI'ın overallRisk değerini kullanma.
