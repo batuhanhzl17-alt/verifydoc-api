@@ -64,20 +64,67 @@ async function postMessage(channel, text, threadTs = null) {
 }
 
 async function getSlackFile(fileId) {
-  const data = await slackApi("files.info", { file: fileId });
+  if (!SLACK_BOT_TOKEN) {
+    throw new Error("SLACK_BOT_TOKEN bulunamadı.");
+  }
+
+  // Slack files.info endpoint'i GET + query parameter kullanır.
+  // Genel slackApi() helper'ımız POST/JSON kullandığı için burada
+  // files.info çağrısını doğrudan yapıyoruz.
+  const infoUrl = new URL("https://slack.com/api/files.info");
+  infoUrl.searchParams.set("file", fileId);
+
+  const infoResponse = await fetch(infoUrl, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+    },
+  });
+
+  const infoText = await infoResponse.text();
+
+  let data;
+  try {
+    data = JSON.parse(infoText);
+  } catch {
+    throw new Error(
+      `Slack files.info JSON döndürmedi. HTTP ${infoResponse.status}`
+    );
+  }
+
+  if (!infoResponse.ok || !data.ok) {
+    throw new Error(
+      `Slack files.info hatası: ${data?.error || `HTTP ${infoResponse.status}`}`
+    );
+  }
+
   const file = data.file;
-  if (!file) throw new Error("Slack dosya bilgisi alınamadı.");
+  if (!file) {
+    throw new Error("Slack dosya bilgisi alınamadı.");
+  }
 
   const url = file.url_private_download || file.url_private;
-  if (!url) throw new Error("Slack dosyasının indirme URL'si bulunamadı.");
+  if (!url) {
+    throw new Error("Slack dosyasının indirme URL'si bulunamadı.");
+  }
 
   const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+    headers: {
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+    },
   });
-  if (!response.ok) throw new Error(`Slack dosyası indirilemedi. HTTP ${response.status}`);
+
+  if (!response.ok) {
+    throw new Error(
+      `Slack dosyası indirilemedi. HTTP ${response.status}`
+    );
+  }
 
   const buffer = Buffer.from(await response.arrayBuffer());
-  if (!buffer.length) throw new Error("Slack dosyası boş.");
+
+  if (!buffer.length) {
+    throw new Error("Slack dosyası boş.");
+  }
 
   return {
     buffer,
@@ -265,80 +312,23 @@ async function handleEvent(payload) {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({
-      ok: false,
-      error: "Method not allowed",
-    });
-  }
+  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
+  if (!SLACK_BOT_TOKEN || !SLACK_SIGNING_SECRET) return res.status(500).json({ ok: false, error: "Slack environment variables eksik." });
 
   const rawBody = await readRawBody(req);
-
-  let payload;
-
-  try {
-    payload = JSON.parse(rawBody.toString("utf8"));
-  } catch (error) {
-    console.error("SLACK JSON PARSE ERROR", error);
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid JSON",
-    });
-  }
-
-  // Slack Event Subscriptions URL verification.
-  // Challenge isteğini normal event kontrollerinden önce cevaplıyoruz.
-  if (payload?.type === "url_verification") {
-    if (!payload.challenge) {
-      return res.status(400).json({
-        ok: false,
-        error: "Slack challenge bulunamadı.",
-      });
-    }
-
-    return res.status(200).json({
-      challenge: payload.challenge,
-    });
-  }
-
-  // Normal Slack event'leri için gerekli environment variables.
-  if (!SLACK_BOT_TOKEN || !SLACK_SIGNING_SECRET) {
-    console.error("Slack environment variables eksik.");
-    return res.status(500).json({
-      ok: false,
-      error: "Slack environment variables eksik.",
-    });
-  }
-
-  // Slack signature verification.
   const timestamp = req.headers["x-slack-request-timestamp"];
   const signature = req.headers["x-slack-signature"];
+  if (!verifySlackSignature(rawBody, timestamp, signature)) return res.status(401).json({ ok: false, error: "Invalid Slack signature" });
 
-  if (!verifySlackSignature(rawBody, timestamp, signature)) {
-    console.error("Invalid Slack signature.");
-    return res.status(401).json({
-      ok: false,
-      error: "Invalid Slack signature",
-    });
-  }
+  let payload;
+  try { payload = JSON.parse(rawBody.toString("utf8")); }
+  catch { return res.status(400).json({ ok: false, error: "Invalid JSON" }); }
 
-  // Normal Slack event callback.
+  if (payload?.type === "url_verification") return res.status(200).json({ challenge: payload.challenge });
+
   if (payload?.type === "event_callback") {
-    waitUntil(
-      handleEvent(payload).catch((error) => {
-        console.error(
-          "SLACK EVENT ERROR",
-          error?.stack || error?.message || error
-        );
-      })
-    );
-
-    return res.status(200).json({
-      ok: true,
-    });
+    waitUntil(handleEvent(payload).catch(error => console.error("SLACK EVENT ERROR", error?.stack || error)));
   }
 
-  return res.status(200).json({
-    ok: true,
-  });
+  return res.status(200).json({ ok: true });
 }
