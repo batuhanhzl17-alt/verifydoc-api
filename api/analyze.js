@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -410,7 +410,26 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   return rois;
 }
 
-async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
+
+async function extractMathFingerprintForFile(input, regions = {}) {
+  if (!input) return null;
+  try {
+    const isPath = typeof input === 'string';
+    const sourcePath = isPath ? input : null;
+    const ext = sourcePath ? path.extname(sourcePath).toLowerCase() : '';
+    if (ext === '.pdf') {
+      const rendered = await renderPdfPagePng(sourcePath, 1, 2.8);
+      if (!rendered?.buffer) return null;
+      return await extractMathematicalFingerprint(rendered.buffer, { regions });
+    }
+    return await extractMathematicalFingerprint(input, { regions });
+  } catch (error) {
+    console.warn('MATH FINGERPRINT FILE HATASI:', error?.message || error);
+    return null;
+  }
+}
+
+async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null, negativeSamples = [] }) {
   if (!targetPath || !bank) {
     return { available: false, status: "missing-target-or-bank" };
   }
@@ -435,17 +454,20 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     }
   }
 
-  const fingerprint = await extractMathematicalFingerprint(targetPath, { regions: targetRegions });
+  const fingerprint = await extractMathFingerprintForFile(targetPath, targetRegions);
+  if (!fingerprint) return { available:false, status:"target-fingerprint-unavailable", bank };
   const family = inferDocumentFamily(fileName, targetText);
   const reference = compareAgainstBaseline(fingerprint, baseline.reference, bank, family);
   const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
 
   let roiForensics = null;
+  let semanticNegativeAffinity = null;
   let semanticReferenceMeasurements = null;
   let global16x16 = { available: false, reason: 'reference-unavailable' };
   if (referencePath && Object.keys(referenceRegions).length) {
     try {
-      const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
+      const referenceFingerprint = await extractMathFingerprintForFile(referencePath, referenceRegions);
+      if (!referenceFingerprint) throw new Error("reference-fingerprint-unavailable");
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
 
       // V1.5: expose the actual mathematical measurements extracted from the
@@ -499,6 +521,47 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         strongThreshold: 5,
         minOverlap: 0.20,
       });
+
+      // Resolution-independent negative population: apply the trusted
+      // reference ROI geometry as normalized coordinates to every known fake.
+      // The negative sample's native resolution is therefore irrelevant.
+      if (Array.isArray(negativeSamples) && negativeSamples.length) {
+        const refW = Number(referenceFingerprint?.source?.width || 0);
+        const refH = Number(referenceFingerprint?.source?.height || 0);
+        const negativeFingerprints = [];
+        for (const sample of negativeSamples.slice(0, 12)) {
+          try {
+            if (!sample?.path || !refW || !refH) continue;
+            const normalizedNegativeRegions = {};
+            for (const [field, box] of Object.entries(referenceRegions)) {
+              const x1=Number(box?.x1), y1=Number(box?.y1), x2=Number(box?.x2), y2=Number(box?.y2);
+              if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1) continue;
+              normalizedNegativeRegions[field] = {
+                xNorm:x1/refW,
+                yNorm:y1/refH,
+                widthNorm:(x2-x1)/refW,
+                heightNorm:(y2-y1)/refH,
+              };
+            }
+            const negFp = await extractMathFingerprintForFile(sample.path, normalizedNegativeRegions);
+            if (negFp) negativeFingerprints.push({ fileName:sample.fileName, path:sample.path, fingerprint:negFp });
+          } catch (e) {
+            console.warn('MATH NEGATIVE ROI SKIP:', sample?.fileName || sample?.path, e?.message || e);
+          }
+        }
+        semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(fingerprint, negativeFingerprints, ['amount','recipientName','recipientIban']);
+        for (const field of Object.keys(semanticNegativeAffinity || {})) {
+          const row = semanticNegativeAffinity[field];
+          const refDistance = Number(roiForensics?.[field]?.meanDistance);
+          if (row?.available && Number.isFinite(refDistance)) {
+            row.referenceDistance = Number(refDistance.toFixed(3));
+            row.negativeAffinityDelta = Number((refDistance - Number(row.medianDistance || row.meanDistance || 0)).toFixed(3));
+            row.referenceCloser = row.negativeAffinityDelta < 0;
+            row.negativeCloser = row.negativeAffinityDelta > 0;
+          }
+        }
+        console.log('MATH SEMANTIC NEGATIVE POPULATION V1:', JSON.stringify(semanticNegativeAffinity));
+      }
     } catch (error) {
       roiForensics = { available: false, status: 'roi-error', error: error?.message || String(error) };
     }
@@ -531,19 +594,52 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     const reliabilityPenalty = negReliability === 'low' ? 'low-sample' : 'population';
     if (negScore >= 70 && affinityDelta >= 10 && negReliability !== 'low') {
       flags.push({
-        code: "NEGATIVE_MATH_AFFINITY",
+        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
         severity: "high",
         reliability: reliabilityPenalty,
         detail: `Matematiksel fingerprint known-negative dağılımına reference dağılımından daha yakın (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
       });
     } else if (negScore >= 60 && affinityDelta >= 5) {
       flags.push({
-        code: "NEGATIVE_MATH_AFFINITY",
+        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
         severity: negReliability === 'low' ? "low" : "medium",
         reliability: reliabilityPenalty,
         detail: `Known-negative matematiksel affinity sinyali var (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
       });
     }
+  }
+
+  // Semantic negative affinity is the intended mathematical forensic signal:
+  // target ROI must be closer to the known-fake population than to the trusted
+  // reference ROI. It is independent of document resolution and global layout.
+  const semanticNegativeRows = Object.entries(semanticNegativeAffinity || {})
+    .map(([field, row]) => ({ field, ...row }))
+    .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
+  const strongSemanticNegativeRows = semanticNegativeRows.filter(row =>
+    Number(row.sampleCount || 0) >= 2 &&
+    Number(row.negativeAffinityDelta || 0) >= 1.25 &&
+    Number(row.medianDistance || 99) <= 5.5
+  );
+  const moderateSemanticNegativeRows = semanticNegativeRows.filter(row =>
+    Number(row.sampleCount || 0) >= 1 &&
+    Number(row.negativeAffinityDelta || 0) >= 0.75
+  );
+  if (strongSemanticNegativeRows.length) {
+    flags.push({
+      code:'SEMANTIC_NEGATIVE_ROI_AFFINITY',
+      severity:'high',
+      reliability:'forensic-signal',
+      fields:strongSemanticNegativeRows.map(x=>x.field),
+      detail:`Kritik ROI matematiksel profili known-negative dağılımına trusted reference ROI'dan belirgin biçimde daha yakın: ${strongSemanticNegativeRows.map(x=>`${x.field} Δ${Number(x.negativeAffinityDelta).toFixed(2)}`).join(', ')}. Bu sinyal çözünürlükten bağımsızdır ve tek başına kesin sahtecilik hükmü değildir.`
+    });
+  } else if (moderateSemanticNegativeRows.length) {
+    flags.push({
+      code:'SEMANTIC_NEGATIVE_ROI_AFFINITY',
+      severity:'medium',
+      reliability:'forensic-signal',
+      fields:moderateSemanticNegativeRows.map(x=>x.field),
+      detail:`Kritik ROI matematiksel profilinde known-negative yönünde yakınlık görüldü: ${moderateSemanticNegativeRows.map(x=>`${x.field} Δ${Number(x.negativeAffinityDelta).toFixed(2)}`).join(', ')}.`
+    });
   }
 
   const roiRows = Object.entries(roiForensics || {})
@@ -611,6 +707,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   return {
     available: true,
     version: 'MATH-FORENSICS-V1.6.3-SCALE-INVARIANT-GLOBAL-BASELINE-GUARD',
+    semanticNegativeVersion: 'MATH-FORENSICS-V2.0.0-SEMANTIC-ROI-POPULATION',
     engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
@@ -642,6 +739,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     // measured mathematically when their boxes were available.
     semanticReferenceMeasurements,
     roi16x16: roiForensics,
+    semanticNegativeAffinity,
     roiSummary: {
       available: roiRows.length > 0,
       fieldsCompared: roiRows.map(x=>x.field),
@@ -2416,11 +2514,11 @@ const NEGATIVE_SAMPLE_MAP = {
     "isbankasi/fake200000.jpg",
   ],
   qnb: ["qnb/qnb5000.jpg", "qnb/qnbfakeiban.jpg"],
-  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vakıf3500fake.jpg"],
+  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vak#U0131f3500fake.jpg"],
   yapikredi: [
-    "yapıkredi/sahte-1.jpg",
-    "yapıkredi/fakeyapi10000.jpg",
-    "yapıkredi/yapifakeiban.jpg",
+    "yap#U0131kredi/sahte-1.jpg",
+    "yap#U0131kredi/fakeyapi10000.jpg",
+    "yap#U0131kredi/yapifakeiban.jpg",
   ],
   ziraat: [
     "ziraat/sahte-1.jpg",
@@ -15963,6 +16061,8 @@ if (type === "image" || type === "pdf") {
       paddleOcrText,
       paddleImageOCR?.text || ""
     ].filter(Boolean).join("\n");
+    let mathematicalNegativeSamples = [];
+    try { mathematicalNegativeSamples = await loadNegativeSampleFiles(bank); } catch {}
     mathematicalForensics = await runMathematicalForensics({
       targetPath: forensicTargetPath,
       targetText: mathText,
@@ -15971,7 +16071,8 @@ if (type === "image" || type === "pdf") {
       referencePath: reference?.path || null,
       targetOCR: paddleImageOCR,
       amountForensics,
-      referenceForensics
+      referenceForensics,
+      negativeSamples: mathematicalNegativeSamples
     });
     console.log("MATHEMATICAL FORENSICS V1.2:", JSON.stringify(mathematicalForensics));
   } catch (error) {
@@ -20813,45 +20914,50 @@ if (!controlledAmountCorroborated) {
   result.categories = finalDeterministicRisk.categories;
 }
 
-// Mathematical fingerprint is intentionally a corroborating signal, not an
-// automatic authenticity verdict. Require a reasonably sized baseline and
-// either a strong reference outlier or a clear known-negative affinity.
-const mathReference = result?.mathematicalForensics?.reference;
-const mathNegative = result?.mathematicalForensics?.negative;
-const mathReferenceReliable = ['medium', 'high'].includes(String(mathReference?.bestMatch?.profile?.reliability || ''));
-const mathNegativeReliable = ['medium', 'high'].includes(String(mathNegative?.bestMatch?.profile?.reliability || ''));
-const mathReferenceOutlier =
-  result?.mathematicalForensics?.available === true &&
-  mathReferenceReliable &&
-  Number(mathReference?.bestMatch?.robustDistance || 0) >= 2.5;
-const mathNegativeAffinity =
-  result?.mathematicalForensics?.available === true &&
-  mathNegativeReliable &&
-  Number(mathNegative?.bestMatch?.similarityScore || 0) >= 70 &&
-  Number(result?.mathematicalForensics?.differential?.negativeMinusReference || 0) >= 10;
+// Mathematical fingerprint policy V2:
+// Whole-document/global reference-vs-negative similarity is diagnostic only.
+// It must never promote the final risk by itself because page resolution,
+// aspect ratio, crop and delivery history can legitimately move global raster
+// statistics. Final mathematical promotion is driven by semantic ROI population
+// evidence below: target ROI vs trusted reference ROI vs known-fake ROI set.
+const semanticNegativeRowsForRisk = Object.entries(result?.mathematicalForensics?.semanticNegativeAffinity || {})
+  .map(([field, row]) => ({ field, ...row }))
+  .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
+const strongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
+  Number(row.sampleCount || 0) >= 2 &&
+  Number(row.negativeAffinityDelta || 0) >= 1.25 &&
+  Number(row.medianDistance || 99) <= 5.5
+);
+const veryStrongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
+  Number(row.sampleCount || 0) >= 2 &&
+  Number(row.negativeAffinityDelta || 0) >= 2.25 &&
+  Number(row.medianDistance || 99) <= 5.5
+);
+const mathSemanticNegativeAffinity = strongSemanticNegativeForRisk.length > 0;
 
-if (mathReferenceOutlier) {
-  finalRiskScore = Math.max(finalRiskScore, 46);
-  result.categories = {
-    ...(result.categories || {}),
-    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 48)
-  };
-}
-
-if (mathNegativeAffinity) {
+if (mathSemanticNegativeAffinity) {
   finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 60)
   };
+  console.log('SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
+    fields: strongSemanticNegativeForRisk.map(x => x.field),
+    deltas: strongSemanticNegativeForRisk.map(x => ({field:x.field, delta:x.negativeAffinityDelta, samples:x.sampleCount})),
+    appliedFloor: 46
+  }));
 }
 
-if (mathReferenceOutlier && mathNegativeAffinity) {
+if (veryStrongSemanticNegativeForRisk.length >= 2) {
   finalRiskScore = Math.max(finalRiskScore, 60);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 65)
   };
+  console.log('VERY STRONG SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
+    fields: veryStrongSemanticNegativeForRisk.map(x => x.field),
+    appliedFloor: 60
+  }));
 }
 
 // AI'ın overallRisk değerini kullanma.
