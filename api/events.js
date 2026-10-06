@@ -64,67 +64,41 @@ async function postMessage(channel, text, threadTs = null) {
 }
 
 async function getSlackFile(fileId) {
-  if (!SLACK_BOT_TOKEN) {
-    throw new Error("SLACK_BOT_TOKEN bulunamadı.");
-  }
+  if (!SLACK_BOT_TOKEN) throw new Error("SLACK_BOT_TOKEN bulunamadı.");
 
-  // Slack files.info endpoint'i GET + query parameter kullanır.
-  // Genel slackApi() helper'ımız POST/JSON kullandığı için burada
-  // files.info çağrısını doğrudan yapıyoruz.
   const infoUrl = new URL("https://slack.com/api/files.info");
   infoUrl.searchParams.set("file", fileId);
 
   const infoResponse = await fetch(infoUrl, {
     method: "GET",
-    headers: {
-      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-    },
+    headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
   });
 
   const infoText = await infoResponse.text();
-
   let data;
   try {
     data = JSON.parse(infoText);
   } catch {
-    throw new Error(
-      `Slack files.info JSON döndürmedi. HTTP ${infoResponse.status}`
-    );
+    throw new Error(`Slack files.info JSON döndürmedi. HTTP ${infoResponse.status}`);
   }
 
   if (!infoResponse.ok || !data.ok) {
-    throw new Error(
-      `Slack files.info hatası: ${data?.error || `HTTP ${infoResponse.status}`}`
-    );
+    throw new Error(`Slack files.info hatası: ${data?.error || `HTTP ${infoResponse.status}`}`);
   }
 
   const file = data.file;
-  if (!file) {
-    throw new Error("Slack dosya bilgisi alınamadı.");
-  }
+  if (!file) throw new Error("Slack dosya bilgisi alınamadı.");
 
   const url = file.url_private_download || file.url_private;
-  if (!url) {
-    throw new Error("Slack dosyasının indirme URL'si bulunamadı.");
-  }
+  if (!url) throw new Error("Slack dosyasının indirme URL'si bulunamadı.");
 
   const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-    },
+    headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
   });
-
-  if (!response.ok) {
-    throw new Error(
-      `Slack dosyası indirilemedi. HTTP ${response.status}`
-    );
-  }
+  if (!response.ok) throw new Error(`Slack dosyası indirilemedi. HTTP ${response.status}`);
 
   const buffer = Buffer.from(await response.arrayBuffer());
-
-  if (!buffer.length) {
-    throw new Error("Slack dosyası boş.");
-  }
+  if (!buffer.length) throw new Error("Slack dosyası boş.");
 
   return {
     buffer,
@@ -142,10 +116,12 @@ function determineType(mimeType, fileName) {
   return null;
 }
 
-async function analyzeFile({ buffer, fileName, mimeType, type }) {
+async function analyzeFile({ buffer, fileName, mimeType, type }, bank = null) {
   const form = new FormData();
   form.append("type", type);
   form.append("fileName", fileName);
+  if (bank) form.append("bank", bank);
+
   const fieldName = type === "image" ? "image" : "file";
   form.append(fieldName, new Blob([buffer], { type: mimeType }), fileName);
 
@@ -275,6 +251,122 @@ async function uploadAnnotatedImage(channel, imageBase64, caption, threadTs = nu
   await slackApi("files.completeUploadExternal", completeBody);
 }
 
+const BANK_OPTIONS = [
+  ["ziraat", "Ziraat Bankası"],
+  ["vakifbank", "VakıfBank"],
+  ["yapikredi", "Yapı Kredi"],
+  ["garanti", "Garanti BBVA"],
+  ["isbankasi", "İş Bankası"],
+  ["enpara", "Enpara"],
+  ["qnb", "QNB"],
+  ["denizbank", "DenizBank"],
+  ["halkbank", "Halkbank"],
+  ["akbank", "Akbank"],
+  ["ing", "ING"],
+  ["teb", "TEB"],
+  ["kuveytturk", "Kuveyt Türk"],
+];
+
+function buildBankSelectionBlocks(fileId, channelId) {
+  const rows = [];
+  for (let i = 0; i < BANK_OPTIONS.length; i += 2) {
+    const elements = BANK_OPTIONS.slice(i, i + 2).map(([value, text]) => ({
+      type: "button",
+      action_id: `verifydoc_bank_${value}`,
+      text: { type: "plain_text", text },
+      value: JSON.stringify({ fileId, channelId, bank: value }),
+    }));
+    rows.push({ type: "actions", elements });
+  }
+
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "🏦 *VerifyDoc dekontu aldı.*\n\nAnalizi doğru referans formatıyla yapmak için lütfen dekontun bankasını seçin:",
+      },
+    },
+    ...rows,
+  ];
+}
+
+async function postBankSelection(channel, fileId) {
+  return slackApi("chat.postMessage", {
+    channel,
+    text: "🏦 VerifyDoc: Lütfen dekontun bankasını seçin.",
+    blocks: buildBankSelectionBlocks(fileId, channel),
+  });
+}
+
+async function updateMessage(channel, ts, text) {
+  return slackApi("chat.update", {
+    channel,
+    ts,
+    text,
+    blocks: [
+      {
+        type: "section",
+        text: { type: "mrkdwn", text },
+      },
+    ],
+  });
+}
+
+function parseBankSelection(value) {
+  try {
+    const data = JSON.parse(String(value || ""));
+    if (!data?.fileId || !data?.bank) return null;
+    const supported = BANK_OPTIONS.some(([bank]) => bank === data.bank);
+    if (!supported) return null;
+    return {
+      fileId: String(data.fileId),
+      channelId: data.channelId ? String(data.channelId) : null,
+      bank: String(data.bank),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function processSelectedBank(payload) {
+  const action = payload?.actions?.[0];
+  const selection = parseBankSelection(action?.value);
+  const channel = payload?.channel?.id;
+  const messageTs = payload?.message?.ts;
+
+  if (!selection || !channel) {
+    throw new Error("Banka seçim bilgisi geçersiz.");
+  }
+
+  if (selection.channelId && selection.channelId !== channel) {
+    throw new Error("Bu banka seçimi farklı bir kanala ait.");
+  }
+
+  const bankName = getBankDisplayName(selection.bank);
+  if (messageTs) {
+    await updateMessage(channel, messageTs, `🏦 *${bankName}* seçildi.\n\n🔎 VerifyDoc analizi başlatılıyor...`);
+  }
+
+  const file = await getSlackFile(selection.fileId);
+  const type = determineType(file.mimeType, file.fileName);
+  if (!type) throw new Error("Seçilen dosya desteklenen bir dekont türü değil.");
+
+  const result = await analyzeFile({ ...file, type }, selection.bank);
+  const resultText = formatAnalysisResult(result);
+  const message = await postMessage(channel, resultText, messageTs || null);
+
+  const annotated = result?.annotatedReferenceDifference;
+  if (annotated?.available === true && annotated?.imageBase64) {
+    await uploadAnnotatedImage(
+      channel,
+      annotated.imageBase64,
+      "🔴 Referans karşılaştırmasında tespit edilen farklar dekont üzerinde işaretlendi.",
+      message?.ts || messageTs || null
+    );
+  }
+}
+
 async function processFileEvent(event, eventId) {
   const channel = event?.channel_id;
   const fileId = event?.file_id || event?.file?.id;
@@ -287,28 +379,44 @@ async function processFileEvent(event, eventId) {
   const type = determineType(file.mimeType, file.fileName);
   if (!type) return;
 
-  await postMessage(channel, "🔎 VerifyDoc dekontu aldı. Analiz başlatıldı...");
-
   try {
-    const result = await analyzeFile(file && { ...file, type });
-    const resultText = formatAnalysisResult(result);
-    const message = await postMessage(channel, resultText);
-    const annotated = result?.annotatedReferenceDifference;
-    if (annotated?.available === true && annotated?.imageBase64) {
-      await uploadAnnotatedImage(channel, annotated.imageBase64, "🔴 Referans karşılaştırmasında tespit edilen farklar dekont üzerinde işaretlendi.", message?.ts || null);
-    }
+    await postBankSelection(channel, fileId);
   } catch (error) {
-    console.error("SLACK ANALYSIS ERROR", { eventId, error: error?.stack || error?.message || error });
-    await postMessage(channel, `⚠️ Analiz sırasında hata oluştu.\n\nHata: ${error?.message || "Bilinmeyen hata"}`);
+    console.error("SLACK BANK SELECTION ERROR", {
+      eventId,
+      error: error?.stack || error?.message || error,
+    });
+    await postMessage(channel, `⚠️ Banka seçim ekranı oluşturulamadı.\n\nHata: ${error?.message || "Bilinmeyen hata"}`);
   }
 }
 
 async function handleEvent(payload) {
-  if (payload?.type !== "event_callback") return;
-  const eventId = payload?.event_id;
-  if (eventId && processedEvents.has(eventId)) return;
-  if (eventId) processedEvents.add(eventId);
-  if (payload?.event?.type === "file_shared") await processFileEvent(payload.event, eventId);
+  if (payload?.type === "event_callback") {
+    const eventId = payload?.event_id;
+    if (eventId && processedEvents.has(eventId)) return;
+    if (eventId) processedEvents.add(eventId);
+    if (payload?.event?.type === "file_shared") {
+      await processFileEvent(payload.event, eventId);
+    }
+    return;
+  }
+
+  if (payload?.type === "block_actions") {
+    await processSelectedBank(payload);
+  }
+}
+
+function parseSlackPayload(rawBody, contentType) {
+  const text = rawBody.toString("utf8");
+
+  if (String(contentType || "").includes("application/x-www-form-urlencoded")) {
+    const params = new URLSearchParams(text);
+    const payloadText = params.get("payload");
+    if (!payloadText) throw new Error("Slack interactive payload bulunamadı.");
+    return JSON.parse(payloadText);
+  }
+
+  return JSON.parse(text);
 }
 
 export default async function handler(req, res) {
@@ -318,16 +426,28 @@ export default async function handler(req, res) {
   const rawBody = await readRawBody(req);
   const timestamp = req.headers["x-slack-request-timestamp"];
   const signature = req.headers["x-slack-signature"];
-  if (!verifySlackSignature(rawBody, timestamp, signature)) return res.status(401).json({ ok: false, error: "Invalid Slack signature" });
+
+  if (!verifySlackSignature(rawBody, timestamp, signature)) {
+    return res.status(401).json({ ok: false, error: "Invalid Slack signature" });
+  }
 
   let payload;
-  try { payload = JSON.parse(rawBody.toString("utf8")); }
-  catch { return res.status(400).json({ ok: false, error: "Invalid JSON" }); }
+  try {
+    payload = parseSlackPayload(rawBody, req.headers["content-type"]);
+  } catch {
+    return res.status(400).json({ ok: false, error: "Invalid Slack payload" });
+  }
 
-  if (payload?.type === "url_verification") return res.status(200).json({ challenge: payload.challenge });
+  if (payload?.type === "url_verification") {
+    return res.status(200).json({ challenge: payload.challenge });
+  }
 
-  if (payload?.type === "event_callback") {
-    waitUntil(handleEvent(payload).catch(error => console.error("SLACK EVENT ERROR", error?.stack || error)));
+  if (payload?.type === "event_callback" || payload?.type === "block_actions") {
+    waitUntil(
+      handleEvent(payload).catch(error =>
+        console.error("SLACK EVENT ERROR", error?.stack || error)
+      )
+    );
   }
 
   return res.status(200).json({ ok: true });
