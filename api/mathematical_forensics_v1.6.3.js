@@ -296,24 +296,6 @@ function roiFingerprintFromRaster(data, width, height) {
       dctHighRatio: raw.dctHighRatio, blockinessHorizontal: raw.blockinessHorizontal, blockinessVertical: raw.blockinessVertical,
     },
     tiles16x16: f.tiles,
-    validation: {
-      sourceWidth: width,
-      sourceHeight: height,
-      background: Number(background),
-      threshold: Number(inkBox?.threshold ?? 0),
-      detected: Boolean(inkBox?.detected),
-      inkPixels: Number(inkBox?.inkPixels || 0),
-      inkRatio: Number((Number(inkBox?.inkPixels || 0) / Math.max(1, width * height)).toFixed(6)),
-      contentWidth,
-      contentHeight,
-      contentAspect: Number((contentWidth / Math.max(1, contentHeight)).toFixed(4)),
-      mean: Number(f.luminanceMean.toFixed(4)),
-      std: Number(f.luminanceStd.toFixed(4)),
-      edgeDensity: Number(f.edgeDensity.toFixed(6)),
-      laplacianVariance: Number(f.laplacianVariance.toFixed(4)),
-      validInk: Boolean(inkBox?.detected) && Number(inkBox?.inkPixels || 0) >= Math.max(8, Math.floor(width * height * 0.003)),
-      validTexture: Number(f.luminanceStd) >= 1.25 || Number(f.edgeDensity) >= 0.001 || Number(f.laplacianVariance) >= 1,
-    },
   };
 }
 
@@ -822,102 +804,16 @@ export function compareSemanticRoiToNegativePopulation(targetFingerprint, negati
   return result;
 }
 
-
-
-// =====================================================
-// TELEGRAM DEGRADATION CALIBRATION V1
-// =====================================================
-// Reference JPG'leri ve negative JPG'leri Telegram'dan geçmiş örneklerdir.
-// Bu katman Telegram/JPEG transport etkisini authenticity sinyali olarak
-// değil, doğal görüntü bozulması kalibrasyonu olarak kullanır.
-export function compareTelegramDegradation(targetFingerprint, referenceFingerprint, transportPairs = []) {
-  if (!targetFingerprint?.available || !referenceFingerprint?.available) {
-    return { available:false, reason:'fingerprint-unavailable' };
-  }
-
-  const featureKeys = [
-    'luminanceMean','luminanceStd','entropy','edgeDensity','meanGradient',
-    'laplacianVariance','darkPixelRatio','brightPixelRatio',
-    'dctLowEnergy','dctMidEnergy','dctHighEnergy','dctHighRatio',
-    'blockinessHorizontal','blockinessVertical'
-  ];
-  const safe = (v) => Number.isFinite(Number(v)) ? Number(v) : null;
-  const rel = (a,b) => {
-    const x=safe(a), y=safe(b);
-    if (x==null || y==null) return null;
-    return Math.abs(x-y) / Math.max(1e-6, Math.abs(y), 1);
-  };
-  const targetMetrics = targetFingerprint.metrics || {};
-  const referenceMetrics = referenceFingerprint.metrics || {};
-  const targetReference = {};
-  for (const key of featureKeys) targetReference[key] = rel(targetMetrics[key], referenceMetrics[key]);
-
-  const pairRows = [];
-  for (const pair of Array.isArray(transportPairs) ? transportPairs : []) {
-    const original = pair?.original?.metrics || pair?.original?.fingerprint?.metrics || null;
-    const telegram = pair?.telegram?.metrics || pair?.telegram?.fingerprint?.metrics || null;
-    if (!original || !telegram) continue;
-    const row = {};
-    for (const key of featureKeys) row[key] = rel(telegram[key], original[key]);
-    pairRows.push(row);
-  }
-
-  const values = (key) => pairRows.map(r=>r[key]).filter(Number.isFinite).sort((a,b)=>a-b);
-  const percentile = (arr,p) => {
-    if (!arr.length) return null;
-    const idx=(arr.length-1)*p; const lo=Math.floor(idx), hi=Math.ceil(idx);
-    return lo===hi ? arr[lo] : arr[lo] + (arr[hi]-arr[lo])*(idx-lo);
-  };
-  const profile = {};
-  for (const key of featureKeys) {
-    const vals=values(key);
-    profile[key]={ sampleCount:vals.length, median:percentile(vals,.5), p90:percentile(vals,.9), p95:percentile(vals,.95) };
-  }
-
-  // Target/reference is a transport-consistency diagnostic. It does NOT
-  // decide authenticity and is intentionally capped at informational severity.
-  const ratios=[];
-  for (const key of featureKeys) {
-    const v=targetReference[key];
-    const p90=profile[key]?.p90;
-    if (Number.isFinite(v) && Number.isFinite(p90) && p90>0) ratios.push(v/p90);
-  }
-  const medianRatio = ratios.length ? [...ratios].sort((a,b)=>a-b)[Math.floor(ratios.length/2)] : null;
-  const status = medianRatio==null ? 'INSUFFICIENT_DATA' : medianRatio <= 1.25 ? 'NORMAL' : medianRatio <= 2.5 ? 'ABOVE_NORMAL' : 'STRONGLY_ABOVE_NORMAL';
-
-  return {
-    available:true,
-    version:'TELEGRAM-DEGRADATION-V1',
-    transportPairCount:pairRows.length,
-    targetReferenceRelativeChanges:targetReference,
-    profile,
-    medianP90Ratio:medianRatio==null?null:Number(medianRatio.toFixed(3)),
-    status,
-    policy:'diagnostic-only; never promotes final authenticity risk',
-  };
-}
-
 export function compareAgainstBaseline(fingerprint, baseline, bank, family='unknown') {
   if (!baseline?.profiles) return { available:false, reason:'baseline-missing' };
   const candidates = Object.values(baseline.profiles).filter(p => p.bank === bank);
   if (!candidates.length) return { available:false, reason:'bank-profile-missing', bank };
-  // V2 family guard: never compare a known document family against a different family.
-  // UNKNOWN is only valid when the target itself is UNKNOWN.
-  const requestedFamily = String(family || 'UNKNOWN').toUpperCase();
-  const pool = candidates.filter(p => String(p?.family || 'UNKNOWN').toUpperCase() === requestedFamily);
-  if (!pool.length) {
-    return {
-      available: false,
-      reason: 'family-profile-missing',
-      bank,
-      requestedFamily,
-      availableFamilies: [...new Set(candidates.map(p => p?.family).filter(Boolean))],
-    };
-  }
+  const exact = candidates.find(p => p.family === family);
+  const pool = exact ? [exact, ...candidates.filter(p => p !== exact)] : candidates;
   const comparisons = pool.map(p => ({...compareFingerprint(fingerprint,p), family:p.family})).filter(x=>x.available);
   comparisons.sort((a,b)=>b.similarityScore-a.similarityScore);
   const best = comparisons[0] || null;
-  return { available:Boolean(best), bank, requestedFamily, bestMatch:best, candidates:comparisons.slice(0,8), profileCount:pool.length };
+  return { available:Boolean(best), bank, requestedFamily:family, bestMatch:best, candidates:comparisons.slice(0,8), profileCount:candidates.length };
 }
 
 export function inferDocumentFamily(name='', text='') {
