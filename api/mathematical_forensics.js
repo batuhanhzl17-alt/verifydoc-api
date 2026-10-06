@@ -425,13 +425,22 @@ function rasterFeatures(data, width, height) {
 export async function extractMathematicalFingerprint(input, options = {}) {
   const buffer = Buffer.isBuffer(input) ? input : await fs.readFile(input);
   const meta = await sharp(buffer).metadata();
-  const rendered = await sharp(buffer)
-    .rotate()
-    .resize({ width: options.size || DEFAULT_SIZE, height: options.size || DEFAULT_SIZE, fit: 'fill' })
-    .grayscale()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-  const raster = rasterFeatures(rendered.data, rendered.info.width, rendered.info.height);
+  // V1.6.3: global raster comparison must be scale/aspect invariant.
+  // The previous fit:'fill' stretched documents with different source ratios
+  // (e.g. QNB 673x461 vs 884x1280), creating artificial cell differences.
+  // Keep aspect ratio and letterbox both rasters into the same analysis canvas.
+  const globalSize = options.size || DEFAULT_SIZE;
+  const rotatedBuffer = await sharp(buffer).rotate().grayscale().raw().toBuffer({ resolveWithObject: true });
+  const globalBackground = borderMedian(rotatedBuffer.data, rotatedBuffer.info.width, rotatedBuffer.info.height);
+  const globalNormalized = letterboxGrayRaw(
+    rotatedBuffer.data,
+    rotatedBuffer.info.width,
+    rotatedBuffer.info.height,
+    globalSize,
+    globalSize,
+    globalBackground
+  );
+  const raster = rasterFeatures(globalNormalized.data, globalNormalized.width, globalNormalized.height);
   const semanticRois = buildSemanticRois(options.regions || {});
   const roi16x16 = {};
   let roiBuffer = null;
@@ -465,6 +474,19 @@ export async function extractMathematicalFingerprint(input, options = {}) {
   return {
     version: VERSION,
     source: { format: meta.format || null, width: meta.width || null, height: meta.height || null, channels: meta.channels || null, space: meta.space || null, chromaSubsampling: meta.chromaSubsampling || null, isProgressive: meta.isProgressive ?? null },
+    globalNormalization: {
+      method: 'aspect-preserving-letterbox-v1',
+      canvas: { width: globalNormalized.width, height: globalNormalized.height },
+      sourceWidth: rotatedBuffer.info.width,
+      sourceHeight: rotatedBuffer.info.height,
+      sourceAspect: Number((rotatedBuffer.info.width / Math.max(1, rotatedBuffer.info.height)).toFixed(6)),
+      scale: Number((globalNormalized.scale || 1).toFixed(8)),
+      offsetX: Number(globalNormalized.offsetX || 0),
+      offsetY: Number(globalNormalized.offsetY || 0),
+      resizedWidth: Number(globalNormalized.resizedWidth || globalNormalized.width),
+      resizedHeight: Number(globalNormalized.resizedHeight || globalNormalized.height),
+      background: Number(globalBackground)
+    },
     jpeg: { available: meta.format === 'jpeg', estimatedQuality: jpeg?.estimatedQuality ?? null, quantizationFitError: jpeg?.fitError ?? null, tableCount: Object.keys(qTables).length, quantizationMeans: Object.values(qTables).map(t => mean(t.values)), quantizationStds: Object.values(qTables).map(t => std(t.values)) },
     // V1.1.1: expose the semantic ROI fingerprints to the caller. The ROI
     // extraction loop above was running correctly, but this object was omitted
@@ -622,14 +644,36 @@ export function compareGlobal16x16(targetFingerprint, referenceFingerprint, crit
   const roiHits = {};
   for (const [field, roi] of Object.entries(criticalRois || {})) {
     const targetBox = roi?.target || roi?.targetSourceBox || roi;
-    const normalized = normalizedBox(targetBox, targetFingerprint?.source?.width, targetFingerprint?.source?.height);
-    if (!normalized) { roiHits[field] = { available:false, reason:'target-roi-box-missing' }; continue; }
+    const normalizedSource = normalizedBox(targetBox, targetFingerprint?.source?.width, targetFingerprint?.source?.height);
+    if (!normalizedSource) { roiHits[field] = { available:false, reason:'target-roi-box-missing' }; continue; }
+    // Global tiles live on the aspect-preserving letterboxed canvas, not the
+    // native source canvas. Map the native ROI into that canvas before testing
+    // cell overlap, otherwise the new normalization would break semantic ROI
+    // attribution.
+    const gn = targetFingerprint?.globalNormalization;
+    const canvasW = Number(gn?.canvas?.width) || grid;
+    const canvasH = Number(gn?.canvas?.height) || grid;
+    const scale = Number(gn?.scale);
+    const ox = Number(gn?.offsetX);
+    const oy = Number(gn?.offsetY);
+    const srcW = Number(targetFingerprint?.source?.width) || 0;
+    const srcH = Number(targetFingerprint?.source?.height) || 0;
+    const mapped = Number.isFinite(scale) && scale > 0 && srcW > 0 && srcH > 0
+      ? {
+          x1: (ox + normalizedSource.x1 * srcW * scale) / canvasW,
+          y1: (oy + normalizedSource.y1 * srcH * scale) / canvasH,
+          x2: (ox + normalizedSource.x2 * srcW * scale) / canvasW,
+          y2: (oy + normalizedSource.y2 * srcH * scale) / canvasH
+        }
+      : normalizedSource;
+    const normalized = mapped;
     const hits = cells.filter(cell => cellOverlapRatio(cell, normalized, grid) >= minOverlap);
     const diffHits = hits.filter(c => c.different);
     const strongHits = hits.filter(c => c.strong);
     roiHits[field] = {
       available:true,
       normalizedBox: normalized,
+      sourceNormalizedBox: normalizedSource,
       overlappingCells: hits.map(c=>c.index),
       differentCells: diffHits.map(c=>c.index),
       strongDifferentCells: strongHits.map(c=>c.index),
