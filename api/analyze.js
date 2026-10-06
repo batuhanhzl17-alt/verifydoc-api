@@ -520,6 +520,122 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   return rois;
 }
 
+
+// =====================================================
+// V2.1 CRITICAL ROI RASTER VALIDATION / SEMANTIC RECOVERY
+// =====================================================
+// Mathematical ROI comparisons are only meaningful when the crop actually
+// contains the semantic glyphs. A normalized coordinate that lands on a flat
+// background is NOT a mathematical sample. For known-negative samples we first
+// try the trusted reference geometry, validate the raster, and only then use
+// OCR to recover the corresponding amount/IBAN box. PDFs are rendered to a
+// canonical PNG before either path is used.
+const mathRasterCache = new Map();
+
+async function prepareMathRaster(inputPath, tag = 'sample') {
+  if (!inputPath) return null;
+  try {
+    const raw = await fs.readFile(inputPath);
+    const hash = createHash('sha256').update(raw).digest('hex').slice(0, 20);
+    const cacheKey = `${path.resolve(inputPath)}:${hash}`;
+    const cached = mathRasterCache.get(cacheKey);
+    if (cached) return cached;
+
+    let source = raw;
+    if (path.extname(inputPath).toLowerCase() === '.pdf') {
+      const rendered = await renderPdfPagePng(inputPath, 1, 2.8);
+      if (!rendered?.buffer) return null;
+      source = rendered.buffer;
+    }
+
+    // Same lossless raster normalization for image and PDF inputs. The
+    // forensic extractor then performs its own grayscale/letterbox normalization.
+    const canonical = await sharp(source).rotate().removeAlpha().png().toBuffer();
+    const out = path.join('/tmp', `verifydoc-math-${tag}-${hash}.png`);
+    try {
+      await fs.access(out);
+    } catch {
+      await fs.writeFile(out, canonical);
+    }
+    mathRasterCache.set(cacheKey, out);
+    return out;
+  } catch (error) {
+    console.warn('MATH RASTER PREP HATASI:', path.basename(inputPath), error?.message || error);
+    return null;
+  }
+}
+
+function mathRoiValidationIsUsable(field, roi) {
+  const v = roi?.validation || {};
+  const minHeight = field === 'recipientIban' ? 5 : 4;
+  const ink = Number(v.inkPixels || 0);
+  const area = Math.max(1, Number(v.sourceWidth || 0) * Number(v.sourceHeight || 0));
+  const inkRatio = ink / area;
+  const std = Number(v.std ?? 0);
+  const edge = Number(v.edgeDensity || 0);
+  const lap = Number(v.laplacianVariance || 0);
+  const texture = std >= 1.25 || edge >= 0.001 || lap >= 1;
+  const geometry = Number(v.contentHeight || 0) >= minHeight && Number(v.contentWidth || 0) >= 4;
+  const enoughInk = Boolean(v.detected) && ink >= Math.max(8, Math.floor(area * 0.003)) && inkRatio >= 0.003;
+  return Boolean(geometry && enoughInk && texture);
+}
+
+function semanticOcrCandidate(field, text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  if (field === 'recipientIban') {
+    const compact = t.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    return /TR[A-Z0-9]{10,}/.test(compact) || /\d{12,}/.test(compact);
+  }
+  // Amount: numeric money-like token, while explicitly excluding identifiers.
+  if (!/\d/.test(t)) return false;
+  if (/(iban|hesap\s*no|musteri|müşteri|sira\s*no|sıra\s*no|fis\s*no|fiş\s*no|referans|islem\s*no|işlem\s*no|vergi\s*no|kart\s*no)/i.test(t)) return false;
+  return /(?:₺|TL|TRY|EUR|USD|GBP)\s*[-+]?\d|[-+]?\d{1,3}(?:[. ]\d{3})*[,.]\d{1,2}\b|[-+]?\d+(?:[,.]\d{1,2})?/.test(t);
+}
+
+async function recoverSemanticRoiWithOcr(inputPath, field, expectedBox, sourceWidth, sourceHeight) {
+  if (!inputPath || !expectedBox || !sourceWidth || !sourceHeight) return null;
+  try {
+    const ocr = await runPaddleOCR(inputPath);
+    const regions = Array.isArray(ocr?.regions) ? ocr.regions : [];
+    if (!regions.length) return null;
+    const ex = {
+      x1: Number(expectedBox.x1) / sourceWidth,
+      y1: Number(expectedBox.y1) / sourceHeight,
+      x2: Number(expectedBox.x2) / sourceWidth,
+      y2: Number(expectedBox.y2) / sourceHeight,
+    };
+    const ecx = (ex.x1 + ex.x2) / 2, ecy = (ex.y1 + ex.y2) / 2;
+    const ew = Math.max(0.0001, ex.x2 - ex.x1), eh = Math.max(0.0001, ex.y2 - ex.y1);
+    const candidates = [];
+    for (const row of regions) {
+      const text = String(row?.text || '').trim();
+      if (!semanticOcrCandidate(field, text)) continue;
+      const b = row?.region;
+      if (!b) continue;
+      const x1 = Number(b.x1), y1 = Number(b.y1), x2 = Number(b.x2), y2 = Number(b.y2);
+      if (![x1,y1,x2,y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1) continue;
+      const n = { x1:x1/sourceWidth, y1:y1/sourceHeight, x2:x2/sourceWidth, y2:y2/sourceHeight };
+      const cx=(n.x1+n.x2)/2, cy=(n.y1+n.y2)/2;
+      const centerD=Math.hypot(cx-ecx, cy-ecy);
+      const sizeD=Math.abs(Math.log(Math.max(0.0001,n.x2-n.x1)/ew)) + Math.abs(Math.log(Math.max(0.0001,n.y2-n.y1)/eh));
+      // Prefer candidates near the trusted semantic location; never select a
+      // distant identifier merely because it is numeric.
+      const maxCenter = field === 'recipientIban' ? 0.22 : 0.16;
+      if (centerD > maxCenter) continue;
+      const score = centerD * 8 + sizeD * 1.5;
+      candidates.push({ score, box:{x1,y1,x2,y2}, text, centerDistance:centerD, sizeDistance:sizeD });
+    }
+    candidates.sort((a,b)=>a.score-b.score);
+    const best = candidates[0];
+    if (!best) return null;
+    return { ...best, method:'semantic-ocr-recovery-v2' };
+  } catch (error) {
+    console.warn('MATH SEMANTIC OCR RECOVERY HATASI:', path.basename(inputPath), field, error?.message || error);
+    return null;
+  }
+}
+
 async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null, negativeSamples = [] }) {
   if (!targetPath || !bank) {
     return { available: false, status: "missing-target-or-bank" };
@@ -542,8 +658,59 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     }
   }
 
-  const fingerprint = await extractMathematicalFingerprint(targetPath, { regions: targetRegions });
+  // V2.1: use one lossless canonical raster path for target/reference math too.
+  // This removes JPEG-vs-PDF raster delivery differences from the ROI extractor.
+  const mathTargetPath = await prepareMathRaster(targetPath, 'target') || targetPath;
+  const mathReferencePath = referencePath
+    ? (await prepareMathRaster(referencePath, 'reference') || referencePath)
+    : null;
+
+  // Validate semantic ROIs before they are allowed into mathematical evidence.
+  // A flat/gray crop is treated as an extraction failure, not as a legitimate
+  // low-texture document feature.
+  const validateAndRecoverMathRois = async (inputPath, regions, sideLabel) => {
+    const out = { ...regions };
+    if (!inputPath || !Object.keys(out).length) return out;
+    let initial = null;
+    try { initial = await extractMathematicalFingerprint(inputPath, { regions: out }); } catch {}
+    const meta = await sharp(inputPath).metadata();
+    const width = Number(meta?.width) || 0, height = Number(meta?.height) || 0;
+    if (!width || !height) return out;
+
+    for (const field of ['amount','recipientIban']) {
+      const box = out[field];
+      if (!box) continue;
+      const roi = initial?.roi16x16?.[field];
+      const usable = mathRoiValidationIsUsable(field, roi);
+      if (usable) {
+        console.log('MATH ROI VALIDATED V2.1:', JSON.stringify({ side:sideLabel, field, method:'trusted-semantic-geometry', box, validation:roi?.validation||null }));
+        continue;
+      }
+
+      const recovered = await recoverSemanticRoiWithOcr(inputPath, field, box, width, height);
+      if (recovered?.box) {
+        out[field] = recovered.box;
+        console.log('MATH ROI RECOVERED V2.1:', JSON.stringify({
+          side:sideLabel, field, method:recovered.method, text:recovered.text,
+          oldBox:box, newBox:recovered.box,
+          centerDistance:recovered.centerDistance, sizeDistance:recovered.sizeDistance,
+        }));
+      } else {
+        delete out[field];
+        console.warn('MATH ROI REJECTED V2.1:', JSON.stringify({
+          side:sideLabel, field, reason:'flat-or-empty-roi', box, validation:roi?.validation||null,
+        }));
+      }
+    }
+    return out;
+  };
+
+  const validatedTargetRegions = await validateAndRecoverMathRois(mathTargetPath, targetRegions, 'target');
+  const validatedReferenceRegions = await validateAndRecoverMathRois(mathReferencePath, referenceRegions, 'reference');
+
+  const fingerprint = await extractMathematicalFingerprint(mathTargetPath, { regions: validatedTargetRegions });
   const family = inferDocumentFamily(fileName, targetText);
+
 
   // V2: global whole-document baseline comparison is intentionally disabled.
   // Authenticity math is driven only by the validated AMOUNT + recipient IBAN
@@ -553,9 +720,9 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   let roiForensics = null;
   let semanticReferenceMeasurements = null;
-  if (referencePath && Object.keys(referenceRegions).length) {
+  if (mathReferencePath && Object.keys(validatedReferenceRegions).length) {
     try {
-      const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
+      const referenceFingerprint = await extractMathematicalFingerprint(mathReferencePath, { regions: validatedReferenceRegions });
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
 
       // V1.5: expose the actual mathematical measurements extracted from the
@@ -638,13 +805,14 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     .filter(([, v]) => v?.available)
     .map(([field, v]) => ({ field, meanDistance: v.meanDistance, maxCellDistance: v.maxCellDistance, topCells: v.topCells }));
 
-  // V2 critical-ROI negative population: use the trusted reference ROI geometry
-  // normalized to each negative raster. This keeps amount/IBAN comparisons
-  // semantic and resolution-independent while avoiding whole-document math.
+  // V2.1 critical-ROI negative population: each negative is first converted
+  // to the same canonical raster pipeline. The trusted reference ROI geometry
+  // is normalized into that raster, then validated. If it lands on a flat/gray
+  // region, OCR recovers the actual semantic field. Invalid crops are excluded.
   let semanticNegativeAffinity = {};
   let criticalRoiCalibration = {};
   try {
-    const refMeta = referencePath ? await sharp(referencePath).metadata() : null;
+    const refMeta = mathReferencePath ? await sharp(mathReferencePath).metadata() : null;
     const refW = Number(refMeta?.width) || 0;
     const refH = Number(refMeta?.height) || 0;
     const negativeFingerprints = [];
@@ -654,35 +822,109 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         const samplePath = typeof sample === 'string' ? sample : sample?.path;
         if (!samplePath) continue;
         try {
-          const meta = await sharp(samplePath).metadata();
+          const mathSamplePath = await prepareMathRaster(samplePath, 'negative');
+          if (!mathSamplePath) {
+            console.warn('MATH NEGATIVE ROI SAMPLE REJECTED V2.1:', path.basename(samplePath), 'raster-preparation-failed');
+            continue;
+          }
+          const meta = await sharp(mathSamplePath).metadata();
           const sw = Number(meta?.width) || 0, sh = Number(meta?.height) || 0;
           if (!sw || !sh) continue;
+
           const mappedRegions = {};
+          const mappedSource = {};
           for (const field of ['amount','recipientIban']) {
-            const box = semanticRois?.[field]?.reference;
+            const box = validatedReferenceRegions?.[field];
             if (!box) continue;
             const x1 = Number(box.x1), y1 = Number(box.y1), x2 = Number(box.x2), y2 = Number(box.y2);
             if (![x1,y1,x2,y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1) continue;
-            mappedRegions[field] = {
+            const mapped = {
               x1: (x1 / refW) * sw,
               y1: (y1 / refH) * sh,
               x2: (x2 / refW) * sw,
               y2: (y2 / refH) * sh,
             };
+            mappedRegions[field] = mapped;
+            mappedSource[field] = { method:'trusted-reference-normalized-v2.1', referenceBox:box, mappedBox:mapped };
           }
           if (!Object.keys(mappedRegions).length) continue;
-          const fp = await extractMathematicalFingerprint(samplePath, { regions: mappedRegions });
-          negativeFingerprints.push({ fingerprint: fp, fileName: path.basename(samplePath), path: samplePath });
+
+          let fp = await extractMathematicalFingerprint(mathSamplePath, { regions: mappedRegions });
+          const acceptedRegions = {};
+          const validation = {};
+
+          for (const field of ['amount','recipientIban']) {
+            let box = mappedRegions[field];
+            if (!box) continue;
+            let roi = fp?.roi16x16?.[field] || null;
+            if (mathRoiValidationIsUsable(field, roi)) {
+              acceptedRegions[field] = box;
+              validation[field] = { method:'trusted-reference-normalized-v2.1', accepted:true, sourceBox:box, raster:roi?.validation||null };
+              continue;
+            }
+
+            const recovered = await recoverSemanticRoiWithOcr(mathSamplePath, field, box, sw, sh);
+            if (recovered?.box) {
+              acceptedRegions[field] = recovered.box;
+              validation[field] = {
+                method:recovered.method, accepted:true, sourceBox:box, recoveredBox:recovered.box,
+                text:recovered.text, centerDistance:recovered.centerDistance, sizeDistance:recovered.sizeDistance,
+                initialRaster:roi?.validation||null,
+              };
+            } else {
+              validation[field] = { method:'rejected-flat-or-empty', accepted:false, sourceBox:box, raster:roi?.validation||null };
+            }
+          }
+
+          if (!Object.keys(acceptedRegions).length) {
+            console.warn('MATH NEGATIVE ROI SAMPLE REJECTED V2.1:', JSON.stringify({
+              sample:path.basename(samplePath), reason:'no-valid-semantic-roi', validation
+            }));
+            continue;
+          }
+
+          // Re-extract using only validated/recovered boxes. This guarantees the
+          // population never contains a stale flat crop from the first mapping.
+          fp = await extractMathematicalFingerprint(mathSamplePath, { regions: acceptedRegions });
+          const postValidation = {};
+          for (const field of Object.keys(acceptedRegions)) {
+            const roi = fp?.roi16x16?.[field] || null;
+            if (!mathRoiValidationIsUsable(field, roi)) {
+              delete acceptedRegions[field];
+              validation[field] = { ...(validation[field] || {}), accepted:false, reason:'post-reextract-validation-failed', raster:roi?.validation||null };
+            } else {
+              postValidation[field] = roi?.validation || null;
+            }
+          }
+          if (!Object.keys(acceptedRegions).length) {
+            console.warn('MATH NEGATIVE ROI SAMPLE REJECTED V2.1:', JSON.stringify({
+              sample:path.basename(samplePath), reason:'post-reextract-empty', validation
+            }));
+            continue;
+          }
+
+          const signature = ['amount','recipientIban'].map(field => {
+            const r=fp?.roi16x16?.[field];
+            if (!r) return `${field}:none`;
+            const m=r.metrics||{};
+            return `${field}:${Number(m.luminanceMean||0).toFixed(2)},${Number(m.luminanceStd||0).toFixed(2)},${Number(m.edgeDensity||0).toFixed(5)},${Number(m.laplacianVariance||0).toFixed(2)},${Number(r?.validation?.inkPixels||0)}`;
+          }).join('|');
+          negativeFingerprints.push({ fingerprint: fp, fileName: path.basename(samplePath), path: mathSamplePath, roiValidation: validation, roiSignature: signature });
           negativeNames.push(path.basename(samplePath));
+          console.log('MATH NEGATIVE ROI SAMPLE V2.1:', JSON.stringify({
+            sample:path.basename(samplePath), raster:path.basename(mathSamplePath), dimensions:{width:sw,height:sh},
+            mappedSource, validation, postValidation, roiSignature:signature,
+          }));
         } catch (sampleError) {
-          console.warn('MATH NEGATIVE ROI SAMPLE HATASI:', path.basename(samplePath), sampleError?.message || sampleError);
+          console.warn('MATH NEGATIVE ROI SAMPLE HATASI V2.1:', path.basename(samplePath), sampleError?.message || sampleError);
         }
       }
       semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(fingerprint, negativeFingerprints, ['amount','recipientIban']);
-      console.log('MATH CRITICAL ROI NEGATIVE POPULATION V2:', JSON.stringify({
+      console.log('MATH CRITICAL ROI NEGATIVE POPULATION V2.1:', JSON.stringify({
         sampleCount: negativeFingerprints.length,
         samples: negativeNames,
         fields: semanticNegativeAffinity,
+        roiSignatures: negativeFingerprints.map(x=>({sample:x.fileName,signature:x.roiSignature})),
       }));
     } else {
       semanticNegativeAffinity = {
@@ -690,7 +932,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         recipientIban: { available:false, reason:'negative-population-insufficient', sampleCount:0 },
       };
     }
-
     for (const field of ['amount','recipientIban']) {
       const refDistance = Number(semanticReferenceMeasurements?.[field]?.comparison?.meanDistance);
       const neg = semanticNegativeAffinity?.[field];
