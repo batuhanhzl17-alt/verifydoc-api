@@ -19763,8 +19763,13 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   const findings = [];
   const seen = new Set();
   const mathFusion = buildReferenceMathematicalFusion(mathematicalForensics, forensic, layout, bank, negativeSampleForensics);
-  const referenceLike = mathFusion.referenceLike;
-  const negativeLike = mathFusion.negativeLike;
+  const referenceLike = mathFusion.referenceLike === true;
+  const negativeLike = mathFusion.negativeLike === true;
+  // SAFE SCOPE: the human-readable report must never read a free variable
+  // named `differential`. The mathematical fusion object is the single source
+  // of truth for the global reference-vs-negative diagnostic value.
+  const differentialValue = Number(mathFusion?.differential);
+  const differential = Number.isFinite(differentialValue) ? differentialValue : null;
   const fieldFusion = mathFusion.fields || {};
   const isMaterialFinding = (row) => {
     const field = String(row?.evidenceField || row?.field || '').replace(/:value$/i, '');
@@ -20127,7 +20132,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   }
   if (referenceLike) userLines.push('', '🟢 Matematiksel değerlendirme: semantic ROI kanıtı referansla uyumlu.');
   else if (negativeLike) userLines.push('', '🔴 Matematiksel değerlendirme: semantic ROI kanıtı negatif örneklerle uyumlu.');
-  else if (differential != null) userLines.push('', `🟡 Genel raster fingerprint: negatif popülasyonuna daha yakın görünüyor (delta ${Number(differential).toFixed(1)}); bu sinyal tek başına sahtecilik kanıtı değildir.`);
+  else if (differential != null) userLines.push('', `🟡 Genel raster fingerprint: negatif popülasyonuna daha yakın görünüyor (delta ${Number(differential).toFixed(1)}); bu global/layout-raster sinyalidir ve tek başına sahtecilik kanıtı değildir.`);
   else userLines.push('', '🟡 Matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
 
   return {
