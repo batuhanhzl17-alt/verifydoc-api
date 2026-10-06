@@ -583,62 +583,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     });
   }
   const strongestRoi = roiRows.sort((a,b)=>Number(b.meanDistance)-Number(a.meanDistance))[0] || null;
-  // V1.6: semantic mathematical calibration. The goal is not to declare
-  // a document fake from one number, but to translate the three intended
-  // signals (meanDistance, strong-cell ratio, Amount Forensics) into one
-  // conservative field-level forensic score. Thresholds are deliberately
-  // broad because the current calibration set is still small.
-  const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
-  const scoreMeanDistance = (d) => {
-    const x = Number(d);
-    if (!Number.isFinite(x)) return null;
-    if (x <= 4.5) return 0;
-    if (x <= 5.0) return 20;
-    if (x <= 5.5) return 40;
-    if (x <= 6.0) return 65;
-    if (x <= 6.5) return 82;
-    return 95;
-  };
-  const scoreStrongRatio = (r) => {
-    const x = clamp01(r);
-    if (x < 0.10) return 0;
-    if (x < 0.20) return 20;
-    if (x < 0.35) return 45;
-    if (x < 0.50) return 70;
-    return 90;
-  };
-  const semanticMathCalibration = {};
-  for (const [field, roi] of Object.entries(roiForensics || {})) {
-    if (!roi?.available) continue;
-    const meanScore = scoreMeanDistance(roi.meanDistance);
-    const strongScore = scoreStrongRatio(roi.strongDifferentRatio);
-    const amountScore = field === 'amount' && Number.isFinite(Number(amountForensics?.score))
-      ? Number(amountForensics.score) : null;
-    const combined = field === 'amount' && amountScore !== null
-      ? (meanScore * 0.45) + (strongScore * 0.25) + (amountScore * 0.30)
-      : (meanScore * 0.65) + (strongScore * 0.35);
-    const level = combined >= 65 ? 'strong-mismatch' : combined >= 45 ? 'elevated-mismatch' : combined >= 25 ? 'watch' : 'reference-near';
-    semanticMathCalibration[field] = {
-      available: true,
-      meanDistance: Number(roi.meanDistance),
-      meanDistanceScore: meanScore,
-      differentRatio: Number(roi.differentRatio || 0),
-      strongDifferentRatio: Number(roi.strongDifferentRatio || 0),
-      strongCellScore: strongScore,
-      amountForensicsScore: amountScore,
-      combinedScore: Number(combined.toFixed(1)),
-      level,
-      interpretation: level === 'reference-near'
-        ? 'Kritik ROI referans matematiksel parmak izine yakın.'
-        : level === 'watch'
-          ? 'ROI referanstan ölçülebilir biçimde ayrışıyor; tek başına sahtecilik hükmü değildir.'
-          : level === 'elevated-mismatch'
-            ? 'ROI referanstan belirgin ayrışıyor; bağımsız forensic sinyallerle birlikte değerlendirilmelidir.'
-            : 'ROI referanstan güçlü biçimde ayrışıyor; özellikle bağımsız Amount Forensics desteği varsa oynama şüphesi güçlenir.'
-    };
-  }
-  const semanticMathStrongFields = Object.entries(semanticMathCalibration).filter(([,v]) => v.level === 'strong-mismatch').map(([f]) => f);
-  const semanticMathElevatedFields = Object.entries(semanticMathCalibration).filter(([,v]) => v.level === 'elevated-mismatch').map(([f]) => f);
 
   if (sameLogicalRecipientIban) {
     console.log('MATH IBAN ROI LAYOUT NORMALIZATION:', JSON.stringify({
@@ -671,13 +615,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
       }
     },
     criticalRoiMismatches,
-    semanticMathCalibration: {
-      version: 'V1.6.0',
-      fields: semanticMathCalibration,
-      strongFields: semanticMathStrongFields,
-      elevatedFields: semanticMathElevatedFields,
-      policy: 'meanDistance + strongDifferentRatio + Amount Forensics; no single metric declares authenticity'
-    },
     // Compact semantic measurement view. This explicitly proves that the
     // reference-side recipientName / recipientIban / amount ROIs were
     // measured mathematically when their boxes were available.
@@ -9876,6 +9813,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
           fields:fieldResults,referenceQuality,semanticValueRegions,
+          ocrRegions: refRegions.map(r => ({ text: r.text, region: r.region })),
         });
       }catch(error){
         console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:',path.basename(referencePath),error?.message||error);
@@ -10029,7 +9967,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       if (targetSemanticRegions[field]) continue;
       const refCandidate=semanticValueRegions[field];
       if (!refCandidate) continue;
-      const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],refOCR?.regions||[]);
+      const referenceRowsForFallback = referenceResults.flatMap(r => Array.isArray(r?.ocrRegions) ? r.ocrRegions : []);
+      const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],referenceRowsForFallback);
       if (fallback) targetSemanticRegions[field]=fallback;
     }
 
@@ -17895,7 +17834,8 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     layoutForensics,
     referenceLocalCrop,
     azureReferenceGeometry,
-    bank
+    bank,
+    mathematicalForensics
   );
   const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
@@ -17909,8 +17849,14 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   // however, the reference section MUST NOT say "Belirgin bir fark yok".
   // Keep the signal deterministic, localized and conservative.
   const buildCriticalRoiReferenceReport = (math) => {
+    const fusionFields = math?.semanticMathCalibration?.fields || {};
     const rows = Array.isArray(math?.criticalRoiMismatches)
-      ? math.criticalRoiMismatches.filter(x => x?.strong)
+      ? math.criticalRoiMismatches.filter(x => {
+          if (!x?.strong) return false;
+          const f = fusionFields[String(x.field || '')];
+          if (!f) return false;
+          return f.level === 'strong-mismatch' || (f.level === 'elevated-mismatch' && (Number(f.amountForensicsScore || 0) >= 80 || Number(f.strongDifferentRatio || 0) >= 0.20));
+        })
       : [];
     if (!rows.length) return null;
 
@@ -17963,7 +17909,25 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   // birleştiriliyor; tekrarlar başlık+detay bazında temizleniyor.
   const mergeReferenceReports = (reports) => {
     const all = [];
+    const informational = [];
     const seen = new Set();
+    const infoSeen = new Set();
+    const fusion = detailedDeterministicReport?.mathematicalFusion || buildReferenceMathematicalFusion(mathematicalForensics, referenceForensics, layoutForensics, bank);
+    const fusionFields = fusion?.fields || {};
+    const keepAsMaterial = (row) => {
+      const kind = String(row?.kind || '');
+      const field = String(row?.evidenceField || row?.field || '').replace(/:value$/i, '');
+      const ff = fusionFields[field];
+      if (kind === 'critical-roi-mismatch') return Boolean(ff?.material);
+      if (['field-position','fused-field','strong-typography'].includes(kind)) {
+        if (ff) return Boolean(ff.material || fusion.negativeLike);
+        return !fusion.referenceLike;
+      }
+      if (['layout','whole-page','azure-layout'].includes(kind)) {
+        return !fusion.referenceLike || fusion.layout?.strong === true;
+      }
+      return true;
+    };
     for (const report of reports.filter(Boolean)) {
       const rows = Array.isArray(report.findings) ? report.findings : [];
       for (const row of rows) {
@@ -17971,29 +17935,46 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
         const detail = String(row?.detail || '').trim();
         if (!title || !detail) continue;
         const key = `${title}|${detail}`.toLocaleLowerCase('tr-TR');
-        if (seen.has(key)) continue;
+        if (seen.has(key) || infoSeen.has(key)) continue;
+        if (!keepAsMaterial(row)) {
+          infoSeen.add(key);
+          informational.push({ ...row, severity: 'informational' });
+          continue;
+        }
         seen.add(key);
         all.push({ ...row });
       }
     }
+    for (const row of (detailedDeterministicReport?.informationalFindings || [])) {
+      const title = String(row?.title || '').trim();
+      const detail = String(row?.detail || '').trim();
+      if (!title || !detail) continue;
+      const key = `${title}|${detail}`.toLocaleLowerCase('tr-TR');
+      if (seen.has(key) || infoSeen.has(key)) continue;
+      infoSeen.add(key);
+      informational.push({ ...row, severity: 'informational' });
+    }
     all.sort((a, b) => Number(a.priority || 9) - Number(b.priority || 9));
+    informational.sort((a, b) => Number(a.priority || 9) - Number(b.priority || 9));
     const unique = all.slice(0, 8);
-    const userText = unique.length
-      ? [
-          '🔎 REFERANS KARŞILAŞTIRMASI',
-          '',
-          '🔴 FARKLAR',
-          ...unique.map(x => `• ${x.title}: ${x.detail}`)
-        ].join('\n')
-      : '🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.';
+    const infoUnique = informational.slice(0, 4);
+    const lines = ['🔎 REFERANS KARŞILAŞTIRMASI'];
+    if (unique.length) lines.push('', '🔴 FARKLAR', ...unique.map(x => `• ${x.title}: ${x.detail}`));
+    if (infoUnique.length) lines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
+    if (!unique.length && !infoUnique.length) lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
+    if (fusion?.referenceLike) lines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
+    else if (fusion?.negativeLike) lines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
+    else lines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
       available: true,
       findings: unique,
+      informationalFindings: infoUnique,
       differenceCount: unique.length,
       strongDifferenceCount: unique.length,
       status: unique.length ? 'differences-found' : 'no-material-difference-found',
-      userText,
+      mathematicalFusion: fusion,
+      userText: lines.join('\n'),
       mergedSources: reports.filter(Boolean).map(x => x.engine || 'unknown')
     };
   };
@@ -19562,7 +19543,89 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
   };
 }
 
-function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null, bank = null) {
+function buildReferenceMathematicalFusion(math = null, forensic = null, layout = null, bank = null) {
+  const differential = Number(math?.differential?.negativeMinusReference);
+  const referenceSimilarity = Number(math?.differential?.referenceSimilarity);
+  const negativeSimilarity = Number(math?.differential?.negativeSimilarity);
+  const referenceLike = Number.isFinite(differential) && differential <= -20;
+  const negativeLike = Number.isFinite(differential) && differential >= 20;
+  const className = referenceLike ? 'reference-like' : negativeLike ? 'negative-like' : 'indeterminate';
+  const semanticFields = math?.semanticMathCalibration?.fields || {};
+  const fieldRows = Array.isArray(forensic?.fields) ? forensic.fields : [];
+  const geometryByField = {};
+  for (const row of fieldRows) {
+    const field = String(row?.field || '').replace(/:value$/i, '');
+    if (!field) continue;
+    const current = geometryByField[field];
+    const candidate = {
+      positionScore: Number(row?.positionScore || 0),
+      styleScore: Number(row?.styleScore || 0),
+      combinedScore: Number(row?.combinedScore || 0),
+      positionResidual: Number(row?.positionResidual || 0),
+      referenceLabelYNorm: Number(row?.referenceLabelYNorm),
+      targetLabelYNorm: Number(row?.targetLabelYNorm),
+    };
+    if (!current || candidate.combinedScore > current.combinedScore) geometryByField[field] = candidate;
+  }
+
+  const criticalRows = Array.isArray(math?.criticalRoiMismatches)
+    ? math.criticalRoiMismatches.filter(x => x?.strong)
+    : [];
+  const criticalByField = {};
+  for (const row of criticalRows) criticalByField[String(row.field || '')] = row;
+
+  const fieldFusion = {};
+  for (const [field, sem] of Object.entries(semanticFields)) {
+    const geo = geometryByField[field] || {};
+    const roiStrong = criticalByField[field];
+    const level = String(sem?.level || 'reference-near');
+    const geometryStrong = Number(geo.positionScore || 0) >= 70 || Number(geo.combinedScore || 0) >= 70;
+    const roiStrongCells = Number(roiStrong?.globalStrongDifferentCount || 0);
+    const roiMean = Number(roiStrong?.roiMeanDistance || sem?.meanDistance || 0);
+    const independent = field === 'amount'
+      ? Number(sem?.amountForensicsScore || 0) >= 80
+      : Number(math?.differential?.negativeMinusReference || 0) >= 20;
+    fieldFusion[field] = {
+      level,
+      combinedScore: Number(sem?.combinedScore || 0),
+      meanDistance: Number(sem?.meanDistance || 0),
+      strongDifferentRatio: Number(sem?.strongDifferentRatio || 0),
+      geometryScore: Math.max(Number(geo.positionScore || 0), Number(geo.combinedScore || 0)),
+      geometryStrong,
+      roiStrongCells,
+      roiMeanDistance: roiMean,
+      independentlyCorroborated: independent,
+      material: level === 'strong-mismatch' || (level === 'elevated-mismatch' && (geometryStrong || independent)),
+    };
+  }
+
+  const layoutScores = [];
+  for (const row of (Array.isArray(layout?.localGapAnomalies) ? layout.localGapAnomalies : [])) {
+    if (Number.isFinite(Number(row?.score))) layoutScores.push(Number(row.score));
+  }
+  for (const row of (Array.isArray(layout?.containerPairs) ? layout.containerPairs : [])) {
+    if (Number.isFinite(Number(row?.score))) layoutScores.push(Number(row.score));
+  }
+  const maxLayoutScore = layoutScores.length ? Math.max(...layoutScores) : 0;
+  const strongLayout = maxLayoutScore >= 75 || String(layout?.severity || '').toLowerCase() === 'strong';
+
+  return {
+    available: true,
+    version: 'V1.6.1-MATHEMATICAL-FUSION',
+    className,
+    differential: Number.isFinite(differential) ? differential : null,
+    referenceSimilarity: Number.isFinite(referenceSimilarity) ? referenceSimilarity : null,
+    negativeSimilarity: Number.isFinite(negativeSimilarity) ? negativeSimilarity : null,
+    referenceLike,
+    negativeLike,
+    thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: 20 },
+    fields: fieldFusion,
+    layout: { maxScore: maxLayoutScore, strong: strongLayout },
+    policy: 'layout + geometry + semantic ROI + typography are mathematical evidence; report severity is fused with reference-vs-negative differential and independent corroboration',
+  };
+}
+
+function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null, bank = null, mathematicalForensics = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
   // The reference is a whole-document fingerprint. Compare structure/spacing first,
   // then fields, typography and localized pixels. Raw scores remain hidden.
@@ -19591,6 +19654,26 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 
   const findings = [];
   const seen = new Set();
+  const mathFusion = buildReferenceMathematicalFusion(mathematicalForensics, forensic, layout, bank);
+  const referenceLike = mathFusion.referenceLike;
+  const negativeLike = mathFusion.negativeLike;
+  const fieldFusion = mathFusion.fields || {};
+  const isMaterialFinding = (row) => {
+    const field = String(row?.evidenceField || row?.field || '').replace(/:value$/i, '');
+    const ff = fieldFusion[field];
+    if (row?.kind === 'critical-roi-mismatch') {
+      if (!ff) return !referenceLike;
+      return Boolean(ff.material);
+    }
+    if (row?.kind === 'field-position' || row?.kind === 'fused-field' || row?.kind === 'strong-typography') {
+      if (!ff) return !referenceLike;
+      return Boolean(ff.material || negativeLike);
+    }
+    if (row?.kind === 'layout' || row?.kind === 'whole-page' || row?.kind === 'azure-layout') {
+      return !referenceLike || mathFusion.layout.strong;
+    }
+    return true;
+  };
 
   // 0) Azure semantic anchor geometry: a second independent eye for
   // large local vertical spacing changes. This is intentionally reported
@@ -19900,8 +19983,13 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   findings.sort((a, b) => a.priority - b.priority);
 
   const unique = [];
+  const informational = [];
   const uniqueKeys = new Set();
   for (const row of findings) {
+    if (!isMaterialFinding(row)) {
+      informational.push({ ...row, severity: 'informational' });
+      continue;
+    }
     const key = `${row.title}|${row.detail}`;
     if (uniqueKeys.has(key)) continue;
     uniqueKeys.add(key);
@@ -19909,27 +19997,40 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     if (unique.length >= 8) break;
   }
 
-  const userText = unique.length
-    ? [
-        '🔎 REFERANS KARŞILAŞTIRMASI',
-        '',
-        '🔴 FARKLAR',
-        ...unique.map(x => `• ${x.title}: ${x.detail}`)
-      ].join('\n')
-    : [
-        '🔎 REFERANS KARŞILAŞTIRMASI',
-        '',
-        '🟢 Belirgin bir fark tespit edilmedi.'
-      ].join('\n');
+  const infoUnique = [];
+  const infoKeys = new Set();
+  for (const row of informational) {
+    const key = `${row.title}|${row.detail}`;
+    if (infoKeys.has(key)) continue;
+    infoKeys.add(key);
+    infoUnique.push(row);
+    if (infoUnique.length >= 4) break;
+  }
+
+  const userLines = ['🔎 REFERANS KARŞILAŞTIRMASI'];
+  if (unique.length) {
+    userLines.push('', '🔴 FARKLAR', ...unique.map(x => `• ${x.title}: ${x.detail}`));
+  }
+  if (infoUnique.length) {
+    userLines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
+  }
+  if (!unique.length && !infoUnique.length) {
+    userLines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
+  }
+  if (referenceLike) userLines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
+  else if (negativeLike) userLines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
+  else userLines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
 
   return {
     headline: unique.length
-      ? `Referans karşılaştırmasında ${unique.length} belirgin fark bulundu.`
-      : 'Referans karşılaştırmasında belirgin fark bulunmadı.',
+      ? `Referans karşılaştırmasında ${unique.length} materyal fark bulundu.`
+      : (infoUnique.length ? `Referans karşılaştırmasında ${infoUnique.length} ölçülebilir fakat tek başına belirleyici olmayan fark bulundu.` : 'Referans karşılaştırmasında belirgin fark bulunmadı.'),
     findings: unique,
+    informationalFindings: infoUnique,
     findingCount: unique.length,
     strongFindingCount: unique.length,
-    userText
+    mathematicalFusion: mathFusion,
+    userText: userLines.join('\n')
   };
 }
 
@@ -20542,38 +20643,6 @@ if (strongCriticalRoiRows.length) {
       independentSupport: criticalRoiIndependentSupport,
     }));
   }
-}
-
-// V1.6: semantic mathematical calibration is now allowed to influence the
-// deterministic decision, but only through a conservative corroboration floor.
-// A strong ROI mismatch by itself never becomes a definitive fake verdict.
-const semanticMathCal = result?.mathematicalForensics?.semanticMathCalibration?.fields || {};
-const mathStrongAmount = semanticMathCal?.amount?.level === 'strong-mismatch';
-const mathStrongIban = semanticMathCal?.recipientIban?.level === 'strong-mismatch';
-const mathStrongFieldCount = [mathStrongAmount, mathStrongIban].filter(Boolean).length;
-if (mathStrongAmount && strongAmountSignal) {
-  finalRiskScore = Math.max(finalRiskScore, 46);
-  result.categories = {
-    ...(result.categories || {}),
-    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 55)
-  };
-  console.log('V1.6 SEMANTIC MATH AMOUNT CORROBORATION:', JSON.stringify({
-    combinedScore: semanticMathCal.amount?.combinedScore,
-    meanDistance: semanticMathCal.amount?.meanDistance,
-    strongDifferentRatio: semanticMathCal.amount?.strongDifferentRatio,
-    amountForensicsScore: semanticMathCal.amount?.amountForensicsScore,
-    appliedFloor: 46
-  }));
-} else if (mathStrongFieldCount >= 2 && (strongAzureSignal || meaningfulPixelReferenceSignal || Number(negativeSampleForensics?.bestMatchScore || 0) >= 70)) {
-  finalRiskScore = Math.max(finalRiskScore, 46);
-  result.categories = {
-    ...(result.categories || {}),
-    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 55)
-  };
-  console.log('V1.6 SEMANTIC MATH MULTI-ROI CORROBORATION:', JSON.stringify({
-    strongFields: Object.entries(semanticMathCal).filter(([,v]) => v?.level === 'strong-mismatch').map(([f]) => f),
-    appliedFloor: 46
-  }));
 }
 
 if (controlledAmountCorroborated) {
