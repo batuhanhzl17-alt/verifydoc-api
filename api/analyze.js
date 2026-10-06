@@ -17835,7 +17835,8 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     referenceLocalCrop,
     azureReferenceGeometry,
     bank,
-    mathematicalForensics
+    mathematicalForensics,
+    negativeSampleForensics
   );
   const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
@@ -17912,7 +17913,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     const informational = [];
     const seen = new Set();
     const infoSeen = new Set();
-    const fusion = detailedDeterministicReport?.mathematicalFusion || buildReferenceMathematicalFusion(mathematicalForensics, referenceForensics, layoutForensics, bank);
+    const fusion = detailedDeterministicReport?.mathematicalFusion || buildReferenceMathematicalFusion(mathematicalForensics, referenceForensics, layoutForensics, bank, negativeSampleForensics);
     const fusionFields = fusion?.fields || {};
     const keepAsMaterial = (row) => {
       const kind = String(row?.kind || '');
@@ -19543,13 +19544,21 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
   };
 }
 
-function buildReferenceMathematicalFusion(math = null, forensic = null, layout = null, bank = null) {
-  const differential = Number(math?.differential?.negativeMinusReference);
+function buildReferenceMathematicalFusion(math = null, forensic = null, layout = null, bank = null, negativeSampleForensics = null) {
+  // V1.6.2 FINAL ADJUDICATOR
+  // A missing negative baseline is NOT a zero similarity. It is an unavailable
+  // signal and must never manufacture a reference-vs-negative differential.
+  const rawDifferential = Number(math?.differential?.negativeMinusReference);
   const referenceSimilarity = Number(math?.differential?.referenceSimilarity);
   const negativeSimilarity = Number(math?.differential?.negativeSimilarity);
-  const referenceLike = Number.isFinite(differential) && differential <= -20;
-  const negativeLike = Number.isFinite(differential) && differential >= 20;
-  const className = referenceLike ? 'reference-like' : negativeLike ? 'negative-like' : 'indeterminate';
+  const referenceAvailable = Number.isFinite(referenceSimilarity);
+  const negativeBaselineAvailable = Number.isFinite(negativeSimilarity);
+  const differentialAvailable = Number.isFinite(rawDifferential) && negativeBaselineAvailable && referenceAvailable;
+  const differential = differentialAvailable ? rawDifferential : null;
+
+  const referenceLikeByDifferential = differentialAvailable && differential <= -20;
+  const negativeLikeByDifferential = differentialAvailable && differential >= 20;
+
   const semanticFields = math?.semanticMathCalibration?.fields || {};
   const fieldRows = Array.isArray(forensic?.fields) ? forensic.fields : [];
   const geometryByField = {};
@@ -19584,7 +19593,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
     const roiMean = Number(roiStrong?.roiMeanDistance || sem?.meanDistance || 0);
     const independent = field === 'amount'
       ? Number(sem?.amountForensicsScore || 0) >= 80
-      : Number(math?.differential?.negativeMinusReference || 0) >= 20;
+      : negativeLikeByDifferential;
     fieldFusion[field] = {
       level,
       combinedScore: Number(sem?.combinedScore || 0),
@@ -19599,33 +19608,100 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
     };
   }
 
+  // Layout evidence can arrive from several generations of the layout engine.
+  // Include all known score-bearing structures instead of assuming only one.
   const layoutScores = [];
-  for (const row of (Array.isArray(layout?.localGapAnomalies) ? layout.localGapAnomalies : [])) {
-    if (Number.isFinite(Number(row?.score))) layoutScores.push(Number(row.score));
-  }
-  for (const row of (Array.isArray(layout?.containerPairs) ? layout.containerPairs : [])) {
-    if (Number.isFinite(Number(row?.score))) layoutScores.push(Number(row.score));
+  const pushScore = (v) => {
+    const n = Number(v);
+    if (Number.isFinite(n)) layoutScores.push(n);
+  };
+  pushScore(layout?.score);
+  pushScore(layout?.maxScore);
+  pushScore(layout?.riskScore);
+  for (const row of (Array.isArray(layout?.localGapAnomalies) ? layout.localGapAnomalies : [])) pushScore(row?.score);
+  for (const row of (Array.isArray(layout?.containerPairs) ? layout.containerPairs : [])) pushScore(row?.score);
+  for (const row of (Array.isArray(layout?.structureSignals) ? layout.structureSignals : [])) pushScore(row?.score);
+  for (const row of (Array.isArray(layout?.unmatchedSpanAnomalies) ? layout.unmatchedSpanAnomalies : [])) pushScore(row?.score);
+  // Reference-field geometry is a valid structural fallback when the dedicated
+  // layout engine did not expose a score (this is what fixes Garanti V1.6.1).
+  for (const row of fieldRows) {
+    pushScore(row?.positionScore);
+    pushScore(row?.combinedScore);
   }
   const maxLayoutScore = layoutScores.length ? Math.max(...layoutScores) : 0;
   const strongLayout = maxLayoutScore >= 75 || String(layout?.severity || '').toLowerCase() === 'strong';
 
+  const knownNegativeScoreRaw = Number(negativeSampleForensics?.bestMatchScore);
+  const knownNegativeAvailable = Number.isFinite(knownNegativeScoreRaw);
+  const knownNegativeScore = knownNegativeAvailable ? knownNegativeScoreRaw : null;
+  const knownNegativeStrong = knownNegativeAvailable && knownNegativeScore >= 80 &&
+    Array.isArray(negativeSampleForensics?.findings) && negativeSampleForensics.findings.length > 0;
+
+  // Known-negative local similarity is deliberately advisory. QNB's original
+  // calibration case showed that a high local score can also capture generic
+  // bank/template/raster similarity. It therefore cannot independently create
+  // a negative-like verdict.
+  const independentNegativeCorroboration = Boolean(
+    strongLayout || criticalRows.length >= 2 ||
+    Object.values(fieldFusion).some(x => x?.material) ||
+    Number(math?.roiSummary?.strongestMeanDistance || 0) >= 6
+  );
+  const knownNegativeCorroborated = knownNegativeStrong && independentNegativeCorroboration;
+
+  let className = 'indeterminate';
+  let referenceLike = false;
+  let negativeLike = false;
+
+  if (referenceLikeByDifferential) {
+    referenceLike = true;
+    className = 'reference-like';
+    // A strong known-negative match blocks an unconditional reference-like
+    // result; keep it indeterminate until an independent adjudicator resolves it.
+    if (knownNegativeStrong && !differentialAvailable) {
+      referenceLike = false;
+      className = 'indeterminate';
+    }
+  } else if (negativeLikeByDifferential) {
+    negativeLike = true;
+    className = 'negative-like';
+  } else if (knownNegativeCorroborated && differentialAvailable && differential >= 0) {
+    negativeLike = true;
+    className = 'negative-like';
+  }
+
   return {
     available: true,
-    version: 'V1.6.1-MATHEMATICAL-FUSION',
+    version: 'V1.6.2-FINAL-ADJUDICATOR',
+    bank: bank || null,
     className,
-    differential: Number.isFinite(differential) ? differential : null,
-    referenceSimilarity: Number.isFinite(referenceSimilarity) ? referenceSimilarity : null,
-    negativeSimilarity: Number.isFinite(negativeSimilarity) ? negativeSimilarity : null,
+    differential,
+    referenceSimilarity: referenceAvailable ? referenceSimilarity : null,
+    negativeSimilarity: negativeBaselineAvailable ? negativeSimilarity : null,
+    referenceBaselineAvailable: referenceAvailable,
+    negativeBaselineAvailable,
     referenceLike,
     negativeLike,
     thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: 20 },
     fields: fieldFusion,
     layout: { maxScore: maxLayoutScore, strong: strongLayout },
-    policy: 'layout + geometry + semantic ROI + typography are mathematical evidence; report severity is fused with reference-vs-negative differential and independent corroboration',
+    knownNegative: {
+      available: knownNegativeAvailable,
+      bestMatchScore: knownNegativeScore,
+      bestSample: negativeSampleForensics?.bestSample || null,
+      strong: knownNegativeStrong,
+      corroborated: knownNegativeCorroborated,
+      policy: 'advisory-only; high local similarity cannot independently declare a document fake'
+    },
+    evidence: {
+      criticalRoiStrongCount: criticalRows.length,
+      independentNegativeCorroboration,
+      differentialAvailable
+    },
+    policy: 'V1.6.2: missing baselines remain unavailable/null; final class is reference-vs-negative differential first, with layout/semantic/known-negative signals as corroboration rather than single-signal verdicts'
   };
 }
 
-function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null, bank = null, mathematicalForensics = null) {
+function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null, bank = null, mathematicalForensics = null, negativeSampleForensics = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
   // The reference is a whole-document fingerprint. Compare structure/spacing first,
   // then fields, typography and localized pixels. Raw scores remain hidden.
@@ -19654,7 +19730,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 
   const findings = [];
   const seen = new Set();
-  const mathFusion = buildReferenceMathematicalFusion(mathematicalForensics, forensic, layout, bank);
+  const mathFusion = buildReferenceMathematicalFusion(mathematicalForensics, forensic, layout, bank, negativeSampleForensics);
   const referenceLike = mathFusion.referenceLike;
   const negativeLike = mathFusion.negativeLike;
   const fieldFusion = mathFusion.fields || {};
