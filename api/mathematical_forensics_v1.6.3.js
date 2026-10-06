@@ -808,12 +808,23 @@ export function compareAgainstBaseline(fingerprint, baseline, bank, family='unkn
   if (!baseline?.profiles) return { available:false, reason:'baseline-missing' };
   const candidates = Object.values(baseline.profiles).filter(p => p.bank === bank);
   if (!candidates.length) return { available:false, reason:'bank-profile-missing', bank };
-  const exact = candidates.find(p => p.family === family);
-  const pool = exact ? [exact, ...candidates.filter(p => p !== exact)] : candidates;
+  // V2 family guard: never compare a known document family against a different family.
+  // UNKNOWN is only valid when the target itself is UNKNOWN.
+  const requestedFamily = String(family || 'UNKNOWN').toUpperCase();
+  const pool = candidates.filter(p => String(p?.family || 'UNKNOWN').toUpperCase() === requestedFamily);
+  if (!pool.length) {
+    return {
+      available: false,
+      reason: 'family-profile-missing',
+      bank,
+      requestedFamily,
+      availableFamilies: [...new Set(candidates.map(p => p?.family).filter(Boolean))],
+    };
+  }
   const comparisons = pool.map(p => ({...compareFingerprint(fingerprint,p), family:p.family})).filter(x=>x.available);
   comparisons.sort((a,b)=>b.similarityScore-a.similarityScore);
   const best = comparisons[0] || null;
-  return { available:Boolean(best), bank, requestedFamily:family, bestMatch:best, candidates:comparisons.slice(0,8), profileCount:candidates.length };
+  return { available:Boolean(best), bank, requestedFamily, bestMatch:best, candidates:comparisons.slice(0,8), profileCount:pool.length };
 }
 
 export function inferDocumentFamily(name='', text='') {
