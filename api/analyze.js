@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -507,8 +507,13 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   // V1.6.2.1: an unavailable baseline is NOT similarity=0.
   // In particular, QNB currently has trusted references but no mathematical
   // negative profile. Using 0 here manufactures a false reference advantage.
-  const referenceAvailable = Boolean(reference?.available && reference?.bestMatch?.available);
-  const negativeAvailable = Boolean(negative?.available && negative?.bestMatch?.available);
+  const referenceAvailable =
+    Boolean(reference?.available) &&
+    Number.isFinite(Number(reference?.bestMatch?.similarityScore));
+  const negativeAvailable =
+    Boolean(negative?.available) &&
+    Number.isFinite(Number(negative?.bestMatch?.similarityScore)) &&
+    Boolean(negative?.bestMatch?.profile);
   const refScore = referenceAvailable
     ? Number(reference.bestMatch.similarityScore)
     : null;
@@ -520,7 +525,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     : null;
 
   const flags = [];
-  if (reference?.available && negative?.available) {
+  if (referenceAvailable && negativeAvailable && Number.isFinite(affinityDelta)) {
     const negReliability = String(negative?.bestMatch?.profile?.reliability || 'insufficient');
     const refReliability = String(reference?.bestMatch?.profile?.reliability || 'insufficient');
     const reliabilityPenalty = negReliability === 'low' ? 'low-sample' : 'population';
@@ -605,7 +610,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.6.2.1-BASELINE-AVAILABILITY-GUARD',
+    version: 'MATH-FORENSICS-V1.6.3-SCALE-INVARIANT-GLOBAL-BASELINE-GUARD',
     engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
@@ -617,6 +622,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
       negativeSimilarity: Number.isFinite(negScore) ? negScore : null,
       referenceBaselineAvailable: referenceAvailable,
       negativeBaselineAvailable: negativeAvailable,
+      differentialAvailable: Number.isFinite(affinityDelta),
       availabilityReason: !negativeAvailable
         ? (negative?.reason || 'negative-baseline-unavailable')
         : null,
@@ -19567,9 +19573,15 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   const rawDifferential = Number(math?.differential?.negativeMinusReference);
   const referenceSimilarity = Number(math?.differential?.referenceSimilarity);
   const negativeSimilarity = Number(math?.differential?.negativeSimilarity);
-  const referenceAvailable = Number.isFinite(referenceSimilarity);
-  const negativeBaselineAvailable = Number.isFinite(negativeSimilarity);
-  const differentialAvailable = Number.isFinite(rawDifferential) && negativeBaselineAvailable && referenceAvailable;
+  const referenceAvailable =
+    math?.differential?.referenceBaselineAvailable === true &&
+    Number.isFinite(referenceSimilarity);
+  const negativeBaselineAvailable =
+    math?.differential?.negativeBaselineAvailable === true &&
+    Number.isFinite(negativeSimilarity);
+  const differentialAvailable =
+    math?.differential?.differentialAvailable === true ||
+    (Number.isFinite(rawDifferential) && negativeBaselineAvailable && referenceAvailable);
   const differential = differentialAvailable ? rawDifferential : null;
 
   const referenceLikeByDifferential = differentialAvailable && differential <= -20;
@@ -19658,11 +19670,13 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   // bank/template/raster similarity. It therefore cannot independently create
   // a negative-like verdict.
   const independentNegativeCorroboration = Boolean(
-    strongLayout || criticalRows.length >= 2 ||
-    Object.values(fieldFusion).some(x => x?.material) ||
-    Number(math?.roiSummary?.strongestMeanDistance || 0) >= 6
+    knownNegativeStrong && (
+      strongLayout ||
+      Number(math?.semanticMathCalibration?.fields?.amount?.amountForensicsScore || 0) >= 80
+    )
   );
-  const knownNegativeCorroborated = knownNegativeStrong && independentNegativeCorroboration;
+  const knownNegativeCorroborated =
+    knownNegativeStrong && independentNegativeCorroboration;
 
   let className = 'indeterminate';
   let referenceLike = false;
@@ -19687,7 +19701,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
 
   return {
     available: true,
-    version: 'V1.6.2-FINAL-ADJUDICATOR',
+    version: 'V1.6.3-FINAL-ADJUDICATOR',
     bank: bank || null,
     className,
     differential,
@@ -20677,10 +20691,10 @@ const strongAmountSignal =
 const strongAzureSignal =
   Array.isArray(azureReferenceGeometry?.strongAnomalies) &&
   azureReferenceGeometry.strongAnomalies.some((x) => Number(x?.score) >= 90);
-const meaningfulPixelReferenceSignal =
+const strongPixelReferenceSignal =
   pixelForensics?.available === true &&
-  Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 45 &&
-  Number(pixelForensics?.score || 0) >= 35;
+  Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 50 &&
+  Number(pixelForensics?.score || 0) >= 55;
 
 const paintOverForV152 =
   result?.paintOverForensicsV2?.available === true
@@ -20710,7 +20724,7 @@ const criticalRoiIndependentSupport = strongCriticalRoiRows.some(row =>
   (String(row?.field) === 'amount' && strongAmountSignal) ||
   (String(row?.field) !== 'amount' && (
     strongAzureSignal ||
-    meaningfulPixelReferenceSignal ||
+    strongPixelReferenceSignal ||
     Number(negativeSampleForensics?.bestMatchScore || 0) >= 70
   ))
 );
@@ -20758,7 +20772,7 @@ if (controlledAmountCorroborated) {
 const independentForensicSupportCount = [
   strongAmountSignal,
   strongAzureSignal,
-  meaningfulPixelReferenceSignal
+  strongPixelReferenceSignal
 ].filter(Boolean).length;
 
 if (strongUnifiedReferenceCount >= 2 && independentForensicSupportCount >= 1) {
@@ -20774,7 +20788,7 @@ if (strongUnifiedReferenceCount >= 2 && independentForensicSupportCount >= 1) {
     independentForensicSupportCount,
     strongAmountSignal,
     strongAzureSignal,
-    meaningfulPixelReferenceSignal,
+    strongPixelReferenceSignal,
     appliedFloor: 70
   }));
 }
