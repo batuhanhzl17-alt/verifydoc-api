@@ -320,7 +320,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       const anchor = await getReferenceAmountAnchor(bank);
       // Trusted anchor is allowed only as a last resort, after the typed
       // anchor builder has already rejected non-money numeric fields.
-      if (anchor && referencePath && String(anchor.source || '').includes('amount')) {
+      if (anchor && referencePath && String(anchor.source || '').trim()) {
         let meta;
         if (path.extname(referencePath).toLowerCase() === '.pdf') {
           const raw = await fs.readFile(referencePath);
@@ -2516,9 +2516,9 @@ const NEGATIVE_SAMPLE_MAP = {
   qnb: ["qnb/qnb5000.jpg", "qnb/qnbfakeiban.jpg"],
   vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vak#U0131f3500fake.jpg"],
   yapikredi: [
-    "yap#U0131kredi/sahte-1.jpg",
-    "yap#U0131kredi/fakeyapi10000.jpg",
-    "yap#U0131kredi/yapifakeiban.jpg",
+    "yapikredi/sahte-1.jpg",
+    "yapikredi/fakeyapi10000.jpg",
+    "yapikredi/yapifakeiban.jpg",
   ],
   ziraat: [
     "ziraat/sahte-1.jpg",
