@@ -553,9 +553,10 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   let roiForensics = null;
   let semanticReferenceMeasurements = null;
+  let referenceFingerprint = null;
   if (referencePath && Object.keys(referenceRegions).length) {
     try {
-      const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
+      referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
 
       // V1.5: expose the actual mathematical measurements extracted from the
@@ -607,6 +608,135 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
       // signals. It is deliberately not computed or used in V2 authenticity math.
     } catch (error) {
       roiForensics = { available: false, status: 'roi-error', error: error?.message || String(error) };
+    }
+  }
+
+  // V2 CRITICAL ROI NEGATIVE POPULATION:
+  // Compare the target's validated semantic AMOUNT / recipient IBAN ROIs
+  // against the same ROI geometry projected into each known-negative sample.
+  // Whole-document/global fingerprint remains disabled.
+  let semanticNegativeAffinity = {};
+  let criticalRoiCalibration = {};
+  if (referenceFingerprint?.source?.width && referenceFingerprint?.source?.height &&
+      Array.isArray(negativeSamples) && negativeSamples.length) {
+    try {
+      const negativeFingerprints = [];
+      const refW = Number(referenceFingerprint.source.width);
+      const refH = Number(referenceFingerprint.source.height);
+      const normalizedReferenceRois = {};
+      for (const field of ['amount', 'recipientIban']) {
+        const box = referenceRegions?.[field];
+        if (!box) continue;
+        const normalized = {
+          x1: Number(box.x1) / refW,
+          y1: Number(box.y1) / refH,
+          x2: Number(box.x2) / refW,
+          y2: Number(box.y2) / refH,
+        };
+        if ([normalized.x1, normalized.y1, normalized.x2, normalized.y2].every(Number.isFinite) &&
+            normalized.x2 > normalized.x1 && normalized.y2 > normalized.y1) {
+          normalizedReferenceRois[field] = normalized;
+        }
+      }
+
+      for (const sample of negativeSamples.slice(0, 12)) {
+        try {
+          const samplePath = typeof sample === 'string' ? sample : sample?.path;
+          const sampleName = typeof sample === 'string' ? path.basename(sample) : (sample?.fileName || path.basename(samplePath || ''));
+          if (!samplePath) continue;
+          const ext = path.extname(samplePath).toLowerCase();
+          if (ext === '.pdf') continue;
+
+          const meta = await sharp(samplePath).metadata();
+          const sw = Number(meta?.width) || 0;
+          const sh = Number(meta?.height) || 0;
+          if (!(sw > 0 && sh > 0)) continue;
+
+          const sampleRegions = {};
+          for (const [field, n] of Object.entries(normalizedReferenceRois)) {
+            sampleRegions[field] = {
+              x1: n.x1 * sw,
+              y1: n.y1 * sh,
+              x2: n.x2 * sw,
+              y2: n.y2 * sh,
+            };
+          }
+          if (!Object.keys(sampleRegions).length) continue;
+
+          const fp = await extractMathematicalFingerprint(samplePath, { regions: sampleRegions });
+          if (fp?.available) {
+            negativeFingerprints.push({
+              fileName: sampleName,
+              path: samplePath,
+              fingerprint: fp,
+            });
+          }
+        } catch (sampleError) {
+          console.warn('MATH NEGATIVE ROI SAMPLE SKIPPED:', JSON.stringify({
+            sample: typeof sample === 'string' ? sample : sample?.fileName,
+            error: sampleError?.message || String(sampleError),
+          }));
+        }
+      }
+
+      semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(
+        fingerprint,
+        negativeFingerprints,
+        ['amount', 'recipientIban']
+      );
+
+      criticalRoiCalibration = {};
+      for (const field of ['amount', 'recipientIban']) {
+        const negativeRow = semanticNegativeAffinity?.[field];
+        const referenceDistance = Number(roiForensics?.[field]?.meanDistance);
+        const negativeMedianDistance = Number(negativeRow?.medianDistance);
+        const sampleCount = Number(negativeRow?.sampleCount || 0);
+        const negativeAffinityDelta =
+          Number.isFinite(referenceDistance) && Number.isFinite(negativeMedianDistance)
+            ? Number((referenceDistance - negativeMedianDistance).toFixed(3))
+            : null;
+
+        // Conservative V2 gate: require a real multi-sample population and a
+        // material distance margin. This is deliberately not a global score.
+        const strongNegativeAffinity =
+          sampleCount >= 3 &&
+          Number.isFinite(negativeAffinityDelta) &&
+          negativeAffinityDelta >= 1.5 &&
+          negativeMedianDistance < referenceDistance &&
+          !(field === 'recipientIban' && sameLogicalRecipientIban);
+
+        criticalRoiCalibration[field] = {
+          available: Boolean(negativeRow?.available && Number.isFinite(referenceDistance)),
+          referenceDistance: Number.isFinite(referenceDistance) ? Number(referenceDistance.toFixed(3)) : null,
+          negativeMeanDistance: Number.isFinite(Number(negativeRow?.meanDistance)) ? Number(negativeRow.meanDistance.toFixed(3)) : null,
+          negativeMedianDistance: Number.isFinite(negativeMedianDistance) ? Number(negativeMedianDistance.toFixed(3)) : null,
+          bestNegativeDistance: Number.isFinite(Number(negativeRow?.bestDistance)) ? Number(negativeRow.bestDistance.toFixed(3)) : null,
+          bestNegativeSample: negativeRow?.bestSample || null,
+          negativeAffinityDelta,
+          sampleCount,
+          strongNegativeAffinity,
+          threshold: {
+            minSampleCount: 3,
+            minDistanceMargin: 1.5,
+          },
+          reason: strongNegativeAffinity
+            ? 'target-critical-roi-is-materially-closer-to-known-negative-population'
+            : sampleCount < 3
+              ? 'negative-population-insufficient'
+              : !Number.isFinite(negativeAffinityDelta)
+                ? 'reference-or-negative-roi-distance-unavailable'
+                : 'critical-roi-threshold-not-met',
+        };
+      }
+
+      console.log('MATH CRITICAL ROI NEGATIVE POPULATION V2:', JSON.stringify({
+        sampleCount: negativeFingerprints.length,
+        fields: criticalRoiCalibration,
+      }));
+    } catch (error) {
+      console.warn('MATH CRITICAL ROI NEGATIVE POPULATION HATASI:', error?.message || error);
+      semanticNegativeAffinity = {};
+      criticalRoiCalibration = {};
     }
   }
 
@@ -15974,6 +16104,69 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
   }
 }
 
+// V2 AMOUNT SEMANTIC HANDOFF:
+// The reference-forensic engine may already have a trusted semantic amount
+// value box even when the older generic money-OCR selector returned
+// available:false. Feed that exact semantic ROI back into Amount Forensics
+// instead of making it search the whole OCR stream again.
+if (
+  (!amountForensics?.available || !(amountForensics?.region && Number(amountForensics.region.x2) > Number(amountForensics.region.x1) && Number(amountForensics.region.y2) > Number(amountForensics.region.y1))) &&
+  referenceForensics?.available
+) {
+  try {
+    const targetAmountRegion = referenceForensics?.targetSemanticRegions?.amount?.region || null;
+    const amountProfile = (Array.isArray(referenceForensics?.typographyFieldProfiles)
+      ? referenceForensics.typographyFieldProfiles
+      : []
+    ).find((row) => {
+      const field = String(row?.field || '').replace(/:value$/i, '').trim().toLocaleLowerCase('tr-TR');
+      return field === 'generic:toplam tahsilat tutari' ||
+        field === 'amount' ||
+        /toplam\s*tahsilat\s*tutari/i.test(String(row?.labelReference || ''));
+    });
+    const targetAmountText = String(amountProfile?.valueTarget || '').trim();
+
+    if (targetAmountRegion && targetAmountText &&
+        Number(targetAmountRegion.x2) > Number(targetAmountRegion.x1) &&
+        Number(targetAmountRegion.y2) > Number(targetAmountRegion.y1)) {
+      const semanticOCR = {
+        success: true,
+        regions: [{
+          text: targetAmountText,
+          region: targetAmountRegion,
+          score: 99,
+          criticalROI: true,
+          resolver: 'reference-forensic-semantic-amount-handoff-v2'
+        }]
+      };
+      const hydrated = await analyzeAmountForensics(
+        forensicTargetPath,
+        semanticOCR,
+        `${fileFingerprint || ''}:semantic-amount-v2`,
+        bank
+      );
+      if (hydrated?.available && hydrated?.region &&
+          Number(hydrated.region.x2) > Number(hydrated.region.x1) &&
+          Number(hydrated.region.y2) > Number(hydrated.region.y1)) {
+        amountForensics = {
+          ...hydrated,
+          referenceGuided: true,
+          semanticHandoff: true,
+          semanticHandoffSource: 'referenceForensics.targetSemanticRegions.amount',
+          selectedAmountText: targetAmountText || hydrated.selectedAmountText || hydrated.amountText || null,
+        };
+        console.log('AMOUNT FORENSICS SEMANTIC HANDOFF V2:', JSON.stringify({
+          source: 'referenceForensics.targetSemanticRegions.amount',
+          region: amountForensics.region,
+          amountText: amountForensics.amountText || amountForensics.selectedAmountText || null,
+        }));
+      }
+    }
+  } catch (error) {
+    console.warn('AMOUNT FORENSICS SEMANTIC HANDOFF HATASI:', error?.message || error);
+  }
+}
+
 const prepStartTime = Date.now();
 console.log("BANK:", bank || "YOK");
 console.log("REFERENCE:", reference?.fileName || "YOK");
@@ -15985,10 +16178,13 @@ console.log("REFERENCE VISUAL IMAGE:", reference?.visualReferencePath ? path.bas
 console.log("REFERENCE VISUAL IMAGES:", JSON.stringify((reference?.visualReferencePaths || []).map(p => path.basename(p))));
 
 // Known-negative sample comparison is advisory. It never replaces the
-// trusted reference engine and does not by itself declare a document fake.
+// trusted reference engine and does not by itself declare the document fake.
+// Keep the loaded samples in function scope because the V2 mathematical
+// critical-ROI stage consumes the same population.
+let negativeSamples = [];
 if ((type === "image" || type === "pdf") && bank) {
   try {
-    const negativeSamples = await loadNegativeSampleFiles(bank);
+    negativeSamples = await loadNegativeSampleFiles(bank);
     if (negativeSamples.length) {
       negativeSampleForensics = await runNegativeSampleComparison({ targetPath: forensicTargetPath, negativeSamples, bank });
       console.log("NEGATIVE SAMPLE FORENSICS:", JSON.stringify(negativeSampleForensics));
