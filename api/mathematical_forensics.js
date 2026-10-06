@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import sharp from 'sharp';
 
-const VERSION = 'MATH-FORENSICS-V1.6.0-SEMANTIC-CALIBRATION';
+const VERSION = 'MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE';
 const DEFAULT_SIZE = 256;
 const TILE_GRID = 16;
 const ROI_CANVAS_WIDTH = 256;
@@ -679,7 +679,7 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
       const edge = Math.abs((Number(a?.edgeDensity)||0)-(Number(b?.edgeDensity)||0))/edgeScale;
       const sd = Math.abs((Number(a?.std)||0)-(Number(b?.std)||0))/stdScale;
       const distance = (Math.min(lap,10)+Math.min(edge,10)+Math.min(sd,10))/3;
-      cells.push({ index:i, row:Math.floor(i/16)+1, col:(i%16)+1, laplacianDistance:Number(lap.toFixed(3)), edgeDistance:Number(edge.toFixed(3)), stdDistance:Number(sd.toFixed(3)), distance:Number(distance.toFixed(3)), different:distance >= 3.5, strong:distance >= 5 });
+      cells.push({ index:i, row:Math.floor(i/16)+1, col:(i%16)+1, laplacianDistance:Number(lap.toFixed(3)), edgeDistance:Number(edge.toFixed(3)), stdDistance:Number(sd.toFixed(3)), distance:Number(distance.toFixed(3)) });
     }
     cells.sort((a,b)=>b.distance-a.distance);
     const ta = t.alignment || {};
@@ -688,16 +688,9 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
       const x = Number(a), y = Number(b);
       return Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0 ? Math.abs(Math.log(x / y)) : null;
     };
-    const differentCount = cells.filter(c => c.different).length;
-    const strongDifferentCount = cells.filter(c => c.strong).length;
-    const cellCount = cells.length;
     result[name] = {
       available: true,
       meanDistance: metric.meanDistance,
-      differentCount,
-      strongDifferentCount,
-      differentRatio: Number((differentCount / Math.max(1, cellCount)).toFixed(4)),
-      strongDifferentRatio: Number((strongDifferentCount / Math.max(1, cellCount)).toFixed(4)),
       metricDistances: metric.metricDistances,
       maxCellDistance: cells[0]?.distance || 0,
       topCells: cells.slice(0, 8),
@@ -713,7 +706,6 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
       rawMetricDistances: compareMetricObjects(t.rawMetrics, r.rawMetrics).metricDistances,
       grid: '16x16',
       cellCount: cells.length,
-      calibration: { differentThreshold: 3.5, strongThreshold: 5 },
     };
   }
   return result;
