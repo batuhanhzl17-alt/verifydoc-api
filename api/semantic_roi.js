@@ -50,6 +50,69 @@ export function sameTurkishIban(a, b) {
   return hasTurkishIbanShape(a) && hasTurkishIbanShape(b) && normalizeTurkishIban(a) === normalizeTurkishIban(b);
 }
 
+export function resolveRecipientInlineSegments(row) {
+  const raw = String(row?.text ?? '').trim();
+  const r = row?.region;
+  if (!raw || !r) return [];
+  const x1 = Number(r.x1), y1 = Number(r.y1), x2 = Number(r.x2), y2 = Number(r.y2);
+  if (![x1,y1,x2,y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1) return [];
+
+  // PaddleOCR occasionally returns the entire beneficiary line as one OCR
+  // region. Split only explicit recipient-name / recipient-IBAN labels; never
+  // infer an IBAN from an unqualified account number.
+  const ibanRe = /(?:ALICI|ALACAKLI|LEHDAR)\s*(?:IBAN|HESAP\s*(?:NO|NUMARASI)|BANKA\s*IBAN)\s*[:：]?\s*TR\d(?:[\s\dA-Z]){20,}/i;
+  const nameRe = /(?:ALICI|ALACAKLI)\s*(?:ÜNVANI|UNVANI|ADI|ADISOYADI|ADI\s*SOYADI|İSMİ|ISMI)\s*[:：]\s*/i;
+  const segments = [];
+  const addSegment = (field, start, end, value, labelText, score) => {
+    const clean = String(value || '').trim();
+    if (!clean) return;
+    const safeStart = Math.max(0, Math.min(raw.length, start));
+    const safeEnd = Math.max(safeStart, Math.min(raw.length, end));
+    const charStart = safeStart / Math.max(1, raw.length);
+    const charEnd = safeEnd / Math.max(1, raw.length);
+    segments.push({
+      field,
+      text: clean,
+      labelText,
+      score,
+      resolver: 'semantic-inline-segment-v164',
+      parentRegion: r,
+      region: {
+        x1: x1 + (x2-x1) * charStart,
+        y1, 
+        x2: x1 + (x2-x1) * charEnd,
+        y2
+      }
+    });
+  };
+
+  const ibanMatch = raw.match(ibanRe);
+  if (ibanMatch) {
+    const start = ibanMatch.index ?? 0;
+    const full = ibanMatch[0];
+    const trIndex = full.search(/TR\d/i);
+    const ibanText = trIndex >= 0 ? full.slice(trIndex).trim() : '';
+    if (hasTurkishIbanShape(ibanText)) {
+      addSegment('recipientIban', start, start + full.length, ibanText, full.slice(0, Math.max(0,trIndex)).trim(), 175);
+    }
+  }
+
+  const nameMatch = raw.match(nameRe);
+  if (nameMatch) {
+    const start = nameMatch.index ?? 0;
+    const valueStart = start + nameMatch[0].length;
+    const end = ibanMatch && (ibanMatch.index ?? raw.length) > valueStart
+      ? (ibanMatch.index ?? raw.length)
+      : raw.length;
+    const value = raw.slice(valueStart, end).replace(/\s{2,}/g, ' ').trim();
+    if (value && !/^TR\d/i.test(value)) {
+      addSegment('recipientName', valueStart, end, value, nameMatch[0].trim(), 165);
+    }
+  }
+
+  return segments;
+}
+
 export function shouldSuppressIbanLayoutMismatch(field, referenceValue, targetValue, context = {}) {
   if (field !== 'recipientIban') return false;
 
