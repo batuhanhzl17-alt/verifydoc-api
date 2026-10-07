@@ -13819,9 +13819,25 @@ async function analyzeAmountReferenceRenderForensics({
       if (!W || !H || !raw.data?.length) return null;
       const pixels = W * H;
       const gray = raw.data;
-      const threshold = 185;
+
+      // V15.10: small Telegram/source ROIs can contain anti-aliased glyphs
+      // whose upper strokes are lighter than the old fixed 185 threshold.
+      // Adapt to the ROI luminance tail while keeping conservative bounds.
+      const sample = [];
+      const step = Math.max(1, Math.floor(pixels / 2500));
+      for (let i = 0; i < pixels; i += step) sample.push(Number(gray[i] || 0));
+      sample.sort((a, b) => a - b);
+      const pct = (q) => sample.length
+        ? sample[Math.min(sample.length - 1, Math.max(0, Math.floor((sample.length - 1) * q)))]
+        : 255;
+      const p10 = pct(0.10);
+      const p90 = pct(0.90);
+      const adaptiveThreshold = p10 + (p90 - p10) * 0.35;
+      const threshold = Math.max(185, Math.min(246, adaptiveThreshold));
       const mask = new Uint8Array(pixels);
       for (let i = 0; i < pixels; i++) if (Number(gray[i] || 0) < threshold) mask[i] = 1;
+      let foregroundPixels = 0;
+      for (let i = 0; i < pixels; i++) foregroundPixels += mask[i];
 
       const seen = new Uint8Array(pixels);
       const qx = new Int32Array(pixels);
@@ -13854,7 +13870,15 @@ async function analyzeAmountReferenceRenderForensics({
           }
         }
       }
-      if (comps.length < 2) return null;
+      if (comps.length < 2) {
+        console.log("AMOUNT RENDER SIGNATURE EXTRACTION DEBUG:", JSON.stringify({
+          width: W, height: H, p10: Number(p10.toFixed(2)), p90: Number(p90.toFixed(2)),
+          threshold: Number(threshold.toFixed(2)), foregroundPixels,
+          foregroundRatio: Number((foregroundPixels / Math.max(1, pixels)).toFixed(4)),
+          componentCount: comps.length, stage: "component-count"
+        }));
+        return null;
+      }
       comps.sort((a,b) => a.minX - b.minX || a.minY - b.minY);
       const median = (arr) => {
         const v = arr.filter(Number.isFinite).sort((a,b)=>a-b);
@@ -13869,7 +13893,15 @@ async function analyzeAmountReferenceRenderForensics({
       };
       const medianH0 = median(comps.map(c=>c.height));
       const glyphs = comps.filter(c => c.height >= Math.max(5, medianH0 * 0.55)).slice(0, 80);
-      if (glyphs.length < 2) return null;
+      if (glyphs.length < 2) {
+        console.log("AMOUNT RENDER SIGNATURE EXTRACTION DEBUG:", JSON.stringify({
+          width: W, height: H, p10: Number(p10.toFixed(2)), p90: Number(p90.toFixed(2)),
+          threshold: Number(threshold.toFixed(2)), foregroundPixels,
+          foregroundRatio: Number((foregroundPixels / Math.max(1, pixels)).toFixed(4)),
+          componentCount: comps.length, glyphCount: glyphs.length, stage: "glyph-count"
+        }));
+        return null;
+      }
       const inkTop = Math.min(...glyphs.map(c=>c.minY));
       const inkBottom = Math.max(...glyphs.map(c=>c.maxY));
       const inkHeight = Math.max(1, inkBottom - inkTop + 1);
@@ -13899,6 +13931,8 @@ async function analyzeAmountReferenceRenderForensics({
       }
       return {
         glyphCount:glyphs.length,
+        threshold:Number(threshold.toFixed(2)),
+        foregroundRatio:Number((foregroundPixels / Math.max(1, pixels)).toFixed(4)),
         glyphWidthHeight:median(widthHeight), glyphWidthHeightMad:mad(widthHeight),
         glyphFill:median(fill), glyphFillMad:mad(fill),
         strokeProxy:median(stroke), strokeProxyMad:mad(stroke),
