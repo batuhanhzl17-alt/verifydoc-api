@@ -9,6 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
+import { runDifferentialImageForensics } from "./differential_image_forensics.js";
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily,
   getAdaptiveNegativePopulationPolicy
 } from "./mathematical_forensics_v1.6.3.js";
@@ -15860,6 +15861,7 @@ let layoutForensics = null;
 let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
+let differentialImageForensics = null;
 let pixelForensics = null;
 let advancedForensics = null;
 let paintOverForensics = null;
@@ -16045,6 +16047,31 @@ if ((type === "image" || type === "pdf") && bank) {
     }
   } catch (error) {
     console.warn("NEGATIVE SAMPLE FORENSICS HATASI:", error?.message || error);
+  }
+}
+
+// =====================================================
+// DIFFERENTIAL IMAGE FORENSICS V1
+// Original references define NORMAL image behavior; known negatives define
+// repeated TAMPER patterns. This layer is advisory and never emits a global
+// fake score.
+// =====================================================
+if ((type === "image" || type === "pdf") && bank) {
+  try {
+    const diffNegativeSamples = await loadNegativeSampleFiles(bank);
+    const diffReferencePaths = Array.isArray(reference?.visualReferencePaths)
+      ? reference.visualReferencePaths
+      : (reference?.visualReferencePath ? [reference.visualReferencePath] : []);
+    differentialImageForensics = await runDifferentialImageForensics({
+      targetPath: forensicTargetPath,
+      referencePaths: diffReferencePaths,
+      negativeSamples: diffNegativeSamples,
+      bank
+    });
+    console.log("DIFFERENTIAL IMAGE FORENSICS V1:", JSON.stringify(differentialImageForensics));
+  } catch (error) {
+    console.warn("DIFFERENTIAL IMAGE FORENSICS HATASI:", error?.message || error);
+    differentialImageForensics = { available:false, status:"error", error:error?.message || String(error), version:"DIFF-IMAGE-V1" };
   }
 }
 
@@ -17880,6 +17907,9 @@ if (negativeSampleForensics) {
 }
 if (visualForensics) {
   result.visualForensics = visualForensics;
+}
+if (differentialImageForensics) {
+  result.differentialImageForensics = differentialImageForensics;
 }
 if (layoutForensics) {
   result.layoutForensics = layoutForensics;
