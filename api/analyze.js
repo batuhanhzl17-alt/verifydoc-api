@@ -13674,6 +13674,297 @@ console.log("AMOUNT FORENSICS STRONG CACHED:", fileFingerprint);
 return finalForensics;
 }
 
+
+// =====================================================
+// AMOUNT REFERENCE RENDER FORENSICS V1
+// =====================================================
+// Purpose:
+//   Compare the TARGET amount ROI against the trusted Enpara amount ROI
+//   using render-level statistics, not literal amount text.
+//
+// This is deliberately independent from Amount Forensics V3:
+//   - V3 asks whether characters inside the TARGET agree with each other.
+//   - This layer asks whether the TARGET amount render looks compatible
+//     with the trusted reference rendering and/or closer to known fakes.
+//
+// It is a corroboration signal. It never declares a document fake alone.
+async function analyzeAmountReferenceRenderForensics({
+  targetPath,
+  targetRegion,
+  referencePath,
+  referenceAmountField,
+  negativeSamples = [],
+}) {
+  const unavailable = (reason) => ({
+    available: false,
+    engine: "amount-reference-render-forensics-v1",
+    status: "unknown",
+    severity: "none",
+    score: 0,
+    reason,
+  });
+
+  if (!targetPath || !targetRegion || !referencePath || !referenceAmountField) {
+    return unavailable("missing-target-reference-or-amount-anchor");
+  }
+
+  try {
+    const pickVisualPath = (input) => {
+      if (Array.isArray(input)) {
+        return input.find((p) => /\.(png|jpe?g|webp)$/i.test(String(p))) || input[0] || null;
+      }
+      return input;
+    };
+
+    const loadRaster = async (input) => {
+      const p = pickVisualPath(input);
+      if (!p) return null;
+      const ext = path.extname(String(p)).toLowerCase();
+      if (ext === ".pdf") {
+        const rendered = await renderPdfPagePng(p, 1, 2.8);
+        return rendered?.buffer || null;
+      }
+      return await fs.readFile(p);
+    };
+
+    const targetBuffer = await loadRaster(targetPath);
+    const referenceBuffer = await loadRaster(referencePath);
+    if (!targetBuffer || !referenceBuffer) return unavailable("image-load-failed");
+
+    const targetMeta = await sharp(targetBuffer).metadata();
+    const referenceMeta = await sharp(referenceBuffer).metadata();
+    const tw = Number(targetMeta.width || 0);
+    const th = Number(targetMeta.height || 0);
+    const rw = Number(referenceMeta.width || 0);
+    const rh = Number(referenceMeta.height || 0);
+    if (!tw || !th || !rw || !rh) return unavailable("image-metadata-unavailable");
+
+    const validBox = (b) => {
+      const x1 = Number(b?.x1), y1 = Number(b?.y1), x2 = Number(b?.x2), y2 = Number(b?.y2);
+      return [x1, y1, x2, y2].every(Number.isFinite) && x2 > x1 && y2 > y1
+        ? { x1, y1, x2, y2 }
+        : null;
+    };
+
+    const cropFromPixels = async (buffer, meta, box, normalized = false) => {
+      const b = validBox(box);
+      if (!b) return null;
+      const W = Number(meta.width), H = Number(meta.height);
+      const x1 = normalized ? b.x1 * W : b.x1;
+      const y1 = normalized ? b.y1 * H : b.y1;
+      const x2 = normalized ? b.x2 * W : b.x2;
+      const y2 = normalized ? b.y2 * H : b.y2;
+      const left = Math.max(0, Math.floor(x1));
+      const top = Math.max(0, Math.floor(y1));
+      const width = Math.min(W - left, Math.max(3, Math.ceil(x2 - x1)));
+      const height = Math.min(H - top, Math.max(3, Math.ceil(y2 - y1)));
+      if (width < 3 || height < 3) return null;
+
+      return sharp(buffer)
+        .grayscale()
+        .extract({ left, top, width, height })
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+    };
+
+    const targetRaw = await cropFromPixels(targetBuffer, targetMeta, targetRegion, false);
+    const refRaw = await cropFromPixels(referenceBuffer, referenceMeta, referenceAmountField, true);
+    if (!targetRaw || !refRaw) return unavailable("amount-roi-crop-failed");
+
+    const signature = (raw) => {
+      const W = Number(raw.info.width || 0);
+      const H = Number(raw.info.height || 0);
+      if (!W || !H || !raw.data?.length) return null;
+
+      let sum = 0, sum2 = 0;
+      let ink220 = 0, ink180 = 0, dark = 0;
+      let grad = 0, gradX = 0, gradY = 0;
+      let activeRows = 0, activeCols = 0;
+      let maxRowInk = 0, maxColInk = 0;
+
+      for (let y = 0; y < H; y++) {
+        let rowInk = 0;
+        for (let x = 0; x < W; x++) {
+          const i = y * W + x;
+          const v = Number(raw.data[i] || 0);
+          sum += v;
+          sum2 += v * v;
+          if (v < 220) { ink220++; rowInk++; }
+          if (v < 180) ink180++;
+          if (v < 185) dark += 255 - v;
+          if (x > 0) {
+            const g = Math.abs(v - Number(raw.data[i - 1] || 0));
+            grad += g; gradX += g;
+          }
+          if (y > 0) {
+            const g = Math.abs(v - Number(raw.data[i - W] || 0));
+            grad += g; gradY += g;
+          }
+        }
+        const rowRatio = W ? rowInk / W : 0;
+        if (rowRatio > 0.015) activeRows++;
+        maxRowInk = Math.max(maxRowInk, rowRatio);
+      }
+
+      for (let x = 0; x < W; x++) {
+        let colInk = 0;
+        for (let y = 0; y < H; y++) {
+          if (Number(raw.data[y * W + x] || 0) < 220) colInk++;
+        }
+        const colRatio = H ? colInk / H : 0;
+        if (colRatio > 0.015) activeCols++;
+        maxColInk = Math.max(maxColInk, colRatio);
+      }
+
+      const pixels = W * H;
+      const mean = pixels ? sum / pixels : 0;
+      const variance = pixels ? Math.max(0, sum2 / pixels - mean * mean) : 0;
+
+      return {
+        aspect: W / Math.max(1, H),
+        mean,
+        std: Math.sqrt(variance),
+        inkRatio: pixels ? ink220 / pixels : 0,
+        inkRatio180: pixels ? ink180 / pixels : 0,
+        darkness: pixels ? dark / pixels : 0,
+        edgeDensity: pixels ? grad / (pixels * 2) : 0,
+        edgeX: pixels ? gradX / pixels : 0,
+        edgeY: pixels ? gradY / pixels : 0,
+        activeRowRatio: H ? activeRows / H : 0,
+        activeColRatio: W ? activeCols / W : 0,
+        maxRowInk,
+        maxColInk,
+      };
+    };
+
+    const targetSig = signature(targetRaw);
+    const referenceSig = signature(refRaw);
+    if (!targetSig || !referenceSig) return unavailable("signature-extraction-failed");
+
+    // Relative distances are intentionally tolerant. The reference may be a
+    // clean raster while the target passed through Telegram/JPEG/resizing.
+    const metricDefs = [
+      ["aspect", 0.10, 0.18],
+      ["mean", 0.08, 38],
+      ["std", 0.08, 24],
+      ["inkRatio", 0.15, 0.30],
+      ["inkRatio180", 0.10, 0.30],
+      ["darkness", 0.12, 32],
+      ["edgeDensity", 0.12, 0.35],
+      ["edgeX", 0.05, 0.35],
+      ["edgeY", 0.05, 0.35],
+      ["activeRowRatio", 0.08, 0.30],
+      ["activeColRatio", 0.05, 0.30],
+      ["maxRowInk", 0.05, 0.30],
+      ["maxColInk", 0.07, 0.30],
+    ];
+
+    const distanceBetween = (a, b) => {
+      let total = 0, weightTotal = 0;
+      const details = {};
+      for (const [key, weight, tolerance] of metricDefs) {
+        const av = Number(a?.[key]), bv = Number(b?.[key]);
+        if (!Number.isFinite(av) || !Number.isFinite(bv)) continue;
+        const scale = Math.max(Number(tolerance), Math.abs(bv) * 0.55, 0.0001);
+        const d = Math.abs(av - bv) / scale;
+        details[key] = Number(d.toFixed(4));
+        total += Math.min(3, d) * weight;
+        weightTotal += weight;
+      }
+      return {
+        distance: weightTotal ? total / weightTotal : 99,
+        details,
+      };
+    };
+
+    const targetToReference = distanceBetween(targetSig, referenceSig);
+
+    const fakeDistances = [];
+    for (const sample of Array.isArray(negativeSamples) ? negativeSamples.slice(0, 12) : []) {
+      try {
+        const fakeBuffer = await loadRaster(sample.path);
+        if (!fakeBuffer) continue;
+        const fakeMeta = await sharp(fakeBuffer).metadata();
+        const fakeRaw = await cropFromPixels(
+          fakeBuffer,
+          fakeMeta,
+          referenceAmountField,
+          true
+        );
+        if (!fakeRaw) continue;
+        const fakeSig = signature(fakeRaw);
+        if (!fakeSig) continue;
+        const d = distanceBetween(targetSig, fakeSig);
+        fakeDistances.push({
+          fileName: sample.fileName || path.basename(sample.path || ""),
+          distance: Number(d.distance.toFixed(4)),
+          details: d.details,
+        });
+      } catch {}
+    }
+
+    fakeDistances.sort((a, b) => a.distance - b.distance);
+    const bestFake = fakeDistances[0] || null;
+    const fakeAffinityMargin = bestFake
+      ? Number((targetToReference.distance - bestFake.distance).toFixed(4))
+      : 0;
+
+    // A target is suspicious only when it is materially unlike the genuine
+    // amount rendering AND the negative population independently points in
+    // the same direction. This is the key anti-false-positive gate for real
+    // Telegram/JPEG documents such as the known-good 350 TL case.
+    const fakeAffinityStrong = Boolean(
+      bestFake &&
+      fakeAffinityMargin >= 0.16 &&
+      bestFake.distance <= 0.95
+    );
+
+    const referenceAnomaly = targetToReference.distance >= 0.85;
+    const strongAnomaly = referenceAnomaly && fakeAffinityStrong;
+    const compatibilityScore = Math.max(
+      0,
+      Math.min(100, Math.round(100 - targetToReference.distance * 55))
+    );
+
+    const status = strongAnomaly
+      ? "anomaly"
+      : targetToReference.distance <= 0.65
+        ? "pass"
+        : "unknown";
+
+    return {
+      available: true,
+      engine: "amount-reference-render-forensics-v1",
+      status,
+      severity: strongAnomaly ? "strong" : status === "pass" ? "none" : "moderate",
+      score: strongAnomaly ? Math.max(60, Math.min(100, Math.round((targetToReference.distance * 45) + (fakeAffinityMargin * 90)))) : 0,
+      referenceCompatibilityScore: compatibilityScore,
+      referenceDistance: Number(targetToReference.distance.toFixed(4)),
+      bestFakeDistance: bestFake ? bestFake.distance : null,
+      fakeAffinityMargin,
+      fakeAffinityStrong,
+      referenceAnchor: {
+        xNorm: Number(referenceAmountField.xNorm || 0),
+        yNorm: Number(referenceAmountField.yNorm || 0),
+        widthNorm: Number(referenceAmountField.widthNorm || 0),
+        heightNorm: Number(referenceAmountField.heightNorm || 0),
+      },
+      targetSignature: targetSig,
+      referenceSignature: referenceSig,
+      bestFake: bestFake ? bestFake.fileName : null,
+      comparedFakeCount: fakeDistances.length,
+      evidence: strongAnomaly
+        ? "Tutar ROI'si güvenilir Enpara referans renderından belirgin şekilde ayrılıyor ve aynı ROI'de bilinen sahte örneklerin render karakteristiğine bağımsız olarak daha yakın."
+        : status === "pass"
+          ? "Tutar ROI'sinin render karakteristiği güvenilir Enpara referansıyla uyumlu; bilinen sahte popülasyonuna anlamlı yakınlık oluşmadı."
+          : "Tutar ROI'si için referans render farkı ölçüldü ancak tek başına güçlü sahtecilik yönü oluşturacak bağımsız negatif korelasyon oluşmadı.",
+    };
+  } catch (error) {
+    console.warn("AMOUNT REFERENCE RENDER FORENSICS HATASI:", error?.message || error);
+    return unavailable(error?.message || String(error));
+  }
+}
+
 // =====================================================
 // JSON RESPONSE
 // =====================================================
@@ -16191,6 +16482,35 @@ if ((type === "image" || type === "pdf") && bank) {
     }
   } catch (error) {
     console.warn("NEGATIVE SAMPLE FORENSICS HATASI:", error?.message || error);
+  }
+}
+
+// =====================================================
+// AMOUNT REFERENCE RENDER FORENSICS V1
+// =====================================================
+// This is deliberately evaluated after the trusted reference and negative
+// population are loaded. It prevents V4 from promoting a localized amount
+// pattern merely because the target resembles the fake population in generic
+// raster/noise cells.
+if ((type === "image" || type === "pdf") && bank && reference && amountForensics?.region) {
+  try {
+    const amountReferenceAnchor = await getReferenceAmountAnchor(bank);
+    if (amountReferenceAnchor) {
+      const amountNegativeSamples = await loadNegativeSampleFiles(bank);
+      const amountRenderForensics = await analyzeAmountReferenceRenderForensics({
+        targetPath: forensicTargetPath,
+        targetRegion: amountForensics.region,
+        referencePath: getVisualReferencePath(reference),
+        referenceAmountField: amountReferenceAnchor,
+        negativeSamples: amountNegativeSamples,
+      });
+      amountForensics.referenceRenderForensics = amountRenderForensics;
+      console.log("AMOUNT REFERENCE RENDER FORENSICS V1:", JSON.stringify(amountRenderForensics));
+    } else {
+      console.warn("AMOUNT REFERENCE RENDER FORENSICS: trusted amount anchor unavailable");
+    }
+  } catch (error) {
+    console.warn("AMOUNT REFERENCE RENDER FORENSICS HATASI:", error?.message || error);
   }
 }
 
@@ -21618,8 +21938,35 @@ const v4LocalPatternStrong = result?.localPatternEvidence?.available === true &&
   result?.localPatternEvidence?.finalPromotionAllowed === true &&
   Array.isArray(result?.localPatternEvidence?.primaryStrongFields) &&
   result.localPatternEvidence.primaryStrongFields.length > 0;
-if (v4LocalPatternStrong) {
-  const promotedFields = result.localPatternEvidence.primaryStrongFields;
+
+const v4PromotedFields = v4LocalPatternStrong
+  ? result.localPatternEvidence.primaryStrongFields
+  : [];
+
+const v4AmountPatternStrong = v4PromotedFields.includes("amount");
+const amountReferenceRender = result?.amountForensics?.referenceRenderForensics || null;
+
+// V15.5: A repeated known-fake pattern in the amount ROI is NOT sufficient by
+// itself. The same ROI must also fail the genuine-reference render check and
+// independently point toward the negative population. This specifically
+// prevents the known-good 350 TL Telegram/JPEG case from being promoted by
+// the same 4/4 edge/stroke/luminance/noise pattern seen in manipulated files.
+const amountReferenceRenderCorroborated = Boolean(
+  amountReferenceRender?.available === true &&
+  amountReferenceRender?.status === "anomaly" &&
+  Number(amountReferenceRender?.score || 0) >= 60 &&
+  amountReferenceRender?.fakeAffinityStrong === true
+);
+
+const v4PromotionAllowed =
+  v4LocalPatternStrong &&
+  (
+    !v4AmountPatternStrong ||
+    amountReferenceRenderCorroborated
+  );
+
+if (v4PromotionAllowed) {
+  const promotedFields = v4PromotedFields;
   finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
@@ -21632,11 +21979,36 @@ if (v4LocalPatternStrong) {
     level1Applied: true,
     promotedFields,
     appliedRiskFloor: 46,
+    amountReferenceRenderCorroborated,
   };
   console.log('V4 LOCAL PATTERN RISK PROMOTION:', JSON.stringify({
     fields: promotedFields,
     appliedFloor: 46,
     knownFakeSamples: result.localPatternEvidence.knownFakeSamples,
+    amountReferenceRenderCorroborated,
+    amountReferenceRenderScore: Number(amountReferenceRender?.score || 0),
+    amountReferenceCompatibility: Number(amountReferenceRender?.referenceCompatibilityScore || 0),
+    amountFakeAffinityMargin: Number(amountReferenceRender?.fakeAffinityMargin || 0),
+  }));
+} else if (v4LocalPatternStrong && v4AmountPatternStrong) {
+  result.evidenceFusion = {
+    ...(result.evidenceFusion || {}),
+    level1Applied: false,
+    promotedFields: [],
+    appliedRiskFloor: 0,
+    amountReferenceRenderCorroborated,
+    suppressionReason: "amount-known-fake-pattern-without-genuine-reference-render-corroboration",
+  };
+  console.log('V4 LOCAL PATTERN PROMOTION SUPPRESSED:', JSON.stringify({
+    fields: v4PromotedFields,
+    amountReferenceRenderCorroborated,
+    amountReferenceRender: amountReferenceRender ? {
+      status: amountReferenceRender.status,
+      score: amountReferenceRender.score,
+      referenceCompatibilityScore: amountReferenceRender.referenceCompatibilityScore,
+      fakeAffinityMargin: amountReferenceRender.fakeAffinityMargin,
+      fakeAffinityStrong: amountReferenceRender.fakeAffinityStrong,
+    } : null,
   }));
 }
 
