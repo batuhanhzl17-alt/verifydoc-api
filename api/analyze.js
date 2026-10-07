@@ -19833,7 +19833,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
       localizedNegativeFields,
       differentialAvailable
     },
-    policy: 'V1.7: global similarity is diagnostic only; fake classification requires localized semantic population evidence'
+    policy: 'V1.9: global similarity is diagnostic only; fake classification requires repeated localized semantic pattern evidence'
   };
 }
 
@@ -20942,7 +20942,7 @@ if (mathSemanticNegativeAffinity) {
   };
   console.log('SEMANTIC NEGATIVE PATTERN CORROBORATION:', JSON.stringify({
     fields: semanticNegativeRowsForRisk.map(x => x.field),
-    agreement: semanticNegativeRowsForRisk.map(x => ({field:x.field, samples:x.sampleCount, patternAgreementCount:x.patternAgreementCount, metrics:x.agreedPatternMetrics})),
+    agreement: semanticNegativeRowsForRisk.map(x => ({field:x.field, samples:x.sampleCount, patternAgreementCount:x.patternAgreementCount, minSampleAgreement:x.minSampleAgreement, components:x.corroboratingComponents, strength:x.patternStrength})),
     appliedFloor: 46
   }));
 }
@@ -20950,7 +20950,7 @@ if (mathSemanticNegativeAffinity) {
 const veryStrongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
   Number(row.sampleCount || 0) >= 3 &&
   Number(row.patternAgreementCount || 0) >= 3 &&
-  Array.isArray(row.agreedPatternMetrics) && row.agreedPatternMetrics.length >= 3
+  Array.isArray(row.corroboratingComponents) && row.corroboratingComponents.length >= 3
 );
 if (veryStrongSemanticNegativeForRisk.length >= 2) {
   finalRiskScore = Math.max(finalRiskScore, 60);
