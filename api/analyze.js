@@ -204,6 +204,11 @@ function resolveMathSemanticValueBox(regions, field) {
 
 async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, bank = null, referencePath = null } = {}) {
   const rois = {};
+  // Visual references can be supplied as an array. Geometry/ROI helpers need
+  // one concrete raster path; always use the first usable visual reference.
+  const roiReferencePath = Array.isArray(referencePath)
+    ? referencePath.find((p) => typeof p === 'string' && p)
+    : referencePath;
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
     ? referenceForensics.typographyFieldProfiles : [];
@@ -320,15 +325,15 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       const anchor = await getReferenceAmountAnchor(bank);
       // Trusted anchor is allowed only as a last resort, after the typed
       // anchor builder has already rejected non-money numeric fields.
-      if (anchor && referencePath && String(anchor.source || '').includes('amount')) {
+      if (anchor && roiReferencePath) {
         let meta;
-        if (path.extname(referencePath).toLowerCase() === '.pdf') {
-          const raw = await fs.readFile(referencePath);
+        if (path.extname(roiReferencePath || '').toLowerCase() === '.pdf') {
+          const raw = await fs.readFile(roiReferencePath);
           const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
           const rendered = await renderPdfPagePng(pdf, 1, 1.8);
           meta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
         } else {
-          meta = await sharp(referencePath).metadata();
+          meta = await sharp(roiReferencePath).metadata();
         }
         if (meta?.width && meta?.height) {
           amountReferenceBox = {
@@ -16172,7 +16177,14 @@ async function runDifferentialImageForensics({ targetPath, referencePath, negati
       if(strength==='strong')anyStrong=true; else if(strength==='limited')anyLimited=true;
       fieldsOut[field]={available:true,targetVsGenuine:{components:componentKeys.map(([label,key])=>({component:label,key,target:td.reduce((s,v)=>s+Number(v[key]||0),0)/td.length,reference:rd.reduce((s,v)=>s+Number(v[key]||0),0)/rd.length}))},sampleAgreement:agreements,agreementCount,agreementRatio:Number(ratio.toFixed(3)),patternComponents,strength,finalPromotionAllowed:strong};
     }
-    const out={available:true,engine:'differential-image-forensics-v2-local-semantic',normalSampleCount:1,tamperSampleCount:negativeSamples.length,fields:fieldsOut,anyStrongLocalizedPattern:anyStrong,anyLimitedLocalizedPattern:anyLimited,policy:'adaptive-local-semantic-pattern-v2'};
+    const primaryStrongFields = ['amount','recipientName'].filter((field) => fieldsOut[field]?.finalPromotionAllowed === true);
+    const advisoryStrongFields = ['recipientIban'].filter((field) => fieldsOut[field]?.finalPromotionAllowed === true);
+    // An IBAN-only raster match is deliberately advisory: different IBAN text
+    // naturally changes glyph/raster statistics even on genuine receipts.
+    // Amount/name can be promoted when the same local physical pattern repeats
+    // across the known-fake population.
+    const promotableStrong = primaryStrongFields.length > 0;
+    const out={available:true,engine:'differential-image-forensics-v2-local-semantic',normalSampleCount:1,tamperSampleCount:negativeSamples.length,fields:fieldsOut,anyStrongLocalizedPattern:promotableStrong,anyLimitedLocalizedPattern:anyLimited,primaryStrongFields,advisoryStrongFields,policy:'adaptive-local-semantic-pattern-v2-field-aware'};
     console.log('DIFFERENTIAL IMAGE FORENSICS V2 START');
     console.log('DIFFERENTIAL IMAGE FORENSICS V2:',JSON.stringify(out));
     console.log('DIFFERENTIAL IMAGE FORENSICS V2 END');
