@@ -756,7 +756,7 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
 }
 
 
-export function compareSemanticRoiToNegativePopulation(targetFingerprint, negativeFingerprints, roiNames = ['amount','recipientName','recipientIban']) {
+export function compareSemanticRoiToNegativePopulation(targetFingerprint, negativeFingerprints, roiNames = ['amount','recipientName','recipientIban'], referenceFingerprint = null) {
   const result = {};
   for (const name of roiNames) {
     const target = targetFingerprint?.roi16x16?.[name];
@@ -771,12 +771,37 @@ export function compareSemanticRoiToNegativePopulation(targetFingerprint, negati
       if (!neg?.metrics) continue;
       const compared = compare16x16Rois(targetFingerprint, fp, [name])[name];
       if (!compared?.available) continue;
+      const targetMetrics = target?.metrics || {};
+      const negativeMetrics = neg?.metrics || {};
+      const referenceMetrics = referenceFingerprint?.roi16x16?.[name]?.metrics || {};
+      const patternMetrics = {};
+      const metricKeys = ['luminanceMean','luminanceStd','entropy','edgeDensity','meanGradient','laplacianVariance','dctLowEnergy','dctMidEnergy','dctHighEnergy','dctHighRatio','blockinessHorizontal','blockinessVertical'];
+      for (const key of metricKeys) {
+        const tv = Number(targetMetrics[key]);
+        const nv = Number(negativeMetrics[key]);
+        const rv = Number(referenceMetrics[key]);
+        if (![tv,nv,rv].every(Number.isFinite)) continue;
+        const scale = Math.max(Math.abs(rv) * 0.05, 0.5);
+        const targetShift = (tv - rv) / scale;
+        const negativeShift = (nv - rv) / scale;
+        const sameDirection = Math.abs(targetShift) >= 0.75 && Math.sign(targetShift) === Math.sign(negativeShift);
+        const closeToTarget = Math.abs(tv - nv) / scale <= Math.max(0.75, Math.abs(targetShift) * 0.45);
+        patternMetrics[key] = {
+          targetShift: Number(targetShift.toFixed(3)),
+          negativeShift: Number(negativeShift.toFixed(3)),
+          sameDirection,
+          closeToTarget,
+          match: Boolean(sameDirection && closeToTarget)
+        };
+      }
       rows.push({
         sample: item?.fileName || item?.source || item?.path || null,
         meanDistance: Number(compared.meanDistance || 0),
         maxCellDistance: Number(compared.maxCellDistance || 0),
         metricDistances: compared.metricDistances || {},
         rawMetricDistances: compared.rawMetricDistances || {},
+        patternMetrics,
+        patternMetricKeys: Object.keys(patternMetrics).filter(k => patternMetrics[k]?.match),
       });
     }
     if (!rows.length) {
@@ -787,6 +812,20 @@ export function compareSemanticRoiToNegativePopulation(targetFingerprint, negati
     const medianDistance = median(distances);
     const meanDistance = mean(distances);
     const best = rows.slice().sort((a,b)=>a.meanDistance-b.meanDistance)[0];
+    const metricAgreement = {};
+    for (const row of rows) {
+      for (const key of (row.patternMetricKeys || [])) metricAgreement[key] = (metricAgreement[key] || 0) + 1;
+    }
+    const policy = getAdaptiveNegativePopulationPolicy(rows.length);
+    const agreedPatternMetrics = Object.entries(metricAgreement)
+      .filter(([,count]) => count >= Math.min(policy.minAgreementCount, rows.length))
+      .sort((a,b)=>b[1]-a[1])
+      .map(([key,count]) => ({key,count}));
+    const patternAgreementCount = rows.filter(r => (r.patternMetricKeys || []).length >= 2).length;
+    const localPatternCorroborated = Boolean(
+      agreedPatternMetrics.length >= 2 &&
+      patternAgreementCount >= policy.minAgreementCount
+    );
     result[name] = {
       available:true,
       sampleCount:rows.length,
@@ -795,6 +834,11 @@ export function compareSemanticRoiToNegativePopulation(targetFingerprint, negati
       bestDistance:Number(best.meanDistance.toFixed(3)),
       bestSample:best.sample,
       samples:rows,
+      adaptivePolicy: policy,
+      agreedPatternMetrics,
+      patternAgreementCount,
+      localPatternCorroborated,
+      finalPromotionAllowed: Boolean(localPatternCorroborated && policy.finalPromotionAllowed && !policy.advisoryOnly),
       // Positive means the target is mathematically closer to the negative
       // population than to the trusted reference ROI.
       referenceDistance:null,
