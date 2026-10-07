@@ -551,7 +551,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
             console.warn('MATH NEGATIVE ROI SKIP:', sample?.fileName || sample?.path, e?.message || e);
           }
         }
-        semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(fingerprint, negativeFingerprints, ['amount','recipientName','recipientIban']);
+        semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(fingerprint, negativeFingerprints, ['amount','recipientName','recipientIban'], referenceFingerprint);
         for (const field of Object.keys(semanticNegativeAffinity || {})) {
           const row = semanticNegativeAffinity[field];
           const refDistance = Number(roiForensics?.[field]?.meanDistance);
@@ -560,6 +560,13 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
             row.negativeAffinityDelta = Number((refDistance - Number(row.medianDistance || row.meanDistance || 0)).toFixed(3));
             row.referenceCloser = row.negativeAffinityDelta < 0;
             row.negativeCloser = row.negativeAffinityDelta > 0;
+          }
+          if (row?.available) {
+            // IMPORTANT: distance alone is never a fake signal. Only a repeated
+            // local raster-change pattern shared by the known-fake population can
+            // become corroborating evidence.
+            row.negativeAffinityDelta = Number.isFinite(Number(row.negativeAffinityDelta))
+              ? row.negativeAffinityDelta : null;
           }
         }
         console.log('MATH SEMANTIC NEGATIVE POPULATION V1:', JSON.stringify(semanticNegativeAffinity));
@@ -19683,10 +19690,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   const negativeLikeByDifferential = false;
 
   const localizedNegativeFields = Object.entries(math?.semanticNegativeAffinity || {})
-    .filter(([, row]) => Number(row?.sampleCount || 0) >= 3 &&
-      Number(row?.negativeAffinityDelta || 0) >= 1.5 &&
-      Number(row?.referenceDistance) >= 1.5 &&
-      Number(row?.medianDistance || 99) <= 5.5)
+    .filter(([, row]) => row?.finalPromotionAllowed === true && row?.localPatternCorroborated === true)
     .map(([field]) => field);
   const localizedNegativeEvidence = localizedNegativeFields.length > 0;
 
@@ -19811,7 +19815,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
     negativeBaselineAvailable,
     referenceLike,
     negativeLike,
-    thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: null, localizedNegativeDeltaMin: 1.5, localizedNegativeMinSamples: 3 },
+    thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: null, localizedPattern: 'shared-direction-raster-pattern', adaptivePopulation: true },
     fields: fieldFusion,
     layout: { maxScore: maxLayoutScore, strong: strongLayout },
     knownNegative: {
@@ -20925,39 +20929,36 @@ if (!controlledAmountCorroborated) {
 // evidence below: target ROI vs trusted reference ROI vs known-fake ROI set.
 const semanticNegativeRowsForRisk = Object.entries(result?.mathematicalForensics?.semanticNegativeAffinity || {})
   .map(([field, row]) => ({ field, ...row }))
-  .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
-const strongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
-  Number(row.sampleCount || 0) >= 2 &&
-  Number(row.negativeAffinityDelta || 0) >= 1.25 &&
-  Number(row.medianDistance || 99) <= 5.5
-);
-const veryStrongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
-  Number(row.sampleCount || 0) >= 2 &&
-  Number(row.negativeAffinityDelta || 0) >= 2.25 &&
-  Number(row.medianDistance || 99) <= 5.5
-);
-const mathSemanticNegativeAffinity = strongSemanticNegativeForRisk.length > 0;
+  .filter(row => row.available && row.localPatternCorroborated === true && row.finalPromotionAllowed === true);
+const mathSemanticNegativeAffinity = semanticNegativeRowsForRisk.length > 0;
 
 if (mathSemanticNegativeAffinity) {
+  // Local known-fake pattern corroboration is intentionally capped. It is
+  // supporting evidence, never a global fake classifier.
   finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 60)
   };
-  console.log('SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
-    fields: strongSemanticNegativeForRisk.map(x => x.field),
-    deltas: strongSemanticNegativeForRisk.map(x => ({field:x.field, delta:x.negativeAffinityDelta, samples:x.sampleCount})),
+  console.log('SEMANTIC NEGATIVE PATTERN CORROBORATION:', JSON.stringify({
+    fields: semanticNegativeRowsForRisk.map(x => x.field),
+    agreement: semanticNegativeRowsForRisk.map(x => ({field:x.field, samples:x.sampleCount, patternAgreementCount:x.patternAgreementCount, metrics:x.agreedPatternMetrics})),
     appliedFloor: 46
   }));
 }
 
+const veryStrongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
+  Number(row.sampleCount || 0) >= 3 &&
+  Number(row.patternAgreementCount || 0) >= 3 &&
+  Array.isArray(row.agreedPatternMetrics) && row.agreedPatternMetrics.length >= 3
+);
 if (veryStrongSemanticNegativeForRisk.length >= 2) {
   finalRiskScore = Math.max(finalRiskScore, 60);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 65)
   };
-  console.log('VERY STRONG SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
+  console.log('VERY STRONG SEMANTIC NEGATIVE PATTERN CORROBORATION:', JSON.stringify({
     fields: veryStrongSemanticNegativeForRisk.map(x => x.field),
     appliedFloor: 60
   }));
