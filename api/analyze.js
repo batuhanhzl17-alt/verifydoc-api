@@ -13739,7 +13739,21 @@ async function analyzeAmountReferenceRenderForensics({
     const rh = Number(referenceMeta.height || 0);
     if (!tw || !th || !rw || !rh) return unavailable("image-metadata-unavailable");
 
-    const validBox = (b) => {
+    const validBox = (b, normalized = false) => {
+      if (!b || typeof b !== "object") return null;
+
+      // Target amountForensics.region uses absolute x1/y1/x2/y2 pixels.
+      // Trusted reference amount anchors use xNorm/yNorm/widthNorm/heightNorm.
+      // Normalize both representations here so the render engine never
+      // silently fails because the reference anchor schema differs.
+      if (normalized && [b.xNorm, b.yNorm, b.widthNorm, b.heightNorm].every(Number.isFinite)) {
+        const x1 = Number(b.xNorm);
+        const y1 = Number(b.yNorm);
+        const x2 = x1 + Number(b.widthNorm);
+        const y2 = y1 + Number(b.heightNorm);
+        return x2 > x1 && y2 > y1 ? { x1, y1, x2, y2 } : null;
+      }
+
       const x1 = Number(b?.x1), y1 = Number(b?.y1), x2 = Number(b?.x2), y2 = Number(b?.y2);
       return [x1, y1, x2, y2].every(Number.isFinite) && x2 > x1 && y2 > y1
         ? { x1, y1, x2, y2 }
@@ -13747,7 +13761,7 @@ async function analyzeAmountReferenceRenderForensics({
     };
 
     const cropFromPixels = async (buffer, meta, box, normalized = false) => {
-      const b = validBox(box);
+      const b = validBox(box, normalized);
       if (!b) return null;
       const W = Number(meta.width), H = Number(meta.height);
       const x1 = normalized ? b.x1 * W : b.x1;
@@ -13767,7 +13781,22 @@ async function analyzeAmountReferenceRenderForensics({
         .toBuffer({ resolveWithObject: true });
     };
 
-    const targetRaw = await cropFromPixels(targetBuffer, targetMeta, targetRegion, false);
+    // OCR/amountForensics region coordinates may belong to the original-oriented
+    // upload dimensions while forensicTargetPath can be a normalized/rendered
+    // raster. Scale the absolute target ROI into the actual raster dimensions.
+    const targetSourceWidth = Number(targetRegion?.sourceWidth || 0);
+    const targetSourceHeight = Number(targetRegion?.sourceHeight || 0);
+    const targetRegionScaled = (targetSourceWidth > 0 && targetSourceHeight > 0)
+      ? {
+          ...targetRegion,
+          x1: Number(targetRegion.x1) * (tw / targetSourceWidth),
+          x2: Number(targetRegion.x2) * (tw / targetSourceWidth),
+          y1: Number(targetRegion.y1) * (th / targetSourceHeight),
+          y2: Number(targetRegion.y2) * (th / targetSourceHeight),
+        }
+      : targetRegion;
+
+    const targetRaw = await cropFromPixels(targetBuffer, targetMeta, targetRegionScaled, false);
     const refRaw = await cropFromPixels(referenceBuffer, referenceMeta, referenceAmountField, true);
     if (!targetRaw || !refRaw) return unavailable("amount-roi-crop-failed");
 
