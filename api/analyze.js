@@ -9,7 +9,9 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily,
+  getAdaptiveNegativePopulationPolicy
+} from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -588,26 +590,10 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     : null;
 
   const flags = [];
-  if (referenceAvailable && negativeAvailable && Number.isFinite(affinityDelta)) {
-    const negReliability = String(negative?.bestMatch?.profile?.reliability || 'insufficient');
-    const refReliability = String(reference?.bestMatch?.profile?.reliability || 'insufficient');
-    const reliabilityPenalty = negReliability === 'low' ? 'low-sample' : 'population';
-    if (negScore >= 70 && affinityDelta >= 10 && negReliability !== 'low') {
-      flags.push({
-        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
-        severity: "high",
-        reliability: reliabilityPenalty,
-        detail: `Matematiksel fingerprint known-negative dağılımına reference dağılımından daha yakın (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
-      });
-    } else if (negScore >= 60 && affinityDelta >= 5) {
-      flags.push({
-        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
-        severity: negReliability === 'low' ? "low" : "medium",
-        reliability: reliabilityPenalty,
-        detail: `Known-negative matematiksel affinity sinyali var (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
-      });
-    }
-  }
+  // GLOBAL POPULATION SIMILARITY IS DIAGNOSTIC ONLY.
+  // Do not emit a negative finding merely because the whole document happens
+  // to resemble the known-fake population. Bank template, JPEG quality,
+  // resolution and Telegram re-encoding can create the same effect.
 
   // Semantic negative affinity is the intended mathematical forensic signal:
   // target ROI must be closer to the known-fake population than to the trusted
@@ -615,15 +601,22 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   const semanticNegativeRows = Object.entries(semanticNegativeAffinity || {})
     .map(([field, row]) => ({ field, ...row }))
     .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
-  const strongSemanticNegativeRows = semanticNegativeRows.filter(row =>
-    Number(row.sampleCount || 0) >= 2 &&
-    Number(row.negativeAffinityDelta || 0) >= 1.25 &&
-    Number(row.medianDistance || 99) <= 5.5
-  );
-  const moderateSemanticNegativeRows = semanticNegativeRows.filter(row =>
-    Number(row.sampleCount || 0) >= 1 &&
-    Number(row.negativeAffinityDelta || 0) >= 0.75
-  );
+  // A semantic negative signal is intentionally hard-gated. It needs a real
+  // population (>=3 known fakes), a meaningful distance margin, and a
+  // localized ROI that is not merely an extreme/noisy raster outlier.
+  const strongSemanticNegativeRows = semanticNegativeRows.filter(row => {
+    const sampleCount = Number(row.sampleCount || 0);
+    const delta = Number(row.negativeAffinityDelta || 0);
+    const refDistance = Number(row.referenceDistance);
+    const medianDistance = Number(row.medianDistance || 99);
+    return sampleCount >= 3 &&
+      Number.isFinite(delta) && delta >= 1.5 &&
+      Number.isFinite(refDistance) && refDistance >= 1.5 &&
+      medianDistance <= 5.5;
+  });
+  // Moderate population proximity is diagnostic data only. It must not create
+  // a user-facing negative finding or influence the final fake decision.
+  const moderateSemanticNegativeRows = [];
   if (strongSemanticNegativeRows.length) {
     flags.push({
       code:'SEMANTIC_NEGATIVE_ROI_AFFINITY',
@@ -706,8 +699,8 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.6.3-SCALE-INVARIANT-GLOBAL-BASELINE-GUARD',
-    semanticNegativeVersion: 'MATH-FORENSICS-V2.0.0-SEMANTIC-ROI-POPULATION',
+    version: 'MATH-FORENSICS-V1.7.0-LOCAL-POPULATION-GUARD',
+    semanticNegativeVersion: 'MATH-FORENSICS-V2.1.0-LOCAL-EVIDENCE-ONLY',
     engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
@@ -18087,7 +18080,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     if (infoUnique.length) lines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
     if (!unique.length && !infoUnique.length) lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
     if (fusion?.referenceLike) lines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
-    else if (fusion?.negativeLike) lines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
+    else if (fusion?.negativeLike) lines.push('', '🔴 Lokal matematiksel kanıt: bilinen sahte örneklerdeki değişim profiliyle anlamlı uyum.');
     else lines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
@@ -19686,7 +19679,16 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   const differential = differentialAvailable ? rawDifferential : null;
 
   const referenceLikeByDifferential = differentialAvailable && differential <= -20;
-  const negativeLikeByDifferential = differentialAvailable && differential >= 20;
+  // Whole-document negative-vs-reference differential is never a fake verdict.
+  const negativeLikeByDifferential = false;
+
+  const localizedNegativeFields = Object.entries(math?.semanticNegativeAffinity || {})
+    .filter(([, row]) => Number(row?.sampleCount || 0) >= 3 &&
+      Number(row?.negativeAffinityDelta || 0) >= 1.5 &&
+      Number(row?.referenceDistance) >= 1.5 &&
+      Number(row?.medianDistance || 99) <= 5.5)
+    .map(([field]) => field);
+  const localizedNegativeEvidence = localizedNegativeFields.length > 0;
 
   const semanticFields = math?.semanticMathCalibration?.fields || {};
   const fieldRows = Array.isArray(forensic?.fields) ? forensic.fields : [];
@@ -19722,7 +19724,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
     const roiMean = Number(roiStrong?.roiMeanDistance || sem?.meanDistance || 0);
     const independent = field === 'amount'
       ? Number(sem?.amountForensicsScore || 0) >= 80
-      : negativeLikeByDifferential;
+      : localizedNegativeEvidence;
     fieldFusion[field] = {
       level,
       combinedScore: Number(sem?.combinedScore || 0),
@@ -19792,10 +19794,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
       referenceLike = false;
       className = 'indeterminate';
     }
-  } else if (negativeLikeByDifferential) {
-    negativeLike = true;
-    className = 'negative-like';
-  } else if (knownNegativeCorroborated && differentialAvailable && differential >= 0) {
+  } else if (localizedNegativeEvidence) {
     negativeLike = true;
     className = 'negative-like';
   }
@@ -19812,7 +19811,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
     negativeBaselineAvailable,
     referenceLike,
     negativeLike,
-    thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: 20 },
+    thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: null, localizedNegativeDeltaMin: 1.5, localizedNegativeMinSamples: 3 },
     fields: fieldFusion,
     layout: { maxScore: maxLayoutScore, strong: strongLayout },
     knownNegative: {
@@ -19821,14 +19820,16 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
       bestSample: negativeSampleForensics?.bestSample || null,
       strong: knownNegativeStrong,
       corroborated: knownNegativeCorroborated,
-      policy: 'advisory-only; high local similarity cannot independently declare a document fake'
+      policy: 'local-evidence-only; global similarity cannot independently declare a document fake'
     },
     evidence: {
       criticalRoiStrongCount: criticalRows.length,
-      independentNegativeCorroboration,
+      independentNegativeCorroboration: false,
+      localizedNegativeEvidence,
+      localizedNegativeFields,
       differentialAvailable
     },
-    policy: 'V1.6.2: missing baselines remain unavailable/null; final class is reference-vs-negative differential first, with layout/semantic/known-negative signals as corroboration rather than single-signal verdicts'
+    policy: 'V1.7: global similarity is diagnostic only; fake classification requires localized semantic population evidence'
   };
 }
 
@@ -20225,8 +20226,10 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     userLines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
   if (referenceLike) userLines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
-  else if (negativeLike) userLines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
-  else userLines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
+  else if (negativeLike) {
+    const fields = Array.isArray(mathFusion?.evidence?.localizedNegativeFields) ? mathFusion.evidence.localizedNegativeFields.join(', ') : '';
+    userLines.push('', `🔴 Lokal matematiksel kanıt: bilinen sahte örneklerdeki değişim profili${fields ? ` (${fields})` : ''} ile anlamlı uyum.`);
+  } else userLines.push('', '🟡 Lokal matematiksel kanıt: belirleyici sahte pattern bulunmadı.');
 
   return {
     headline: unique.length
