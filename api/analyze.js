@@ -16055,7 +16055,7 @@ if ((type === "image" || type === "pdf") && bank) {
 // This layer measures local raster/texture/chroma direction, not document text.
 // It is deliberately separate from global negativeSimilarity and legacy scores.
 // =====================================================
-async function runDifferentialImageForensics({ targetPath, referencePath, negativeSamples = [], type = 'image' }) {
+async function runDifferentialImageForensics({ targetPath, referencePath, negativeSamples = [], type = 'image', semanticRois = null }) {
   const unavailable = (reason) => ({ available:false, engine:'differential-image-forensics-v1', reason });
   if (!targetPath || !referencePath || !Array.isArray(negativeSamples) || !negativeSamples.length) {
     return unavailable('missing-target-reference-or-negative-population');
@@ -16069,74 +16069,116 @@ async function runDifferentialImageForensics({ targetPath, referencePath, negati
       }
       return await fs.readFile(input);
     };
-    const W=256, H=256, grid=16, cell=W/grid;
-    const descriptor = async (buf) => {
-      const {data,info}=await sharp(buf).resize(W,H,{fit:'fill'}).removeAlpha().raw().toBuffer({resolveWithObject:true});
-      const out=[];
+    const W=256, H=256;
+    const descriptor = async (buf, box=null) => {
+      const src = sharp(buf).removeAlpha();
+      const meta = await src.metadata();
+      const sw=Number(meta.width||0), sh=Number(meta.height||0);
+      let crop = src;
+      if (box && sw && sh) {
+        const x1=Math.max(0,Math.min(sw-1,Math.round(Number(box.x1)*sw)));
+        const y1=Math.max(0,Math.min(sh-1,Math.round(Number(box.y1)*sh)));
+        const x2=Math.max(x1+1,Math.min(sw,Math.round(Number(box.x2)*sw)));
+        const y2=Math.max(y1+1,Math.min(sh,Math.round(Number(box.y2)*sh)));
+        crop = crop.extract({left:x1,top:y1,width:x2-x1,height:y2-y1});
+      }
+      const {data,info}=await crop.resize(W,H,{fit:'fill'}).raw().toBuffer({resolveWithObject:true});
+      const grid=16, cell=W/grid, out=[];
       for(let gy=0;gy<grid;gy++) for(let gx=0;gx<grid;gx++) {
         const vals=[], grads=[], chrom=[];
         for(let y=gy*cell;y<(gy+1)*cell;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
           const i=(y*info.width+x)*info.channels;
-          const r=data[i]||0,g=data[i+1]||0,b=data[i+2]||0;
+          const r=data[i]||0,g=data[i+1]||r,b=data[i+2]||r;
           vals.push(.299*r+.587*g+.114*b); chrom.push(Math.abs(r-g)+Math.abs(g-b));
-          if(x<((gx+1)*cell-1)) { const j=(y*info.width+x+1)*info.channels; grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]||0)-(data[i+1]||0))); }
-          if(y<((gy+1)*cell-1)) { const j=((y+1)*info.width+x)*info.channels; grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]||0)-(data[i+1]||0))); }
+          if(x<((gx+1)*cell-1)){const j=(y*info.width+x+1)*info.channels;grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]||0)-(data[i+1]||0)));}
         }
-        const mean=vals.reduce((a,b)=>a+b,0)/vals.length;
-        const variance=vals.reduce((a,b)=>a+(b-mean)**2,0)/vals.length;
+        for(let y=gy*cell;y<(gy+1)*cell-1;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
+          const i=(y*info.width+x)*info.channels, j=((y+1)*info.width+x)*info.channels;
+          grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]||0)-(data[i+1]||0)));
+        }
+        const mean=vals.reduce((a,b)=>a+b,0)/Math.max(1,vals.length);
+        const variance=vals.reduce((a,b)=>a+(b-mean)**2,0)/Math.max(1,vals.length);
         const gm=grads.reduce((a,b)=>a+b,0)/Math.max(1,grads.length);
-        const cm=chrom.reduce((a,b)=>a+b,0)/chrom.length;
-        out.push({lumaStd:Math.sqrt(variance),edge:gm,chroma:cm});
+        const cm=chrom.reduce((a,b)=>a+b,0)/Math.max(1,chrom.length);
+        out.push({lumaStd:Math.sqrt(variance),edge:gm,chroma:cm,luminance:mean});
       }
       return out;
     };
     const [tb,rb]=await Promise.all([load(targetPath),load(Array.isArray(referencePath)?referencePath[0]:referencePath)]);
     if(!tb||!rb) return unavailable('image-load-failed');
-    const [td,rd]=await Promise.all([descriptor(tb),descriptor(rb)]);
-    const negs=[];
-    for(const sample of negativeSamples.slice(0,12)) {
-      try { const b=await load(sample.path); if(b) negs.push({file:sample.fileName, d:await descriptor(b)}); } catch(e) { console.warn('DIFF FORENSICS NEGATIVE SKIP:',sample?.fileName,e?.message||e); }
-    }
-    if(!negs.length) return unavailable('negative-images-unavailable');
+    const refMeta=await sharp(rb).metadata();
+    const refW=Number(refMeta.width||0), refH=Number(refMeta.height||0);
+    if(!refW||!refH) return unavailable('reference-metadata-unavailable');
 
-    const fields={};
-    const components=['edge','stroke','luminance','raster'];
-    const compKey={edge:'edge',stroke:'lumaStd',luminance:'luminance',raster:'chroma'};
-    for(const field of ['document']) {
-      const agreements=[]; const counts={edge:0,stroke:0,luminance:0,raster:0};
-      for(const n of negs) {
-        let matched=0, matchedComponents=[];
-        for(let i=0;i<td.length;i++) {
-          const t=td[i], r=rd[i], f=n.d[i];
-          const metrics=['edge','lumaStd','chroma'];
-          for(const metric of metrics) {
-            const scale=Math.max(0.75,Math.abs(r[metric])*0.12,Math.abs(f[metric])*0.12);
-            const tr=Math.abs(t[metric]-r[metric])/scale;
-            const tf=Math.abs(t[metric]-f[metric])/scale;
-            if(tf+0.15 < tr && tr>=1.2) {
-              const c=metric==='edge'?'edge':metric==='lumaStd'?'stroke':metric==='chroma'?'raster':'luminance';
-              counts[c]++; matched++; matchedComponents.push(c);
-              break;
-            }
-          }
-        }
-        const uniq=[...new Set(matchedComponents)];
-        agreements.push({sample:n.file,agreementCount:matched,componentCount:3,matchedComponents:uniq,matched:uniq.length>=1});
+    const fields=['amount','recipientName','recipientIban'];
+    const fieldsOut={};
+    let anyStrong=false;
+    let anyLimited=false;
+    for(const field of fields){
+      const pair=semanticRois?.[field];
+      if(!pair?.target || !pair?.reference){
+        fieldsOut[field]={available:false,reason:'semantic-roi-unavailable',sampleCount:negativeSamples.length};
+        continue;
       }
+      const normBox=(box)=>{
+        const x1=Number(box?.x1),y1=Number(box?.y1),x2=Number(box?.x2),y2=Number(box?.y2);
+        if(![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1)return null;
+        return {x1:x1/refW,y1:y1/refH,x2:x2/refW,y2:y2/refH};
+      };
+      const targetMeta=await sharp(tb).metadata();
+      const targetW=Number(targetMeta.width||0),targetH=Number(targetMeta.height||0);
+      const targetNorm={x1:Number(pair.target.x1)/Math.max(1,targetW),y1:Number(pair.target.y1)/Math.max(1,targetH),x2:Number(pair.target.x2)/Math.max(1,targetW),y2:Number(pair.target.y2)/Math.max(1,targetH)};
+      const refNorm=normBox(pair.reference);
+      if(!refNorm||![targetNorm.x1,targetNorm.y1,targetNorm.x2,targetNorm.y2].every(Number.isFinite)){
+        fieldsOut[field]={available:false,reason:'invalid-semantic-roi',sampleCount:negativeSamples.length}; continue;
+      }
+      const td=await descriptor(tb,targetNorm), rd=await descriptor(rb,refNorm);
+      const agreements=[];
+      const patternComponents={edge:0,stroke:0,luminance:0,raster:0};
+      const refVsTarget=[];
+      const componentKeys=[['edge','edge'],['stroke','lumaStd'],['luminance','luminance'],['raster','chroma']];
+      for(const sample of negativeSamples.slice(0,12)){
+        let fb; try{fb=await load(sample.path);}catch(e){fb=null;}
+        if(!fb)continue;
+        let fd; try{fd=await descriptor(fb,refNorm);}catch(e){fd=null;}
+        if(!fd)continue;
+        let matchedComponents=[];
+        for(const [label,key] of componentKeys){
+          const targetD=[],fakeD=[],referenceD=[];
+          for(let i=0;i<td.length;i++){
+            const t=Number(td[i]?.[key]), r=Number(rd[i]?.[key]), f=Number(fd[i]?.[key]);
+            if(![t,r,f].every(Number.isFinite))continue;
+            const scale=Math.max(0.75,Math.abs(r)*0.12,Math.abs(f)*0.12,Math.abs(t)*0.06);
+            targetD.push(Math.abs(t-r)/scale); fakeD.push(Math.abs(t-f)/scale); referenceD.push(Math.abs(f-r)/scale);
+          }
+          const tMed=targetD.length?targetD.sort((a,b)=>a-b)[Math.floor(targetD.length/2)]:0;
+          const fMed=fakeD.length?fakeD.sort((a,b)=>a-b)[Math.floor(fakeD.length/2)]:0;
+          const rMed=referenceD.length?referenceD.sort((a,b)=>a-b)[Math.floor(referenceD.length/2)]:0;
+          // A fake-pattern component must be measurably closer to the target
+          // in the known-fake sample than to the trusted reference, while the
+          // target must itself differ from the trusted reference.
+          const matched=tMed>=1.15 && fMed+0.12<tMed && rMed>=0.45;
+          if(matched){matchedComponents.push(label);patternComponents[label]++;}
+        }
+        agreements.push({sample:sample.fileName,agreementCount:matchedComponents.length,componentCount:4,matchedComponents,matched:matchedComponents.length>=1});
+      }
+      const sampleCount=agreements.length;
       const agreementCount=agreements.filter(x=>x.matched).length;
-      const sampleCount=negs.length;
       const ratio=sampleCount?agreementCount/sampleCount:0;
-      const strong = sampleCount>=3 ? agreementCount>=2 && ratio>=0.5 : sampleCount===2 ? agreementCount===2 : false;
-      fields[field]={sampleCount, sampleAgreement:agreements, agreementCount, agreementRatio:Number(ratio.toFixed(3)), patternComponents:counts, strength:strong?'strong':agreementCount?'limited':'none', finalPromotionAllowed:strong};
+      // Adaptive population policy: one sample is advisory only; two require
+      // agreement in both; 3+ require at least 2 repeated samples / 50%.
+      const strong=sampleCount>=3 ? agreementCount>=2 && ratio>=0.5 : sampleCount===2 ? agreementCount===2 : false;
+      const strength=strong?'strong':agreementCount?'limited':'none';
+      if(strength==='strong')anyStrong=true; else if(strength==='limited')anyLimited=true;
+      fieldsOut[field]={available:true,targetVsGenuine:{components:componentKeys.map(([label,key])=>({component:label,key,target:td.reduce((s,v)=>s+Number(v[key]||0),0)/td.length,reference:rd.reduce((s,v)=>s+Number(v[key]||0),0)/rd.length}))},sampleAgreement:agreements,agreementCount,agreementRatio:Number(ratio.toFixed(3)),patternComponents,strength,finalPromotionAllowed:strong};
     }
-    const row=fields.document;
-    const out={available:true,engine:'differential-image-forensics-v1',normalSampleCount:1,tamperSampleCount:negs.length,fields,anyStrongLocalizedPattern:Boolean(row.finalPromotionAllowed),policy:'normal-vs-tamper-local-pattern-v1'};
-    console.log('DIFFERENTIAL IMAGE FORENSICS V1 START');
-    console.log('DIFFERENTIAL IMAGE FORENSICS V1:',JSON.stringify(out));
-    console.log('DIFFERENTIAL IMAGE FORENSICS V1 END');
+    const out={available:true,engine:'differential-image-forensics-v2-local-semantic',normalSampleCount:1,tamperSampleCount:negativeSamples.length,fields:fieldsOut,anyStrongLocalizedPattern:anyStrong,anyLimitedLocalizedPattern:anyLimited,policy:'adaptive-local-semantic-pattern-v2'};
+    console.log('DIFFERENTIAL IMAGE FORENSICS V2 START');
+    console.log('DIFFERENTIAL IMAGE FORENSICS V2:',JSON.stringify(out));
+    console.log('DIFFERENTIAL IMAGE FORENSICS V2 END');
     return out;
-  } catch(error) {
-    console.warn('DIFFERENTIAL IMAGE FORENSICS V1 HATASI:',error?.message||error);
+  } catch(error){
+    console.warn('DIFFERENTIAL IMAGE FORENSICS V2 HATASI:',error?.message||error);
     return unavailable(error?.message||String(error));
   }
 }
@@ -16146,11 +16188,19 @@ async function runDifferentialImageForensics({ targetPath, referencePath, negati
 if ((type === "image" || type === "pdf") && bank && reference) {
   try {
     const diffNegatives = await loadNegativeSampleFiles(bank);
+    const differentialSemanticRois = await getMathSemanticRois({
+      amountForensics,
+      referenceForensics,
+      targetOCR: paddleImageOCR,
+      bank,
+      referencePath: getVisualReferencePath(reference),
+    });
     differentialImageForensics = await runDifferentialImageForensics({
       targetPath: forensicTargetPath,
       referencePath: getVisualReferencePath(reference),
       negativeSamples: diffNegatives,
       type,
+      semanticRois: differentialSemanticRois,
     });
   } catch (error) {
     console.warn("DIFFERENTIAL IMAGE FORENSICS V1 HATASI:", error?.message || error);
