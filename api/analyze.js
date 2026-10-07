@@ -11,6 +11,7 @@ import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
+import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -2206,6 +2207,13 @@ try {
   if (paddleCacheKey) paddleOCRInFlight.delete(paddleCacheKey);
 }
 
+}
+
+// Compatibility entry point retained for callers that explicitly expect the
+// JPEG PaddleOCR name. The existing OCR implementation and caching stay in
+// runPaddleOCR; this wrapper does not alter its behavior.
+async function runPaddleOCRForJPEG(filePath) {
+  return runPaddleOCR(filePath);
 }
 let ocrWorker = null;
 async function getOCRWorker() {
@@ -15779,6 +15787,8 @@ let paintOverForensicsV2 = null;
 let openSourceForensics = null;
 let fontForensics = null;
 let mathematicalForensics = null;
+let multimodalReceiptEvidence = null;
+let semanticEvidenceFusion = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
 
@@ -15817,7 +15827,7 @@ console.log(
 );
 
 paddleImageOCR =
-await runPaddleOCR(
+await runPaddleOCRForJPEG(
 forensicTargetPath
 );
 
@@ -15855,6 +15865,29 @@ JSON.stringify(amountForensics)
 
 }
 
+}
+
+// Independent visual evidence layer. It uses the already configured
+// OPENAI_API_KEY through the existing OpenAI client, and it never returns a
+// real/fake verdict. PaddleOCR remains the text-recognition engine.
+if ((type === "image" || type === "pdf") && forensicTargetPath) {
+  try {
+    const evidenceImage = await fs.readFile(forensicTargetPath);
+    multimodalReceiptEvidence = await analyzeReceiptImageEvidence({
+      openai,
+      imageBuffer: evidenceImage,
+      mimeType: forensicTargetMime || "image/jpeg",
+    });
+    console.log("MULTIMODAL RECEIPT EVIDENCE:", JSON.stringify({
+      available: multimodalReceiptEvidence?.available === true,
+      status: multimodalReceiptEvidence?.status || null,
+      model: multimodalReceiptEvidence?.model || null,
+      fields: Object.keys(multimodalReceiptEvidence?.evidence || {}),
+    }));
+  } catch (error) {
+    console.warn("MULTIMODAL RECEIPT EVIDENCE ERROR:", error?.message || error);
+    multimodalReceiptEvidence = { available: false, status: "error", error: error?.message || String(error) };
+  }
 }
 
 // =====================================================
@@ -17706,6 +17739,18 @@ result =
 parseAIResponse(
 response.output_text
 );
+
+// Semantic fusion is evidence-only: it records agreement or disagreement
+// between the visual reader, PaddleOCR, and the primary extraction. No value
+// here independently raises risk or declares fraud.
+if (multimodalReceiptEvidence) {
+  semanticEvidenceFusion = fuseReceiptSemanticEvidence({
+    evidenceResult: multimodalReceiptEvidence,
+    paddleOCR: paddleImageOCR,
+    primaryDocumentData: result?.documentData,
+  });
+  result.semanticEvidenceFusion = semanticEvidenceFusion;
+}
 
 // Deterministik yapısal geometri sinyali AI çıktısından bağımsızdır.
 if (layoutForensics?.available && result?.checks) {
