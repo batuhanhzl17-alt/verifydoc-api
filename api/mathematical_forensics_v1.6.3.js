@@ -757,13 +757,44 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
 
 
 export function compareSemanticRoiToNegativePopulation(targetFingerprint, negativeFingerprints, roiNames = ['amount','recipientName','recipientIban'], referenceFingerprint = null) {
+  // LOCAL KNOWN-FAKE PATTERN CORROBORATION V1.9
+  // This is NOT a whole-document "negative similarity" score. For each
+  // semantic ROI we measure the target's directional raster change from the
+  // trusted reference and ask whether the SAME physical change repeats across
+  // known-fake samples. The result is intentionally component-based and
+  // sample-count aware so generic JPEG/template similarity cannot masquerade
+  // as a fake pattern.
+  const COMPONENTS = {
+    luminance: ['luminanceMean', 'luminanceStd'],
+    edge: ['edgeDensity', 'meanGradient'],
+    stroke: ['laplacianVariance'],
+    raster: ['entropy', 'dctLowEnergy', 'dctMidEnergy', 'dctHighEnergy', 'dctHighRatio', 'blockinessHorizontal', 'blockinessVertical'],
+  };
+  const metricKeys = Object.values(COMPONENTS).flat();
   const result = {};
+
+  const componentMatchesForRow = (patternMetrics) => {
+    const out = {};
+    for (const [component, keys] of Object.entries(COMPONENTS)) {
+      const matches = keys.filter(k => patternMetrics?.[k]?.match === true);
+      const available = keys.filter(k => patternMetrics?.[k]);
+      out[component] = {
+        matchCount: matches.length,
+        availableCount: available.length,
+        matched: matches.length >= (component === 'raster' ? 2 : 1),
+        matchedMetrics: matches,
+      };
+    }
+    return out;
+  };
+
   for (const name of roiNames) {
     const target = targetFingerprint?.roi16x16?.[name];
     if (!target?.metrics) {
       result[name] = { available:false, reason:'target-roi-missing' };
       continue;
     }
+
     const rows = [];
     for (const item of (Array.isArray(negativeFingerprints) ? negativeFingerprints : [])) {
       const fp = item?.fingerprint || item;
@@ -771,29 +802,43 @@ export function compareSemanticRoiToNegativePopulation(targetFingerprint, negati
       if (!neg?.metrics) continue;
       const compared = compare16x16Rois(targetFingerprint, fp, [name])[name];
       if (!compared?.available) continue;
-      const targetMetrics = target?.metrics || {};
-      const negativeMetrics = neg?.metrics || {};
+
+      const targetMetrics = target.metrics || {};
+      const negativeMetrics = neg.metrics || {};
       const referenceMetrics = referenceFingerprint?.roi16x16?.[name]?.metrics || {};
       const patternMetrics = {};
-      const metricKeys = ['luminanceMean','luminanceStd','entropy','edgeDensity','meanGradient','laplacianVariance','dctLowEnergy','dctMidEnergy','dctHighEnergy','dctHighRatio','blockinessHorizontal','blockinessVertical'];
+
       for (const key of metricKeys) {
         const tv = Number(targetMetrics[key]);
         const nv = Number(negativeMetrics[key]);
         const rv = Number(referenceMetrics[key]);
-        if (![tv,nv,rv].every(Number.isFinite)) continue;
+        if (![tv, nv, rv].every(Number.isFinite)) continue;
+
+        // Robust enough for ROI metrics without letting a near-zero reference
+        // create an explosive ratio. Direction is always measured from the
+        // trusted reference toward the target/known-fake sample.
         const scale = Math.max(Math.abs(rv) * 0.05, 0.5);
         const targetShift = (tv - rv) / scale;
         const negativeShift = (nv - rv) / scale;
-        const sameDirection = Math.abs(targetShift) >= 0.75 && Math.sign(targetShift) === Math.sign(negativeShift);
-        const closeToTarget = Math.abs(tv - nv) / scale <= Math.max(0.75, Math.abs(targetShift) * 0.45);
+        const targetMagnitude = Math.abs(targetShift);
+        const negativeMagnitude = Math.abs(negativeShift);
+        const sameDirection = targetMagnitude >= 0.75 && negativeMagnitude >= 0.75 &&
+          Math.sign(targetShift) === Math.sign(negativeShift);
+        const closeToTarget = Math.abs(tv - nv) / scale <= Math.max(0.75, targetMagnitude * 0.45);
         patternMetrics[key] = {
           targetShift: Number(targetShift.toFixed(3)),
           negativeShift: Number(negativeShift.toFixed(3)),
           sameDirection,
           closeToTarget,
-          match: Boolean(sameDirection && closeToTarget)
+          match: Boolean(sameDirection && closeToTarget),
         };
       }
+
+      const components = componentMatchesForRow(patternMetrics);
+      const matchedComponents = Object.entries(components)
+        .filter(([, v]) => v.matched)
+        .map(([k]) => k);
+
       rows.push({
         sample: item?.fileName || item?.source || item?.path || null,
         meanDistance: Number(compared.meanDistance || 0),
@@ -802,51 +847,85 @@ export function compareSemanticRoiToNegativePopulation(targetFingerprint, negati
         rawMetricDistances: compared.rawMetricDistances || {},
         patternMetrics,
         patternMetricKeys: Object.keys(patternMetrics).filter(k => patternMetrics[k]?.match),
+        components,
+        matchedComponents,
+        componentMatchCount: matchedComponents.length,
       });
     }
+
     if (!rows.length) {
       result[name] = { available:false, reason:'negative-roi-unavailable', sampleCount:0 };
       continue;
     }
+
     const distances = rows.map(x => x.meanDistance).filter(Number.isFinite).sort((a,b)=>a-b);
     const medianDistance = median(distances);
-    const meanDistance = mean(distances);
+    const meanDistance = medianDistance === null ? null : distances.reduce((a,b)=>a+b,0) / Math.max(1, distances.length);
     const best = rows.slice().sort((a,b)=>a.meanDistance-b.meanDistance)[0];
-    const metricAgreement = {};
-    for (const row of rows) {
-      for (const key of (row.patternMetricKeys || [])) metricAgreement[key] = (metricAgreement[key] || 0) + 1;
-    }
     const policy = getAdaptiveNegativePopulationPolicy(rows.length);
-    const agreedPatternMetrics = Object.entries(metricAgreement)
-      .filter(([,count]) => count >= Math.min(policy.minAgreementCount, rows.length))
-      .sort((a,b)=>b[1]-a[1])
-      .map(([key,count]) => ({key,count}));
-    const patternAgreementCount = rows.filter(r => (r.patternMetricKeys || []).length >= 2).length;
+
+    const componentAgreement = {};
+    for (const component of Object.keys(COMPONENTS)) {
+      const count = rows.filter(r => r.components?.[component]?.matched === true).length;
+      componentAgreement[component] = {
+        count,
+        ratio: Number((count / Math.max(1, rows.length)).toFixed(3)),
+        samples: rows.filter(r => r.components?.[component]?.matched === true).map(r => r.sample),
+      };
+    }
+
+    // A sample is considered a repeating local fake pattern only when at least
+    // two physical components agree. This avoids declaring a pattern from one
+    // generic raster statistic such as entropy alone.
+    const samplePatternAgreement = rows.map(r => ({
+      sample: r.sample,
+      matchedComponents: r.matchedComponents,
+      componentMatchCount: r.componentMatchCount,
+      patternStrength: r.componentMatchCount >= 3 ? 'strong' : r.componentMatchCount >= 2 ? 'moderate' : 'weak',
+    }));
+
+    const minSampleAgreement = rows.length === 1 ? 1 : rows.length === 2 ? 2 : Math.max(2, Math.ceil(rows.length * 0.5));
+    const corroboratingComponents = Object.entries(componentAgreement)
+      .filter(([, v]) => v.count >= minSampleAgreement)
+      .sort((a,b) => b[1].count - a[1].count)
+      .map(([component, v]) => ({ component, count:v.count, ratio:v.ratio, samples:v.samples }));
+
+    const patternAgreementCount = rows.filter(r => r.componentMatchCount >= 2).length;
     const localPatternCorroborated = Boolean(
-      agreedPatternMetrics.length >= 2 &&
-      patternAgreementCount >= policy.minAgreementCount
+      corroboratingComponents.length >= 2 &&
+      patternAgreementCount >= minSampleAgreement
     );
+
+    let strength = 'insufficient';
+    if (localPatternCorroborated) {
+      if (rows.length >= 5 && patternAgreementCount >= 3) strength = 'strong';
+      else if (rows.length >= 3 && patternAgreementCount >= 2) strength = 'moderate';
+      else strength = 'limited';
+    } else if (patternAgreementCount > 0) {
+      strength = 'weak';
+    }
+
     result[name] = {
       available:true,
       sampleCount:rows.length,
-      meanDistance:Number(meanDistance.toFixed(3)),
-      medianDistance:Number(medianDistance.toFixed(3)),
+      meanDistance:Number.isFinite(meanDistance) ? Number(meanDistance.toFixed(3)) : null,
+      medianDistance:Number.isFinite(medianDistance) ? Number(medianDistance.toFixed(3)) : null,
       bestDistance:Number(best.meanDistance.toFixed(3)),
       bestSample:best.sample,
       samples:rows,
-      adaptivePolicy: policy,
-      agreedPatternMetrics,
+      samplePatternAgreement,
+      componentAgreement,
+      corroboratingComponents,
       patternAgreementCount,
+      minSampleAgreement,
+      patternStrength:strength,
+      adaptivePolicy:policy,
       localPatternCorroborated,
-      finalPromotionAllowed: Boolean(localPatternCorroborated && policy.finalPromotionAllowed && !policy.advisoryOnly),
-      // Positive means the target is mathematically closer to the negative
-      // population than to the trusted reference ROI.
+      finalPromotionAllowed:Boolean(localPatternCorroborated && policy.finalPromotionAllowed && !policy.advisoryOnly),
       referenceDistance:null,
       negativeAffinityDelta:null,
-      // Diagnostic only: a negative population match is meaningful only when
-      // it is localized to this semantic ROI and materially beats the trusted
-      // reference distance. Global negative similarity is never inferred here.
-      evidenceType:'localized-semantic-population',
+      evidenceType:'localized-semantic-known-fake-pattern',
+      policyVersion:'LOCAL-PATTERN-V1.9',
     };
   }
   return result;
