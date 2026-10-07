@@ -18,6 +18,22 @@ import { createRequire } from "module"
 import { fileURLToPath, pathToFileURL } from "url"
 const require = createRequire(import.meta.url);
 
+// Receipt verification is intentionally limited to the beneficiary IBAN,
+// primary transaction amount, beneficiary name, and the bank template layout.
+// Keep costly, whole-document/AI forensic side passes disabled; the primary
+// extraction and the local trusted-reference checks remain active.
+const FOCUSED_RECEIPT_REVIEW = Object.freeze({
+  fields: new Set(["amount", "recipientName", "recipientIban"]),
+  runNegativeSampleVision: false,
+  runOpenSourceForensics: false,
+  runAzureLayout: false,
+  runTerraVisualReview: false,
+  runWholePagePixelForensics: false,
+  runSecondaryRasterSensors: false,
+  runLocalCropComparator: false,
+  runPdfFontForensics: false,
+});
+
 // Vercel/ESM ortamında @napi-rs/canvas named export her zaman düzgün gelmeyebilir.
 // createRequire ile CommonJS yükleyerek createCanvas erişimini sabitliyoruz.
 let napiCanvas = null;
@@ -8895,6 +8911,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const label = inline?.label || rfLabelPart(raw);
         const key = canonical?.key || rfGenericFieldKey(label);
         if (!key) continue;
+        const focusedField = recipientNameLabel(label) ? "recipientName"
+          : recipientIbanLabel(label) ? "recipientIban"
+          : canonical?.key || key;
+        if (!FOCUSED_RECEIPT_REVIEW.fields.has(focusedField)) continue;
         // V12: A generic OCR string is not a field label merely because it is
         // text. Reject known/static/dynamic values (FAST text, bank names,
         // names, footer values, etc.) before they can enter the label matcher.
@@ -9264,21 +9284,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         // fields. Broad whole-document matching was the source of wrong-place
         // promotions in earlier versions. Generic bank labels are mapped to a
         // semantic field only when their label is an exact/near-exact critical label.
-        const TP_ALLOWED_FIELDS=new Set([
-          'amount','iban','senderName','recipientName','senderAddress','recipientAddress','address',
-          'transactionNo','accountNo','taxNo'
-        ]);
+        const TP_ALLOWED_FIELDS=new Set(['amount','iban','recipientIban','recipientName']);
         const TP_GENERIC_CRITICAL_MAP={
-          'generic:GIDEN FAST EFT':'senderName',
           'generic:EFT TUTARI':'amount',
-          'generic:MUSTERI UNVANI':'senderName',
-          'generic:SIRA NO':'transactionNo',
-          'generic:FIS NO':'transactionNo',
-          'generic:ESENTEPE':'address',
-          'generic:ADRES':'address',
           'generic:ALICI UNVANI':'recipientName',
-          'generic:ALICI IBAN':'iban',
-          'generic:IBAN/KART NO':'iban'
+          'generic:ALICI IBAN':'iban'
         };
         const tpSemanticField=(key)=>TP_GENERIC_CRITICAL_MAP[String(key||'')] || String(key||'');
         const tpAllowedFieldKey=(key)=>TP_ALLOWED_FIELDS.has(tpSemanticField(key));
@@ -15875,7 +15885,7 @@ function getVisualReferencePath(reference) {
 // =====================================================
 // Font metadata is independent from raster/reference adjudication. Keep it
 // active for PDF targets so real embedded-font substitutions are not lost.
-if (type === "pdf" && reference?.path) {
+if (FOCUSED_RECEIPT_REVIEW.runPdfFontForensics && type === "pdf" && reference?.path) {
   try {
     const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
       ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
@@ -15938,7 +15948,7 @@ console.log("REFERENCE VISUAL IMAGES:", JSON.stringify((reference?.visualReferen
 
 // Known-negative sample comparison is advisory. It never replaces the
 // trusted reference engine and does not by itself declare a document fake.
-if ((type === "image" || type === "pdf") && bank) {
+if (FOCUSED_RECEIPT_REVIEW.runNegativeSampleVision && (type === "image" || type === "pdf") && bank) {
   try {
     const negativeSamples = await loadNegativeSampleFiles(bank);
     if (negativeSamples.length) {
@@ -15956,7 +15966,7 @@ if ((type === "image" || type === "pdf") && bank) {
 // Independent mathematical fingerprint. It compares the target against
 // real/reference and known-negative populations for the detected bank.
 // It is advisory and does not replace the existing forensic engines.
-if (type === "image" || type === "pdf") {
+if ((type === "image" || type === "pdf") && bank && reference) {
   try {
     const mathText = [
       extractedPdfText,
@@ -15988,7 +15998,7 @@ const prepTasks = [];
 // V66: deploy-safe open-source-style forensic layer runs in parallel with
 // existing Azure/reference preparation. It is advisory and does not replace
 // the trusted-reference engine.
-if (type === "image" || type === "pdf") {
+if (FOCUSED_RECEIPT_REVIEW.runOpenSourceForensics && (type === "image" || type === "pdf")) {
   prepTasks.push((async () => {
     try {
       const osf = await runOpenSourceForensics({
@@ -16005,7 +16015,7 @@ if (type === "image" || type === "pdf") {
   })());
 }
 
-prepTasks.push((async () => {
+if (FOCUSED_RECEIPT_REVIEW.runAzureLayout) prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
@@ -16024,7 +16034,7 @@ prepTasks.push((async () => {
   }
 })());
 
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+if (FOCUSED_RECEIPT_REVIEW.runLocalCropComparator && (type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
   prepTasks.push((async () => {
     try {
       const ta = await analyzeReferenceTemplateAgainstDocument(
@@ -16590,8 +16600,10 @@ const softTerraReasons = terraGateReasons.filter((reason) =>
   reason === "template-strong-geometry" || reason === "local-render-outlier"
 );
 const shouldRunTerra =
-  hardTerraReasons.length > 0 ||
-  terraGateReasons.length >= 2;
+  FOCUSED_RECEIPT_REVIEW.runTerraVisualReview && (
+    hardTerraReasons.length > 0 ||
+    terraGateReasons.length >= 2
+  );
 
 console.log("TERRA CONDITIONAL GATE V64:", JSON.stringify({
   shouldRunTerra,
@@ -16671,7 +16683,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunRefere
 // =====================================================
 // ANALYZE44 — PIXEL / IMAGE FORENSICS
 // =====================================================
-if ((type === "image" || type === "pdf") && bank && reference) {
+if (FOCUSED_RECEIPT_REVIEW.runWholePagePixelForensics && (type === "image" || type === "pdf") && bank && reference) {
   try {
     const visualReferencePath = getVisualReferencePath(reference);
     const trustedReferencePaths = Array.isArray(visualReferencePath)
@@ -16687,7 +16699,7 @@ if ((type === "image" || type === "pdf") && bank && reference) {
 // =====================================================
 // V68 — RGB / CFA-LIKE / JPEG GRID / AMOUNT REFERENCE TONE
 // =====================================================
-if ((type === "image" || type === "pdf") && bank && reference) {
+if (FOCUSED_RECEIPT_REVIEW.runSecondaryRasterSensors && (type === "image" || type === "pdf") && bank && reference) {
   try {
     const visualReferencePath = getVisualReferencePath(reference);
     const trustedReferencePaths = Array.isArray(visualReferencePath)
@@ -20878,20 +20890,82 @@ informationCheck;
 // ANA SKOR
 // =====================================================
 
-const finalScore =
-Number(
-result.overallRisk
-) || 0;
+const priorRiskScore = Number(result.overallRisk) || 0;
+const focusedReceiptMode = type === "image" || type === "pdf";
+const normalizedFocusedField = (value) => String(value || "")
+  .replace(/:value$/i, "")
+  .replace(/^generic:/i, "")
+  .toLocaleLowerCase("tr-TR")
+  .replace(/[ıİ]/g, "i");
+const isFocusedReceiptField = (row) => {
+  const field = normalizedFocusedField(row?.field);
+  const labels = [row?.labelText, row?.targetLabelText, row?.label, row?.field]
+    .filter(Boolean).join(" ");
+  return field === "amount" || /(?:tutar|amount)/i.test(labels) ||
+    field === "recipientname" || /alici.{0,12}(?:adi|unvani)|beneficiary.{0,8}name/i.test(labels) ||
+    field === "recipientiban" || recipientIbanLabel(labels) || /(?:alici|alacakli|beneficiary|payee|receiver).{0,12}iban/i.test(labels);
+};
+const focusedFieldAnomalies = [];
+const strongAmountForensics = amountForensics?.available === true &&
+  amountForensics?.severity === "strong" && Number(amountForensics?.score || 0) >= 80 &&
+  (amountForensics?.referenceGuided === true || amountReferenceGuided === true);
+if (strongAmountForensics) focusedFieldAnomalies.push({ field: "amount", source: "amount-forensics" });
 
-const finalSuspicious =
-finalScore >= 46;
+for (const row of (Array.isArray(referenceForensics?.characterFindings) ? referenceForensics.characterFindings : [])) {
+  if (String(row?.severity || "").toLowerCase() === "strong" && row?.scope === "value" && isFocusedReceiptField(row)) {
+    focusedFieldAnomalies.push({ field: row.field, source: "reference-character-forensics" });
+  }
+}
+const templateFieldRows = Array.isArray(referenceTemplateAnalysis?.fields)
+  ? referenceTemplateAnalysis.fields
+  : [];
+// The existing template comparator scores 0..100, where scores below its
+// existing 35-point weak-placement boundary are clear position/shape outliers.
+// Require two separate labels so a single OCR box miss cannot trigger a warning.
+const strongLayoutOutliers = templateFieldRows.filter(row =>
+  row?.status === "matched" && Number(row?.geometryScore) < 35
+);
+const focusedLayoutAnomaly = strongLayoutOutliers.length >= 2;
+const hasFocusedAnomaly = focusedFieldAnomalies.length > 0 || focusedLayoutAnomaly;
+const focusedReviewAvailable = paddleImageOCR?.success === true && Boolean(reference) &&
+  Array.isArray(referenceTemplateAnalysis?.fields);
+const focusedWarning = focusedReviewAvailable && hasFocusedAnomaly;
+
+result.focusedReceiptReview = {
+  available: focusedReviewAvailable,
+  checkedFields: ["recipientIban", "amount", "recipientName"],
+  layoutCompared: Boolean(referenceTemplateAnalysis),
+  status: !focusedReviewAvailable ? "incomplete" : focusedWarning ? "warning" : "clear",
+  fieldFindings: focusedFieldAnomalies,
+  layoutFindingCount: strongLayoutOutliers.length,
+};
+
+// Receipt decisions come only from the requested fields and the trusted
+// template's overall layout. Whole-document/other-field scores are diagnostic.
+const finalScore = focusedReceiptMode
+  ? (focusedWarning ? 46 : Math.min(45, priorRiskScore))
+  : priorRiskScore;
+const finalSuspicious = focusedReceiptMode
+  ? focusedWarning
+  : finalScore >= 46;
+result.overallRisk = finalScore;
+result.riskLabel = getRiskLabel(finalScore);
+if (focusedReceiptMode) {
+  result.categories = {
+    visualRisk: 0,
+    textRisk: 0,
+    layoutRisk: focusedWarning && focusedLayoutAnomaly ? 70 : 0,
+    financialDataRisk: focusedWarning && focusedFieldAnomalies.length ? 70 : 0,
+    editingRisk: focusedWarning ? 60 : 0,
+  };
+}
 
 // =====================================================
 // V67: TELEGRAM / ANA EKRAN İÇİN KANONİK BULGU ALANI
 // =====================================================
 // UI tarafı farklı alanları tüketse bile somut referans farkları tek bir
 // standart alanda hazır bulunsun. Ham engine skorları burada gösterilmez.
-const primaryForensicFindings = Array.isArray(result?.referenceForensicReport?.findings)
+const legacyPrimaryForensicFindings = Array.isArray(result?.referenceForensicReport?.findings)
   ? result.referenceForensicReport.findings.slice(0, 8).map((x) => ({
       title: String(x?.title || '').trim(),
       detail: String(x?.detail || '').trim(),
@@ -20899,8 +20973,50 @@ const primaryForensicFindings = Array.isArray(result?.referenceForensicReport?.f
     })).filter((x) => x.title && x.detail)
   : [];
 
-const canonicalReferenceText = result?.referenceForensicReport?.userText ||
-  "🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.";
+const focusedPrimaryForensicFindings = (focusedReviewAvailable ? [
+  ...focusedFieldAnomalies.map((row) => {
+    const field = normalizedFocusedField(row.field);
+    const title = field.includes("iban") ? "Alıcı IBAN"
+      : field.includes("name") || field.includes("alici") ? "Alıcı adı"
+      : "İşlem tutarı";
+    return {
+      title,
+      detail: "Bu alanın lokal görüntü/karakter ölçümleri referansla uyumsuz anomali gösterdi.",
+      confidence: 90,
+    };
+  }),
+  ...(focusedLayoutAnomaly ? [{
+    title: "Dekont yerleşimi",
+    detail: "Birden fazla alanın konumu referans şablondan belirgin şekilde farklı.",
+    confidence: 90,
+  }] : []),
+].filter((row, index, rows) => rows.findIndex(x => x.title === row.title) === index) : []);
+const primaryForensicFindings = focusedReceiptMode
+  ? focusedPrimaryForensicFindings
+  : legacyPrimaryForensicFindings;
+
+const canonicalReferenceText = focusedReceiptMode
+  ? (!focusedReviewAvailable
+      ? "🔎 Kontrol tamamlanamadı. Referans veya OCR sonucu mevcut değil."
+      : (primaryForensicFindings.length
+          ? `🔎 KONTROL SONUCU\n\n🔴 UYARI\n${primaryForensicFindings.map(x => `• ${x.title}: ${x.detail}`).join("\n")}`
+          : "🔎 KONTROL SONUCU\n\n🟢 Alıcı IBAN, işlem tutarı, alıcı adı ve dekont yerleşiminde belirgin anormallik bulunmadı."))
+  : (result?.referenceForensicReport?.userText ||
+      "🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.");
+
+if (focusedReceiptMode) {
+  result.referenceForensicReport = {
+    available: focusedReviewAvailable,
+    referenceCount: Number(result?.referenceForensicReport?.referenceCount || 0),
+    differenceCount: primaryForensicFindings.length,
+    strongDifferenceCount: primaryForensicFindings.length,
+    findings: primaryForensicFindings,
+    status: !focusedReviewAvailable ? "incomplete"
+      : primaryForensicFindings.length ? "differences-found" : "no-material-difference-found",
+    userText: canonicalReferenceText,
+  };
+  result.summary = canonicalReferenceText;
+}
 
 // Ana ekranın kullanabileceği kısa, deterministik özet. Önce somut referans
 // farklarını verir; AI açıklaması varsa sonradan ayrıca kullanılabilir.
