@@ -68,6 +68,9 @@ const referenceAmountAnchorCache = new Map();
 // PaddleOCR pahalı bir uzak API çağrısıdır. Aynı dosya analiz hattında
 // birden fazla kez istendiğinde aynı OCR sonucunu yeniden üretme.
 const paddleOCRCache = new Map();
+// JPEG OCR preprocessing cache: keeps the normalized 2400px OCR copy stable
+// across repeated calls in the same analysis. Forensics never uses this copy.
+const paddleJPEGPreprocessCache = new Map();
 
 // =====================================================
 // MATHEMATICAL FORENSICS BASELINE
@@ -1860,7 +1863,129 @@ async function runAzureReferenceGeometryComparison(targetAzureLayout, bank, sele
   }
 }
 
-async function runPaddleOCR(
+// =====================================================
+// JPEG-SPECIFIC PADDLEOCR PIPELINE
+// =====================================================
+// JPEGs often arrive from Telegram/browser uploads as extensionless /tmp files.
+// PaddleOCR's SDK uses the filename/format when submitting the file, so an
+// extensionless JPEG can be rejected even though its bytes are valid. We create
+// a real .jpg OCR-only copy, orient it, and normalize its long edge to 2400px.
+// The original raster is never replaced and is still used by forensic layers.
+async function runPaddleOCRForJPEG(filePath) {
+  if (!filePath) {
+    return { text:'', confidence:0, success:false, regions:[], error:'JPEG OCR filePath missing.' };
+  }
+
+  let sourceHash = null;
+  let sourceMeta = null;
+  let sourceBuffer = null;
+  try {
+    sourceBuffer = await fs.readFile(filePath);
+    sourceHash = createHash('sha256').update(sourceBuffer).digest('hex');
+    sourceMeta = await sharp(sourceBuffer).metadata();
+  } catch (error) {
+    console.warn('PADDLEOCR JPEG PREP HATASI:', error?.message || error);
+    return { text:'', confidence:0, success:false, regions:[], error:error?.message || String(error) };
+  }
+
+  if (String(sourceMeta?.format || '').toLowerCase() !== 'jpeg') {
+    return runPaddleOCRRaw(filePath);
+  }
+
+  const cacheKey = `jpeg-ocr-v1:${sourceHash}`;
+  let prep = paddleJPEGPreprocessCache.get(cacheKey);
+  try {
+    if (!prep) {
+      const rawWidth = Number(sourceMeta?.width || 0);
+      const rawHeight = Number(sourceMeta?.height || 0);
+      const orientation = Number(sourceMeta?.orientation || 1);
+      const orientedWidth = [5,6,7,8].includes(orientation) ? rawHeight : rawWidth;
+      const orientedHeight = [5,6,7,8].includes(orientation) ? rawWidth : rawHeight;
+      if (!orientedWidth || !orientedHeight) throw new Error('JPEG_METADATA_DIMENSIONS_UNAVAILABLE');
+
+      const outputPath = `/tmp/verifydoc-paddle-jpeg-${sourceHash.slice(0,24)}.jpg`;
+      const out = await sharp(sourceBuffer)
+        .rotate()
+        .resize({ width:2400, height:2400, fit:'inside', withoutEnlargement:false })
+        .jpeg({ quality:92, chromaSubsampling:'4:4:4', progressive:false })
+        .toFile(outputPath);
+
+      prep = {
+        outputPath,
+        sourceWidth: orientedWidth,
+        sourceHeight: orientedHeight,
+        outputWidth: Number(out.width || 0),
+        outputHeight: Number(out.height || 0),
+      };
+      paddleJPEGPreprocessCache.set(cacheKey, prep);
+
+      console.log('PADDLEOCR JPEG NORMALIZED:', JSON.stringify({
+        sourceWidth: orientedWidth,
+        sourceHeight: orientedHeight,
+        outputWidth: prep.outputWidth,
+        outputHeight: prep.outputHeight,
+        longEdge: Math.max(prep.outputWidth, prep.outputHeight),
+        quality:92,
+        chromaSubsampling:'4:4:4'
+      }));
+    } else {
+      console.log('PADDLEOCR JPEG NORMALIZED CACHE HIT:', prep.outputPath);
+    }
+
+    const ocr = await runPaddleOCRRaw(prep.outputPath);
+    if (!ocr?.success) return ocr;
+
+    // PaddleOCR boxes are in the normalized OCR raster. Map them back to the
+    // original oriented JPEG coordinate system so every downstream semantic
+    // ROI continues to refer to the original forensic image.
+    const sx = prep.sourceWidth / Math.max(1, prep.outputWidth);
+    const sy = prep.sourceHeight / Math.max(1, prep.outputHeight);
+    const regions = Array.isArray(ocr.regions) ? ocr.regions.map((item) => {
+      const r = item?.region;
+      if (!r) return item;
+      return {
+        ...item,
+        region: {
+          ...r,
+          x1: Number(r.x1) * sx,
+          y1: Number(r.y1) * sy,
+          x2: Number(r.x2) * sx,
+          y2: Number(r.y2) * sy,
+          sourceWidth: prep.sourceWidth,
+          sourceHeight: prep.sourceHeight,
+          ocrWidth: prep.outputWidth,
+          ocrHeight: prep.outputHeight,
+          coordinateSpace: 'original-oriented-jpeg'
+        }
+      };
+    }) : [];
+
+    return {
+      ...ocr,
+      regions,
+      preprocessing: {
+        engine:'jpeg-ocr-preprocess-v1',
+        sourceFormat:'jpeg',
+        sourceWidth:prep.sourceWidth,
+        sourceHeight:prep.sourceHeight,
+        ocrWidth:prep.outputWidth,
+        ocrHeight:prep.outputHeight,
+        longEdge:Math.max(prep.outputWidth, prep.outputHeight),
+        quality:92,
+        chromaSubsampling:'4:4:4',
+        mappedToOriginal:true
+      }
+    };
+  } catch (error) {
+    console.warn('PADDLEOCR JPEG HATASI:', error?.message || error);
+    return {
+      text:'', confidence:0, success:false, regions:[],
+      error:error?.message || String(error)
+    };
+  }
+}
+
+async function runPaddleOCRRaw(
 filePath
 ) {
 
@@ -2300,6 +2425,21 @@ try {
 }
 
 }
+// Public OCR entry point. JPEG is routed through the dedicated normalized
+// pipeline; PDF/PNG/other inputs keep the existing raw Paddle path.
+async function runPaddleOCR(filePath) {
+  if (!filePath) return runPaddleOCRRaw(filePath);
+  try {
+    const meta = await sharp(filePath).metadata();
+    const format = String(meta?.format || '').toLowerCase();
+    if (format === 'jpeg') return runPaddleOCRForJPEG(filePath);
+  } catch (error) {
+    // If Sharp cannot inspect the input, preserve the existing raw OCR fallback.
+    console.warn('PADDLEOCR FORMAT TESPİTİ FALLBACK:', error?.message || error);
+  }
+  return runPaddleOCRRaw(filePath);
+}
+
 let ocrWorker = null;
 async function getOCRWorker() {
 if (!ocrWorker) {
@@ -16055,13 +16195,13 @@ if ((type === "image" || type === "pdf") && bank) {
 }
 
 // =====================================================
-// DIFFERENTIAL IMAGE FORENSICS V1
+// DIFFERENTIAL IMAGE FORENSICS V3
 // NORMAL = trusted reference population; TAMPER = known-negative population.
 // This layer measures local raster/texture/chroma direction, not document text.
 // It is deliberately separate from global negativeSimilarity and legacy scores.
 // =====================================================
 async function runDifferentialImageForensics({ targetPath, referencePath, negativeSamples = [], type = 'image', semanticRois = null }) {
-  const unavailable = (reason) => ({ available:false, engine:'differential-image-forensics-v1', reason });
+  const unavailable = (reason) => ({ available:false, engine:'differential-image-forensics-v3-local-semantic-noise', reason });
   if (!targetPath || !referencePath || !Array.isArray(negativeSamples) || !negativeSamples.length) {
     return unavailable('missing-target-reference-or-negative-population');
   }
@@ -16074,7 +16214,8 @@ async function runDifferentialImageForensics({ targetPath, referencePath, negati
       }
       return await fs.readFile(input);
     };
-    const W=256, H=256;
+
+    const W=256, H=256, grid=16, cell=W/grid;
     const descriptor = async (buf, box=null) => {
       const src = sharp(buf).removeAlpha();
       const meta = await src.metadata();
@@ -16088,18 +16229,21 @@ async function runDifferentialImageForensics({ targetPath, referencePath, negati
         crop = crop.extract({left:x1,top:y1,width:x2-x1,height:y2-y1});
       }
       const {data,info}=await crop.resize(W,H,{fit:'fill'}).raw().toBuffer({resolveWithObject:true});
-      const grid=16, cell=W/grid, out=[];
+      const out=[];
       for(let gy=0;gy<grid;gy++) for(let gx=0;gx<grid;gx++) {
         const vals=[], grads=[], chrom=[];
         for(let y=gy*cell;y<(gy+1)*cell;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
           const i=(y*info.width+x)*info.channels;
-          const r=data[i]||0,g=data[i+1]||r,b=data[i+2]||r;
+          const r=data[i]||0,g=data[i+1]??r,b=data[i+2]??r;
           vals.push(.299*r+.587*g+.114*b); chrom.push(Math.abs(r-g)+Math.abs(g-b));
-          if(x<((gx+1)*cell-1)){const j=(y*info.width+x+1)*info.channels;grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]||0)-(data[i+1]||0)));}
+          if(x<((gx+1)*cell-1)){
+            const j=(y*info.width+x+1)*info.channels;
+            grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]??0)-(data[i+1]??0)));
+          }
         }
         for(let y=gy*cell;y<(gy+1)*cell-1;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
           const i=(y*info.width+x)*info.channels, j=((y+1)*info.width+x)*info.channels;
-          grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]||0)-(data[i+1]||0)));
+          grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]??0)-(data[i+1]??0)));
         }
         const mean=vals.reduce((a,b)=>a+b,0)/Math.max(1,vals.length);
         const variance=vals.reduce((a,b)=>a+(b-mean)**2,0)/Math.max(1,vals.length);
@@ -16109,44 +16253,203 @@ async function runDifferentialImageForensics({ targetPath, referencePath, negati
       }
       return out;
     };
+
+    // Noise residual is deliberately measured on a BACKGROUND RING around the
+    // semantic value box, not on the glyphs themselves. This reduces the
+    // natural text-content difference between genuine and fake samples.
+    const noiseRingDescriptor = async (buf, box=null) => {
+      const src = sharp(buf).removeAlpha();
+      const meta = await src.metadata();
+      const sw=Number(meta.width||0), sh=Number(meta.height||0);
+      if (!sw || !sh) return null;
+
+      const bx1=Math.max(0,Math.min(sw-1,Number(box?.x1||0)*sw));
+      const by1=Math.max(0,Math.min(sh-1,Number(box?.y1||0)*sh));
+      const bx2=Math.max(bx1+1,Math.min(sw,Number(box?.x2||1)*sw));
+      const by2=Math.max(by1+1,Math.min(sh,Number(box?.y2||1)*sh));
+      const bw=bx2-bx1, bh=by2-by1;
+      const padX=Math.max(10,Math.min(sw*.22,bw*1.35));
+      const padY=Math.max(10,Math.min(sh*.22,bh*2.0));
+      const left=Math.max(0,Math.floor(bx1-padX));
+      const top=Math.max(0,Math.floor(by1-padY));
+      const right=Math.min(sw,Math.ceil(bx2+padX));
+      const bottom=Math.min(sh,Math.ceil(by2+padY));
+      const cw=Math.max(2,right-left), ch=Math.max(2,bottom-top);
+
+      const basePipeline=sharp(buf).removeAlpha().extract({left,top,width:cw,height:ch}).resize(W,H,{fit:'fill'}).grayscale();
+      const smoothPipeline=basePipeline.clone().blur(1);
+      const [base,smooth]=await Promise.all([
+        basePipeline.raw().toBuffer({resolveWithObject:true}),
+        smoothPipeline.raw().toBuffer({resolveWithObject:true})
+      ]);
+
+      const maskX1=((bx1-left)/cw)*W;
+      const maskY1=((by1-top)/ch)*H;
+      const maskX2=((bx2-left)/cw)*W;
+      const maskY2=((by2-top)/ch)*H;
+      const dilateX=Math.max(2,(maskX2-maskX1)*0.10);
+      const dilateY=Math.max(2,(maskY2-maskY1)*0.22);
+      const mx1=Math.max(0,maskX1-dilateX), my1=Math.max(0,maskY1-dilateY);
+      const mx2=Math.min(W,maskX2+dilateX), my2=Math.min(H,maskY2+dilateY);
+
+      const out=[];
+      for(let gy=0;gy<grid;gy++) for(let gx=0;gx<grid;gx++) {
+        const residuals=[];
+        for(let y=gy*cell;y<(gy+1)*cell;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
+          if(x>=mx1 && x<mx2 && y>=my1 && y<my2) continue;
+          const i=y*base.info.width+x;
+          const a=Number(base.data[i]||0), b=Number(smooth.data[i]||0);
+          residuals.push(Math.abs(a-b));
+        }
+        // If a very small ring cell is mostly masked, use a neutral zero rather
+        // than leaking glyph energy into the background estimate.
+        const meanResidual=residuals.length ? residuals.reduce((a,b)=>a+b,0)/residuals.length : 0;
+        const sorted=residuals.slice().sort((a,b)=>a-b);
+        const med=sorted.length ? sorted[Math.floor(sorted.length/2)] : 0;
+        const mad=sorted.length ? sorted.reduce((s,v)=>s+Math.abs(v-med),0)/sorted.length : 0;
+        out.push({noiseResidual:meanResidual,noiseMad:mad,sampleCount:residuals.length});
+      }
+      return out;
+    };
+
     const [tb,rb]=await Promise.all([load(targetPath),load(Array.isArray(referencePath)?referencePath[0]:referencePath)]);
     if(!tb||!rb) return unavailable('image-load-failed');
     const refMeta=await sharp(rb).metadata();
+    const targetMeta=await sharp(tb).metadata();
     const refW=Number(refMeta.width||0), refH=Number(refMeta.height||0);
-    if(!refW||!refH) return unavailable('reference-metadata-unavailable');
+    const targetW=Number(targetMeta.width||0), targetH=Number(targetMeta.height||0);
+    if(!refW||!refH||!targetW||!targetH) return unavailable('image-metadata-unavailable');
 
     const fields=['amount','recipientName','recipientIban'];
     const fieldsOut={};
+    const heatmapOut={};
     let anyStrong=false;
     let anyLimited=false;
+
+    const medianOf=(arr)=>{const a=arr.filter(Number.isFinite).slice().sort((x,y)=>x-y);return a.length?a[Math.floor(a.length/2)]:0;};
+    const meanOf=(arr)=>arr.length?arr.reduce((s,v)=>s+v,0)/arr.length:0;
+    const robustMedian=(arr)=>{
+      const a=arr.filter(Number.isFinite).slice().sort((x,y)=>x-y);
+      return a.length?a[Math.floor(a.length/2)]:0;
+    };
+    const robustMad=(arr)=>{
+      const clean=arr.filter(Number.isFinite);
+      if(!clean.length)return 0;
+      const med=robustMedian(clean);
+      return robustMedian(clean.map(v=>Math.abs(v-med)));
+    };
+    const robustZ=(value, center, mad, floor=0.25)=>{
+      const scale=Math.max(floor,1.4826*Math.abs(Number(mad)||0));
+      return Math.abs(Number(value)-Number(center))/scale;
+    };
+    const clamp01=(v)=>Math.max(0,Math.min(1,Number(v)||0));
+    const heatColor=(value)=>{
+      const t=clamp01(value);
+      const stops=[[0,245,245,245],[0.25,220,235,255],[0.5,255,235,150],[0.75,255,165,80],[1,205,45,45]];
+      for(let i=1;i<stops.length;i++){
+        if(t<=stops[i][0]){
+          const a=stops[i-1],b=stops[i],u=(t-a[0])/Math.max(1e-9,b[0]-a[0]);
+          return `rgb(${Math.round(a[1]+(b[1]-a[1])*u)},${Math.round(a[2]+(b[2]-a[2])*u)},${Math.round(a[3]+(b[3]-a[3])*u)})`;
+        }
+      }
+      return 'rgb(205,45,45)';
+    };
+    const heatmapSvg=(title,values)=>{
+      const safe=Array.from({length:grid*grid},(_,i)=>clamp01(values?.[i]));
+      const rects=safe.map((v,i)=>{
+        const gx=i%grid,gy=Math.floor(i/grid);
+        return `<rect x=\"${gx*16}\" y=\"${gy*16}\" width=\"16\" height=\"16\" fill=\"${heatColor(v)}\"/>`;
+      }).join('');
+      return `<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"280\" viewBox=\"0 0 256 280\"><rect width=\"256\" height=\"280\" fill=\"white\"/><text x=\"8\" y=\"16\" font-family=\"Arial,sans-serif\" font-size=\"12\" fill=\"#111\">${String(title).replace(/[&<>\"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[m]))}</text><g transform=\"translate(0,24)\">${rects}<rect x=\"0\" y=\"0\" width=\"256\" height=\"256\" fill=\"none\" stroke=\"#666\"/></g><text x=\"8\" y=\"272\" font-family=\"Arial,sans-serif\" font-size=\"10\" fill=\"#555\">0 = normal/low deviation · 1 = high localized deviation/consensus</text></svg>`;
+    };
+    const buildHeatmaps=async(field,targetNoise,referenceNoise,td,rd,spatialTileCounts,sampleCount)=>{
+      const refResiduals=referenceNoise.map(v=>Number(v?.noiseResidual)).filter(Number.isFinite);
+      const refMads=referenceNoise.map(v=>Number(v?.noiseMad)).filter(Number.isFinite);
+      const refResidualCenter=robustMedian(refResiduals);
+      const refResidualMad=Math.max(0.05,robustMad(refResiduals));
+      const refMadCenter=robustMedian(refMads);
+      const refMadMad=Math.max(0.05,robustMad(refMads));
+      const noiseValues=targetNoise.map((v,i)=>{
+        const r=referenceNoise[i];
+        const rz=robustZ(Number(v?.noiseResidual),Number(r?.noiseResidual),refResidualMad,0.18);
+        const mz=robustZ(Number(v?.noiseMad),Number(r?.noiseMad),refMadMad,0.10);
+        const absoluteZ=Math.max(rz,mz);
+        const targetBaselineZ=robustZ(Number(v?.noiseResidual),refResidualCenter,refResidualMad,0.18);
+        return clamp01(Math.max(absoluteZ/6,targetBaselineZ/6));
+      });
+      const componentValues=td.map((t,i)=>{
+        const r=rd[i]||{};
+        const edge=Math.abs(Number(t?.edge)-Number(r?.edge))/Math.max(0.75,Math.abs(Number(r?.edge))*0.12);
+        const stroke=Math.abs(Number(t?.lumaStd)-Number(r?.lumaStd))/Math.max(0.75,Math.abs(Number(r?.lumaStd))*0.12);
+        const lum=Math.abs(Number(t?.luminance)-Number(r?.luminance))/Math.max(0.75,Math.abs(Number(r?.luminance))*0.12);
+        const chroma=Math.abs(Number(t?.chroma)-Number(r?.chroma))/Math.max(0.75,Math.abs(Number(r?.chroma))*0.12);
+        return clamp01(Math.max(edge,stroke,lum,chroma)/6);
+      });
+      const consensusValues=(spatialTileCounts||new Array(grid*grid).fill(0)).map(v=>sampleCount?clamp01(Number(v)/sampleCount):0);
+      const dir=`/tmp/verifydoc-heatmaps-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+      await fs.mkdir(dir,{recursive:true});
+      const specs=[
+        {kind:'noiseResidual',title:`${field} · Noise residual / MAD`,values:noiseValues},
+        {kind:'referenceDifference',title:`${field} · Target vs genuine reference`,values:componentValues},
+        {kind:'knownFakeConsensus',title:`${field} · Known-fake spatial consensus`,values:consensusValues}
+      ];
+      const artifacts=[];
+      for(const spec of specs){
+        const svg=heatmapSvg(spec.title,spec.values);
+        const fileName=`${field}-${spec.kind}.svg`;
+        const outputPath=path.join(dir,fileName);
+        await fs.writeFile(outputPath,svg,'utf8');
+        artifacts.push({kind:spec.kind,format:'svg',path:outputPath,width:256,height:280,values:spec.values});
+      }
+      return {
+        available:true,
+        field,
+        grid:'16x16',
+        backgroundRing:true,
+        textMaskExcluded:true,
+        mad:{referenceResidualMedian:refResidualCenter,referenceResidualMAD:refResidualMad,referenceNoiseMADMedian:refMadCenter,referenceNoiseMADMAD:refMadMad},
+        artifacts
+      };
+    };
+
     for(const field of fields){
       const pair=semanticRois?.[field];
       if(!pair?.target || !pair?.reference){
         fieldsOut[field]={available:false,reason:'semantic-roi-unavailable',sampleCount:negativeSamples.length};
         continue;
       }
-      const normBox=(box)=>{
+      const normBox=(box,width,height)=>{
         const x1=Number(box?.x1),y1=Number(box?.y1),x2=Number(box?.x2),y2=Number(box?.y2);
         if(![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1)return null;
-        return {x1:x1/refW,y1:y1/refH,x2:x2/refW,y2:y2/refH};
+        return {x1:x1/Math.max(1,width),y1:y1/Math.max(1,height),x2:x2/Math.max(1,width),y2:y2/Math.max(1,height)};
       };
-      const targetMeta=await sharp(tb).metadata();
-      const targetW=Number(targetMeta.width||0),targetH=Number(targetMeta.height||0);
-      const targetNorm={x1:Number(pair.target.x1)/Math.max(1,targetW),y1:Number(pair.target.y1)/Math.max(1,targetH),x2:Number(pair.target.x2)/Math.max(1,targetW),y2:Number(pair.target.y2)/Math.max(1,targetH)};
-      const refNorm=normBox(pair.reference);
-      if(!refNorm||![targetNorm.x1,targetNorm.y1,targetNorm.x2,targetNorm.y2].every(Number.isFinite)){
-        fieldsOut[field]={available:false,reason:'invalid-semantic-roi',sampleCount:negativeSamples.length}; continue;
+      const targetNorm=normBox(pair.target,targetW,targetH);
+      const refNorm=normBox(pair.reference,refW,refH);
+      if(!refNorm||!targetNorm){
+        fieldsOut[field]={available:false,reason:'invalid-semantic-roi',sampleCount:negativeSamples.length};
+        continue;
       }
+
       const td=await descriptor(tb,targetNorm), rd=await descriptor(rb,refNorm);
+      const targetNoise=await noiseRingDescriptor(tb,targetNorm);
+      const referenceNoise=await noiseRingDescriptor(rb,refNorm);
+      if(!targetNoise || !referenceNoise){
+        fieldsOut[field]={available:false,reason:'noise-descriptor-unavailable',sampleCount:negativeSamples.length};
+        continue;
+      }
+
       const agreements=[];
-      const patternComponents={edge:0,stroke:0,luminance:0,raster:0};
-      const refVsTarget=[];
+      const patternComponents={edge:0,stroke:0,luminance:0,raster:0,noise:0};
+      const spatialTileCounts=new Array(grid*grid).fill(0);
       const componentKeys=[['edge','edge'],['stroke','lumaStd'],['luminance','luminance'],['raster','chroma']];
+
       for(const sample of negativeSamples.slice(0,12)){
         let fb; try{fb=await load(sample.path);}catch(e){fb=null;}
         if(!fb)continue;
-        let fd; try{fd=await descriptor(fb,refNorm);}catch(e){fd=null;}
-        if(!fd)continue;
+        let fd, fakeNoise;
+        try{fd=await descriptor(fb,refNorm); fakeNoise=await noiseRingDescriptor(fb,refNorm);}catch(e){fd=null;fakeNoise=null;}
+        if(!fd || !fakeNoise)continue;
+
         let matchedComponents=[];
         for(const [label,key] of componentKeys){
           const targetD=[],fakeD=[],referenceD=[];
@@ -16156,41 +16459,130 @@ async function runDifferentialImageForensics({ targetPath, referencePath, negati
             const scale=Math.max(0.75,Math.abs(r)*0.12,Math.abs(f)*0.12,Math.abs(t)*0.06);
             targetD.push(Math.abs(t-r)/scale); fakeD.push(Math.abs(t-f)/scale); referenceD.push(Math.abs(f-r)/scale);
           }
-          const tMed=targetD.length?targetD.sort((a,b)=>a-b)[Math.floor(targetD.length/2)]:0;
-          const fMed=fakeD.length?fakeD.sort((a,b)=>a-b)[Math.floor(fakeD.length/2)]:0;
-          const rMed=referenceD.length?referenceD.sort((a,b)=>a-b)[Math.floor(referenceD.length/2)]:0;
-          // A fake-pattern component must be measurably closer to the target
-          // in the known-fake sample than to the trusted reference, while the
-          // target must itself differ from the trusted reference.
+          const tMed=medianOf(targetD), fMed=medianOf(fakeD), rMed=medianOf(referenceD);
           const matched=tMed>=1.15 && fMed+0.12<tMed && rMed>=0.45;
           if(matched){matchedComponents.push(label);patternComponents[label]++;}
         }
-        agreements.push({sample:sample.fileName,agreementCount:matchedComponents.length,componentCount:4,matchedComponents,matched:matchedComponents.length>=1});
+
+        // Noise is evaluated tile-by-tile. A sample only corroborates the
+        // pattern when the target is farther from genuine than from this fake
+        // in the same background-ring cells.
+        const matchedNoiseTiles=[];
+        for(let i=0;i<targetNoise.length;i++){
+          const t=Number(targetNoise[i]?.noiseResidual), r=Number(referenceNoise[i]?.noiseResidual), f=Number(fakeNoise[i]?.noiseResidual);
+          const tm=Number(targetNoise[i]?.noiseMad), rm=Number(referenceNoise[i]?.noiseMad), fm=Number(fakeNoise[i]?.noiseMad);
+          if(![t,r,f,tm,rm,fm].every(Number.isFinite)) continue;
+          const residualScale=Math.max(0.18,Math.abs(r)*0.25,Math.abs(f)*0.25,Math.abs(t)*0.12);
+          const madScale=Math.max(0.10,Math.abs(rm)*0.35,Math.abs(fm)*0.35,Math.abs(tm)*0.15);
+          const residualTarget=Math.abs(t-r)/residualScale;
+          const residualFake=Math.abs(t-f)/residualScale;
+          const madTarget=Math.abs(tm-rm)/madScale;
+          const madFake=Math.abs(tm-fm)/madScale;
+          const matched=(residualTarget>=1.20 && residualFake+0.15<residualTarget) || (madTarget>=1.20 && madFake+0.15<madTarget);
+          if(matched) matchedNoiseTiles.push(i);
+        }
+        if(matchedNoiseTiles.length>=2){
+          patternComponents.noise++;
+          for(const idx of matchedNoiseTiles) spatialTileCounts[idx]++;
+        }
+        agreements.push({
+          sample:sample.fileName,
+          agreementCount:matchedComponents.length,
+          componentCount:5,
+          matchedComponents,
+          matchedNoiseTileCount:matchedNoiseTiles.length,
+          matched:matchedComponents.length>=1,
+          noiseMatched:matchedNoiseTiles.length>=2,
+          noiseTileIndices:matchedNoiseTiles.slice(0,40)
+        });
       }
+
       const sampleCount=agreements.length;
       const agreementCount=agreements.filter(x=>x.matched).length;
       const ratio=sampleCount?agreementCount/sampleCount:0;
-      // Adaptive population policy: one sample is advisory only; two require
-      // agreement in both; 3+ require at least 2 repeated samples / 50%.
-      const strong=sampleCount>=3 ? agreementCount>=2 && ratio>=0.5 : sampleCount===2 ? agreementCount===2 : false;
-      const strength=strong?'strong':agreementCount?'limited':'none';
-      if(strength==='strong')anyStrong=true; else if(strength==='limited')anyLimited=true;
-      fieldsOut[field]={available:true,targetVsGenuine:{components:componentKeys.map(([label,key])=>({component:label,key,target:td.reduce((s,v)=>s+Number(v[key]||0),0)/td.length,reference:rd.reduce((s,v)=>s+Number(v[key]||0),0)/rd.length}))},sampleAgreement:agreements,agreementCount,agreementRatio:Number(ratio.toFixed(3)),patternComponents,strength,finalPromotionAllowed:strong};
+      const noiseAgreementCount=agreements.filter(x=>x.noiseMatched).length;
+      const noiseRatio=sampleCount?noiseAgreementCount/sampleCount:0;
+      const spatialThreshold=sampleCount>=3 ? Math.ceil(sampleCount*0.5) : sampleCount===2 ? 2 : 2;
+      const spatialConsensusTiles=spatialTileCounts.filter(x=>x>=spatialThreshold).length;
+      const maxSpatialAgreement=spatialTileCounts.length ? Math.max(...spatialTileCounts) : 0;
+      const spatialConsensusRatio=sampleCount ? maxSpatialAgreement/sampleCount : 0;
+
+      // Existing component agreement is intentionally NOT sufficient anymore.
+      // A promoted localized pattern needs repeated noise corroboration in the
+      // same local cells. This is the key guard against 4/4 edge/stroke/luma
+      // matches that are merely consequences of different text glyphs.
+      const componentStrong = sampleCount>=3 ? agreementCount>=2 && ratio>=0.5 : sampleCount===2 ? agreementCount===2 : false;
+      const noiseStrong = sampleCount>=3
+        ? noiseAgreementCount>=2 && noiseRatio>=0.5 && spatialConsensusTiles>=2 && spatialConsensusRatio>=0.5
+        : sampleCount===2
+          ? noiseAgreementCount===2 && spatialConsensusTiles>=2 && spatialConsensusRatio>=1
+          : false;
+      const strong=componentStrong && noiseStrong;
+      const strength=strong?'strong':(agreementCount||noiseAgreementCount)?'limited':'none';
+      if(strong)anyStrong=true; else if(agreementCount||noiseAgreementCount)anyLimited=true;
+
+      try {
+        heatmapOut[field]=await buildHeatmaps(field,targetNoise,referenceNoise,td,rd,spatialTileCounts,sampleCount);
+      } catch (heatmapError) {
+        heatmapOut[field]={available:false,reason:heatmapError?.message||String(heatmapError)};
+        console.warn('DIFFERENTIAL HEATMAP HATASI:',field,heatmapError?.message||heatmapError);
+      }
+
+      fieldsOut[field]={
+        available:true,
+        targetVsGenuine:{
+          components:componentKeys.map(([label,key])=>({component:label,key,target:meanOf(td.map(v=>Number(v[key]))),reference:meanOf(rd.map(v=>Number(v[key])))})),
+          noise:{
+            targetMean:meanOf(targetNoise.map(v=>Number(v.noiseResidual))),
+            referenceMean:meanOf(referenceNoise.map(v=>Number(v.noiseResidual))),
+            targetMAD:meanOf(targetNoise.map(v=>Number(v.noiseMad))),
+            referenceMAD:meanOf(referenceNoise.map(v=>Number(v.noiseMad)))
+          }
+        },
+        sampleAgreement:agreements,
+        agreementCount,
+        agreementRatio:Number(ratio.toFixed(3)),
+        patternComponents,
+        heatmap:heatmapOut[field] || {available:false,reason:'not-generated'},
+        noisePattern:{
+          agreementCount:noiseAgreementCount,
+          agreementRatio:Number(noiseRatio.toFixed(3)),
+          spatialConsensusTiles,
+          maxSpatialAgreement,
+          spatialConsensusRatio:Number(spatialConsensusRatio.toFixed(3)),
+          matchedTileCounts:spatialTileCounts.map((count,index)=>({tile:index,count})).filter(x=>x.count>0).sort((a,b)=>b.count-a.count).slice(0,20)
+        },
+        strength,
+        finalPromotionAllowed:strong,
+        promotionReason:strong
+          ? 'repeated-component-plus-background-noise-pattern-in-same-local-cells'
+          : 'component-agreement-without-sufficient-local-noise-spatial-corroboration'
+      };
     }
-    const primaryStrongFields = ['amount','recipientName'].filter((field) => fieldsOut[field]?.finalPromotionAllowed === true);
-    const advisoryStrongFields = ['recipientIban'].filter((field) => fieldsOut[field]?.finalPromotionAllowed === true);
-    // An IBAN-only raster match is deliberately advisory: different IBAN text
-    // naturally changes glyph/raster statistics even on genuine receipts.
-    // Amount/name can be promoted when the same local physical pattern repeats
-    // across the known-fake population.
-    const promotableStrong = primaryStrongFields.length > 0;
-    const out={available:true,engine:'differential-image-forensics-v2-local-semantic',normalSampleCount:1,tamperSampleCount:negativeSamples.length,fields:fieldsOut,anyStrongLocalizedPattern:promotableStrong,anyLimitedLocalizedPattern:anyLimited,primaryStrongFields,advisoryStrongFields,policy:'adaptive-local-semantic-pattern-v2-field-aware'};
-    console.log('DIFFERENTIAL IMAGE FORENSICS V2 START');
-    console.log('DIFFERENTIAL IMAGE FORENSICS V2:',JSON.stringify(out));
-    console.log('DIFFERENTIAL IMAGE FORENSICS V2 END');
+
+    const primaryStrongFields=['amount','recipientName'].filter(field=>fieldsOut[field]?.finalPromotionAllowed===true);
+    const advisoryStrongFields=['recipientIban'].filter(field=>fieldsOut[field]?.finalPromotionAllowed===true);
+    const promotableStrong=primaryStrongFields.length>0;
+    const out={
+      available:true,
+      engine:'differential-image-forensics-v3-local-semantic-noise',
+      normalSampleCount:1,
+      tamperSampleCount:negativeSamples.length,
+      fields:fieldsOut,
+      heatmaps:heatmapOut,
+      heatmapPolicy:'visualization-only-no-risk-promotion',
+      anyStrongLocalizedPattern:promotableStrong,
+      anyLimitedLocalizedPattern:anyLimited,
+      primaryStrongFields,
+      advisoryStrongFields,
+      policy:'adaptive-local-semantic-pattern-v3-noise-spatial-corroboration'
+    };
+    console.log('DIFFERENTIAL IMAGE FORENSICS V3 START');
+    console.log('DIFFERENTIAL IMAGE FORENSICS V3:',JSON.stringify(out));
+    console.log('DIFFERENTIAL IMAGE FORENSICS V3 END');
     return out;
   } catch(error){
-    console.warn('DIFFERENTIAL IMAGE FORENSICS V2 HATASI:',error?.message||error);
+    console.warn('DIFFERENTIAL IMAGE FORENSICS V3 HATASI:',error?.message||error);
     return unavailable(error?.message||String(error));
   }
 }
@@ -16215,8 +16607,8 @@ if ((type === "image" || type === "pdf") && bank && reference) {
       semanticRois: differentialSemanticRois,
     });
   } catch (error) {
-    console.warn("DIFFERENTIAL IMAGE FORENSICS V1 HATASI:", error?.message || error);
-    differentialImageForensics = { available:false, engine:'differential-image-forensics-v1', reason:error?.message || String(error) };
+    console.warn("DIFFERENTIAL IMAGE FORENSICS V3 HATASI:", error?.message || error);
+    differentialImageForensics = { available:false, engine:'differential-image-forensics-v3-local-semantic-noise', reason:error?.message || String(error) };
   }
 }
 
@@ -18395,6 +18787,8 @@ if (differentialImageForensics?.available === true) {
       agreementCount: Number(row.agreementCount || 0),
       agreementRatio: Number(row.agreementRatio || 0),
       patternComponents: row.patternComponents || {},
+      noisePattern: row.noisePattern || null,
+      promotionReason: row.promotionReason || null,
       strength: row.strength || 'none',
       finalPromotionAllowed: row.finalPromotionAllowed === true,
       advisoryOnly: field === 'recipientIban',
@@ -18405,7 +18799,7 @@ if (differentialImageForensics?.available === true) {
   const strongEvidence = primaryStrongFields.map((field) => fieldEvidence[field]).filter(Boolean);
   result.localPatternEvidence = {
     available: true,
-    policy: diff.policy || 'adaptive-local-semantic-pattern-v2-field-aware',
+    policy: diff.policy || 'adaptive-local-semantic-pattern-v3-noise-spatial-corroboration',
     knownFakeSamples: Number(diff.tamperSampleCount || 0),
     fields: fieldEvidence,
     primaryStrongFields,
