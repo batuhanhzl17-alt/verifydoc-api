@@ -1216,9 +1216,9 @@ async function recordForensicWatchEvent({
     return {
       available: false,
       recorded: false,
-      status: "SUSPICIOUS",
-      eventType: signal.eventType,
-      strongSignal: signal.strongSignal,
+      status: signal.strongSignal ? "SUSPICIOUS" : "CLEAN",
+      eventType: signal.strongSignal ? signal.eventType : "advisory",
+      strongSignal: Boolean(signal.strongSignal),
     };
   }
 
@@ -1247,7 +1247,7 @@ async function recordForensicWatchEvent({
       available: true,
       recorded: false,
       duplicate: true,
-      status: duplicateRows[0]?.status || "SUSPICIOUS",
+      status: duplicateRows[0]?.status || (signal.strongSignal ? "SUSPICIOUS" : "CLEAN"),
       eventType: signal.eventType,
       strongSignal: signal.strongSignal,
       occurrenceCount: 1,
@@ -1334,9 +1334,9 @@ async function recordForensicWatchEvent({
     return {
       available: true,
       recorded: false,
-      status: "SUSPICIOUS",
-      eventType: signal.eventType,
-      strongSignal: signal.strongSignal,
+      status: signal.strongSignal ? "SUSPICIOUS" : "CLEAN",
+      eventType: signal.strongSignal ? signal.eventType : "advisory",
+      strongSignal: Boolean(signal.strongSignal),
       error: error?.message || "watchlist insert failed",
     };
   }
@@ -22119,11 +22119,17 @@ const amountReferenceRender = result?.amountForensics?.referenceRenderForensics 
 // independently point toward the negative population. This specifically
 // prevents the known-good 350 TL Telegram/JPEG case from being promoted by
 // the same 4/4 edge/stroke/luminance/noise pattern seen in manipulated files.
+// V15.13 HARD INVARIANT:
+// Amount render corroboration can ONLY come from the final V15.11
+// fake-affinity decision. No legacy score/reference signal may override it.
+const amountReferenceRenderFakeAffinityStrong =
+  amountReferenceRender?.fakeAffinityStrong === true;
+
 const amountReferenceRenderCorroborated = Boolean(
   amountReferenceRender?.available === true &&
   amountReferenceRender?.status === "anomaly" &&
   Number(amountReferenceRender?.score || 0) >= 60 &&
-  amountReferenceRender?.fakeAffinityStrong === true
+  amountReferenceRenderFakeAffinityStrong
 );
 
 const v4PromotionAllowed =
@@ -22312,14 +22318,44 @@ if (paddleCriticalFailure) {
 // Bu kayıt analiz kullanımını engellemez.
 // Amaç: düşük overallRisk skoruna rağmen gerçekten somut bir forensic
 // fark bulunduğunda olayı veritabanında kaybetmemek.
-const forensicWatchlist = await recordForensicWatchEvent({
-  result,
-  type,
-  bank: bank || null,
-  fileFingerprint,
-  telegramUserId,
-  telegramUsername,
-});
+// V15.13 WATCHLIST HARD INVARIANT:
+// Watchlist status is never allowed to independently contradict the canonical
+// FINAL SUSPICIOUS decision. Independent corroboration is required as well.
+const finalIndependentCorroboration = Boolean(
+  result?.amountForensics?.referenceRenderForensics?.fakeAffinityStrong === true ||
+  result?.negativeSampleForensics?.strongCorroboration === true ||
+  result?.openSourceForensics?.strongCorroboration === true ||
+  result?.evidenceFusion?.amountReferenceRenderCorroborated === true ||
+  result?.mathematicalForensics?.independentNegativeCorroboration === true
+);
+
+const watchlistEligible = Boolean(
+  finalSuspicious === true &&
+  finalIndependentCorroboration === true
+);
+
+const forensicWatchlist = watchlistEligible
+  ? await recordForensicWatchEvent({
+      result,
+      type,
+      bank: bank || null,
+      fileFingerprint,
+      telegramUserId,
+      telegramUsername,
+    })
+  : {
+      available: forensicWatchlistConfigReady(),
+      recorded: false,
+      duplicate: false,
+      status: finalSuspicious ? null : "CLEAN",
+      eventType: finalSuspicious ? null : "advisory",
+      strongSignal: false,
+      immediateFinancialBlacklist: false,
+      occurrenceCount: 0,
+      reason: finalSuspicious
+        ? "final-suspicious-without-independent-corroboration"
+        : "final-suspicious-false"
+    };
 
 // İç karar kaynağını API cevabına taşımıyoruz.
 delete result.__watchlistOriginalAmountConsistency;
