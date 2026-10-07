@@ -13942,14 +13942,27 @@ async function analyzeAmountReferenceRenderForensics({
     // amount rendering AND the negative population independently points in
     // the same direction. This is the key anti-false-positive gate for real
     // Telegram/JPEG documents such as the known-good 350 TL case.
+    // Negative-population proximity is deliberately stricter than the generic
+    // reference-distance gate. A single clean reference can differ strongly
+    // from a real Telegram/JPEG render because of font scale, crop geometry,
+    // digit count and compression. We therefore require the target to be
+    // materially closer to the known-fake population itself before allowing
+    // this engine to produce an anomaly.
     const fakeAffinityStrong = Boolean(
       bestFake &&
-      fakeAffinityMargin >= 0.16 &&
-      bestFake.distance <= 0.95
+      fakeAffinityMargin >= 0.25 &&
+      bestFake.distance <= 0.50
     );
 
     const referenceAnomaly = targetToReference.distance >= 0.85;
-    const strongAnomaly = referenceAnomaly && fakeAffinityStrong;
+    // Either a clear reference failure + strong negative affinity, or a very
+    // strong negative-population match that beats the genuine reference by a
+    // meaningful margin. This avoids promoting genuine 350 TL solely because
+    // its single-reference render differs in scale/aspect from enpara.jpg.
+    const strongAnomaly = fakeAffinityStrong && (
+      referenceAnomaly ||
+      (bestFake && bestFake.distance <= 0.35 && fakeAffinityMargin >= 0.25)
+    );
     const compatibilityScore = Math.max(
       0,
       Math.min(100, Math.round(100 - targetToReference.distance * 55))
