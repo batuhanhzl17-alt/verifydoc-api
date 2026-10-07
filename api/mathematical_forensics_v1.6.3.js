@@ -799,6 +799,10 @@ export function compareSemanticRoiToNegativePopulation(targetFingerprint, negati
       // population than to the trusted reference ROI.
       referenceDistance:null,
       negativeAffinityDelta:null,
+      // Diagnostic only: a negative population match is meaningful only when
+      // it is localized to this semantic ROI and materially beats the trusted
+      // reference distance. Global negative similarity is never inferred here.
+      evidenceType:'localized-semantic-population',
     };
   }
   return result;
@@ -825,4 +829,61 @@ export function inferDocumentFamily(name='', text='') {
   if (/eft/.test(s)) return 'EFT';
   if (/e[- ]?dekont|dekont/.test(s)) return 'DEKONT';
   return 'UNKNOWN';
+}
+
+
+/**
+ * Adaptive known-negative population policy.
+ * 0 samples: no negative-population evidence.
+ * 1 sample: only very strong local agreement; advisory only.
+ * 2 samples: require agreement across both samples; limited confidence.
+ * 3+ samples: standard population comparison.
+ */
+export function getAdaptiveNegativePopulationPolicy(sampleCount) {
+  const n = Math.max(0, Number(sampleCount) || 0);
+  if (n <= 0) {
+    return {
+      sampleCount: 0,
+      available: false,
+      confidence: "insufficient",
+      minStrongFields: Infinity,
+      minAgreementCount: Infinity,
+      maxAllowedDistance: null,
+      finalPromotionAllowed: false,
+    };
+  }
+  if (n === 1) {
+    return {
+      sampleCount: 1,
+      available: true,
+      confidence: "very-low",
+      minStrongFields: 1,
+      minAgreementCount: 1,
+      maxAllowedDistance: 0.90,
+      finalPromotionAllowed: false,
+      advisoryOnly: true,
+    };
+  }
+  if (n === 2) {
+    return {
+      sampleCount: 2,
+      available: true,
+      confidence: "low",
+      minStrongFields: 1,
+      minAgreementCount: 2,
+      maxAllowedDistance: 0.95,
+      finalPromotionAllowed: true,
+      cappedPromotion: true,
+    };
+  }
+  return {
+    sampleCount: n,
+    available: true,
+    confidence: n >= 5 ? "high" : "medium",
+    minStrongFields: 1,
+    minAgreementCount: Math.max(1, Math.min(2, n)),
+    maxAllowedDistance: 1.0,
+    finalPromotionAllowed: true,
+    advisoryOnly: false,
+  };
 }
