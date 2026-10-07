@@ -14043,34 +14043,11 @@ async function analyzeAmountReferenceRenderForensics({
     // amount rendering AND the negative population independently points in
     // the same direction. This is the key anti-false-positive gate for real
     // Telegram/JPEG documents such as the known-good 350 TL case.
-    // V15.11: absolute fake-population proximity is required in addition to
-    // the reference-vs-fake margin.  A genuine Telegram/JPEG target can be
-    // farther from the single clean reference than from every negative sample
-    // simply because amount content/scale/compression differs.  The old 0.95
-    // ceiling therefore made the real 350 TL case falsely qualify.
-    //
-    // The gate intentionally remains corroborative, not a standalone verdict:
-    //   1) the target must be materially closer to the negative population,
-    //   2) the closest negative must itself be reasonably close, and
-    //   3) the negative must beat the genuine reference by a meaningful margin.
-    const fakeAffinityRatio = bestFake && targetToReference.distance > 0
-      ? bestFake.distance / targetToReference.distance
-      : Infinity;
     const fakeAffinityStrong = Boolean(
       bestFake &&
-      fakeAffinityMargin >= 0.30 &&
-      bestFake.distance <= 0.60 &&
-      fakeAffinityRatio <= 0.61
+      fakeAffinityMargin >= 0.16 &&
+      bestFake.distance <= 0.95
     );
-
-    console.log("AMOUNT RENDER FAKE-AFFINITY GATE V15.11:", JSON.stringify({
-      bestFakeDistance: bestFake ? bestFake.distance : null,
-      referenceDistance: Number(targetToReference.distance.toFixed(4)),
-      fakeAffinityMargin,
-      fakeAffinityRatio: Number.isFinite(fakeAffinityRatio) ? Number(fakeAffinityRatio.toFixed(4)) : null,
-      fakeAffinityStrong,
-      thresholds: { maxBestFakeDistance: 0.60, minMargin: 0.30, maxRatio: 0.61 }
-    }));
 
     const referenceAnomaly = targetToReference.distance >= 0.85;
     const strongAnomaly = referenceAnomaly && fakeAffinityStrong;
@@ -14105,7 +14082,7 @@ async function analyzeAmountReferenceRenderForensics({
       targetSignature: targetSig,
       referenceSignature: referenceSig,
       sameCharacterGlyphDistance: Number.isFinite(sameCharacterGlyphDistance) ? Number(sameCharacterGlyphDistance.toFixed(4)) : null,
-      scoringModel: 'content-independent-glyph-render-v15.11',
+      scoringModel: 'content-independent-glyph-render-v15.9',
 
       bestFake: bestFake ? bestFake.fileName : null,
       comparedFakeCount: fakeDistances.length,
@@ -19132,7 +19109,18 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     // to resolution, crop and delivery/compression history.
     const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
     const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
-    if (strongFields.length) {
+    // V15.12: A clean/compatible trusted-reference comparison suppresses
+    // negative-sample/local-raster chatter from the user-facing report.
+    // Negative samples remain diagnostic in backend logs, but they must not
+    // contradict a clean reference result (e.g. genuine 350 TL).
+    const cleanTrustedReference = Boolean(
+      !unique.length &&
+      !infoUnique.length &&
+      (fusion?.referenceBaselineAvailable === true || fusion?.referenceLike === true) &&
+      fusion?.negativeLike !== true &&
+      fusion?.knownNegative?.corroborated !== true
+    );
+    if (strongFields.length && !cleanTrustedReference) {
       const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
       const sampleCounts = strongFields.map((field) => {
         const row = diff?.fields?.[field];
@@ -19143,10 +19131,16 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
         `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
         `• Sahte örnek uyumu: ${sampleCounts.length === 1 ? `${sampleCounts[0]}/${sampleTotal}` : strongFields.map((f, i) => `${fieldLabels[f] || f} ${sampleCounts[i]}/${sampleTotal}`).join(', ')}`
       );
-    } else if (diff?.available === true) {
+    } else if (diff?.available === true && !cleanTrustedReference) {
       lines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
         '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
     }
+    console.log('V15.12 USER REPORT NEGATIVE-PATTERN GATE:', JSON.stringify({
+      cleanTrustedReference,
+      strongFields,
+      exposed: Boolean(strongFields.length && !cleanTrustedReference),
+      reason: cleanTrustedReference ? 'trusted-reference-clean' : 'reference-not-clean-or-negative-corroborated'
+    }));
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
       available: true,
@@ -21339,17 +21333,34 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   // intentionally omitted from the normal user-facing report.
   const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
   const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
-  if (strongFields.length) {
+  // V15.12: Keep negative/local-raster evidence out of the user report when
+  // the trusted-reference comparison itself is clean. This is intentionally
+  // a UI/report gate only; raw forensic evidence remains available in logs.
+  const cleanTrustedReference = Boolean(
+    !unique.length &&
+    !infoUnique.length &&
+    (mathFusion?.referenceBaselineAvailable === true || mathFusion?.referenceLike === true) &&
+    mathFusion?.negativeLike !== true &&
+    mathFusion?.knownNegative?.corroborated !== true
+  );
+  if (strongFields.length && !cleanTrustedReference) {
     const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
     const sampleTotal = Number(diff?.tamperSampleCount || 0);
     const agreements = strongFields.map((field) => `${fieldLabels[field] || field} ${Number(diff?.fields?.[field]?.agreementCount || 0)}/${sampleTotal}`);
     userLines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
       `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
       `• Sahte örnek uyumu: ${agreements.join(', ')}`);
-  } else if (diff?.available === true) {
+  } else if (diff?.available === true && !cleanTrustedReference) {
     userLines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
       '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
   }
+
+  console.log('V15.12 USER REPORT NEGATIVE-PATTERN GATE:', JSON.stringify({
+    cleanTrustedReference,
+    strongFields,
+    exposed: Boolean(strongFields.length && !cleanTrustedReference),
+    reason: cleanTrustedReference ? 'trusted-reference-clean' : 'reference-not-clean-or-negative-corroborated'
+  }));
 
   return {
     headline: unique.length
