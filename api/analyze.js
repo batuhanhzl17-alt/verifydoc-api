@@ -9,7 +9,8 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
+import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -90,13 +91,156 @@ async function loadMathematicalBaseline() {
   }
 }
 
-async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, bank = null } = {}) {
+
+function resolveMathSemanticValueBox(regions, field) {
+  const rows = Array.isArray(regions) ? regions.filter(x => x?.region && String(x.text || '').trim()) : [];
+  if (!rows.length) return null;
+  const box = (x) => {
+    const r=x?.region||x;
+    const x1=Number(r?.x1),y1=Number(r?.y1),x2=Number(r?.x2),y2=Number(r?.y2);
+    return [x1,y1,x2,y2].every(Number.isFinite)&&x2>x1&&y2>y1 ? {x1,y1,x2,y2}:null;
+  };
+  const norm = (v) => String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğışöüıİ]/g,c=>({ç:'c',ğ:'g',ı:'i',İ:'i',ş:'s',ö:'o',ü:'u'}[c]||c));
+  const NAME_STOPWORDS = new Set([
+    'ALICI','ALACAKLI','GONDEREN','GONDERICI','GIDEN','GONDERILEN','BANKA','SUBE','IBAN','HESAP','TUTAR',
+    'ACIKLAMA','TARIH','ISLEM','ISLEM TARIHI','ETTN','SORGU','SIRA','NO','NUMARA','NUMARASI','KART',
+    'FAST','EFT','HAVALE','TRANSFER','ODEME','ODEME','ISLEM TUTARI','GIDEN FAST','GIDEN FAST EFT',
+    'PARA','CINSI','TL','TRY','USD','EUR','GBP','FIS','FIS NO','REFERANS','REFERANS NO','MUSTERI','MUSTERI NO',
+    'VERGI','VERGI NO','MERSIS','TICARET','TICARET SICIL','KOMISYON','MASRAF','UCRET','TOPLAM','CEP SUBE'
+  ]);
+  const nameLike = (v) => {
+    const t=String(v||'').trim();
+    if(!t || /\d/.test(t)) return false;
+    const canonical=norm(t).replace(/[^a-z0-9çğıöşü\s]/gi,' ').replace(/\s+/g,' ').trim();
+    if(!canonical || NAME_STOPWORDS.has(canonical)) return false;
+    const words=t.split(/\s+/).filter(Boolean);
+    if(words.length<2 || words.length>6) return false;
+    if(words.some(w=>w.length<2 || !/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]+$/.test(w))) return false;
+    // A semantic name must contain at least two plausible alphabetic tokens and
+    // must not be composed only of transaction/action vocabulary. This blocks
+    // false positives such as "GIDEN FAST EFT" while preserving names like
+    // "Sudenaz Özel" and multi-word company/person names.
+    const actionWords=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
+    const upper=words.map(w=>norm(w).toUpperCase());
+    if(upper.filter(w=>actionWords.has(w)).length>=1) return false;
+    return upper.filter(w=>/^[A-ZÇĞİÖŞÜ]{2,}$/.test(w)).length>=2;
+  };
+  const ibanLike = (v) => /^TR\s*\d{2}(?:[\s-]*[0-9A-Z]){22,}$/i.test(String(v||'')) || /^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
+  const isLabel = (item) => {
+    if (!item) return false;
+    if (field === 'recipientName') {
+      if (recipientNameLabel(item?.text)) return true;
+      // Reuse the bank/reference field grammar as a second semantic gate.
+      // This catches OCR variants such as "Alıcı İsim/Unvan" without
+      // reopening the old broad name-neighbor heuristic.
+      try { return referenceFieldRuleForText(item?.text)?.key === 'recipientName'; } catch { return false; }
+    }
+    if (recipientIbanLabel(item?.text)) return true;
+    try { return referenceFieldRuleForText(item?.text)?.key === 'recipientIban'; } catch { return false; }
+  };
+  // V1.5.4: PaddleOCR may return the whole Enpara beneficiary block as one
+  // region, e.g. `ALICI UNVANI: Sudenaz Özel ALICI IBAN: TR...`. Resolve the
+  // embedded semantic segments before falling back to label-neighbor geometry.
+  const inlineSemanticRows = [];
+  for (const row of rows) {
+    const segments = resolveRecipientInlineSegments(row);
+    for (const segment of segments) {
+      if (segment.field === field) {
+        inlineSemanticRows.push(segment);
+      }
+    }
+  }
+  if (inlineSemanticRows.length) {
+    inlineSemanticRows.sort((a,b)=>Number(b.score||0)-Number(a.score||0));
+    const bestInline = inlineSemanticRows[0];
+    return {
+      text: bestInline.text,
+      region: bestInline.region,
+      score: bestInline.score,
+      resolver: bestInline.resolver,
+      criticalROI: true,
+      labelText: bestInline.labelText,
+      parentRegion: bestInline.parentRegion,
+    };
+  }
+
+  const labels=rows.filter(isLabel);
+  if(!labels.length) return null;
+  const solutions=[];
+  for(const label of labels){
+    const lb=box(label); if(!lb) continue;
+    const raw=String(label.text||'');
+    const colon=raw.search(/[:：]/);
+    const inline=colon>=0 ? raw.slice(colon+1).trim() : '';
+    const semanticLabelKey = field==='recipientName'
+      ? (recipientNameLabel(raw) ? 'recipientName' : (()=>{ try { return referenceFieldRuleForText(raw)?.key || null; } catch { return null; } })())
+      : (recipientIbanLabel(raw) ? 'recipientIban' : (()=>{ try { return referenceFieldRuleForText(raw)?.key || null; } catch { return null; } })());
+    if(field==='recipientName' && semanticLabelKey==='recipientName' && nameLike(inline)) solutions.push({value:inline,region:lb,score:150,resolver:'semantic-inline-label-v152'});
+    if(field==='recipientIban' && semanticLabelKey==='recipientIban' && inline && ibanLike(inline)) solutions.push({value:inline,region:lb,score:160,resolver:'semantic-inline-iban-v152'});
+    const lh=Math.max(6,lb.y2-lb.y1);
+    for(const row of rows){
+      if(row===label) continue; const rb=box(row); if(!rb) continue;
+      const text=String(row.text||'').trim();
+      const valid=field==='recipientName'?nameLike(text):ibanLike(text);
+      if(!valid) continue;
+      const overlapY=Math.min(lb.y2,rb.y2)-Math.max(lb.y1,rb.y1);
+      const sameLine=overlapY>=-lh*.45 && rb.x1>=lb.x1-lh*.5 && rb.x1-lb.x2<Math.max(420,lh*18);
+      const belowGap=rb.y1-lb.y2;
+      const below=belowGap>=-lh*.35 && belowGap<Math.max(170,lh*6) && Math.abs(((rb.x1+rb.x2)/2)-((lb.x1+lb.x2)/2))<Math.max(500,lh*18);
+      if(!sameLine&&!below) continue;
+      const cost=(sameLine?Math.max(0,rb.x1-lb.x2)/lh:4+Math.max(0,belowGap)/lh) + Math.abs(((rb.y1+rb.y2)/2)-((lb.y1+lb.y2)/2))/lh*.25;
+      const score=120-cost*8+(sameLine?25:0);
+      solutions.push({value:text,region:rb,score,resolver:field==='recipientIban'?'semantic-label-neighbor-iban-v1':'semantic-label-neighbor-name-v1'});
+    }
+    if(field==='recipientIban'){
+      const joined=resolveSplitTurkishIban(rows,label);
+      if(joined) solutions.push({value:joined.text,region:joined.region,score:joined.score+30,resolver:joined.resolver});
+    }
+  }
+  solutions.sort((a,b)=>Number(b.score)-Number(a.score));
+  const best=solutions[0];
+  return best ? {text:best.value,region:best.region,score:best.score,resolver:best.resolver} : null;
+}
+
+async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, bank = null, referencePath = null } = {}) {
   const rois = {};
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
     ? referenceForensics.typographyFieldProfiles : [];
   const findings = Array.isArray(referenceForensics?.characterFindings)
     ? referenceForensics.characterFindings : [];
+  const targetSemanticRegions = referenceForensics?.targetSemanticRegions || {};
+  const referenceSemanticRegions = referenceForensics?.referenceSemanticRegions || {};
+
+  const normalizedBox = (b, width, height) => {
+    if (!b) return null;
+    const x1=Number(b.x1),y1=Number(b.y1),x2=Number(b.x2),y2=Number(b.y2);
+    if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1 || !width || !height) return null;
+    return {x:(x1+x2)/(2*width), y:(y1+y2)/(2*height), w:(x2-x1)/width, h:(y2-y1)/height};
+  };
+  const inferRasterSize = (rows) => {
+    const xs=rows.flatMap(r=>[Number(r?.region?.x1),Number(r?.region?.x2)]).filter(Number.isFinite);
+    const ys=rows.flatMap(r=>[Number(r?.region?.y1),Number(r?.region?.y2)]).filter(Number.isFinite);
+    return {width:xs.length?Math.max(...xs):0,height:ys.length?Math.max(...ys):0};
+  };
+  const geometryFallback = (field, referenceCandidate, targetRows, referenceRows) => {
+    if (!referenceCandidate || !Array.isArray(targetRows) || !targetRows.length) return null;
+    const refSize=inferRasterSize(referenceRows), tarSize=inferRasterSize(targetRows);
+    const refNorm=normalizedBox(referenceCandidate.region,refSize.width,refSize.height);
+    if (!refNorm || !tarSize.width || !tarSize.height) return null;
+    const valid = field==='recipientName' ? nameLike : ibanLike;
+    const candidates=targetRows.filter(r=>r?.region && valid(String(r.text||'').trim()));
+    const scored=candidates.map(r=>{
+      const n=normalizedBox(r.region,tarSize.width,tarSize.height);
+      if(!n) return null;
+      const d=Math.hypot((n.x-refNorm.x), (n.y-refNorm.y));
+      const sizeD=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,refNorm.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,refNorm.h)));
+      return {row:r,d,sizeD,score:100-d*180-sizeD*18};
+    }).filter(Boolean).sort((a,b)=>b.score-a.score);
+    const best=scored[0];
+    if(!best || best.score<55) return null;
+    return {text:String(best.row.text).trim(),region:best.row.region,score:Number(best.score.toFixed(2)),resolver:`reference-geometry-${field}-v1`};
+  };
 
   const normalizeField = (v) => String(v || '')
     .toLocaleLowerCase('tr-TR')
@@ -112,15 +256,18 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
 
   // The reference engine keeps some bank-specific labels as generic keys.
   // Canonicalize those keys before looking for the three semantic ROIs.
-  // Example: generic:ALICI UNVANI -> recipientName,
-  // generic:IBAN/KART NO -> recipientIban.
+  // Only explicitly beneficiary-labelled IBANs qualify for recipientIban.
+  // A generic IBAN can be the sender's own account and must not be paired.
   const canonicalField = (value) => {
     const raw = String(value || '').replace(/:value$/i, '');
+    const label = raw.replace(/^generic:/i, '');
+    if (recipientNameLabel(label)) return 'recipientName';
+    if (recipientIbanLabel(label)) return 'recipientIban';
+    if (senderIbanLabel(label)) return 'senderIban';
     const n = normalizeField(raw);
-    if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani') || n.includes('aliciisimunvan')) return 'recipientName';
-    if (n.includes('aliciiban') || n.includes('iban') || n.includes('ibankartno')) return 'recipientIban';
+    if (n.includes('aliciunvani') || n.includes('aliciadi') || n.includes('alacakliadi') || n.includes('alacakliunvani') || n.includes('aliciisimunvan') || n.includes('beneficiaryname') || n.includes('payeename') || n.includes('lehdar')) return 'recipientName';
+    if (n.includes('aliciiban') || n.includes('alici hesap') || n.includes('alacakliiban') || n.includes('lehdariban') || n.includes('beneficiaryiban') || n.includes('payeeiban') || n.includes('receiveriban') || n.includes('recipientiban')) return 'recipientIban';
     if (n.includes('recipientname') || n.includes('aliciunvan') || n.includes('aliciadi')) return 'recipientName';
-    if (n.includes('recipientiban')) return 'recipientIban';
     if (n === 'amount' || n === 'totalamount' || n.includes('efttutari') || n.includes('fasttutari') || n.includes('islemtutari')) return 'amount';
     return n;
   };
@@ -132,8 +279,18 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
 
   const allRows = [...fields, ...profiles];
   const findField = (canonical) => {
-    const row = allRows.find(f => canonicalField(f?.field) === canonical &&
-      (boxFrom(f).target || boxFrom(f).reference));
+    const matchesSemantic = f => canonicalField(f?.field) === canonical;
+    let candidates = allRows.filter(matchesSemantic);
+    if (canonical === 'amount') {
+      candidates = candidates.filter(f => {
+        const label = normalizeField([f?.referenceLabel, f?.targetLabel, f?.labelReference, f?.field].filter(Boolean).join(' '));
+        return f?.templateRole !== 'secondaryAmount' &&
+          !/(masraf|komisyon|ucret|vergi|toplamtahsilat|toplamislem|bs?mv)/.test(label);
+      }).sort((a, b) => Number(b?.templateRole === 'primaryAmount') - Number(a?.templateRole === 'primaryAmount'));
+    }
+    const completeRow = candidates.find(f => boxFrom(f).target && boxFrom(f).reference);
+    if (completeRow) return completeRow;
+    const row = candidates.find(f => boxFrom(f).target || boxFrom(f).reference);
     if (row) return row;
     // Character findings are the final fallback because older profiles did not
     // expose value boxes even though the forensic engine had already computed them.
@@ -141,38 +298,110 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       (f?.targetValueBox || f?.referenceValueBox || f?.targetBox || f?.referenceBox)) || null;
   };
 
-  // Amount target ROI is intentionally taken from the trusted Amount Forensics
-  // region. The reference side has two valid sources: the semantic field box,
-  // or the same trusted raster amount anchor used by Amount Forensics itself.
-  // The anchor fallback is important because some reference-field variants do
-  // not expose a value box even though the bank-specific amount geometry is known.
+  // Prefer Amount Forensics' validated target ROI. If that selector cannot
+  // promote a value, use only the typed amount label's adjacent OCR value box.
+  // A reference amount label/value box is preferred; the normalized trusted
+  // anchor is converted to that reference raster's pixel coordinates as fallback.
   const amountField = findField('amount');
-  let amountReferenceBox = boxFrom(amountField).reference;
+  // HARD SAFETY: only an explicitly amount-typed reference field may seed the
+  // mathematical amount ROI. Never fall back to an arbitrary numeric box
+  // (SIRA NO / FIS NO / HESAP NO / IBAN etc.).
+  const amountFieldLabel = normalizeField([
+    amountField?.referenceLabel, amountField?.targetLabel,
+    amountField?.labelReference, amountField?.labelTarget, amountField?.field
+  ].filter(Boolean).join(' '));
+  const amountFieldRole = String(amountField?.templateRole || '');
+  const amountFieldIsTyped = Boolean(amountField) &&
+    (amountFieldRole === 'primaryAmount' || canonicalField(amountField?.field) === 'amount') &&
+    !/(sirano|fisno|islemno|referans|hesapno|musterino|iban|kartno|vergino)/.test(amountFieldLabel);
+  let amountReferenceBox = amountFieldIsTyped ? boxFrom(amountField).reference : null;
   if (!amountReferenceBox && bank) {
     try {
       const anchor = await getReferenceAmountAnchor(bank);
-      if (anchor) amountReferenceBox = anchor;
+      // Trusted anchor is allowed only as a last resort, after the typed
+      // anchor builder has already rejected non-money numeric fields.
+      if (anchor && referencePath && String(anchor.source || '').includes('amount')) {
+        let meta;
+        if (path.extname(referencePath).toLowerCase() === '.pdf') {
+          const raw = await fs.readFile(referencePath);
+          const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+          const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+          meta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
+        } else {
+          meta = await sharp(referencePath).metadata();
+        }
+        if (meta?.width && meta?.height) {
+          amountReferenceBox = {
+            x1: Number(anchor.xNorm) * Number(meta.width),
+            y1: Number(anchor.yNorm) * Number(meta.height),
+            x2: (Number(anchor.xNorm) + Number(anchor.widthNorm)) * Number(meta.width),
+            y2: (Number(anchor.yNorm) + Number(anchor.heightNorm)) * Number(meta.height),
+          };
+        }
+      }
     } catch (error) {
       console.warn('MATH AMOUNT ANCHOR FALLBACK HATASI:', error?.message || error);
     }
   }
-  if (amountForensics?.region && amountReferenceBox) {
-    rois.amount = { target: amountForensics.region, reference: amountReferenceBox, source: amountField ? 'semantic-reference-field' : 'trusted-reference-amount-anchor' };
+  const amountTargetBox = amountForensics?.region || (amountFieldIsTyped ? boxFrom(amountField).target : null);
+  if (amountTargetBox && amountReferenceBox) {
+    rois.amount = { target: amountTargetBox, reference: amountReferenceBox, source: amountForensics?.region ? 'trusted-amount-forensics' : amountFieldIsTyped ? 'semantic-label-neighbor' : 'trusted-reference-anchor' };
+  } else {
+    console.warn('MATH AMOUNT ROI SKIPPED: NO VALID TYPED REFERENCE AMOUNT BOX');
   }
 
-  const recipientName = findField('recipientName');
+  let recipientName = findField('recipientName');
+  const semanticNameHasBothSides = Boolean(targetSemanticRegions.recipientName?.region && referenceSemanticRegions.recipientName?.region);
+  const fieldNameHasBothSides = Boolean(boxFrom(recipientName).target && boxFrom(recipientName).reference);
+  // V1.5.4: an older reference-forensic field row may exist with only one
+  // side populated. Never let that incomplete row mask the new geometry-first
+  // semantic ROI, which has independently resolved both target/reference boxes.
+  if ((!fieldNameHasBothSides && semanticNameHasBothSides) || (!recipientName && semanticNameHasBothSides)) {
+    recipientName = {
+      field:'recipientName',
+      referenceLabel: referenceSemanticRegions.recipientName?.labelText || 'ALICI',
+      targetLabel: targetSemanticRegions.recipientName?.labelText || 'ALICI',
+      referenceValueBox: referenceSemanticRegions.recipientName?.region || null,
+      targetValueBox: targetSemanticRegions.recipientName?.region || null,
+      semanticResolver: referenceSemanticRegions.recipientName?.resolver || targetSemanticRegions.recipientName?.resolver || 'semantic-inline-multi-label-v154'
+    };
+  }
   if (recipientName) {
     const boxes = boxFrom(recipientName);
-    if (boxes.target && boxes.reference) rois.recipientName = { target: boxes.target, reference: boxes.reference };
+    const labelText = String(recipientName?.referenceLabel || recipientName?.targetLabel || recipientName?.labelReference || recipientName?.field || '');
+    const nameLabelValid = recipientNameLabel(labelText) || /alacakli|alici|beneficiary|payee|receiver|lehdar/i.test(normalizeField(labelText));
+    const plausible = (b) => {
+      if (!b) return false;
+      const w = Number(b.x2) - Number(b.x1);
+      const h = Number(b.y2) - Number(b.y1);
+      return w >= 12 && h >= 6 && w / Math.max(1,h) >= 1.2;
+    };
+    if (nameLabelValid && plausible(boxes.target) && plausible(boxes.reference)) {
+      rois.recipientName = { target: boxes.target, reference: boxes.reference, source: 'semantic-label-neighbor', validated: true };
+    } else {
+      console.warn('MATH RECIPIENT NAME ROI SKIPPED: label/value geometry not validated');
+    }
   }
 
-  const recipientIban = findField('recipientIban');
+  let recipientIban = findField('recipientIban');
+  const semanticIbanHasBothSides = Boolean(targetSemanticRegions.recipientIban?.region && referenceSemanticRegions.recipientIban?.region);
+  const fieldIbanHasBothSides = Boolean(boxFrom(recipientIban).target && boxFrom(recipientIban).reference);
+  if ((!fieldIbanHasBothSides && semanticIbanHasBothSides) || (!recipientIban && semanticIbanHasBothSides)) {
+    recipientIban = {
+      field:'recipientIban',
+      referenceLabel: referenceSemanticRegions.recipientIban?.labelText || 'ALICI IBAN',
+      targetLabel: targetSemanticRegions.recipientIban?.labelText || 'ALICI IBAN',
+      referenceValueBox: referenceSemanticRegions.recipientIban?.region || null,
+      targetValueBox: targetSemanticRegions.recipientIban?.region || null,
+      semanticResolver: referenceSemanticRegions.recipientIban?.resolver || targetSemanticRegions.recipientIban?.resolver || 'semantic-inline-multi-label-v154'
+    };
+  }
   if (recipientIban) {
     const boxes = boxFrom(recipientIban);
     if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference };
   }
 
-  console.log('MATH SEMANTIC ROI RESOLVER V1.3:', JSON.stringify({
+  console.log('MATH SEMANTIC ROI RESOLVER V1.5.4:', JSON.stringify({
     fields: fields.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     profiles: profiles.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => [k, {target:Boolean(v?.target), reference:Boolean(v?.reference), source:v?.source || 'semantic-field'}])),
@@ -181,14 +410,20 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   return rois;
 }
 
-async function runMathematicalForensics({ targetPath, targetText = "", bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
+async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
   if (!targetPath || !bank) {
     return { available: false, status: "missing-target-or-bank" };
   }
   const baseline = await loadMathematicalBaseline();
   if (!baseline) return { available: false, status: "baseline-unavailable" };
 
-  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, bank });
+  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, targetOCR, bank, referencePath });
+  const ibanProfile = (Array.isArray(referenceForensics?.typographyFieldProfiles) ? referenceForensics.typographyFieldProfiles : [])
+    .find(profile => {
+      const field = String(profile?.field || '').replace(/:value$/i, '');
+      return /^recipientIban$/i.test(field) || recipientIbanLabel(field.replace(/^generic:/i, '')) || recipientIbanLabel(profile?.labelReference);
+    });
+  const sameLogicalRecipientIban = Boolean(ibanProfile && sameTurkishIban(ibanProfile.valueReference, ibanProfile.valueTarget));
   const targetRegions = {};
   const referenceRegions = {};
   for (const [name, pair] of Object.entries(semanticRois)) {
@@ -206,11 +441,58 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
   const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
 
   let roiForensics = null;
+  let semanticReferenceMeasurements = null;
   let global16x16 = { available: false, reason: 'reference-unavailable' };
   if (referencePath && Object.keys(referenceRegions).length) {
     try {
       const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
+
+      // V1.5: expose the actual mathematical measurements extracted from the
+      // SAME semantic ROIs on both sides. This is deliberately a compact
+      // diagnostic object: the full 16x16 cells remain available through
+      // roi16x16, while this block makes it explicit which reference ROI was
+      // found and which mathematical fingerprint was measured.
+      semanticReferenceMeasurements = {};
+      for (const field of ['amount', 'recipientName', 'recipientIban']) {
+        const t = fingerprint?.roi16x16?.[field] || null;
+        const r = referenceFingerprint?.roi16x16?.[field] || null;
+        const c = roiForensics?.[field] || null;
+        semanticReferenceMeasurements[field] = {
+          available: Boolean(t?.metrics && r?.metrics),
+          targetSourceBox: t?.sourceBox || null,
+          referenceSourceBox: r?.sourceBox || null,
+          targetMetrics: t?.metrics || null,
+          referenceMetrics: r?.metrics || null,
+          targetRawMetrics: t?.rawMetrics || null,
+          referenceRawMetrics: r?.rawMetrics || null,
+          targetNormalization: t?.normalization || null,
+          referenceNormalization: r?.normalization || null,
+          targetAlignment: t?.alignment || null,
+          referenceAlignment: r?.alignment || null,
+          comparison: c ? {
+            meanDistance: c.meanDistance,
+            maxCellDistance: c.maxCellDistance,
+            metricDistances: c.metricDistances,
+            rawMetricDistances: c.rawMetricDistances,
+            topCells: c.topCells,
+            grid: c.grid,
+            cellCount: c.cellCount,
+          } : null,
+        };
+      }
+
+      console.log('MATH SEMANTIC REFERENCE FINGERPRINT V1.5:', JSON.stringify(
+        Object.fromEntries(Object.entries(semanticReferenceMeasurements).map(([field, v]) => [field, {
+          available: v.available,
+          referenceSourceBox: v.referenceSourceBox,
+          targetSourceBox: v.targetSourceBox,
+          meanDistance: v.comparison?.meanDistance ?? null,
+          maxCellDistance: v.comparison?.maxCellDistance ?? null,
+          grid: v.comparison?.grid || '16x16',
+          cellCount: v.comparison?.cellCount || 0,
+        }]))
+      ));
       const criticalRoiBoxes = Object.fromEntries(Object.entries(semanticRois).map(([field, pair]) => [field, { target: pair?.target, reference: pair?.reference }]));
       global16x16 = compareGlobal16x16(fingerprint, referenceFingerprint, criticalRoiBoxes, {
         differentThreshold: 3.5,
@@ -222,12 +504,28 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
     }
   }
 
-  const refScore = Number(reference?.bestMatch?.similarityScore || 0);
-  const negScore = Number(negative?.bestMatch?.similarityScore || 0);
-  const affinityDelta = Number((negScore - refScore).toFixed(2));
+  // V1.6.2.1: an unavailable baseline is NOT similarity=0.
+  // In particular, QNB currently has trusted references but no mathematical
+  // negative profile. Using 0 here manufactures a false reference advantage.
+  const referenceAvailable =
+    Boolean(reference?.available) &&
+    Number.isFinite(Number(reference?.bestMatch?.similarityScore));
+  const negativeAvailable =
+    Boolean(negative?.available) &&
+    Number.isFinite(Number(negative?.bestMatch?.similarityScore)) &&
+    Boolean(negative?.bestMatch?.profile);
+  const refScore = referenceAvailable
+    ? Number(reference.bestMatch.similarityScore)
+    : null;
+  const negScore = negativeAvailable
+    ? Number(negative.bestMatch.similarityScore)
+    : null;
+  const affinityDelta = (Number.isFinite(refScore) && Number.isFinite(negScore))
+    ? Number((negScore - refScore).toFixed(2))
+    : null;
 
   const flags = [];
-  if (reference?.available && negative?.available) {
+  if (referenceAvailable && negativeAvailable && Number.isFinite(affinityDelta)) {
     const negReliability = String(negative?.bestMatch?.profile?.reliability || 'insufficient');
     const refReliability = String(reference?.bestMatch?.profile?.reliability || 'insufficient');
     const reliabilityPenalty = negReliability === 'low' ? 'low-sample' : 'population';
@@ -252,12 +550,39 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
     .filter(([, v]) => v?.available)
     .map(([field, v]) => ({ field, meanDistance: v.meanDistance, maxCellDistance: v.maxCellDistance, topCells: v.topCells }));
 
+  const globalDifferentRatio = global16x16?.available && global16x16.cellCount
+    ? Number(global16x16.differentCount || 0) / Number(global16x16.cellCount) : 0;
+  const globalStrongRatio = global16x16?.available && global16x16.cellCount
+    ? Number(global16x16.strongDifferentCount || 0) / Number(global16x16.cellCount) : 0;
+  const globalAlignmentConflict = globalDifferentRatio >= 0.65 && globalStrongRatio >= 0.60;
+
   const criticalRoiMismatches = Object.entries(global16x16?.criticalRoiHits || {})
     .filter(([, hit]) => hit?.available && hit.differentCount > 0)
     .map(([field, hit]) => {
       const roi = roiForensics?.[field];
       const roiMean = Number(roi?.meanDistance || 0);
       const roiStrong = roiMean >= 3 || Number(roi?.maxCellDistance || 0) >= 6;
+      const sameIbanLayoutOnly = shouldSuppressIbanLayoutMismatch(
+        field,
+        ibanProfile?.valueReference,
+        ibanProfile?.valueTarget,
+        {
+          recipientNameTarget: semanticRois?.recipientName?.target,
+          recipientNameReference: semanticRois?.recipientName?.reference,
+          recipientIbanTarget: semanticRois?.recipientIban?.target,
+          recipientIbanReference: semanticRois?.recipientIban?.reference,
+        }
+      );
+      const ibanValuesKnown = field === 'recipientIban' && Boolean(ibanProfile?.valueReference && ibanProfile?.valueTarget);
+      const ibanValuesDiffer = ibanValuesKnown && !sameTurkishIban(ibanProfile.valueReference, ibanProfile.valueTarget);
+      const roiValidated = field === 'amount'
+        ? Boolean(semanticRois?.amount?.validated !== false && semanticRois?.amount?.target && semanticRois?.amount?.reference)
+        : field === 'recipientName'
+          ? Boolean(semanticRois?.recipientName?.validated)
+          : field === 'recipientIban'
+            ? Boolean(ibanValuesDiffer)
+            : true;
+      const globalConflictNeedsGuard = globalAlignmentConflict && field !== 'amount';
       return {
         field,
         globalDifferentCount: hit.differentCount,
@@ -266,7 +591,10 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
         globalMeanDistance: hit.meanDistance,
         roiMeanDistance: roiMean,
         roiMaxCellDistance: Number(roi?.maxCellDistance || 0),
-        strong: Boolean(hit.strongDifferentCount > 0 && roiStrong),
+        strong: Boolean(!sameIbanLayoutOnly && roiValidated && !globalConflictNeedsGuard && hit.strongDifferentCount > 0 && roiStrong),
+        suppressed: Boolean(sameIbanLayoutOnly || !roiValidated || globalConflictNeedsGuard),
+        validation: { roiValidated, ibanValuesKnown, ibanValuesDiffer, globalAlignmentConflict },
+        suppressionReason: sameIbanLayoutOnly ? (sameTurkishIban(ibanProfile?.valueReference, ibanProfile?.valueTarget) ? 'same-logical-iban-format-or-line-wrap' : 'recipient-name-line-wrap') : null,
       };
     });
 
@@ -282,21 +610,47 @@ async function runMathematicalForensics({ targetPath, targetText = "", bank = nu
   }
   const strongestRoi = roiRows.sort((a,b)=>Number(b.meanDistance)-Number(a.meanDistance))[0] || null;
 
+  if (sameLogicalRecipientIban) {
+    console.log('MATH IBAN ROI LAYOUT NORMALIZATION:', JSON.stringify({
+      sameCanonicalValue: true,
+      action: 'preserve-pixel-diagnostics; suppress-recipientIban-critical-gate',
+      reason: 'spaces-or-line-breaks-do-not-change-logical-IBAN',
+    }));
+  }
+
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE',
-    engine: 'mathematical-forensics-v1.2.1-16x16-critical-roi-gate',
+    version: 'MATH-FORENSICS-V1.6.4-SCALE-INVARIANT-LINE-WRAP-GUARD',
+    engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
     reference,
     negative,
     differential: {
       negativeMinusReference: affinityDelta,
-      referenceSimilarity: refScore,
-      negativeSimilarity: negScore,
+      referenceSimilarity: Number.isFinite(refScore) ? refScore : null,
+      negativeSimilarity: Number.isFinite(negScore) ? negScore : null,
+      referenceBaselineAvailable: referenceAvailable,
+      negativeBaselineAvailable: negativeAvailable,
+      differentialAvailable: Number.isFinite(affinityDelta),
+      availabilityReason: !negativeAvailable
+        ? (negative?.reason || 'negative-baseline-unavailable')
+        : null,
     },
-    global16x16,
+    global16x16: {
+      ...global16x16,
+      alignmentGuard: {
+        conflict: globalAlignmentConflict,
+        differentRatio: Number(globalDifferentRatio.toFixed(4)),
+        strongRatio: Number(globalStrongRatio.toFixed(4)),
+        policy: 'global-map-is-localization-layer; critical ROI requires semantic validation'
+      }
+    },
     criticalRoiMismatches,
+    // Compact semantic measurement view. This explicitly proves that the
+    // reference-side recipientName / recipientIban / amount ROIs were
+    // measured mathematically when their boxes were available.
+    semanticReferenceMeasurements,
     roi16x16: roiForensics,
     roiSummary: {
       available: roiRows.length > 0,
@@ -2060,14 +2414,31 @@ return value
 // Bunlar gercek referans degildir. Yalnizca daha once manipule edilmis
 // orneklerde gorulen lokal izlerle benzerlik aramak icin kullanilir.
 const NEGATIVE_SAMPLE_MAP = {
-  vakifbank: ["vakifbank/sahte-1.jpg"],
-  ziraat: ["ziraat/sahte-1.jpg", "ziraat/sahte-2.jpg"],
-  yapikredi: ["yapikredi/sahte-1.jpg"],
-  garanti: ["garanti/sahte-hesap-ozeti-1.pdf"],
-  isbankasi: ["isbankasi/sahte-hesap-ozeti-1.pdf"],
-  // Enpara bilinen sahte örnekleri.
-  // Bunlar yalnızca known-fake calibration/evidence için kullanılır;
-  // trusted reference değildir.
+  garanti: [
+    "garanti/sahte-hesap-ozeti-1.pdf",
+    "garanti/fake.amount-1000.jpg",
+    "garanti/fake.iban.change.jpg",
+  ],
+  halkbank: ["halkbank/fake2000.jpg", "halkbank/fakeibanhalk.jpg"],
+  isbankasi: [
+    "isbankasi/sahte-hesap-ozeti-1.pdf",
+    "isbankasi/fake.iban-change.jpg",
+    "isbankasi/fake200000.jpg",
+  ],
+  qnb: ["qnb/qnb5000.jpg", "qnb/qnbfakeiban.jpg"],
+  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vakıf3500fake.jpg"],
+  yapikredi: [
+    "yapıkredi/sahte-1.jpg",
+    "yapıkredi/fakeyapi10000.jpg",
+    "yapıkredi/yapifakeiban.jpg",
+  ],
+  ziraat: [
+    "ziraat/sahte-1.jpg",
+    "ziraat/sahte-2.jpg",
+    "ziraat/ziraat7000fake.jpg",
+    "ziraat/ziraatfakeiban.jpg",
+  ],
+  // Enpara known-fake samples are calibration evidence, never trusted references.
   enpara: [
     "enpara/fake.3000.jpg",
     "enpara/fake.8000.jpg",
@@ -5847,7 +6218,7 @@ count,
 async function getReferenceAmountAnchor(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
-  const cacheKey = `amount-anchor:v16:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}`;
+  const cacheKey = `amount-anchor:v17:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
   const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
@@ -5904,8 +6275,74 @@ async function getReferenceAmountAnchor(bank) {
           : [];
         if (!width || !height || !regions.length) continue;
 
-        const moneyCandidates = regions.filter(r => moneyRe.test(r.text) && /\d/.test(r.text));
+        // V1.4.1: Some bank OCR layouts split an amount into integer/decimal
+        // fragments (for example `758` + `37`) or return a plain integer
+        // (`750`) without the currency token. The old resolver discarded those
+        // candidates before the label relation was evaluated, which is why
+        // Halkbank `ISLEM TUTARI (TL)` could produce no reference anchor.
+        const strictMoneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)\s*[-+]?\s*\d|[-+]?\d{1,3}(?:[. ]\d{3})*[,.]\d{1,2}\b|[-+]?\d{1,3}(?:[. ]\d{3})+(?:\b|\s)/i;
+        const integerMoneyRe = /^[-+]?\d{1,6}$/;
+        const explicitAmountLabelRe = /(?:b\s*\/\s*a\s*para\s*cinsi\s*tutar|işlem\s*tutar(?:ı|i)?(?:\s*\(\s*(?:tl|try)\s*\))?|islem\s*tutar(?:i|ı)?(?:\s*\(\s*(?:tl|try)\s*\))?|giden\s*fast(?:\s*eft)?\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|ana\s*tutar|giden\s*tutar)/i;
+        const moneyCandidates = regions.filter(r =>
+          /\d/.test(r.text) && (strictMoneyRe.test(r.text) || integerMoneyRe.test(String(r.text).trim()))
+        );
         if (!moneyCandidates.length) continue;
+
+        // Identify explicit amount labels once so a plain integer can be
+        // accepted only when it is geometrically tied to a real amount label.
+        // PaddleOCR can split headers such as `B/A` + `Para Cinsi` + `Tutar`
+        // into separate regions. Build synthetic label regions from adjacent
+        // same-line tokens as well; otherwise the raster fallback has no
+        // reliable anchor to work from.
+        const amountLabels = [];
+        const pushAmountLabel = (text, region, source = 'ocr') => {
+          if (!region || !Number.isFinite(region.x1) || !Number.isFinite(region.y1)) return;
+          if (!String(text || '').trim()) return;
+          amountLabels.push({ text: String(text).trim(), region, source });
+        };
+        for (const r of regions) {
+          if (explicitAmountLabelRe.test(String(r.text || '')) || /\btutar(?:ı|i)?\b/i.test(String(r.text || ''))) {
+            pushAmountLabel(r.text, r.region, 'ocr-token');
+          }
+        }
+        const labelTokens = regions
+          .filter(r => /(?:b\s*\/?\s*a|para|cinsi|tutar(?:ı|i)?|islem|işlem|tl|try)/i.test(String(r.text || '')))
+          .sort((a,b) => a.region.y1 - b.region.y1 || a.region.x1 - b.region.x1);
+        for (let i = 0; i < labelTokens.length; i++) {
+          const base = labelTokens[i];
+          const br = base.region;
+          const bh = Math.max(8, br.y2 - br.y1);
+          const line = labelTokens.filter(other => {
+            if (other === base) return false;
+            const or = other.region;
+            const oh = Math.max(8, or.y2 - or.y1);
+            const cy = (br.y1 + br.y2) / 2;
+            const oy = (or.y1 + or.y2) / 2;
+            return Math.abs(cy - oy) <= Math.max(bh, oh) * 1.15 &&
+              or.x1 >= br.x1 - Math.max(bh, oh) * 1.5 &&
+              or.x1 <= br.x2 + Math.max(bh, oh) * 14;
+          });
+          if (line.length) {
+            const group = [base, ...line].sort((a,b) => a.region.x1 - b.region.x1);
+            const joined = group.map(x => String(x.text || '').trim()).filter(Boolean).join(' ');
+            if (explicitAmountLabelRe.test(joined) || /(?:para|cinsi|tutar|islem|işlem)/i.test(joined)) {
+              const x1 = Math.min(...group.map(x => x.region.x1));
+              const y1 = Math.min(...group.map(x => x.region.y1));
+              const x2 = Math.max(...group.map(x => x.region.x2));
+              const y2 = Math.max(...group.map(x => x.region.y2));
+              pushAmountLabel(joined, { x1, y1, x2, y2 }, 'ocr-reconstructed');
+            }
+          }
+        }
+        // De-duplicate identical boxes/text so scoring remains deterministic.
+        const seenAmountLabels = new Set();
+        const uniqueAmountLabels = amountLabels.filter(label => {
+          const r = label.region;
+          const key = `${label.text.toLowerCase()}|${Math.round(r.x1)}|${Math.round(r.y1)}|${Math.round(r.x2)}|${Math.round(r.y2)}`;
+          if (seenAmountLabels.has(key)) return false;
+          seenAmountLabels.add(key);
+          return true;
+        });
 
         const scored = moneyCandidates.map(candidate => {
           const cr = candidate.region;
@@ -5932,10 +6369,189 @@ async function getReferenceAmountAnchor(bank) {
           // information block; use this only as a weak tie-breaker.
           const yNorm = cr.y1 / height;
           if (yNorm > 0.12 && yNorm < 0.65) score += 8;
+          const candidateText = String(candidate.text || '').trim();
+          const integerOnly = /^[-+]?\d{1,6}$/.test(candidateText);
+
+          // Explicit-label proximity is a stronger signal than the generic
+          // `primaryLabelRe` match. It also permits OCR-split/plain-integer
+          // amounts, but only inside the amount row/field neighborhood.
+          for (const label of amountLabels) {
+            const lr = label.region;
+            const lh = Math.max(8, lr.y2 - lr.y1);
+            const lcY = (lr.y1 + lr.y2) / 2;
+            const ccY = (cr.y1 + cr.y2) / 2;
+            const sameLine = Math.abs(ccY - lcY) <= Math.max(lh * 1.5, 32);
+            const rightOfLabel = cr.x1 >= lr.x1 - lh * 0.5;
+            const horizontalGap = cr.x1 - lr.x2;
+            const closeRight = horizontalGap >= -lh && horizontalGap <= Math.max(420, lh * 18);
+            const verticalClose = Math.abs(cr.y1 - lr.y1) <= Math.max(lh * 2.0, 55);
+            const below = cr.y1 >= lr.y2 && (cr.y1 - lr.y2) <= Math.max(lh * 2.5, 80);
+            if ((sameLine && rightOfLabel && closeRight) || (below && verticalClose)) {
+              score += 170;
+              primaryHits++;
+              break;
+            }
+          }
+
+          if (integerOnly && primaryHits === 0) score -= 180;
+          if (/[-/]\d|\b(?:IBAN|NO|NUMARASI|REFERANS|HESAP|FIS|SIRA)\b/i.test(candidateText)) score -= 220;
           return { candidate, score, primaryHits, negativeHits };
         }).sort((a,b) => b.score - a.score);
 
-        const best = scored.find(x => x.primaryHits > 0 && x.negativeHits === 0) || scored[0];
+        let best = scored.find(x => x.primaryHits > 0 && x.negativeHits === 0 && x.score >= 40) || null;
+
+        // V1.4.2.1: Do not invoke Tesseract in the Vercel reference-anchor path.
+        // Vercel deployments may not contain tesseract.js-core's WASM asset,
+        // which can abort the whole Node runtime before the Promise rejection
+        // is safely contained. PaddleOCR is already available here, so when
+        // its word segmentation misses the numeric value we use a raster
+        // projection fallback on the SAME reference image instead.
+        if (!best && amountLabels.length) {
+          try {
+            const buffer = await fs.readFile(referencePath);
+            const raw = await sharp(buffer).greyscale().raw().toBuffer({ resolveWithObject: true });
+            const imgW = Number(raw.info?.width) || width;
+            const imgH = Number(raw.info?.height) || height;
+            const pixels = raw.data;
+            const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+            const isInk = v => Number(v) < 185;
+            const makeRuns = (values, minCount = 1, mergeGap = 6) => {
+              const runs = [];
+              let startRun = -1;
+              let last = -1;
+              for (let i = 0; i < values.length; i++) {
+                if (values[i] >= minCount) {
+                  if (startRun < 0) startRun = i;
+                  last = i;
+                } else if (startRun >= 0 && i - last > mergeGap) {
+                  runs.push({ start: startRun, end: last });
+                  startRun = -1;
+                  last = -1;
+                }
+              }
+              if (startRun >= 0) runs.push({ start: startRun, end: last });
+              return runs;
+            };
+            const rasterCandidates = [];
+
+            const inspectBand = (label, mode, x1, x2, y1, y2) => {
+              const lr = label.region;
+              const lh = Math.max(8, lr.y2 - lr.y1);
+              const bx1 = clamp(Math.floor(x1), 0, imgW - 1);
+              const bx2 = clamp(Math.ceil(x2), bx1 + 1, imgW);
+              const by1 = clamp(Math.floor(y1), 0, imgH - 1);
+              const by2 = clamp(Math.ceil(y2), by1 + 1, imgH);
+
+              // First isolate horizontal text bands. This prevents an Enpara
+              // header-over-value search from merging the value with the
+              // horizontal table border below it.
+              const rowInk = new Array(by2 - by1).fill(0);
+              for (let y = by1; y < by2; y++) {
+                const row = y * imgW;
+                for (let x = bx1; x < bx2; x++) if (isInk(pixels[row + x])) rowInk[y - by1]++;
+              }
+              const rowRuns = makeRuns(rowInk, Math.max(2, Math.floor(lh * 0.18)), 2);
+
+              for (const rowRun of rowRuns) {
+                const bandY1 = by1 + rowRun.start;
+                const bandY2 = by1 + rowRun.end + 1;
+                const bandH = bandY2 - bandY1;
+                if (bandH < Math.max(3, lh * 0.35) || bandH > Math.max(70, lh * 2.8)) continue;
+
+                const columnInk = new Array(bx2 - bx1).fill(0);
+                for (let y = bandY1; y < bandY2; y++) {
+                  const row = y * imgW;
+                  for (let x = bx1; x < bx2; x++) if (isInk(pixels[row + x])) columnInk[x - bx1]++;
+                }
+                const runs = makeRuns(columnInk, Math.max(1, Math.floor(bandH * 0.15)), Math.max(5, Math.round(lh * 0.7)));
+                for (const run of runs) {
+                  const rx1 = bx1 + run.start;
+                  const rx2 = bx1 + run.end + 1;
+                  const rw = rx2 - rx1;
+                  if (rw < Math.max(18, lh * 1.5) || rw > Math.min(420, imgW * 0.42)) continue;
+
+                  let minY = bandY2, maxY = bandY1, inkCount = 0;
+                  for (let y = bandY1; y < bandY2; y++) {
+                    const row = y * imgW;
+                    for (let x = rx1; x < rx2; x++) {
+                      if (isInk(pixels[row + x])) {
+                        minY = Math.min(minY, y);
+                        maxY = Math.max(maxY, y);
+                        inkCount++;
+                      }
+                    }
+                  }
+                  if (inkCount < 18 || maxY <= minY) continue;
+                  const rh = maxY - minY + 1;
+                  if (rh < Math.max(3, lh * 0.45) || rh > Math.max(70, lh * 2.5)) continue;
+
+                  const gapRight = rx1 - lr.x2;
+                  const centerX = (rx1 + rx2) / 2;
+                  const labelCenterX = (lr.x1 + lr.x2) / 2;
+                  const horizontalRelation = Math.abs(centerX - labelCenterX) / Math.max(1, imgW);
+                  const compactness = Math.min(1, rw / Math.max(1, lh * 10));
+                  const inkDensity = inkCount / Math.max(1, rw * rh);
+                  let score = 0;
+                  if (mode === 'right') {
+                    score = 1200 - Math.abs(gapRight - lh * 2) * 2 - compactness * 220 + (rx1 / imgW) * 120 + Math.min(120, inkDensity * 1000);
+                  } else {
+                    const verticalGap = minY - lr.y2;
+                    score = 1150 - Math.abs(verticalGap - lh * 2.2) * 3 - horizontalRelation * 500 - compactness * 180 + Math.min(120, inkDensity * 1000);
+                  }
+                  rasterCandidates.push({ score, mode, box: { x1: rx1, y1: minY, x2: rx2, y2: maxY + 1 }, label: String(label.text || '') });
+                }
+              }
+            };
+
+            for (const label of amountLabels) {
+              const lr = label.region;
+              const lh = Math.max(8, lr.y2 - lr.y1);
+              const lw = Math.max(lh * 3, lr.x2 - lr.x1);
+              const cy = (lr.y1 + lr.y2) / 2;
+
+              // Same-line/right-side layout: Halkbank and many bank forms.
+              inspectBand(
+                label, 'right',
+                lr.x2 + Math.max(2, lh * 0.3), imgW,
+                cy - Math.max(lh * 1.6, 24), cy + Math.max(lh * 1.6, 24)
+              );
+
+              // Header-over-value layout: Enpara's `B/A Para Cinsi Tutar`
+              // header sits above the actual numeric value. Search below the
+              // label while keeping the candidate horizontally aligned with
+              // the `Tutar` portion of the header.
+              inspectBand(
+                label, 'below',
+                Math.max(0, lr.x2 - lw * 0.45), Math.min(imgW, lr.x2 + lw * 0.55),
+                lr.y2 + Math.max(2, lh * 0.4), lr.y2 + Math.max(lh * 7, 150)
+              );
+            }
+
+            rasterCandidates.sort((a, b) => b.score - a.score);
+            const rasterBest = rasterCandidates[0] || null;
+            if (rasterBest) {
+              const r = rasterBest.box;
+              best = {
+                candidate: { text: '__RASTER_AMOUNT_BOX__', region: r },
+                score: 45,
+                primaryHits: 1,
+                negativeHits: 0,
+                source: `raster-label-${rasterBest.mode}-projection`,
+              };
+              console.log('REFERENCE AMOUNT ANCHOR V1.4.2.2 RASTER FALLBACK:', JSON.stringify({
+                bank: normalizedBank,
+                referenceFile: path.basename(referencePath),
+                selectedBox: r,
+                label: rasterBest.label,
+                mode: rasterBest.mode,
+                score: rasterBest.score,
+              }));
+            }
+          } catch (fallbackError) {
+            console.warn('REFERENCE AMOUNT ANCHOR V1.4.2.2 RASTER FALLBACK HATASI:', fallbackError?.message || fallbackError);
+          }
+        }
+
         if (!best || best.score < 20) continue;
         const r = best.candidate.region;
         entries.push({
@@ -5952,7 +6568,7 @@ async function getReferenceAmountAnchor(bank) {
 
     if (!entries.length) {
       referenceAmountAnchorCache.set(cacheKey, null);
-      console.warn('REFERENCE AMOUNT ANCHOR V16: UYGUN TUTAR ALANI BULUNAMADI');
+      console.warn('REFERENCE AMOUNT ANCHOR V16.1: UYGUN TUTAR ALANI BULUNAMADI');
       return null;
     }
 
@@ -5970,10 +6586,10 @@ async function getReferenceAmountAnchor(bank) {
         width: Math.max(...entries.map(x => x.widthNorm)) - Math.min(...entries.map(x => x.widthNorm)),
         height: Math.max(...entries.map(x => x.heightNorm)) - Math.min(...entries.map(x => x.heightNorm)),
       },
-      source: 'trusted-telegram-raster-ensemble-v16',
+      source: 'trusted-telegram-raster-ensemble-v16.1-explicit-amount-label-fallback',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
-    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE V16:', JSON.stringify({
+    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE V16.1:', JSON.stringify({
       bank: anchor.bank, pageNumber: anchor.pageNumber,
       xNorm: anchor.xNorm, yNorm: anchor.yNorm,
       widthNorm: anchor.widthNorm, heightNorm: anchor.heightNorm,
@@ -5997,8 +6613,10 @@ const referenceTemplateProfileCache = new Map();
 const referenceRasterOcrCache = new Map();
 
 const REFERENCE_FIELD_RULES = [
-  { key: "senderName", patterns: [/gönderen\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /gönderici\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /gonderen\s*(?:adi|ad[ıi]\s*soyad[ıi]?)/i] },
-  { key: "recipientName", patterns: [/alıcı\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i, /alici\s*(?:adi|ad[ıi]\s*soyadi)/i, /alacaklı\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?)/i] },
+  { key: "senderName", patterns: [/gönderen\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı)/i, /gönderici\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı)/i, /gonderen\s*(?:adi|ad[ıi]\s*soyad[ıi]?|unvani)/i] },
+  { key: "recipientName", patterns: [/^alıcı(?:\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı|ismi|adi soyadi))?$/i, /^alacaklı(?:\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı|ismi))?$/i, /^beneficiary(?:\s*name)?$/i, /^payee(?:\s*name)?$/i, /^receiver(?:\s*name)?$/i, /^lehdar(?:\s*(?:adı|unvanı))?$/i] },
+  { key: "senderIban", patterns: [/^gönderen\s*(?:hesap\s*)?iban$/i, /^gönderici\s*(?:hesap\s*)?iban$/i, /^gonderen\s*(?:hesap\s*)?iban$/i, /^sender\s*(?:account\s*)?iban$/i, /^originator\s*(?:account\s*)?iban$/i] },
+  { key: "recipientIban", patterns: [/^alıcı\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^alacaklı\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^lehdar\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^beneficiary\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i, /^payee\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i, /^receiver\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i] },
   { key: "senderAddress", patterns: [/gönderen\s*adres/i, /gönderici\s*adres/i, /gonderen\s*adres/i, /gonderici\s*adres/i] },
   { key: "recipientAddress", patterns: [/alıcı\s*adres/i, /alici\s*adres/i, /alacaklı\s*adres/i, /alacakli\s*adres/i] },
   { key: "address", patterns: [/\badres\b/i] },
@@ -6027,7 +6645,14 @@ function referenceFieldRuleForText(text) {
   // OCR can mix Turkish dotted/dotless I (İ/I/ı), especially in JPEG input.
   // Match rules against the same canonical alphabet used by the forensic
   // matcher so labels such as İŞLEM TARİHİ are not silently lost.
-  const value = normalizeFieldTextForMatch(String(text || ""));
+  const label = rfLabelPart(String(text || ""));
+  const value = normalizeFieldTextForMatch(label);
+  if (recipientNameLabel(text)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'recipientName') || null;
+  if (recipientIbanLabel(label)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'recipientIban') || null;
+  if (senderIbanLabel(label)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'senderIban') || null;
+  // Paddle commonly reads the final R in TUTAR as N on compact bank fonts.
+  const valueWithoutAmount = value.replace(/\s*[:=\-]?\s*[-+]?\s*\d[\d.,\s]*(?:TL|TRY|EUR|USD|GBP)?$/i, '').trim();
+  if (/(?:^|\s)(?:ISLEM|FAST|GIDEN|GONDERILEN|TRANSFER|HAVALE)\s+TUTAN$/.test(valueWithoutAmount)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'amount') || null;
   for (const rule of REFERENCE_FIELD_RULES) {
     if (rule.patterns.some((pattern) => {
       try {
@@ -6040,6 +6665,37 @@ function referenceFieldRuleForText(text) {
     })) return rule;
   }
   return null;
+}
+
+function rfSplitInlineLabelValue(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  if (/[:：]/.test(raw)) {
+    const label = rfLabelPart(raw);
+    const rule = referenceFieldRuleForText(label);
+    const value = raw.split(/[:：]/).slice(1).join(':').trim();
+    if (rule && value && rfValueTypeForField(rule.key, value, label) !== 'other') return { label, value, rule };
+    return null;
+  }
+
+  // OCR may put a complete field on one line without punctuation. Find the
+  // longest known semantic label prefix whose remaining text has the right
+  // value type; this avoids treating MUSTERI UNVANI as recipientName.
+  const words = raw.split(/\s+/).filter(Boolean);
+  const candidates = [];
+  for (let count = 1; count < words.length; count++) {
+    const label = words.slice(0, count).join(' ');
+    const value = words.slice(count).join(' ');
+    const rule = referenceFieldRuleForText(label);
+    if (!rule || !value) continue;
+    const firstValueToken = normalizeFieldTextForMatch(value.split(/\s+/)[0] || '');
+    if (['BANKA','HESAP','IBAN','HESABI','NO','NUMARASI'].includes(firstValueToken)) continue;
+    const type = rfValueTypeForField(rule.key, value, label);
+    if (type === 'other' || type === 'empty' || type === 'known-static-value') continue;
+    candidates.push({ label, value, rule, prefixWords: count });
+  }
+  candidates.sort((a, b) => b.prefixWords - a.prefixWords);
+  return candidates[0] || null;
 }
 
 function groupPdfTextLines(items, viewport) {
@@ -6816,13 +7472,17 @@ function rfInferSemanticFieldKey(field, labelText = '') {
   const rawField = String(field || '');
   if (!rawField.startsWith('generic:')) return rawField;
   const n = normalizeFieldTextForMatch(labelText || rawField.slice(8)).replace(/[:：]/g,'').replace(/\s+/g,' ').trim();
+  const label = labelText || rawField.slice(8);
+  if (recipientIbanLabel(label)) return 'iban';
+  if (senderIbanLabel(label)) return 'iban';
   // V1.2.5 CRITICAL ROI: bank-specific Enpara labels must resolve to the
   // same semantic value type used by the critical typography gate. Without
   // these aliases, labels such as GİDEN FAST EFT and MÜŞTERİ ÜNVANI became
   // generic-text, so rfFindValueRegion() could legally attach an unrelated
   // nearby text box. That is the wrong-place ROI bug we are fixing here.
-  if (/alici\s+iban|alici\s+hesap\s+no.*iban|iban\s*\/?\s*kart\s*no|iban/.test(n)) return 'iban';
-  if (/alici\s+(?:ad\s+soyad|unvan|ünvan)|alici\s*unvani|alici\s*adi/.test(n)) return 'recipientName';
+  if (/iban\s*\/?\s*kart\s*no/.test(n)) return 'generic-text';
+  if (/\biban\b/.test(n)) return 'generic-text';
+  if (recipientNameLabel(labelText || rawField.slice(8))) return 'recipientName';
   if (/gonderen\s+ad\s+soyad|gonderici\s+ad\s+soyad|musteri\s+unvani|musteri\s+adi|giden\s+fast\s+eft/.test(n)) return 'senderName';
   if (/eft\s+tutari|giden\s+eft\s+tutari|giden\s+fast\s+tutari|islem\s+tutari|masraf\s+tutari|tutar/.test(n)) return 'amount';
   if (/islem\s+tarihi|tarih/.test(n)) return 'date';
@@ -6888,17 +7548,20 @@ function rfLooksLikeLabelRegion(region) {
 function rfCriticalSemanticKeyV126(field,labelText=''){
   const raw=String(field||'');
   const n=normalizeFieldTextForMatch(labelText||raw.replace(/^generic:/i,'')).replace(/[:：]/g,' ').replace(/\s+/g,' ').trim();
-  if(/iban|iban\s*\/?\s*kart\s*no/i.test(n))return 'iban';
+  const label=labelText||raw.replace(/^generic:/i,'');
+  if(recipientIbanLabel(label))return 'recipientIban';
+  if(senderIbanLabel(label))return 'senderIban';
+  if(/iban|iban\s*\/?\s*kart\s*no/i.test(n))return 'genericIban';
   if(/eft\s+tutari|giden\s+fast\s+tutari|giden\s+eft\s+tutari|islem\s+tutari|tutar/i.test(n))return 'amount';
   if(/musteri\s+unvani|musteri\s+adi|gonderen\s+(?:ad|adi|unvani)|gonderici\s+(?:ad|adi|unvani)|giden\s+fast\s+eft/i.test(n))return 'senderName';
-  if(/alici\s+(?:ad|adi|unvani|unvan)/i.test(n))return 'recipientName';
+  if(recipientNameLabel(labelText||raw.replace(/^generic:/i,'')))return 'recipientName';
   if(/sira\s+no|fis\s+no|islem\s+no|sorgu\s+no|referans\s+no/i.test(n))return 'transactionNo';
   if(/esentepe|adres|address/i.test(n))return 'address';
   if(/^generic:IBAN\/KART NO$/i.test(raw))return 'iban';
   if(/^generic:EFT TUTARI$/i.test(raw))return 'amount';
   if(/^generic:MUSTERI UNVANI$/i.test(raw)||/^generic:GIDEN FAST EFT$/i.test(raw))return 'senderName';
   if(/^generic:ALICI UNVANI$/i.test(raw))return 'recipientName';
-  if(/^generic:ALICI IBAN$/i.test(raw))return 'iban';
+  if(/^generic:ALICI IBAN$/i.test(raw))return 'recipientIban';
   if(/^generic:(?:SIRA NO|FIS NO)$/i.test(raw))return 'transactionNo';
   if(/^generic:(?:ESENTEPE|ADRES)/i.test(raw))return 'address';
   return rfInferSemanticFieldKey(field,labelText);
@@ -6943,7 +7606,7 @@ function rfCriticalCandidateScoreV126(label,candidate,semanticKey){
 }
 function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
   const semanticKey=rfCriticalSemanticKeyV126(field,label?.labelText||label?.text||'');
-  const labelText=String(label?.labelText||label?.text||'').trim();
+  const labelText=String(label?.text && /[:：]/.test(label.text) ? label.text : (label?.labelText||label?.text||'')).trim();
 
   // V1.2.7: OCR can return LABEL:VALUE in one region. Split it semantically
   // before searching nearby regions. This is especially important for
@@ -6956,7 +7619,7 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
     const sameSemantic=leftKey===semanticKey;
     let valid=false;
     if(sameSemantic){
-      if(semanticKey==='iban') valid=rfCriticalLooksIbanV126(inlineValue);
+      if(semanticKey==='iban'||semanticKey==='recipientIban'||semanticKey==='senderIban') valid=rfCriticalLooksIbanV126(inlineValue);
       else if(semanticKey==='amount') valid=rfCriticalLooksAmountV126(inlineValue);
       else if(semanticKey==='transactionNo') valid=rfCriticalLooksNumericIdV126(inlineValue);
       else if(semanticKey==='senderName'||semanticKey==='recipientName') valid=rfCriticalLooksNameV126(inlineValue);
@@ -6988,12 +7651,19 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
     }
   }
 
+  // OCR can split a logical IBAN across adjacent lines. Join only fragments
+  // whose normalized value is a complete Turkish IBAN, and compare both lines.
+  if(semanticKey==='iban'||semanticKey==='recipientIban'||semanticKey==='senderIban'){
+    const joined=resolveSplitTurkishIban(regions,label);
+    if(joined)return joined;
+  }
+
   const candidates=(Array.isArray(regions)?regions:[])
     .filter(v=>v&&v!==label&&v.region&&String(v.text||'').trim())
     .map(v=>{
       const text=String(v.text||'').trim();
       let ok=false;
-      if(semanticKey==='iban')ok=rfCriticalLooksIbanV126(text);
+      if(semanticKey==='iban'||semanticKey==='recipientIban'||semanticKey==='senderIban')ok=rfCriticalLooksIbanV126(text);
       else if(semanticKey==='amount')ok=rfCriticalLooksAmountV126(text);
       else if(semanticKey==='transactionNo')ok=rfCriticalLooksNumericIdV126(text);
       else if(semanticKey==='senderName'||semanticKey==='recipientName')ok=rfCriticalLooksNameV126(text);
@@ -7008,7 +7678,7 @@ function rfResolveCriticalValueRegionV127(regions,label,field,options={}){
       if(!ok||rfLooksLikeLabelRegion(v))return null;
       const cost=rfCriticalCandidateScoreV126(label,v,semanticKey);
       if(!Number.isFinite(cost))return null;
-      const limit=semanticKey==='address'?16:semanticKey==='iban'?14:
+      const limit=semanticKey==='address'?16:(semanticKey==='iban'||semanticKey==='recipientIban'||semanticKey==='senderIban')?14:
         (semanticKey==='transactionNo'||semanticKey==='amount')?10:14;
       if(cost>limit)return null;
       return {...v,criticalROI:true,resolver:'semantic-typed-relative-v127',_cost:cost};
@@ -7023,6 +7693,16 @@ function rfFindValueRegion(regions, label, expectedField = null) {
   if (!label?.region) return null;
   const rawField = String(expectedField || label?.rule?.key || '');
   const field = rfInferSemanticFieldKey(rawField, label?.labelText || label?.text || '');
+
+  if (label?.inlineSemanticValue && label?.inlineSemanticValueRegion) {
+    return {
+      text: label.inlineSemanticValue,
+      region: rfFocusValueRegion(label.inlineSemanticValueRegion, label.text || '', field, label.labelText, label.inlineSemanticValue),
+      score: 100,
+      criticalROI: true,
+      resolver: 'inline-label-neighbor-semantic-v1',
+    };
+  }
 
   // OCR frequently returns `LABEL : VALUE` as one region. Only accept it if
   // the text before the colon is actually the same semantic field.
@@ -7752,14 +8432,13 @@ function rfFocusLabelRegion(region, fullText) {
   };
 }
 
-function rfFocusValueRegion(region, fullText, field) {
+function rfFocusValueRegion(region, fullText, field, inlineLabel = null, inlineValue = null) {
   if (!region) return null;
   const s = String(fullText || '');
-  if (!/[:：]/.test(s)) return region;
-  const parts = s.split(/[:：]/);
-  const left = String(parts[0] || '').trim();
-  const total = s.replace(/[:：]/g, '').trim();
-  const ratio = total.length ? left.length / total.length : 0.45;
+  if (!/[:：]/.test(s) && !(inlineLabel && inlineValue)) return region;
+  const left = String(inlineLabel || s.split(/[:：]/)[0] || '').trim();
+  const value = String(inlineValue || s.split(/[:：]/).slice(1).join(':') || '').trim();
+  const ratio = (left.length + value.length) ? left.length / (left.length + value.length) : 0.45;
   // OCR kutusu etiket+değeri birlikte tuttuğunda sağdaki bölüm değer için
   // yaklaşık bir ROI'dir. Aşırı küçük/büyük kesimleri engelliyoruz.
   const startRatio = Math.max(0.22, Math.min(0.72, ratio + 0.06));
@@ -7798,6 +8477,7 @@ function rfCanonicalLabelScore(field, text) {
       return new RegExp(normalizeFieldTextForMatch(re.source), flags).test(label);
     } catch { return re.test(label); }
   })) score += 100;
+  if (field === 'recipientName' && recipientNameLabel(label)) score = Math.max(score, 100);
   else if (label.length <= 42) score += 25;
   if (/[:：]/.test(s)) score += 30;
   // A field label followed by a value is more useful than a generic word
@@ -8169,6 +8849,22 @@ function rfFieldLabelText(label){
 // - Customer/recipient names = semantic inline/relative value ROI only.
 // - Dynamic transaction IDs are never treated as literal-value mismatches.
 // - V15.2, Amount Forensics and Known-Fake layers remain untouched.
+function resolveSemanticGeometryFallbackV152(field, referenceCandidate, targetRows, referenceRows) {
+  if (!referenceCandidate || !Array.isArray(targetRows) || !targetRows.length) return null;
+  const boxOf=(b)=>{const r=b?.region||b;if(!r)return null;const x1=Number(r.x1),y1=Number(r.y1),x2=Number(r.x2),y2=Number(r.y2);return [x1,y1,x2,y2].every(Number.isFinite)&&x2>x1&&y2>y1?{x1,y1,x2,y2}:null};
+  const size=(rows)=>{const xs=rows.flatMap(r=>[Number(r?.region?.x1),Number(r?.region?.x2)]).filter(Number.isFinite);const ys=rows.flatMap(r=>[Number(r?.region?.y1),Number(r?.region?.y2)]).filter(Number.isFinite);return {w:xs.length?Math.max(...xs):0,h:ys.length?Math.max(...ys):0};};
+  const refBox=boxOf(referenceCandidate); if(!refBox)return null;
+  const rs=size(referenceRows||[]),ts=size(targetRows||[]); if(!rs.w||!rs.h||!ts.w||!ts.h)return null;
+  const rn={x:(refBox.x1+refBox.x2)/(2*rs.w),y:(refBox.y1+refBox.y2)/(2*rs.h),w:(refBox.x2-refBox.x1)/rs.w,h:(refBox.y2-refBox.y1)/rs.h};
+  const norm=v=>String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğışöüıİ]/g,c=>({ç:'c',ğ:'g',ı:'i',İ:'i',ş:'s',ö:'o',ü:'u'}[c]||c));
+  const stop=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
+  const nameLike=v=>{const t=String(v||'').trim();if(!t||/\d/.test(t))return false;const ws=t.split(/\s+/).filter(Boolean);if(ws.length<2||ws.length>6)return false;const up=ws.map(w=>norm(w).toUpperCase());if(up.some(w=>stop.has(w)))return false;return ws.every(w=>/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]{2,}$/.test(w));};
+  const ibanLike=v=>/^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
+  const valid=field==='recipientName'?nameLike:ibanLike;
+  const scored=targetRows.filter(r=>r?.region&&valid(r.text)).map(r=>{const b=boxOf(r),n={x:(b.x1+b.x2)/(2*ts.w),y:(b.y1+b.y2)/(2*ts.h),w:(b.x2-b.x1)/ts.w,h:(b.y2-b.y1)/ts.h};const d=Math.hypot(n.x-rn.x,n.y-rn.y),sd=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,rn.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,rn.h)));return {r,d,sd,score:100-d*180-sd*18};}).sort((a,b)=>b.score-a.score);
+  const best=scored[0];return best&&best.score>=55?{text:String(best.r.text).trim(),region:best.r.region,score:Number(best.score.toFixed(2)),resolver:`reference-geometry-${field}-v152`}:null;
+}
+
 async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null, amountForensics = null, referenceAmountFieldArg = null) {
   const referenceAmountField = referenceAmountFieldArg || null;
   const normalizedBank = normalizeBank(bank);
@@ -8204,8 +8900,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       for (const r of regions) {
         const raw = String(r.text || '').trim();
         if (!raw) continue;
-        const canonical = referenceFieldRuleForText(raw);
-        const label = rfLabelPart(raw);
+        const inline = rfSplitInlineLabelValue(raw);
+        const canonical = inline?.rule || referenceFieldRuleForText(raw);
+        const label = inline?.label || rfLabelPart(raw);
         const key = canonical?.key || rfGenericFieldKey(label);
         if (!key) continue;
         // V12: A generic OCR string is not a field label merely because it is
@@ -8217,6 +8914,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           ...r,
           rule: canonical || { key, patterns: [] },
           labelText: label,
+          inlineSemanticValue: inline?.value || null,
+          inlineSemanticValueRegion: inline ? r.region : null,
           canonicalScore: canonical ? rfCanonicalLabelScore(key, raw) : 35,
           templateRole: role,
         });
@@ -8627,7 +9326,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const tpCriticalKeyAlias=(key)=>{
           const k=String(key||'');
           if(/^generic:ESENTEPE/i.test(k) || /^generic:.*\bADRES\b/i.test(k)) return 'address';
-          if(/^generic:ALICI\s+UNVANI/i.test(k)) return 'recipientName';
+          if(recipientNameLabel(k.replace(/^generic:/i,''))) return 'recipientName';
           if(/^generic:ALICI\s+IBAN/i.test(k)) return 'iban';
           return tpSemanticField(k);
         };
@@ -8683,7 +9382,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             amount:[/^(giden\s+fast|giden\s+eft|islem|eft|transfer|ana)\s+tutari$/i,/^tutar$/i],
             iban:[/^iban(?:\s+no)?$/i,/^iban\/kart\s+no$/i,/^(gonderen|alici|alacakli)\s+iban$/i],
             senderName:[/^gonderen(?:\s+adi)?$/i,/^gonderici(?:\s+adi)?$/i],
-            recipientName:[/^(alici|alacakli)(?:\s+adi|\s+unvani)?$/i],
+            recipientName:[/^(alici|alacakli)(?:\s+adi|\s+ad\s+soyadi|\s+unvani|\s+unvan|\s+ismi|\s+isim)?$/i,/^(beneficiary|payee|receiver)(?:\s+name)?$/i,/^lehdar(?:\s+(adi|unvani))?$/i],
             senderAddress:[/^(gonderen|gonderici)\s+adres$/i],
             recipientAddress:[/^(alici|alacakli)\s+adres$/i],
             address:[/^adres$/i],
@@ -9106,6 +9805,16 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           }
         }
 
+        const semanticValueRegions = {
+          recipientName: resolveMathSemanticValueBox(refRegions, 'recipientName'),
+          recipientIban: resolveMathSemanticValueBox(refRegions, 'recipientIban'),
+        };
+        console.log('MATH REFERENCE SEMANTIC VALUE RESOLVER V1.5.4:', JSON.stringify({
+          reference:path.basename(referencePath),
+          recipientName:semanticValueRegions.recipientName ? {box:semanticValueRegions.recipientName.region,resolver:semanticValueRegions.recipientName.resolver} : null,
+          recipientIban:semanticValueRegions.recipientIban ? {box:semanticValueRegions.recipientIban.region,resolver:semanticValueRegions.recipientIban.resolver} : null,
+        }));
+
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
         const typographyMedium=typographyFindings.filter(x=>x.severity==='medium');
         const typographyComparableCount=typographyFieldProfiles.length;
@@ -9135,7 +9844,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           characterFindingCount:typographyFindings.length,
           characterFindings:typographyFindings.slice(0,20),
           typographyFieldProfiles:typographyFieldProfiles.slice(0,30),
-          fields:fieldResults,referenceQuality,
+          fields:fieldResults,referenceQuality,semanticValueRegions,
+          ocrRegions: refRegions.map(r => ({ text: r.text, region: r.region })),
         });
       }catch(error){
         console.warn('REFERENCE FORENSIC TEK DOSYA ATLANDI:',path.basename(referencePath),error?.message||error);
@@ -9272,6 +9982,28 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       if(keep)spacingAnomalies.push({...rows.sort((a,b)=>b.score-a.score)[0],ensembleMedianScore:rfClamp100(med),referenceCountForPair:rows.length});
     }
 
+    const semanticValueRegions = {};
+    for (const key of ['recipientName','recipientIban']) {
+      const candidates = referenceResults.map(r=>r?.semanticValueRegions?.[key]).filter(Boolean);
+      if (candidates.length) semanticValueRegions[key] = candidates[0];
+    }
+    const targetSemanticRegions = {
+      recipientName: resolveMathSemanticValueBox(targetOCR?.regions || [], 'recipientName'),
+      recipientIban: resolveMathSemanticValueBox(targetOCR?.regions || [], 'recipientIban'),
+    };
+    // V1.5.2: Enpara can expose the beneficiary value without a clean OCR
+    // "ALICI" label on the target. If the trusted reference semantic ROI is
+    // known, resolve the target by normalized geometry, but ONLY among strict
+    // name/IBAN candidates. Never use an arbitrary numeric/text box.
+    for (const field of ['recipientName','recipientIban']) {
+      if (targetSemanticRegions[field]) continue;
+      const refCandidate=semanticValueRegions[field];
+      if (!refCandidate) continue;
+      const referenceRowsForFallback = referenceResults.flatMap(r => Array.isArray(r?.ocrRegions) ? r.ocrRegions : []);
+      const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],referenceRowsForFallback);
+      if (fallback) targetSemanticRegions[field]=fallback;
+    }
+
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
     const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
     const maxSpacingScore=spacingAnomalies.length?Math.max(...spacingAnomalies.map(x=>Number(x.score)||0)):0;
@@ -9305,6 +10037,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       score,severity,
       independentSignals:[suspicious.length>=1,strongSpacing.length>=1,referenceResults.length>=2,suspicious.length>=2].filter(Boolean).length,
       references:referenceResults.map(x=>({file:x.file,fieldCount:x.fieldCount,styleScore:x.styleScore,localAnomalyScore:x.localAnomalyScore,suspiciousFieldCount:x.suspiciousFieldCount,suspiciousFields:x.suspiciousFields,spacingAnomalyCount:x.spacingAnomalyCount,spacingAnomalies:x.spacingAnomalies,referenceQuality:x.referenceQuality})),
+      referenceSemanticRegions:semanticValueRegions,
+      targetSemanticRegions,
       fields,fieldObservations,
       evidence:localized.length
         ? `Referans ensemble + semantik occurrence eşleştirme + affine hizalama sonrasında ${suspicious.length} alan ve ${spacingAnomalies.length} yerel yapısal aralık anomalisi bulundu: ${localized.join(', ')}.`
@@ -11101,8 +11835,8 @@ function reconstructedAmountLabelEvidence(group) {
         .replace(/\s+/g, " ")
         .trim();
 
-      const strong = /giden fast tutar|gönderilen fast tutar|giden tutar|gönderim tutar/.test(normalized);
-      const medium = /işlem tutar|transfer tutar|ana tutar|tutar/.test(normalized);
+      const strong = /GIDEN FAST TUTAR|GONDERILEN FAST TUTAR|GIDEN TUTAR|GONDERIM TUTAR/.test(normalized);
+      const medium = /ISLEM TUTAR|TRANSFER TUTAR|ANA TUTAR|\bTUTAR\b/.test(normalized);
       if (!strong && !medium) continue;
 
       const gap = gx1 - last.x2;
@@ -11120,15 +11854,15 @@ function reconstructedAmountLabelEvidence(group) {
 }
 
 function extractStrongAmountFromText(text) {
-  const raw = cleanAmountText(text || "");
+  const raw = normalizePrimaryAmountOCRText(text || "");
   if (!raw) return null;
   const patterns = [
-    /giden\s*fast\s*tutar[ıi]?\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /gönderilen\s*(?:fast\s*)?tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /transfer\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /işlem\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /ana\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
-    /giden\s*tutar\s*[:\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /GIDEN\s*FAST\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /GONDERILEN\s*(?:FAST\s*)?TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /TRANSFER\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /ISLEM\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /ANA\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
+    /GIDEN\s*TUTARI?\s*[:=\-]?\s*([-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{1,2})?)/i,
   ];
   for (const re of patterns) {
     const m = raw.match(re);
@@ -11141,6 +11875,11 @@ function normalizePrimaryAmountOCRText(text) {
   return cleanAmountText(text || "")
     .toLocaleUpperCase("tr-TR")
     .replace(/[İIı]/g, "I")
+    .replace(/Ğ/g, "G")
+    .replace(/Ü/g, "U")
+    .replace(/Ş/g, "S")
+    .replace(/Ö/g, "O")
+    .replace(/Ç/g, "C")
     // PaddleOCR bazı fontlarda T harfini I/J/L gibi okuyabiliyor.
     .replace(/GIDEN\s+FAST\s+IUTARI/g, "GIDEN FAST TUTARI")
     .replace(/GIDEN\s+FAST\s+TUTARL/g, "GIDEN FAST TUTARI")
@@ -11148,6 +11887,10 @@ function normalizePrimaryAmountOCRText(text) {
     .replace(/GONDERILEN\s+FAST\s+IUTARI/g, "GONDERILEN FAST TUTARI")
     .replace(/GONDERILEN\s+FAST\s+TUTARL/g, "GONDERILEN FAST TUTARI")
     .replace(/GONDERIM\s+IUTARI/g, "GONDERIM TUTARI")
+    // Compact receipt fonts often make the final R in TUTAR look like N.
+    .replace(/\bTUTAN(?=\b|\s)/g, "TUTAR")
+    .replace(/\bTUTARL(?=\b|\s)/g, "TUTARI")
+    .replace(/\bTUTAR1(?=\b|\s)/g, "TUTARI")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -11258,17 +12001,18 @@ function buildDeterministicAmountLabelCandidates() {
     }))
     .sort((a,b) => a.y1 - b.y1 || a.x1 - b.x1);
 
-  const strong = /giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar|b\s*\/\s*a\s*para\s*cinsi\s*tutar/i;
-  const medium = /(?:para\s*cinsi\s*tutar|\btutar\b|amount)/i;
+  const strong = /GIDEN\s*FAST\s*TUTAR|GONDERILEN\s*(?:FAST\s*)?TUTAR|TRANSFER\s*TUTAR|ISLEM\s*TUTAR|ANA\s*TUTAR|GONDERIM\s*TUTAR|GIDEN\s*TUTAR|B\s*\/\s*A\s*PARA\s*CINSI\s*TUTAR/;
+  const medium = /(?:PARA\s*CINSI\s*TUTAR|\bTUTAR\b|AMOUNT)/;
   const negative = /müşteri\s*no|musteri\s*no|sorgu\s*no|fiş\s*no|fis\s*no|işlem\s*no|islem\s*no|referans|ettn|iban|hesap\s*no|vergi\s*no|sıra\s*no|sira\s*no/i;
   const numeric = /^[-+]?\s*(?:₺|€|\$|£)?\s*(?:(?:\d{1,3}(?:[.,]\d{3})+)|\d+)(?:[.,]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?$/i;
   const candidates = [];
 
   for (let i=0; i<regions.length; i++) {
     const label = regions[i];
-    if (negative.test(label.text)) continue;
-    const labelIsStrong = strong.test(label.text);
-    const labelIsMedium = medium.test(label.text);
+    const labelText = normalizePrimaryAmountOCRText(label.text);
+    if (negative.test(labelText)) continue;
+    const labelIsStrong = strong.test(labelText);
+    const labelIsMedium = medium.test(labelText);
     if (!labelIsStrong && !labelIsMedium) continue;
 
     const lh = Math.max(8, label.y2-label.y1);
@@ -11305,10 +12049,10 @@ function buildDeterministicAmountLabelCandidates() {
       labelDerivedScore: score,
       amountCandidateScore: score,
       referencePositionScore: 0,
-      directLabelEvidence: { score, label: label.text, distance: best.cost, hard: labelIsStrong },
-      reconstructedLabelEvidence: { score, label: label.text, distance: best.cost, hard: labelIsStrong },
-      labelEvidence: { score, positive: [label.text], negative: [] },
-      context: { score: 0, positive: [label.text], negative: [] },
+      directLabelEvidence: { score, label: labelText, distance: best.cost, hard: labelIsStrong },
+      reconstructedLabelEvidence: { score, label: labelText, distance: best.cost, hard: labelIsStrong },
+      labelEvidence: { score, positive: [labelText], negative: [] },
+      context: { score: 0, positive: [labelText], negative: [] },
       anchor: { score: 0, anchors: [] },
       templateScore: 0,
       signal: 1,
@@ -11353,8 +12097,8 @@ function buildInlineAmountCandidates() {
   // Öncelik özellikle "GİDEN FAST TUTARI" gibi ana işlem tutarı
   // etiketlerindedir. "TOPLAM TAHSİLAT TUTARI" komisyon dahil toplamdır;
   // ana tutar yerine otomatik seçilmemelidir.
-  const primaryLabel = /(?:giden\s*fast\s*tutar[ıi]?|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|havale\s*tutar|işlem\s*tutar[ıi]?|giden\s*tutar[ıi]?|ana\s*tutar[ıi]?)/i;
-  const totalLabel = /(?:toplam\s*(?:tahsilat|işlem|ödeme)\s*tutar[ıi]?|toplam\s*tutar[ıi]?)/i;
+  const primaryLabel = /(?:GIDEN\s*FAST\s*TUTARI?|GONDERILEN\s*(?:FAST\s*)?TUTARI?|TRANSFER\s*TUTARI?|HAVALE\s*TUTARI?|ISLEM\s*TUTARI?|GIDEN\s*TUTARI?|ANA\s*TUTARI?)/;
+  const totalLabel = /(?:TOPLAM\s*(?:TAHSILAT|ISLEM|ODEME)\s*TUTARI?|TOPLAM\s*TUTARI?)/;
   const amountToken = /[-+]?\s*(?:(?:\d{1,3}(?:[.,]\d{3})+)|\d+)(?:[.,]\d{1,2})?/;
   const excluded = /(?:müşteri\s*no|musteri\s*no|işlem\s*ref|işlem\s*no|islem\s*no|sorgu\s*no|referans|seri\s*no|sıra\s*no|sira\s*no|hesap\s*no|iban|tckn|vergi\s*no|ettn|belge\s*(?:no|numarası|numarasi))/i;
 
@@ -11892,7 +12636,25 @@ return String(a.text).localeCompare(String(b.text));
 // The ranked list is the single source of truth for the selected amount.
 // Analyze 30 accidentally referenced `candidate` without defining it, which
 // caused a Vercel ReferenceError before the amount result could be returned.
-const candidate = rankedCandidates[0] || null;
+// V1.5.2: money-format gate. A reference-guided amount candidate must either
+// carry an explicit currency/decimal money form or be explicitly tied to a
+// primary amount label. Plain IDs (Fiş No / Referans No / Sıra No) are not
+// allowed to win merely because they are numeric.
+const moneyFormatV152 = /^(?:[-+]?\s*(?:₺|TL|TRY|EUR|USD|GBP)\s*)?[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,\.]\d{2})(?:\s*(?:TL|TRY|₺|EUR|USD|GBP))?$/i;
+const explicitAmountRoleV152 = (c) => Boolean(
+  c?.inlineAmountLabel || c?.directLabelEvidence?.hard || c?.reconstructedLabelEvidence?.hard ||
+  /(?:giden\s*fast|gönderilen\s*(?:fast\s*)?tutar|işlem\s*tutar|transfer\s*tutar|ana\s*tutar|giden\s*tutar|tutar)/i.test(String(c?.directLabelEvidence?.label || c?.reconstructedLabelEvidence?.label || ''))
+);
+const gatedRankedCandidatesV152 = rankedCandidates.filter(c => {
+  const text=String(c?.text||'').replace(/\s+/g,' ').trim();
+  const money=moneyFormatV152.test(text);
+  const explicit=explicitAmountRoleV152(c);
+  const idLike=/^(?:\d{7,}|20\d{6,}|\d{1,6})$/.test(text);
+  if (money) return true;
+  if (explicit && !/(?:IBAN|REFERANS|FIS|SIRA|HESAP|MÜŞTERİ|MUSTERI|SORGU)/i.test(text)) return true;
+  return !idLike && explicit;
+});
+const candidate = gatedRankedCandidatesV152[0] || null;
 
 if (!candidate) {
   console.warn(
@@ -12649,6 +13411,8 @@ directAmountLabelScore: Number(candidate.directLabelEvidence?.score || 0),
 directAmountLabel: candidate.directLabelEvidence?.label || null,
 },
 selectionMethod,
+selectionGate: 'money-format-or-explicit-primary-amount-v1.5.2',
+gatedCandidateCount: gatedRankedCandidatesV152.length,
 selectedAmountText: normalizeOCRAmountLiteral(candidate.text),
 referenceAmountText: null,
 segmentFeatures: features.map((feature, index) => ({
@@ -15215,6 +15979,7 @@ if (type === "image" || type === "pdf") {
       bank,
       fileName,
       referencePath: reference?.path || null,
+      targetOCR: paddleImageOCR,
       amountForensics,
       referenceForensics
     });
@@ -17101,7 +17866,9 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     layoutForensics,
     referenceLocalCrop,
     azureReferenceGeometry,
-    bank
+    bank,
+    mathematicalForensics,
+    negativeSampleForensics
   );
   const aiReport = Array.isArray(referenceVisualAdjudication?.findings) && referenceVisualAdjudication.findings.length
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
@@ -17115,8 +17882,14 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   // however, the reference section MUST NOT say "Belirgin bir fark yok".
   // Keep the signal deterministic, localized and conservative.
   const buildCriticalRoiReferenceReport = (math) => {
+    const fusionFields = math?.semanticMathCalibration?.fields || {};
     const rows = Array.isArray(math?.criticalRoiMismatches)
-      ? math.criticalRoiMismatches.filter(x => x?.strong)
+      ? math.criticalRoiMismatches.filter(x => {
+          if (!x?.strong) return false;
+          const f = fusionFields[String(x.field || '')];
+          if (!f) return false;
+          return f.level === 'strong-mismatch' || (f.level === 'elevated-mismatch' && (Number(f.amountForensicsScore || 0) >= 80 || Number(f.strongDifferentRatio || 0) >= 0.20));
+        })
       : [];
     if (!rows.length) return null;
 
@@ -17169,7 +17942,25 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   // birleştiriliyor; tekrarlar başlık+detay bazında temizleniyor.
   const mergeReferenceReports = (reports) => {
     const all = [];
+    const informational = [];
     const seen = new Set();
+    const infoSeen = new Set();
+    const fusion = detailedDeterministicReport?.mathematicalFusion || buildReferenceMathematicalFusion(mathematicalForensics, referenceForensics, layoutForensics, bank, negativeSampleForensics);
+    const fusionFields = fusion?.fields || {};
+    const keepAsMaterial = (row) => {
+      const kind = String(row?.kind || '');
+      const field = String(row?.evidenceField || row?.field || '').replace(/:value$/i, '');
+      const ff = fusionFields[field];
+      if (kind === 'critical-roi-mismatch') return Boolean(ff?.material);
+      if (['field-position','fused-field','strong-typography'].includes(kind)) {
+        if (ff) return Boolean(ff.material || fusion.negativeLike);
+        return !fusion.referenceLike;
+      }
+      if (['layout','whole-page','azure-layout'].includes(kind)) {
+        return !fusion.referenceLike || fusion.layout?.strong === true;
+      }
+      return true;
+    };
     for (const report of reports.filter(Boolean)) {
       const rows = Array.isArray(report.findings) ? report.findings : [];
       for (const row of rows) {
@@ -17177,29 +17968,46 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
         const detail = String(row?.detail || '').trim();
         if (!title || !detail) continue;
         const key = `${title}|${detail}`.toLocaleLowerCase('tr-TR');
-        if (seen.has(key)) continue;
+        if (seen.has(key) || infoSeen.has(key)) continue;
+        if (!keepAsMaterial(row)) {
+          infoSeen.add(key);
+          informational.push({ ...row, severity: 'informational' });
+          continue;
+        }
         seen.add(key);
         all.push({ ...row });
       }
     }
+    for (const row of (detailedDeterministicReport?.informationalFindings || [])) {
+      const title = String(row?.title || '').trim();
+      const detail = String(row?.detail || '').trim();
+      if (!title || !detail) continue;
+      const key = `${title}|${detail}`.toLocaleLowerCase('tr-TR');
+      if (seen.has(key) || infoSeen.has(key)) continue;
+      infoSeen.add(key);
+      informational.push({ ...row, severity: 'informational' });
+    }
     all.sort((a, b) => Number(a.priority || 9) - Number(b.priority || 9));
+    informational.sort((a, b) => Number(a.priority || 9) - Number(b.priority || 9));
     const unique = all.slice(0, 8);
-    const userText = unique.length
-      ? [
-          '🔎 REFERANS KARŞILAŞTIRMASI',
-          '',
-          '🔴 FARKLAR',
-          ...unique.map(x => `• ${x.title}: ${x.detail}`)
-        ].join('\n')
-      : '🔎 REFERANS KARŞILAŞTIRMASI\n\n🟢 Belirgin bir fark tespit edilmedi.';
+    const infoUnique = informational.slice(0, 4);
+    const lines = ['🔎 REFERANS KARŞILAŞTIRMASI'];
+    if (unique.length) lines.push('', '🔴 FARKLAR', ...unique.map(x => `• ${x.title}: ${x.detail}`));
+    if (infoUnique.length) lines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
+    if (!unique.length && !infoUnique.length) lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
+    if (fusion?.referenceLike) lines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
+    else if (fusion?.negativeLike) lines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
+    else lines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
       available: true,
       findings: unique,
+      informationalFindings: infoUnique,
       differenceCount: unique.length,
       strongDifferenceCount: unique.length,
       status: unique.length ? 'differences-found' : 'no-material-difference-found',
-      userText,
+      mathematicalFusion: fusion,
+      userText: lines.join('\n'),
       mergedSources: reports.filter(Boolean).map(x => x.engine || 'unknown')
     };
   };
@@ -18768,7 +19576,172 @@ function buildV46ReferenceDifferenceReport(forensic, layout = null, localCrop = 
   };
 }
 
-function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null, bank = null) {
+function buildReferenceMathematicalFusion(math = null, forensic = null, layout = null, bank = null, negativeSampleForensics = null) {
+  // V1.6.2 FINAL ADJUDICATOR
+  // A missing negative baseline is NOT a zero similarity. It is an unavailable
+  // signal and must never manufacture a reference-vs-negative differential.
+  const rawDifferential = Number(math?.differential?.negativeMinusReference);
+  const referenceSimilarity = Number(math?.differential?.referenceSimilarity);
+  const negativeSimilarity = Number(math?.differential?.negativeSimilarity);
+  const referenceAvailable =
+    math?.differential?.referenceBaselineAvailable === true &&
+    Number.isFinite(referenceSimilarity);
+  const negativeBaselineAvailable =
+    math?.differential?.negativeBaselineAvailable === true &&
+    Number.isFinite(negativeSimilarity);
+  const differentialAvailable =
+    math?.differential?.differentialAvailable === true ||
+    (Number.isFinite(rawDifferential) && negativeBaselineAvailable && referenceAvailable);
+  const differential = differentialAvailable ? rawDifferential : null;
+
+  const referenceLikeByDifferential = differentialAvailable && differential <= -20;
+  const negativeLikeByDifferential = differentialAvailable && differential >= 20;
+
+  const semanticFields = math?.semanticMathCalibration?.fields || {};
+  const fieldRows = Array.isArray(forensic?.fields) ? forensic.fields : [];
+  const geometryByField = {};
+  for (const row of fieldRows) {
+    const field = String(row?.field || '').replace(/:value$/i, '');
+    if (!field) continue;
+    const current = geometryByField[field];
+    const candidate = {
+      positionScore: Number(row?.positionScore || 0),
+      styleScore: Number(row?.styleScore || 0),
+      combinedScore: Number(row?.combinedScore || 0),
+      positionResidual: Number(row?.positionResidual || 0),
+      referenceLabelYNorm: Number(row?.referenceLabelYNorm),
+      targetLabelYNorm: Number(row?.targetLabelYNorm),
+    };
+    if (!current || candidate.combinedScore > current.combinedScore) geometryByField[field] = candidate;
+  }
+
+  const criticalRows = Array.isArray(math?.criticalRoiMismatches)
+    ? math.criticalRoiMismatches.filter(x => x?.strong)
+    : [];
+  const criticalByField = {};
+  for (const row of criticalRows) criticalByField[String(row.field || '')] = row;
+
+  const fieldFusion = {};
+  for (const [field, sem] of Object.entries(semanticFields)) {
+    const geo = geometryByField[field] || {};
+    const roiStrong = criticalByField[field];
+    const level = String(sem?.level || 'reference-near');
+    const geometryStrong = Number(geo.positionScore || 0) >= 70 || Number(geo.combinedScore || 0) >= 70;
+    const roiStrongCells = Number(roiStrong?.globalStrongDifferentCount || 0);
+    const roiMean = Number(roiStrong?.roiMeanDistance || sem?.meanDistance || 0);
+    const independent = field === 'amount'
+      ? Number(sem?.amountForensicsScore || 0) >= 80
+      : negativeLikeByDifferential;
+    fieldFusion[field] = {
+      level,
+      combinedScore: Number(sem?.combinedScore || 0),
+      meanDistance: Number(sem?.meanDistance || 0),
+      strongDifferentRatio: Number(sem?.strongDifferentRatio || 0),
+      geometryScore: Math.max(Number(geo.positionScore || 0), Number(geo.combinedScore || 0)),
+      geometryStrong,
+      roiStrongCells,
+      roiMeanDistance: roiMean,
+      independentlyCorroborated: independent,
+      material: level === 'strong-mismatch' || (level === 'elevated-mismatch' && (geometryStrong || independent)),
+    };
+  }
+
+  // Layout evidence can arrive from several generations of the layout engine.
+  // Include all known score-bearing structures instead of assuming only one.
+  const layoutScores = [];
+  const pushScore = (v) => {
+    const n = Number(v);
+    if (Number.isFinite(n)) layoutScores.push(n);
+  };
+  pushScore(layout?.score);
+  pushScore(layout?.maxScore);
+  pushScore(layout?.riskScore);
+  for (const row of (Array.isArray(layout?.localGapAnomalies) ? layout.localGapAnomalies : [])) pushScore(row?.score);
+  for (const row of (Array.isArray(layout?.containerPairs) ? layout.containerPairs : [])) pushScore(row?.score);
+  for (const row of (Array.isArray(layout?.structureSignals) ? layout.structureSignals : [])) pushScore(row?.score);
+  for (const row of (Array.isArray(layout?.unmatchedSpanAnomalies) ? layout.unmatchedSpanAnomalies : [])) pushScore(row?.score);
+  // Reference-field geometry is a valid structural fallback when the dedicated
+  // layout engine did not expose a score (this is what fixes Garanti V1.6.1).
+  for (const row of fieldRows) {
+    pushScore(row?.positionScore);
+    pushScore(row?.combinedScore);
+  }
+  const maxLayoutScore = layoutScores.length ? Math.max(...layoutScores) : 0;
+  const strongLayout = maxLayoutScore >= 75 || String(layout?.severity || '').toLowerCase() === 'strong';
+
+  const knownNegativeScoreRaw = Number(negativeSampleForensics?.bestMatchScore);
+  const knownNegativeAvailable = Number.isFinite(knownNegativeScoreRaw);
+  const knownNegativeScore = knownNegativeAvailable ? knownNegativeScoreRaw : null;
+  const knownNegativeStrong = knownNegativeAvailable && knownNegativeScore >= 80 &&
+    Array.isArray(negativeSampleForensics?.findings) && negativeSampleForensics.findings.length > 0;
+
+  // Known-negative local similarity is deliberately advisory. QNB's original
+  // calibration case showed that a high local score can also capture generic
+  // bank/template/raster similarity. It therefore cannot independently create
+  // a negative-like verdict.
+  const independentNegativeCorroboration = Boolean(
+    knownNegativeStrong && (
+      strongLayout ||
+      Number(math?.semanticMathCalibration?.fields?.amount?.amountForensicsScore || 0) >= 80
+    )
+  );
+  const knownNegativeCorroborated =
+    knownNegativeStrong && independentNegativeCorroboration;
+
+  let className = 'indeterminate';
+  let referenceLike = false;
+  let negativeLike = false;
+
+  if (referenceLikeByDifferential) {
+    referenceLike = true;
+    className = 'reference-like';
+    // A strong known-negative match blocks an unconditional reference-like
+    // result; keep it indeterminate until an independent adjudicator resolves it.
+    if (knownNegativeStrong && !differentialAvailable) {
+      referenceLike = false;
+      className = 'indeterminate';
+    }
+  } else if (negativeLikeByDifferential) {
+    negativeLike = true;
+    className = 'negative-like';
+  } else if (knownNegativeCorroborated && differentialAvailable && differential >= 0) {
+    negativeLike = true;
+    className = 'negative-like';
+  }
+
+  return {
+    available: true,
+    version: 'V1.6.3-FINAL-ADJUDICATOR',
+    bank: bank || null,
+    className,
+    differential,
+    referenceSimilarity: referenceAvailable ? referenceSimilarity : null,
+    negativeSimilarity: negativeBaselineAvailable ? negativeSimilarity : null,
+    referenceBaselineAvailable: referenceAvailable,
+    negativeBaselineAvailable,
+    referenceLike,
+    negativeLike,
+    thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: 20 },
+    fields: fieldFusion,
+    layout: { maxScore: maxLayoutScore, strong: strongLayout },
+    knownNegative: {
+      available: knownNegativeAvailable,
+      bestMatchScore: knownNegativeScore,
+      bestSample: negativeSampleForensics?.bestSample || null,
+      strong: knownNegativeStrong,
+      corroborated: knownNegativeCorroborated,
+      policy: 'advisory-only; high local similarity cannot independently declare a document fake'
+    },
+    evidence: {
+      criticalRoiStrongCount: criticalRows.length,
+      independentNegativeCorroboration,
+      differentialAvailable
+    },
+    policy: 'V1.6.2: missing baselines remain unavailable/null; final class is reference-vs-negative differential first, with layout/semantic/known-negative signals as corroboration rather than single-signal verdicts'
+  };
+}
+
+function buildHumanReadableReferenceForensicReport(forensic, layout = null, localCrop = null, azureGeometry = null, bank = null, mathematicalForensics = null, negativeSampleForensics = null) {
   // CLEAN USER-FACING REFERENCE COMPARISON
   // The reference is a whole-document fingerprint. Compare structure/spacing first,
   // then fields, typography and localized pixels. Raw scores remain hidden.
@@ -18797,6 +19770,26 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
 
   const findings = [];
   const seen = new Set();
+  const mathFusion = buildReferenceMathematicalFusion(mathematicalForensics, forensic, layout, bank, negativeSampleForensics);
+  const referenceLike = mathFusion.referenceLike;
+  const negativeLike = mathFusion.negativeLike;
+  const fieldFusion = mathFusion.fields || {};
+  const isMaterialFinding = (row) => {
+    const field = String(row?.evidenceField || row?.field || '').replace(/:value$/i, '');
+    const ff = fieldFusion[field];
+    if (row?.kind === 'critical-roi-mismatch') {
+      if (!ff) return !referenceLike;
+      return Boolean(ff.material);
+    }
+    if (row?.kind === 'field-position' || row?.kind === 'fused-field' || row?.kind === 'strong-typography') {
+      if (!ff) return !referenceLike;
+      return Boolean(ff.material || negativeLike);
+    }
+    if (row?.kind === 'layout' || row?.kind === 'whole-page' || row?.kind === 'azure-layout') {
+      return !referenceLike || mathFusion.layout.strong;
+    }
+    return true;
+  };
 
   // 0) Azure semantic anchor geometry: a second independent eye for
   // large local vertical spacing changes. This is intentionally reported
@@ -19106,8 +20099,13 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   findings.sort((a, b) => a.priority - b.priority);
 
   const unique = [];
+  const informational = [];
   const uniqueKeys = new Set();
   for (const row of findings) {
+    if (!isMaterialFinding(row)) {
+      informational.push({ ...row, severity: 'informational' });
+      continue;
+    }
     const key = `${row.title}|${row.detail}`;
     if (uniqueKeys.has(key)) continue;
     uniqueKeys.add(key);
@@ -19115,27 +20113,40 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     if (unique.length >= 8) break;
   }
 
-  const userText = unique.length
-    ? [
-        '🔎 REFERANS KARŞILAŞTIRMASI',
-        '',
-        '🔴 FARKLAR',
-        ...unique.map(x => `• ${x.title}: ${x.detail}`)
-      ].join('\n')
-    : [
-        '🔎 REFERANS KARŞILAŞTIRMASI',
-        '',
-        '🟢 Belirgin bir fark tespit edilmedi.'
-      ].join('\n');
+  const infoUnique = [];
+  const infoKeys = new Set();
+  for (const row of informational) {
+    const key = `${row.title}|${row.detail}`;
+    if (infoKeys.has(key)) continue;
+    infoKeys.add(key);
+    infoUnique.push(row);
+    if (infoUnique.length >= 4) break;
+  }
+
+  const userLines = ['🔎 REFERANS KARŞILAŞTIRMASI'];
+  if (unique.length) {
+    userLines.push('', '🔴 FARKLAR', ...unique.map(x => `• ${x.title}: ${x.detail}`));
+  }
+  if (infoUnique.length) {
+    userLines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
+  }
+  if (!unique.length && !infoUnique.length) {
+    userLines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
+  }
+  if (referenceLike) userLines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
+  else if (negativeLike) userLines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
+  else userLines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
 
   return {
     headline: unique.length
-      ? `Referans karşılaştırmasında ${unique.length} belirgin fark bulundu.`
-      : 'Referans karşılaştırmasında belirgin fark bulunmadı.',
+      ? `Referans karşılaştırmasında ${unique.length} materyal fark bulundu.`
+      : (infoUnique.length ? `Referans karşılaştırmasında ${infoUnique.length} ölçülebilir fakat tek başına belirleyici olmayan fark bulundu.` : 'Referans karşılaştırmasında belirgin fark bulunmadı.'),
     findings: unique,
+    informationalFindings: infoUnique,
     findingCount: unique.length,
     strongFindingCount: unique.length,
-    userText
+    mathematicalFusion: mathFusion,
+    userText: userLines.join('\n')
   };
 }
 
@@ -19690,10 +20701,10 @@ const strongAmountSignal =
 const strongAzureSignal =
   Array.isArray(azureReferenceGeometry?.strongAnomalies) &&
   azureReferenceGeometry.strongAnomalies.some((x) => Number(x?.score) >= 90);
-const meaningfulPixelReferenceSignal =
+const strongPixelReferenceSignal =
   pixelForensics?.available === true &&
-  Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 45 &&
-  Number(pixelForensics?.score || 0) >= 35;
+  Number(pixelForensics?.referenceMismatchScore || pixelForensics?.metrics?.referenceMismatchScore || 0) >= 50 &&
+  Number(pixelForensics?.score || 0) >= 55;
 
 const paintOverForV152 =
   result?.paintOverForensicsV2?.available === true
@@ -19723,7 +20734,7 @@ const criticalRoiIndependentSupport = strongCriticalRoiRows.some(row =>
   (String(row?.field) === 'amount' && strongAmountSignal) ||
   (String(row?.field) !== 'amount' && (
     strongAzureSignal ||
-    meaningfulPixelReferenceSignal ||
+    strongPixelReferenceSignal ||
     Number(negativeSampleForensics?.bestMatchScore || 0) >= 70
   ))
 );
@@ -19771,7 +20782,7 @@ if (controlledAmountCorroborated) {
 const independentForensicSupportCount = [
   strongAmountSignal,
   strongAzureSignal,
-  meaningfulPixelReferenceSignal
+  strongPixelReferenceSignal
 ].filter(Boolean).length;
 
 if (strongUnifiedReferenceCount >= 2 && independentForensicSupportCount >= 1) {
@@ -19787,7 +20798,7 @@ if (strongUnifiedReferenceCount >= 2 && independentForensicSupportCount >= 1) {
     independentForensicSupportCount,
     strongAmountSignal,
     strongAzureSignal,
-    meaningfulPixelReferenceSignal,
+    strongPixelReferenceSignal,
     appliedFloor: 70
   }));
 }
