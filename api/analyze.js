@@ -22112,15 +22112,18 @@ const v4PromotedFields = v4LocalPatternStrong
 
 const v4AmountPatternStrong = v4PromotedFields.includes("amount");
 const amountReferenceRender = result?.amountForensics?.referenceRenderForensics || null;
+const localizedPaintOver = result?.paintOverForensicsV2?.available === true
+  ? result.paintOverForensicsV2
+  : (paintOverForensics || result?.paintOverForensics || null);
 
 // A negative-sample match is not independent proof of editing. Require an
 // existing manipulation-specific sensor before any localized pattern can
 // cross the final suspicious threshold.
 const localizedPaintOverStrong = Boolean(
-  paintOverV152?.available === true &&
-  Number(paintOverV152?.score || 0) >= 75 &&
-  Number(paintOverV152?.metrics?.supportSignals || 0) >= 3 &&
-  Number(paintOverV152?.metrics?.amountSupport || 0) >= 20
+  localizedPaintOver?.available === true &&
+  Number(localizedPaintOver?.score || 0) >= 75 &&
+  Number(localizedPaintOver?.metrics?.supportSignals || 0) >= 3 &&
+  Number(localizedPaintOver?.metrics?.amountSupport || 0) >= 20
 );
 const independentManipulationEvidence = Boolean(
   localizedPaintOverStrong ||
