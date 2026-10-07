@@ -14043,11 +14043,34 @@ async function analyzeAmountReferenceRenderForensics({
     // amount rendering AND the negative population independently points in
     // the same direction. This is the key anti-false-positive gate for real
     // Telegram/JPEG documents such as the known-good 350 TL case.
+    // V15.11: absolute fake-population proximity is required in addition to
+    // the reference-vs-fake margin.  A genuine Telegram/JPEG target can be
+    // farther from the single clean reference than from every negative sample
+    // simply because amount content/scale/compression differs.  The old 0.95
+    // ceiling therefore made the real 350 TL case falsely qualify.
+    //
+    // The gate intentionally remains corroborative, not a standalone verdict:
+    //   1) the target must be materially closer to the negative population,
+    //   2) the closest negative must itself be reasonably close, and
+    //   3) the negative must beat the genuine reference by a meaningful margin.
+    const fakeAffinityRatio = bestFake && targetToReference.distance > 0
+      ? bestFake.distance / targetToReference.distance
+      : Infinity;
     const fakeAffinityStrong = Boolean(
       bestFake &&
-      fakeAffinityMargin >= 0.16 &&
-      bestFake.distance <= 0.95
+      fakeAffinityMargin >= 0.30 &&
+      bestFake.distance <= 0.60 &&
+      fakeAffinityRatio <= 0.61
     );
+
+    console.log("AMOUNT RENDER FAKE-AFFINITY GATE V15.11:", JSON.stringify({
+      bestFakeDistance: bestFake ? bestFake.distance : null,
+      referenceDistance: Number(targetToReference.distance.toFixed(4)),
+      fakeAffinityMargin,
+      fakeAffinityRatio: Number.isFinite(fakeAffinityRatio) ? Number(fakeAffinityRatio.toFixed(4)) : null,
+      fakeAffinityStrong,
+      thresholds: { maxBestFakeDistance: 0.60, minMargin: 0.30, maxRatio: 0.61 }
+    }));
 
     const referenceAnomaly = targetToReference.distance >= 0.85;
     const strongAnomaly = referenceAnomaly && fakeAffinityStrong;
@@ -14082,7 +14105,7 @@ async function analyzeAmountReferenceRenderForensics({
       targetSignature: targetSig,
       referenceSignature: referenceSig,
       sameCharacterGlyphDistance: Number.isFinite(sameCharacterGlyphDistance) ? Number(sameCharacterGlyphDistance.toFixed(4)) : null,
-      scoringModel: 'content-independent-glyph-render-v15.9',
+      scoringModel: 'content-independent-glyph-render-v15.11',
 
       bestFake: bestFake ? bestFake.fileName : null,
       comparedFakeCount: fakeDistances.length,
