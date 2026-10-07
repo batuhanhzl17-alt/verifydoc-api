@@ -6792,6 +6792,11 @@ async function getReferenceAmountAnchor(bank) {
           yNorm: r.y1 / height,
           widthNorm: Math.max(0.001, (r.x2-r.x1) / width),
           heightNorm: Math.max(0.001, (r.y2-r.y1) / height),
+          // Keep the reference OCR value only as a glyph-alignment hint.
+          // It is NEVER used as a literal-value authenticity signal.
+          text: best?.candidate?.text && best.candidate.text !== '__RASTER_AMOUNT_BOX__'
+            ? String(best.candidate.text).trim()
+            : null,
           referenceFile: path.basename(referencePath),
         });
       } catch (error) {
@@ -6819,6 +6824,10 @@ async function getReferenceAmountAnchor(bank) {
         width: Math.max(...entries.map(x => x.widthNorm)) - Math.min(...entries.map(x => x.widthNorm)),
         height: Math.max(...entries.map(x => x.heightNorm)) - Math.min(...entries.map(x => x.heightNorm)),
       },
+      // Reference text is diagnostic only. If multiple trusted references exist,
+      // prefer the first usable value rather than turning literal amount content
+      // into the reference score.
+      text: entries.find(x => x.text)?.text || null,
       source: 'trusted-telegram-raster-ensemble-v16.1-explicit-amount-label-fallback',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
@@ -13693,6 +13702,7 @@ async function analyzeAmountReferenceRenderForensics({
   targetRegion,
   referencePath,
   referenceAmountField,
+  targetAmountText = null,
   negativeSamples = [],
 }) {
   const unavailable = (reason) => ({
@@ -13800,69 +13810,104 @@ async function analyzeAmountReferenceRenderForensics({
     const refRaw = await cropFromPixels(referenceBuffer, referenceMeta, referenceAmountField, true);
     if (!targetRaw || !refRaw) return unavailable("amount-roi-crop-failed");
 
+    // V15.9: CONTENT-INDEPENDENT RENDER SIGNATURE
+    // The trusted reference is a render/pixel baseline, not a literal amount
+    // baseline. Amount length/content must not dominate the reference score.
     const signature = (raw) => {
-      const W = Number(raw.info.width || 0);
-      const H = Number(raw.info.height || 0);
+      const W = Number(raw.info?.width || 0);
+      const H = Number(raw.info?.height || 0);
       if (!W || !H || !raw.data?.length) return null;
-
-      let sum = 0, sum2 = 0;
-      let ink220 = 0, ink180 = 0, dark = 0;
-      let grad = 0, gradX = 0, gradY = 0;
-      let activeRows = 0, activeCols = 0;
-      let maxRowInk = 0, maxColInk = 0;
-
-      for (let y = 0; y < H; y++) {
-        let rowInk = 0;
-        for (let x = 0; x < W; x++) {
-          const i = y * W + x;
-          const v = Number(raw.data[i] || 0);
-          sum += v;
-          sum2 += v * v;
-          if (v < 220) { ink220++; rowInk++; }
-          if (v < 180) ink180++;
-          if (v < 185) dark += 255 - v;
-          if (x > 0) {
-            const g = Math.abs(v - Number(raw.data[i - 1] || 0));
-            grad += g; gradX += g;
-          }
-          if (y > 0) {
-            const g = Math.abs(v - Number(raw.data[i - W] || 0));
-            grad += g; gradY += g;
-          }
-        }
-        const rowRatio = W ? rowInk / W : 0;
-        if (rowRatio > 0.015) activeRows++;
-        maxRowInk = Math.max(maxRowInk, rowRatio);
-      }
-
-      for (let x = 0; x < W; x++) {
-        let colInk = 0;
-        for (let y = 0; y < H; y++) {
-          if (Number(raw.data[y * W + x] || 0) < 220) colInk++;
-        }
-        const colRatio = H ? colInk / H : 0;
-        if (colRatio > 0.015) activeCols++;
-        maxColInk = Math.max(maxColInk, colRatio);
-      }
-
       const pixels = W * H;
-      const mean = pixels ? sum / pixels : 0;
-      const variance = pixels ? Math.max(0, sum2 / pixels - mean * mean) : 0;
+      const gray = raw.data;
+      const threshold = 185;
+      const mask = new Uint8Array(pixels);
+      for (let i = 0; i < pixels; i++) if (Number(gray[i] || 0) < threshold) mask[i] = 1;
 
+      const seen = new Uint8Array(pixels);
+      const qx = new Int32Array(pixels);
+      const qy = new Int32Array(pixels);
+      const comps = [];
+      for (let sy = 0; sy < H; sy++) {
+        for (let sx = 0; sx < W; sx++) {
+          const si = sy * W + sx;
+          if (!mask[si] || seen[si]) continue;
+          let head = 0, tail = 0;
+          qx[tail] = sx; qy[tail] = sy; tail++; seen[si] = 1;
+          let minX = sx, maxX = sx, minY = sy, maxY = sy, area = 0, perimeter = 0;
+          while (head < tail) {
+            const cx = qx[head], cy = qy[head++];
+            area++;
+            minX = Math.min(minX, cx); maxX = Math.max(maxX, cx);
+            minY = Math.min(minY, cy); maxY = Math.max(maxY, cy);
+            for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+              const nx = cx + dx, ny = cy + dy;
+              if (nx < 0 || ny < 0 || nx >= W || ny >= H) { perimeter++; continue; }
+              const ni = ny * W + nx;
+              if (!mask[ni]) perimeter++;
+              else if (!seen[ni]) { seen[ni] = 1; qx[tail] = nx; qy[tail] = ny; tail++; }
+            }
+          }
+          const cw = maxX - minX + 1;
+          const ch = maxY - minY + 1;
+          if (area >= 5 && ch >= 5 && ch <= H * 0.80 && cw <= W * 0.35) {
+            comps.push({ minX, maxX, minY, maxY, width:cw, height:ch, area, perimeter });
+          }
+        }
+      }
+      if (comps.length < 2) return null;
+      comps.sort((a,b) => a.minX - b.minX || a.minY - b.minY);
+      const median = (arr) => {
+        const v = arr.filter(Number.isFinite).sort((a,b)=>a-b);
+        if (!v.length) return 0;
+        const m = Math.floor(v.length/2);
+        return v.length % 2 ? v[m] : (v[m-1] + v[m])/2;
+      };
+      const mad = (arr) => {
+        const v = arr.filter(Number.isFinite);
+        const m = median(v);
+        return median(v.map(x => Math.abs(x-m)));
+      };
+      const medianH0 = median(comps.map(c=>c.height));
+      const glyphs = comps.filter(c => c.height >= Math.max(5, medianH0 * 0.55)).slice(0, 80);
+      if (glyphs.length < 2) return null;
+      const inkTop = Math.min(...glyphs.map(c=>c.minY));
+      const inkBottom = Math.max(...glyphs.map(c=>c.maxY));
+      const inkHeight = Math.max(1, inkBottom - inkTop + 1);
+      const widthHeight = glyphs.map(c=>c.width/Math.max(1,c.height));
+      const fill = glyphs.map(c=>c.area/Math.max(1,c.width*c.height));
+      const stroke = glyphs.map(c=>c.area/Math.max(1,c.perimeter*c.perimeter));
+      const centerY = glyphs.map(c=>((c.minY+c.maxY)/2-inkTop)/inkHeight);
+      const gaps = [];
+      for (let i=1;i<glyphs.length;i++) gaps.push((glyphs[i].minX-glyphs[i-1].maxX-1)/Math.max(1,medianH0));
+      const edge = [];
+      const buckets = [0,0,0,0];
+      let bucketN=0;
+      for (const c of glyphs) {
+        let e=0,n=0;
+        for (let y=c.minY;y<=c.maxY;y++) {
+          for (let x=c.minX;x<=c.maxX;x++) {
+            const i=y*W+x, v=Number(gray[i]||0);
+            if (v<230) {
+              n++;
+              if (x>c.minX && Math.abs(v-Number(gray[i-1]||0))>12) e++;
+              if (y>c.minY && Math.abs(v-Number(gray[i-W]||0))>12) e++;
+              buckets[v<64?0:v<128?1:v<200?2:3]++; bucketN++;
+            }
+          }
+        }
+        if (n) edge.push(e/n);
+      }
       return {
-        aspect: W / Math.max(1, H),
-        mean,
-        std: Math.sqrt(variance),
-        inkRatio: pixels ? ink220 / pixels : 0,
-        inkRatio180: pixels ? ink180 / pixels : 0,
-        darkness: pixels ? dark / pixels : 0,
-        edgeDensity: pixels ? grad / (pixels * 2) : 0,
-        edgeX: pixels ? gradX / pixels : 0,
-        edgeY: pixels ? gradY / pixels : 0,
-        activeRowRatio: H ? activeRows / H : 0,
-        activeColRatio: W ? activeCols / W : 0,
-        maxRowInk,
-        maxColInk,
+        glyphCount:glyphs.length,
+        glyphWidthHeight:median(widthHeight), glyphWidthHeightMad:mad(widthHeight),
+        glyphFill:median(fill), glyphFillMad:mad(fill),
+        strokeProxy:median(stroke), strokeProxyMad:mad(stroke),
+        verticalCenter:median(centerY), verticalCenterMad:mad(centerY),
+        spacingToHeight:median(gaps), spacingMad:mad(gaps),
+        edgeDensity:median(edge), edgeDensityMad:mad(edge),
+        grayDistribution:bucketN ? buckets.map(x=>x/bucketN) : [0,0,0,0],
+        // Diagnostic only; never used in reference compatibility.
+        legacyAspect:W/Math.max(1,H), legacyInkRatio:pixels?mask.reduce((a,v)=>a+v,0)/pixels:0,
       };
     };
 
@@ -13873,19 +13918,15 @@ async function analyzeAmountReferenceRenderForensics({
     // Relative distances are intentionally tolerant. The reference may be a
     // clean raster while the target passed through Telegram/JPEG/resizing.
     const metricDefs = [
-      ["aspect", 0.10, 0.18],
-      ["mean", 0.08, 38],
-      ["std", 0.08, 24],
-      ["inkRatio", 0.15, 0.30],
-      ["inkRatio180", 0.10, 0.30],
-      ["darkness", 0.12, 32],
-      ["edgeDensity", 0.12, 0.35],
-      ["edgeX", 0.05, 0.35],
-      ["edgeY", 0.05, 0.35],
-      ["activeRowRatio", 0.08, 0.30],
-      ["activeColRatio", 0.05, 0.30],
-      ["maxRowInk", 0.05, 0.30],
-      ["maxColInk", 0.07, 0.30],
+      ["glyphWidthHeight", 0.16, 0.10],
+      ["glyphFill", 0.16, 0.10],
+      ["strokeProxy", 0.20, 0.010],
+      ["verticalCenter", 0.08, 0.08],
+      ["spacingToHeight", 0.12, 0.16],
+      ["edgeDensity", 0.14, 0.12],
+      ["glyphWidthHeightMad", 0.04, 0.08],
+      ["glyphFillMad", 0.04, 0.08],
+      ["strokeProxyMad", 0.06, 0.004],
     ];
 
     const distanceBetween = (a, b) => {
@@ -13894,19 +13935,50 @@ async function analyzeAmountReferenceRenderForensics({
       for (const [key, weight, tolerance] of metricDefs) {
         const av = Number(a?.[key]), bv = Number(b?.[key]);
         if (!Number.isFinite(av) || !Number.isFinite(bv)) continue;
-        const scale = Math.max(Number(tolerance), Math.abs(bv) * 0.55, 0.0001);
+        const scale = Math.max(Number(tolerance), Math.abs(bv) * 0.65, 0.0001);
         const d = Math.abs(av - bv) / scale;
         details[key] = Number(d.toFixed(4));
         total += Math.min(3, d) * weight;
         weightTotal += weight;
       }
-      return {
-        distance: weightTotal ? total / weightTotal : 99,
-        details,
-      };
+      // Antialiasing/compression distribution is useful, but deliberately low-weight.
+      if (Array.isArray(a?.grayDistribution) && Array.isArray(b?.grayDistribution)) {
+        const gd = a.grayDistribution.reduce((sum,v,i)=>sum+Math.abs(Number(v||0)-Number(b.grayDistribution[i]||0)),0)/2;
+        details.grayDistribution = Number(gd.toFixed(4));
+        total += Math.min(1, gd) * 0.05;
+        weightTotal += 0.05;
+      }
+      return { distance: weightTotal ? total / weightTotal : 99, details };
     };
 
     const targetToReference = distanceBetween(targetSig, referenceSig);
+
+    let sameCharacterGlyphDistance = null;
+    try {
+      const targetText = String(targetAmountText || '').trim();
+      const referenceText = String(referenceAmountField?.text || '').trim();
+      if (targetText && referenceText) {
+        const targetGlyphs = await rfNumericGlyphSequence(
+          targetBuffer, targetRegionScaled, { width: tw, height: th }, targetText
+        );
+        const refBox = {
+          x1: Number(referenceAmountField.xNorm || 0) * rw,
+          y1: Number(referenceAmountField.yNorm || 0) * rh,
+          x2: (Number(referenceAmountField.xNorm || 0) + Number(referenceAmountField.widthNorm || 0)) * rw,
+          y2: (Number(referenceAmountField.yNorm || 0) + Number(referenceAmountField.heightNorm || 0)) * rh,
+        };
+        const referenceGlyphs = await rfNumericGlyphSequence(
+          referenceBuffer, refBox, { width: rw, height: rh }, referenceText
+        );
+        sameCharacterGlyphDistance = rfNumericGlyphDistance(targetGlyphs, referenceGlyphs);
+      }
+    } catch {}
+    if (Number.isFinite(sameCharacterGlyphDistance)) {
+      // Same-character glyph evidence is highly relevant to font/raster identity,
+      // but it must not dominate the content-independent style baseline.
+      targetToReference.distance = Number(Math.min(3, targetToReference.distance * 0.82 + sameCharacterGlyphDistance * 0.18).toFixed(4));
+      targetToReference.details.sameCharacterGlyphDistance = Number(sameCharacterGlyphDistance.toFixed(4));
+    }
 
     const fakeDistances = [];
     for (const sample of Array.isArray(negativeSamples) ? negativeSamples.slice(0, 12) : []) {
@@ -13914,12 +13986,7 @@ async function analyzeAmountReferenceRenderForensics({
         const fakeBuffer = await loadRaster(sample.path);
         if (!fakeBuffer) continue;
         const fakeMeta = await sharp(fakeBuffer).metadata();
-        const fakeRaw = await cropFromPixels(
-          fakeBuffer,
-          fakeMeta,
-          referenceAmountField,
-          true
-        );
+        const fakeRaw = await cropFromPixels(fakeBuffer, fakeMeta, referenceAmountField, true);
         if (!fakeRaw) continue;
         const fakeSig = signature(fakeRaw);
         if (!fakeSig) continue;
@@ -13942,27 +14009,14 @@ async function analyzeAmountReferenceRenderForensics({
     // amount rendering AND the negative population independently points in
     // the same direction. This is the key anti-false-positive gate for real
     // Telegram/JPEG documents such as the known-good 350 TL case.
-    // Negative-population proximity is deliberately stricter than the generic
-    // reference-distance gate. A single clean reference can differ strongly
-    // from a real Telegram/JPEG render because of font scale, crop geometry,
-    // digit count and compression. We therefore require the target to be
-    // materially closer to the known-fake population itself before allowing
-    // this engine to produce an anomaly.
     const fakeAffinityStrong = Boolean(
       bestFake &&
-      fakeAffinityMargin >= 0.25 &&
-      bestFake.distance <= 0.50
+      fakeAffinityMargin >= 0.16 &&
+      bestFake.distance <= 0.95
     );
 
     const referenceAnomaly = targetToReference.distance >= 0.85;
-    // Either a clear reference failure + strong negative affinity, or a very
-    // strong negative-population match that beats the genuine reference by a
-    // meaningful margin. This avoids promoting genuine 350 TL solely because
-    // its single-reference render differs in scale/aspect from enpara.jpg.
-    const strongAnomaly = fakeAffinityStrong && (
-      referenceAnomaly ||
-      (bestFake && bestFake.distance <= 0.35 && fakeAffinityMargin >= 0.25)
-    );
+    const strongAnomaly = referenceAnomaly && fakeAffinityStrong;
     const compatibilityScore = Math.max(
       0,
       Math.min(100, Math.round(100 - targetToReference.distance * 55))
@@ -13993,6 +14047,9 @@ async function analyzeAmountReferenceRenderForensics({
       },
       targetSignature: targetSig,
       referenceSignature: referenceSig,
+      sameCharacterGlyphDistance: Number.isFinite(sameCharacterGlyphDistance) ? Number(sameCharacterGlyphDistance.toFixed(4)) : null,
+      scoringModel: 'content-independent-glyph-render-v15.9',
+
       bestFake: bestFake ? bestFake.fileName : null,
       comparedFakeCount: fakeDistances.length,
       evidence: strongAnomaly
@@ -16544,6 +16601,7 @@ if ((type === "image" || type === "pdf") && bank && reference && amountForensics
         targetRegion: amountForensics.region,
         referencePath: getVisualReferencePath(reference),
         referenceAmountField: amountReferenceAnchor,
+        targetAmountText: amountForensics?.selectedAmountText || amountForensics?.amountText || result?.documentData?.amount || null,
         negativeSamples: amountNegativeSamples,
       });
       amountForensics.referenceRenderForensics = amountRenderForensics;
@@ -19017,34 +19075,18 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     // to resolution, crop and delivery/compression history.
     const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
     const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
-    const amountRender = result?.amountForensics?.referenceRenderForensics || null;
-    const amountPatternCorroborated = Boolean(
-      amountRender?.available === true &&
-      amountRender?.status === 'anomaly' &&
-      Number(amountRender?.score || 0) >= 60 &&
-      amountRender?.fakeAffinityStrong === true
-    );
-    const displayStrongFields = strongFields.filter(field => field !== 'amount' || amountPatternCorroborated);
-    const suppressedAmountPattern = strongFields.includes('amount') && !amountPatternCorroborated;
-
-    if (displayStrongFields.length) {
+    if (strongFields.length) {
       const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
-      const sampleCounts = displayStrongFields.map((field) => {
+      const sampleCounts = strongFields.map((field) => {
         const row = diff?.fields?.[field];
         return Number(row?.agreementCount || 0);
       });
       const sampleTotal = Number(diff?.tamperSampleCount || 0);
       lines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
-        `• ${displayStrongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
-        `• Sahte örnek uyumu: ${sampleCounts.length === 1 ? `${sampleCounts[0]}/${sampleTotal}` : displayStrongFields.map((f, i) => `${fieldLabels[f] || f} ${sampleCounts[i]}/${sampleTotal}`).join(', ')}`
+        `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
+        `• Sahte örnek uyumu: ${sampleCounts.length === 1 ? `${sampleCounts[0]}/${sampleTotal}` : strongFields.map((f, i) => `${fieldLabels[f] || f} ${sampleCounts[i]}/${sampleTotal}`).join(', ')}`
       );
-    }
-    if (suppressedAmountPattern) {
-      lines.push('', '🟡 LOKAL ÖRÜNTÜ BENZERLİĞİ',
-        '• Tutar bölgesinde bilinen sahte örneklerle benzer lokal raster özellikleri ölçüldü.',
-        '• Ancak bu benzerlik bağımsız referans-render / sahte-popülasyon doğrulamasıyla desteklenmedi; tek başına manipülasyon kanıtı olarak değerlendirilmedi.');
-    }
-    if (!displayStrongFields.length && !suppressedAmountPattern && diff?.available === true) {
+    } else if (diff?.available === true) {
       lines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
         '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
     }
@@ -21240,30 +21282,14 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   // intentionally omitted from the normal user-facing report.
   const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
   const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
-  const amountRender = result?.amountForensics?.referenceRenderForensics || null;
-  const amountPatternCorroborated = Boolean(
-    amountRender?.available === true &&
-    amountRender?.status === 'anomaly' &&
-    Number(amountRender?.score || 0) >= 60 &&
-    amountRender?.fakeAffinityStrong === true
-  );
-  const displayStrongFields = strongFields.filter(field => field !== 'amount' || amountPatternCorroborated);
-  const suppressedAmountPattern = strongFields.includes('amount') && !amountPatternCorroborated;
-
-  if (displayStrongFields.length) {
+  if (strongFields.length) {
     const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
     const sampleTotal = Number(diff?.tamperSampleCount || 0);
-    const agreements = displayStrongFields.map((field) => `${fieldLabels[field] || field} ${Number(diff?.fields?.[field]?.agreementCount || 0)}/${sampleTotal}`);
+    const agreements = strongFields.map((field) => `${fieldLabels[field] || field} ${Number(diff?.fields?.[field]?.agreementCount || 0)}/${sampleTotal}`);
     userLines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
-      `• ${displayStrongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
+      `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
       `• Sahte örnek uyumu: ${agreements.join(', ')}`);
-  }
-  if (suppressedAmountPattern) {
-    userLines.push('', '🟡 LOKAL ÖRÜNTÜ BENZERLİĞİ',
-      '• Tutar bölgesinde bilinen sahte örneklerle benzer lokal raster özellikleri ölçüldü.',
-      '• Ancak bu benzerlik bağımsız referans-render / sahte-popülasyon doğrulamasıyla desteklenmedi; tek başına manipülasyon kanıtı olarak değerlendirilmedi.');
-  }
-  if (!displayStrongFields.length && !suppressedAmountPattern && diff?.available === true) {
+  } else if (diff?.available === true) {
     userLines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
       '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
   }
