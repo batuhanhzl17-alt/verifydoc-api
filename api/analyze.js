@@ -18258,9 +18258,26 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     if (unique.length) lines.push('', '🔴 FARKLAR', ...unique.map(x => `• ${x.title}: ${x.detail}`));
     if (infoUnique.length) lines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
     if (!unique.length && !infoUnique.length) lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
-    if (fusion?.referenceLike) lines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
-    else if (fusion?.negativeLike) lines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
-    else lines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
+    // Global mathematical / negative-like similarity is diagnostic only.
+    // Do not expose it in the normal user-facing report; it is too sensitive
+    // to resolution, crop and delivery/compression history.
+    const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
+    const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
+    if (strongFields.length) {
+      const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
+      const sampleCounts = strongFields.map((field) => {
+        const row = diff?.fields?.[field];
+        return Number(row?.agreementCount || 0);
+      });
+      const sampleTotal = Number(diff?.tamperSampleCount || 0);
+      lines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
+        `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
+        `• Sahte örnek uyumu: ${sampleCounts.length === 1 ? `${sampleCounts[0]}/${sampleTotal}` : strongFields.map((f, i) => `${fieldLabels[f] || f} ${sampleCounts[i]}/${sampleTotal}`).join(', ')}`
+      );
+    } else if (diff?.available === true) {
+      lines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
+        '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
+    }
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
       available: true,
@@ -18357,6 +18374,56 @@ if (pixelForensics) {
   result.pixelForensics = pixelForensics;
 }
 if (differentialImageForensics) result.differentialImageForensics = differentialImageForensics;
+
+// =====================================================
+// V4 EVIDENCE FUSION — LOCAL PATTERN / MATRIX EVIDENCE
+// =====================================================
+// Keep raw matrix/differential measurements available for diagnostics, but
+// adjudicate only repeated critical-ROI patterns. Global negative similarity
+// is deliberately excluded from this evidence tier.
+if (differentialImageForensics?.available === true) {
+  const diff = differentialImageForensics;
+  const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı', recipientIban: 'Alıcı IBAN' };
+  const fieldEvidence = {};
+  for (const field of ['amount', 'recipientName', 'recipientIban']) {
+    const row = diff.fields?.[field];
+    if (!row?.available) continue;
+    fieldEvidence[field] = {
+      field,
+      label: fieldLabels[field],
+      sampleCount: Number(row.sampleAgreement?.length || 0),
+      agreementCount: Number(row.agreementCount || 0),
+      agreementRatio: Number(row.agreementRatio || 0),
+      patternComponents: row.patternComponents || {},
+      strength: row.strength || 'none',
+      finalPromotionAllowed: row.finalPromotionAllowed === true,
+      advisoryOnly: field === 'recipientIban',
+    };
+  }
+  const primaryStrongFields = Array.isArray(diff.primaryStrongFields) ? diff.primaryStrongFields : [];
+  const anyStrong = primaryStrongFields.length > 0;
+  const strongEvidence = primaryStrongFields.map((field) => fieldEvidence[field]).filter(Boolean);
+  result.localPatternEvidence = {
+    available: true,
+    policy: diff.policy || 'adaptive-local-semantic-pattern-v2-field-aware',
+    knownFakeSamples: Number(diff.tamperSampleCount || 0),
+    fields: fieldEvidence,
+    primaryStrongFields,
+    advisoryStrongFields: Array.isArray(diff.advisoryStrongFields) ? diff.advisoryStrongFields : [],
+    anyStrongLocalizedPattern: anyStrong,
+    evidenceLevel: anyStrong ? 'LEVEL_1_STRONG' : 'LEVEL_4_DIAGNOSTIC',
+    finalPromotionAllowed: anyStrong,
+  };
+  result.evidenceFusion = {
+    ...(result.evidenceFusion || {}),
+    level1LocalizedKnownFakePattern: anyStrong,
+    level1Fields: strongEvidence,
+    level4GlobalNegativeLike: false,
+    finalPromotionAllowed: anyStrong,
+    policy: 'v4-local-pattern-evidence-fusion',
+  };
+  console.log('V4 LOCAL PATTERN EVIDENCE FUSION:', JSON.stringify(result.evidenceFusion));
+}
 
 if (advancedForensics) {
   result.advancedForensics = advancedForensics;
@@ -20397,9 +20464,21 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   if (!unique.length && !infoUnique.length) {
     userLines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
-  if (referenceLike) userLines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
-  else if (negativeLike) userLines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
-  else userLines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
+  // Global mathematical / negative-like similarity is diagnostic only and
+  // intentionally omitted from the normal user-facing report.
+  const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
+  const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
+  if (strongFields.length) {
+    const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
+    const sampleTotal = Number(diff?.tamperSampleCount || 0);
+    const agreements = strongFields.map((field) => `${fieldLabels[field] || field} ${Number(diff?.fields?.[field]?.agreementCount || 0)}/${sampleTotal}`);
+    userLines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
+      `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
+      `• Sahte örnek uyumu: ${agreements.join(', ')}`);
+  } else if (diff?.available === true) {
+    userLines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
+      '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
+  }
 
   return {
     headline: unique.length
@@ -21135,6 +21214,37 @@ if (veryStrongSemanticNegativeForRisk.length >= 2) {
 
 // AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
+
+// V4: repeated localized known-fake pattern is a real evidence tier.
+// Apply the promotion to the canonical result score AFTER all legacy/math
+// promotions. Previously this floor was written only to the local
+// `finalRiskScore` variable, while the safety gate still read the stale
+// `result.overallRisk`, causing Enpara 1000 (4/4 strong) to fall back to 23.
+const v4LocalPatternStrong = result?.localPatternEvidence?.available === true &&
+  result?.localPatternEvidence?.finalPromotionAllowed === true &&
+  Array.isArray(result?.localPatternEvidence?.primaryStrongFields) &&
+  result.localPatternEvidence.primaryStrongFields.length > 0;
+if (v4LocalPatternStrong) {
+  const promotedFields = result.localPatternEvidence.primaryStrongFields;
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 65),
+  };
+  result.overallRisk = finalRiskScore;
+  result.riskLabel = getRiskLabel(finalRiskScore);
+  result.evidenceFusion = {
+    ...(result.evidenceFusion || {}),
+    level1Applied: true,
+    promotedFields,
+    appliedRiskFloor: 46,
+  };
+  console.log('V4 LOCAL PATTERN RISK PROMOTION:', JSON.stringify({
+    fields: promotedFields,
+    appliedFloor: 46,
+    knownFakeSamples: result.localPatternEvidence.knownFakeSamples,
+  }));
+}
 
 
 // =====================================================
