@@ -9,10 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { runDifferentialImageForensics } from "./differential_image_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily,
-  getAdaptiveNegativePopulationPolicy
-} from "./mathematical_forensics_v1.6.3.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -552,7 +549,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
             console.warn('MATH NEGATIVE ROI SKIP:', sample?.fileName || sample?.path, e?.message || e);
           }
         }
-        semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(fingerprint, negativeFingerprints, ['amount','recipientName','recipientIban'], referenceFingerprint);
+        semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(fingerprint, negativeFingerprints, ['amount','recipientName','recipientIban']);
         for (const field of Object.keys(semanticNegativeAffinity || {})) {
           const row = semanticNegativeAffinity[field];
           const refDistance = Number(roiForensics?.[field]?.meanDistance);
@@ -561,13 +558,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
             row.negativeAffinityDelta = Number((refDistance - Number(row.medianDistance || row.meanDistance || 0)).toFixed(3));
             row.referenceCloser = row.negativeAffinityDelta < 0;
             row.negativeCloser = row.negativeAffinityDelta > 0;
-          }
-          if (row?.available) {
-            // IMPORTANT: distance alone is never a fake signal. Only a repeated
-            // local raster-change pattern shared by the known-fake population can
-            // become corroborating evidence.
-            row.negativeAffinityDelta = Number.isFinite(Number(row.negativeAffinityDelta))
-              ? row.negativeAffinityDelta : null;
           }
         }
         console.log('MATH SEMANTIC NEGATIVE POPULATION V1:', JSON.stringify(semanticNegativeAffinity));
@@ -598,10 +588,26 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     : null;
 
   const flags = [];
-  // GLOBAL POPULATION SIMILARITY IS DIAGNOSTIC ONLY.
-  // Do not emit a negative finding merely because the whole document happens
-  // to resemble the known-fake population. Bank template, JPEG quality,
-  // resolution and Telegram re-encoding can create the same effect.
+  if (referenceAvailable && negativeAvailable && Number.isFinite(affinityDelta)) {
+    const negReliability = String(negative?.bestMatch?.profile?.reliability || 'insufficient');
+    const refReliability = String(reference?.bestMatch?.profile?.reliability || 'insufficient');
+    const reliabilityPenalty = negReliability === 'low' ? 'low-sample' : 'population';
+    if (negScore >= 70 && affinityDelta >= 10 && negReliability !== 'low') {
+      flags.push({
+        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
+        severity: "high",
+        reliability: reliabilityPenalty,
+        detail: `Matematiksel fingerprint known-negative dağılımına reference dağılımından daha yakın (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
+      });
+    } else if (negScore >= 60 && affinityDelta >= 5) {
+      flags.push({
+        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
+        severity: negReliability === 'low' ? "low" : "medium",
+        reliability: reliabilityPenalty,
+        detail: `Known-negative matematiksel affinity sinyali var (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
+      });
+    }
+  }
 
   // Semantic negative affinity is the intended mathematical forensic signal:
   // target ROI must be closer to the known-fake population than to the trusted
@@ -609,22 +615,15 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   const semanticNegativeRows = Object.entries(semanticNegativeAffinity || {})
     .map(([field, row]) => ({ field, ...row }))
     .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
-  // A semantic negative signal is intentionally hard-gated. It needs a real
-  // population (>=3 known fakes), a meaningful distance margin, and a
-  // localized ROI that is not merely an extreme/noisy raster outlier.
-  const strongSemanticNegativeRows = semanticNegativeRows.filter(row => {
-    const sampleCount = Number(row.sampleCount || 0);
-    const delta = Number(row.negativeAffinityDelta || 0);
-    const refDistance = Number(row.referenceDistance);
-    const medianDistance = Number(row.medianDistance || 99);
-    return sampleCount >= 3 &&
-      Number.isFinite(delta) && delta >= 1.5 &&
-      Number.isFinite(refDistance) && refDistance >= 1.5 &&
-      medianDistance <= 5.5;
-  });
-  // Moderate population proximity is diagnostic data only. It must not create
-  // a user-facing negative finding or influence the final fake decision.
-  const moderateSemanticNegativeRows = [];
+  const strongSemanticNegativeRows = semanticNegativeRows.filter(row =>
+    Number(row.sampleCount || 0) >= 2 &&
+    Number(row.negativeAffinityDelta || 0) >= 1.25 &&
+    Number(row.medianDistance || 99) <= 5.5
+  );
+  const moderateSemanticNegativeRows = semanticNegativeRows.filter(row =>
+    Number(row.sampleCount || 0) >= 1 &&
+    Number(row.negativeAffinityDelta || 0) >= 0.75
+  );
   if (strongSemanticNegativeRows.length) {
     flags.push({
       code:'SEMANTIC_NEGATIVE_ROI_AFFINITY',
@@ -707,8 +706,8 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   return {
     available: true,
-    version: 'MATH-FORENSICS-V1.7.0-LOCAL-POPULATION-GUARD',
-    semanticNegativeVersion: 'MATH-FORENSICS-V2.1.0-LOCAL-EVIDENCE-ONLY',
+    version: 'MATH-FORENSICS-V1.6.3-SCALE-INVARIANT-GLOBAL-BASELINE-GUARD',
+    semanticNegativeVersion: 'MATH-FORENSICS-V2.0.0-SEMANTIC-ROI-POPULATION',
     engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
@@ -15861,8 +15860,8 @@ let layoutForensics = null;
 let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
-let differentialImageForensics = null;
 let pixelForensics = null;
+let differentialImageForensics = null;
 let advancedForensics = null;
 let paintOverForensics = null;
 let paintOverForensicsV2 = null;
@@ -16052,26 +16051,110 @@ if ((type === "image" || type === "pdf") && bank) {
 
 // =====================================================
 // DIFFERENTIAL IMAGE FORENSICS V1
-// Original references define NORMAL image behavior; known negatives define
-// repeated TAMPER patterns. This layer is advisory and never emits a global
-// fake score.
+// NORMAL = trusted reference population; TAMPER = known-negative population.
+// This layer measures local raster/texture/chroma direction, not document text.
+// It is deliberately separate from global negativeSimilarity and legacy scores.
 // =====================================================
-if ((type === "image" || type === "pdf") && bank) {
+async function runDifferentialImageForensics({ targetPath, referencePath, negativeSamples = [], type = 'image' }) {
+  const unavailable = (reason) => ({ available:false, engine:'differential-image-forensics-v1', reason });
+  if (!targetPath || !referencePath || !Array.isArray(negativeSamples) || !negativeSamples.length) {
+    return unavailable('missing-target-reference-or-negative-population');
+  }
   try {
-    const diffNegativeSamples = await loadNegativeSampleFiles(bank);
-    const diffReferencePaths = Array.isArray(reference?.visualReferencePaths)
-      ? reference.visualReferencePaths
-      : (reference?.visualReferencePath ? [reference.visualReferencePath] : []);
+    const load = async (input) => {
+      const ext = path.extname(String(input)).toLowerCase();
+      if (ext === '.pdf') {
+        const rendered = await renderPdfPagePng(input, 1, 2.8);
+        return rendered?.buffer || null;
+      }
+      return await fs.readFile(input);
+    };
+    const W=256, H=256, grid=16, cell=W/grid;
+    const descriptor = async (buf) => {
+      const {data,info}=await sharp(buf).resize(W,H,{fit:'fill'}).removeAlpha().raw().toBuffer({resolveWithObject:true});
+      const out=[];
+      for(let gy=0;gy<grid;gy++) for(let gx=0;gx<grid;gx++) {
+        const vals=[], grads=[], chrom=[];
+        for(let y=gy*cell;y<(gy+1)*cell;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
+          const i=(y*info.width+x)*info.channels;
+          const r=data[i]||0,g=data[i+1]||0,b=data[i+2]||0;
+          vals.push(.299*r+.587*g+.114*b); chrom.push(Math.abs(r-g)+Math.abs(g-b));
+          if(x<((gx+1)*cell-1)) { const j=(y*info.width+x+1)*info.channels; grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]||0)-(data[i+1]||0))); }
+          if(y<((gy+1)*cell-1)) { const j=((y+1)*info.width+x)*info.channels; grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]||0)-(data[i+1]||0))); }
+        }
+        const mean=vals.reduce((a,b)=>a+b,0)/vals.length;
+        const variance=vals.reduce((a,b)=>a+(b-mean)**2,0)/vals.length;
+        const gm=grads.reduce((a,b)=>a+b,0)/Math.max(1,grads.length);
+        const cm=chrom.reduce((a,b)=>a+b,0)/chrom.length;
+        out.push({lumaStd:Math.sqrt(variance),edge:gm,chroma:cm});
+      }
+      return out;
+    };
+    const [tb,rb]=await Promise.all([load(targetPath),load(Array.isArray(referencePath)?referencePath[0]:referencePath)]);
+    if(!tb||!rb) return unavailable('image-load-failed');
+    const [td,rd]=await Promise.all([descriptor(tb),descriptor(rb)]);
+    const negs=[];
+    for(const sample of negativeSamples.slice(0,12)) {
+      try { const b=await load(sample.path); if(b) negs.push({file:sample.fileName, d:await descriptor(b)}); } catch(e) { console.warn('DIFF FORENSICS NEGATIVE SKIP:',sample?.fileName,e?.message||e); }
+    }
+    if(!negs.length) return unavailable('negative-images-unavailable');
+
+    const fields={};
+    const components=['edge','stroke','luminance','raster'];
+    const compKey={edge:'edge',stroke:'lumaStd',luminance:'luminance',raster:'chroma'};
+    for(const field of ['document']) {
+      const agreements=[]; const counts={edge:0,stroke:0,luminance:0,raster:0};
+      for(const n of negs) {
+        let matched=0, matchedComponents=[];
+        for(let i=0;i<td.length;i++) {
+          const t=td[i], r=rd[i], f=n.d[i];
+          const metrics=['edge','lumaStd','chroma'];
+          for(const metric of metrics) {
+            const scale=Math.max(0.75,Math.abs(r[metric])*0.12,Math.abs(f[metric])*0.12);
+            const tr=Math.abs(t[metric]-r[metric])/scale;
+            const tf=Math.abs(t[metric]-f[metric])/scale;
+            if(tf+0.15 < tr && tr>=1.2) {
+              const c=metric==='edge'?'edge':metric==='lumaStd'?'stroke':metric==='chroma'?'raster':'luminance';
+              counts[c]++; matched++; matchedComponents.push(c);
+              break;
+            }
+          }
+        }
+        const uniq=[...new Set(matchedComponents)];
+        agreements.push({sample:n.file,agreementCount:matched,componentCount:3,matchedComponents:uniq,matched:uniq.length>=1});
+      }
+      const agreementCount=agreements.filter(x=>x.matched).length;
+      const sampleCount=negs.length;
+      const ratio=sampleCount?agreementCount/sampleCount:0;
+      const strong = sampleCount>=3 ? agreementCount>=2 && ratio>=0.5 : sampleCount===2 ? agreementCount===2 : false;
+      fields[field]={sampleCount, sampleAgreement:agreements, agreementCount, agreementRatio:Number(ratio.toFixed(3)), patternComponents:counts, strength:strong?'strong':agreementCount?'limited':'none', finalPromotionAllowed:strong};
+    }
+    const row=fields.document;
+    const out={available:true,engine:'differential-image-forensics-v1',normalSampleCount:1,tamperSampleCount:negs.length,fields,anyStrongLocalizedPattern:Boolean(row.finalPromotionAllowed),policy:'normal-vs-tamper-local-pattern-v1'};
+    console.log('DIFFERENTIAL IMAGE FORENSICS V1 START');
+    console.log('DIFFERENTIAL IMAGE FORENSICS V1:',JSON.stringify(out));
+    console.log('DIFFERENTIAL IMAGE FORENSICS V1 END');
+    return out;
+  } catch(error) {
+    console.warn('DIFFERENTIAL IMAGE FORENSICS V1 HATASI:',error?.message||error);
+    return unavailable(error?.message||String(error));
+  }
+}
+
+// Differential normal-vs-tamper image layer. Legacy/global negative similarity
+// remains diagnostic and is never used as this layer's evidence.
+if ((type === "image" || type === "pdf") && bank && reference) {
+  try {
+    const diffNegatives = await loadNegativeSampleFiles(bank);
     differentialImageForensics = await runDifferentialImageForensics({
       targetPath: forensicTargetPath,
-      referencePaths: diffReferencePaths,
-      negativeSamples: diffNegativeSamples,
-      bank
+      referencePath: getVisualReferencePath(reference),
+      negativeSamples: diffNegatives,
+      type,
     });
-    console.log("DIFFERENTIAL IMAGE FORENSICS V1:", JSON.stringify(differentialImageForensics));
   } catch (error) {
-    console.warn("DIFFERENTIAL IMAGE FORENSICS HATASI:", error?.message || error);
-    differentialImageForensics = { available:false, status:"error", error:error?.message || String(error), version:"DIFF-IMAGE-V1" };
+    console.warn("DIFFERENTIAL IMAGE FORENSICS V1 HATASI:", error?.message || error);
+    differentialImageForensics = { available:false, engine:'differential-image-forensics-v1', reason:error?.message || String(error) };
   }
 }
 
@@ -17908,9 +17991,6 @@ if (negativeSampleForensics) {
 if (visualForensics) {
   result.visualForensics = visualForensics;
 }
-if (differentialImageForensics) {
-  result.differentialImageForensics = differentialImageForensics;
-}
 if (layoutForensics) {
   result.layoutForensics = layoutForensics;
 }
@@ -18117,7 +18197,7 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     if (infoUnique.length) lines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
     if (!unique.length && !infoUnique.length) lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
     if (fusion?.referenceLike) lines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
-    else if (fusion?.negativeLike) lines.push('', '🔴 Lokal matematiksel kanıt: bilinen sahte örneklerdeki değişim profiliyle anlamlı uyum.');
+    else if (fusion?.negativeLike) lines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
     else lines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
@@ -18214,6 +18294,7 @@ if (openSourceForensics) {
 if (pixelForensics) {
   result.pixelForensics = pixelForensics;
 }
+if (differentialImageForensics) result.differentialImageForensics = differentialImageForensics;
 
 if (advancedForensics) {
   result.advancedForensics = advancedForensics;
@@ -19716,13 +19797,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
   const differential = differentialAvailable ? rawDifferential : null;
 
   const referenceLikeByDifferential = differentialAvailable && differential <= -20;
-  // Whole-document negative-vs-reference differential is never a fake verdict.
-  const negativeLikeByDifferential = false;
-
-  const localizedNegativeFields = Object.entries(math?.semanticNegativeAffinity || {})
-    .filter(([, row]) => row?.finalPromotionAllowed === true && row?.localPatternCorroborated === true)
-    .map(([field]) => field);
-  const localizedNegativeEvidence = localizedNegativeFields.length > 0;
+  const negativeLikeByDifferential = differentialAvailable && differential >= 20;
 
   const semanticFields = math?.semanticMathCalibration?.fields || {};
   const fieldRows = Array.isArray(forensic?.fields) ? forensic.fields : [];
@@ -19758,7 +19833,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
     const roiMean = Number(roiStrong?.roiMeanDistance || sem?.meanDistance || 0);
     const independent = field === 'amount'
       ? Number(sem?.amountForensicsScore || 0) >= 80
-      : localizedNegativeEvidence;
+      : negativeLikeByDifferential;
     fieldFusion[field] = {
       level,
       combinedScore: Number(sem?.combinedScore || 0),
@@ -19828,7 +19903,10 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
       referenceLike = false;
       className = 'indeterminate';
     }
-  } else if (localizedNegativeEvidence) {
+  } else if (negativeLikeByDifferential) {
+    negativeLike = true;
+    className = 'negative-like';
+  } else if (knownNegativeCorroborated && differentialAvailable && differential >= 0) {
     negativeLike = true;
     className = 'negative-like';
   }
@@ -19845,7 +19923,7 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
     negativeBaselineAvailable,
     referenceLike,
     negativeLike,
-    thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: null, localizedPattern: 'shared-direction-raster-pattern', adaptivePopulation: true },
+    thresholds: { referenceLikeMaxDifferential: -20, negativeLikeMinDifferential: 20 },
     fields: fieldFusion,
     layout: { maxScore: maxLayoutScore, strong: strongLayout },
     knownNegative: {
@@ -19854,16 +19932,14 @@ function buildReferenceMathematicalFusion(math = null, forensic = null, layout =
       bestSample: negativeSampleForensics?.bestSample || null,
       strong: knownNegativeStrong,
       corroborated: knownNegativeCorroborated,
-      policy: 'local-evidence-only; global similarity cannot independently declare a document fake'
+      policy: 'advisory-only; high local similarity cannot independently declare a document fake'
     },
     evidence: {
       criticalRoiStrongCount: criticalRows.length,
-      independentNegativeCorroboration: false,
-      localizedNegativeEvidence,
-      localizedNegativeFields,
+      independentNegativeCorroboration,
       differentialAvailable
     },
-    policy: 'V1.9: global similarity is diagnostic only; fake classification requires repeated localized semantic pattern evidence'
+    policy: 'V1.6.2: missing baselines remain unavailable/null; final class is reference-vs-negative differential first, with layout/semantic/known-negative signals as corroboration rather than single-signal verdicts'
   };
 }
 
@@ -20260,10 +20336,8 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     userLines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
   if (referenceLike) userLines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
-  else if (negativeLike) {
-    const fields = Array.isArray(mathFusion?.evidence?.localizedNegativeFields) ? mathFusion.evidence.localizedNegativeFields.join(', ') : '';
-    userLines.push('', `🔴 Lokal matematiksel kanıt: bilinen sahte örneklerdeki değişim profili${fields ? ` (${fields})` : ''} ile anlamlı uyum.`);
-  } else userLines.push('', '🟡 Lokal matematiksel kanıt: belirleyici sahte pattern bulunmadı.');
+  else if (negativeLike) userLines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
+  else userLines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
 
   return {
     headline: unique.length
@@ -20959,36 +21033,39 @@ if (!controlledAmountCorroborated) {
 // evidence below: target ROI vs trusted reference ROI vs known-fake ROI set.
 const semanticNegativeRowsForRisk = Object.entries(result?.mathematicalForensics?.semanticNegativeAffinity || {})
   .map(([field, row]) => ({ field, ...row }))
-  .filter(row => row.available && row.localPatternCorroborated === true && row.finalPromotionAllowed === true);
-const mathSemanticNegativeAffinity = semanticNegativeRowsForRisk.length > 0;
+  .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
+const strongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
+  Number(row.sampleCount || 0) >= 2 &&
+  Number(row.negativeAffinityDelta || 0) >= 1.25 &&
+  Number(row.medianDistance || 99) <= 5.5
+);
+const veryStrongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
+  Number(row.sampleCount || 0) >= 2 &&
+  Number(row.negativeAffinityDelta || 0) >= 2.25 &&
+  Number(row.medianDistance || 99) <= 5.5
+);
+const mathSemanticNegativeAffinity = strongSemanticNegativeForRisk.length > 0;
 
 if (mathSemanticNegativeAffinity) {
-  // Local known-fake pattern corroboration is intentionally capped. It is
-  // supporting evidence, never a global fake classifier.
   finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 60)
   };
-  console.log('SEMANTIC NEGATIVE PATTERN CORROBORATION:', JSON.stringify({
-    fields: semanticNegativeRowsForRisk.map(x => x.field),
-    agreement: semanticNegativeRowsForRisk.map(x => ({field:x.field, samples:x.sampleCount, patternAgreementCount:x.patternAgreementCount, minSampleAgreement:x.minSampleAgreement, components:x.corroboratingComponents, strength:x.patternStrength})),
+  console.log('SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
+    fields: strongSemanticNegativeForRisk.map(x => x.field),
+    deltas: strongSemanticNegativeForRisk.map(x => ({field:x.field, delta:x.negativeAffinityDelta, samples:x.sampleCount})),
     appliedFloor: 46
   }));
 }
 
-const veryStrongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
-  Number(row.sampleCount || 0) >= 3 &&
-  Number(row.patternAgreementCount || 0) >= 3 &&
-  Array.isArray(row.corroboratingComponents) && row.corroboratingComponents.length >= 3
-);
 if (veryStrongSemanticNegativeForRisk.length >= 2) {
   finalRiskScore = Math.max(finalRiskScore, 60);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 65)
   };
-  console.log('VERY STRONG SEMANTIC NEGATIVE PATTERN CORROBORATION:', JSON.stringify({
+  console.log('VERY STRONG SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
     fields: veryStrongSemanticNegativeForRisk.map(x => x.field),
     appliedFloor: 60
   }));
@@ -21017,6 +21094,29 @@ informationCheck;
 // =====================================================
 // ANA SKOR
 // =====================================================
+
+// Legacy raster/amount/paint-over signals cannot independently cross the suspicious
+// threshold anymore. A new local normal-vs-tamper corroboration is required.
+// This specifically prevents genuine references with generic raster differences
+// from becoming suspicious merely because an old sensor scored high.
+const diffStrong = differentialImageForensics?.available === true &&
+  differentialImageForensics?.anyStrongLocalizedPattern === true;
+if (!diffStrong && Number(result.overallRisk || 0) >= 46) {
+  result.overallRisk = 45;
+  result.riskLabel = getRiskLabel(45);
+  console.log('DIFFERENTIAL FORENSICS SAFETY GATE: legacy-only risk capped below suspicious threshold');
+}
+
+// FINAL DIFFERENTIAL SAFETY GATE: after every legacy/math promotion has run,
+// do not allow an image document to become suspicious without the new local
+// NORMAL-vs-TAMPER corroboration. This keeps legacy sensors diagnostic.
+const finalDiffStrong = differentialImageForensics?.available === true &&
+  differentialImageForensics?.anyStrongLocalizedPattern === true;
+if (!finalDiffStrong && Number(result.overallRisk || 0) >= 46) {
+  result.overallRisk = 45;
+  result.riskLabel = getRiskLabel(45);
+  console.log('DIFFERENTIAL FORENSICS FINAL GATE: no localized tamper corroboration; risk capped at 45');
+}
 
 const finalScore =
 Number(
