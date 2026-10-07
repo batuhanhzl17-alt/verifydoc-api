@@ -9,7 +9,7 @@ import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
 import { analyzeFontForensics } from "./font_forensics.js";
-import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareSemanticRoiToNegativePopulation, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
+import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -68,9 +68,6 @@ const referenceAmountAnchorCache = new Map();
 // PaddleOCR pahalı bir uzak API çağrısıdır. Aynı dosya analiz hattında
 // birden fazla kez istendiğinde aynı OCR sonucunu yeniden üretme.
 const paddleOCRCache = new Map();
-// JPEG OCR preprocessing cache: keeps the normalized 2400px OCR copy stable
-// across repeated calls in the same analysis. Forensics never uses this copy.
-const paddleJPEGPreprocessCache = new Map();
 
 // =====================================================
 // MATHEMATICAL FORENSICS BASELINE
@@ -207,11 +204,6 @@ function resolveMathSemanticValueBox(regions, field) {
 
 async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, bank = null, referencePath = null } = {}) {
   const rois = {};
-  // Visual references can be supplied as an array. Geometry/ROI helpers need
-  // one concrete raster path; always use the first usable visual reference.
-  const roiReferencePath = Array.isArray(referencePath)
-    ? referencePath.find((p) => typeof p === 'string' && p)
-    : referencePath;
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
     ? referenceForensics.typographyFieldProfiles : [];
@@ -328,15 +320,15 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       const anchor = await getReferenceAmountAnchor(bank);
       // Trusted anchor is allowed only as a last resort, after the typed
       // anchor builder has already rejected non-money numeric fields.
-      if (anchor && roiReferencePath) {
+      if (anchor && referencePath && String(anchor.source || '').includes('amount')) {
         let meta;
-        if (path.extname(roiReferencePath || '').toLowerCase() === '.pdf') {
-          const raw = await fs.readFile(roiReferencePath);
+        if (path.extname(referencePath).toLowerCase() === '.pdf') {
+          const raw = await fs.readFile(referencePath);
           const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
           const rendered = await renderPdfPagePng(pdf, 1, 1.8);
           meta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
         } else {
-          meta = await sharp(roiReferencePath).metadata();
+          meta = await sharp(referencePath).metadata();
         }
         if (meta?.width && meta?.height) {
           amountReferenceBox = {
@@ -418,26 +410,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   return rois;
 }
 
-
-async function extractMathFingerprintForFile(input, regions = {}) {
-  if (!input) return null;
-  try {
-    const isPath = typeof input === 'string';
-    const sourcePath = isPath ? input : null;
-    const ext = sourcePath ? path.extname(sourcePath).toLowerCase() : '';
-    if (ext === '.pdf') {
-      const rendered = await renderPdfPagePng(sourcePath, 1, 2.8);
-      if (!rendered?.buffer) return null;
-      return await extractMathematicalFingerprint(rendered.buffer, { regions });
-    }
-    return await extractMathematicalFingerprint(input, { regions });
-  } catch (error) {
-    console.warn('MATH FINGERPRINT FILE HATASI:', error?.message || error);
-    return null;
-  }
-}
-
-async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null, negativeSamples = [] }) {
+async function runMathematicalForensics({ targetPath, targetText = "", targetOCR = null, bank = null, fileName = "", referencePath = null, amountForensics = null, referenceForensics = null }) {
   if (!targetPath || !bank) {
     return { available: false, status: "missing-target-or-bank" };
   }
@@ -462,20 +435,17 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     }
   }
 
-  const fingerprint = await extractMathFingerprintForFile(targetPath, targetRegions);
-  if (!fingerprint) return { available:false, status:"target-fingerprint-unavailable", bank };
+  const fingerprint = await extractMathematicalFingerprint(targetPath, { regions: targetRegions });
   const family = inferDocumentFamily(fileName, targetText);
   const reference = compareAgainstBaseline(fingerprint, baseline.reference, bank, family);
   const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
 
   let roiForensics = null;
-  let semanticNegativeAffinity = null;
   let semanticReferenceMeasurements = null;
   let global16x16 = { available: false, reason: 'reference-unavailable' };
   if (referencePath && Object.keys(referenceRegions).length) {
     try {
-      const referenceFingerprint = await extractMathFingerprintForFile(referencePath, referenceRegions);
-      if (!referenceFingerprint) throw new Error("reference-fingerprint-unavailable");
+      const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
 
       // V1.5: expose the actual mathematical measurements extracted from the
@@ -529,47 +499,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         strongThreshold: 5,
         minOverlap: 0.20,
       });
-
-      // Resolution-independent negative population: apply the trusted
-      // reference ROI geometry as normalized coordinates to every known fake.
-      // The negative sample's native resolution is therefore irrelevant.
-      if (Array.isArray(negativeSamples) && negativeSamples.length) {
-        const refW = Number(referenceFingerprint?.source?.width || 0);
-        const refH = Number(referenceFingerprint?.source?.height || 0);
-        const negativeFingerprints = [];
-        for (const sample of negativeSamples.slice(0, 12)) {
-          try {
-            if (!sample?.path || !refW || !refH) continue;
-            const normalizedNegativeRegions = {};
-            for (const [field, box] of Object.entries(referenceRegions)) {
-              const x1=Number(box?.x1), y1=Number(box?.y1), x2=Number(box?.x2), y2=Number(box?.y2);
-              if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1) continue;
-              normalizedNegativeRegions[field] = {
-                xNorm:x1/refW,
-                yNorm:y1/refH,
-                widthNorm:(x2-x1)/refW,
-                heightNorm:(y2-y1)/refH,
-              };
-            }
-            const negFp = await extractMathFingerprintForFile(sample.path, normalizedNegativeRegions);
-            if (negFp) negativeFingerprints.push({ fileName:sample.fileName, path:sample.path, fingerprint:negFp });
-          } catch (e) {
-            console.warn('MATH NEGATIVE ROI SKIP:', sample?.fileName || sample?.path, e?.message || e);
-          }
-        }
-        semanticNegativeAffinity = compareSemanticRoiToNegativePopulation(fingerprint, negativeFingerprints, ['amount','recipientName','recipientIban']);
-        for (const field of Object.keys(semanticNegativeAffinity || {})) {
-          const row = semanticNegativeAffinity[field];
-          const refDistance = Number(roiForensics?.[field]?.meanDistance);
-          if (row?.available && Number.isFinite(refDistance)) {
-            row.referenceDistance = Number(refDistance.toFixed(3));
-            row.negativeAffinityDelta = Number((refDistance - Number(row.medianDistance || row.meanDistance || 0)).toFixed(3));
-            row.referenceCloser = row.negativeAffinityDelta < 0;
-            row.negativeCloser = row.negativeAffinityDelta > 0;
-          }
-        }
-        console.log('MATH SEMANTIC NEGATIVE POPULATION V1:', JSON.stringify(semanticNegativeAffinity));
-      }
     } catch (error) {
       roiForensics = { available: false, status: 'roi-error', error: error?.message || String(error) };
     }
@@ -602,52 +531,19 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     const reliabilityPenalty = negReliability === 'low' ? 'low-sample' : 'population';
     if (negScore >= 70 && affinityDelta >= 10 && negReliability !== 'low') {
       flags.push({
-        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
+        code: "NEGATIVE_MATH_AFFINITY",
         severity: "high",
         reliability: reliabilityPenalty,
         detail: `Matematiksel fingerprint known-negative dağılımına reference dağılımından daha yakın (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
       });
     } else if (negScore >= 60 && affinityDelta >= 5) {
       flags.push({
-        code: "GLOBAL_NEGATIVE_MATH_AFFINITY_ADVISORY",
+        code: "NEGATIVE_MATH_AFFINITY",
         severity: negReliability === 'low' ? "low" : "medium",
         reliability: reliabilityPenalty,
         detail: `Known-negative matematiksel affinity sinyali var (negative ${negScore.toFixed(1)} / reference ${refScore.toFixed(1)}).`
       });
     }
-  }
-
-  // Semantic negative affinity is the intended mathematical forensic signal:
-  // target ROI must be closer to the known-fake population than to the trusted
-  // reference ROI. It is independent of document resolution and global layout.
-  const semanticNegativeRows = Object.entries(semanticNegativeAffinity || {})
-    .map(([field, row]) => ({ field, ...row }))
-    .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
-  const strongSemanticNegativeRows = semanticNegativeRows.filter(row =>
-    Number(row.sampleCount || 0) >= 2 &&
-    Number(row.negativeAffinityDelta || 0) >= 1.25 &&
-    Number(row.medianDistance || 99) <= 5.5
-  );
-  const moderateSemanticNegativeRows = semanticNegativeRows.filter(row =>
-    Number(row.sampleCount || 0) >= 1 &&
-    Number(row.negativeAffinityDelta || 0) >= 0.75
-  );
-  if (strongSemanticNegativeRows.length) {
-    flags.push({
-      code:'SEMANTIC_NEGATIVE_ROI_AFFINITY',
-      severity:'high',
-      reliability:'forensic-signal',
-      fields:strongSemanticNegativeRows.map(x=>x.field),
-      detail:`Kritik ROI matematiksel profili known-negative dağılımına trusted reference ROI'dan belirgin biçimde daha yakın: ${strongSemanticNegativeRows.map(x=>`${x.field} Δ${Number(x.negativeAffinityDelta).toFixed(2)}`).join(', ')}. Bu sinyal çözünürlükten bağımsızdır ve tek başına kesin sahtecilik hükmü değildir.`
-    });
-  } else if (moderateSemanticNegativeRows.length) {
-    flags.push({
-      code:'SEMANTIC_NEGATIVE_ROI_AFFINITY',
-      severity:'medium',
-      reliability:'forensic-signal',
-      fields:moderateSemanticNegativeRows.map(x=>x.field),
-      detail:`Kritik ROI matematiksel profilinde known-negative yönünde yakınlık görüldü: ${moderateSemanticNegativeRows.map(x=>`${x.field} Δ${Number(x.negativeAffinityDelta).toFixed(2)}`).join(', ')}.`
-    });
   }
 
   const roiRows = Object.entries(roiForensics || {})
@@ -715,7 +611,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   return {
     available: true,
     version: 'MATH-FORENSICS-V1.6.3-SCALE-INVARIANT-GLOBAL-BASELINE-GUARD',
-    semanticNegativeVersion: 'MATH-FORENSICS-V2.0.0-SEMANTIC-ROI-POPULATION',
     engine: 'mathematical-forensics-v1.6.2.1-semantic-reference-roi',
     bank,
     family,
@@ -747,7 +642,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     // measured mathematically when their boxes were available.
     semanticReferenceMeasurements,
     roi16x16: roiForensics,
-    semanticNegativeAffinity,
     roiSummary: {
       available: roiRows.length > 0,
       fieldsCompared: roiRows.map(x=>x.field),
@@ -1216,9 +1110,9 @@ async function recordForensicWatchEvent({
     return {
       available: false,
       recorded: false,
-      status: signal.strongSignal ? "SUSPICIOUS" : "CLEAN",
-      eventType: signal.strongSignal ? signal.eventType : "advisory",
-      strongSignal: Boolean(signal.strongSignal),
+      status: "SUSPICIOUS",
+      eventType: signal.eventType,
+      strongSignal: signal.strongSignal,
     };
   }
 
@@ -1247,7 +1141,7 @@ async function recordForensicWatchEvent({
       available: true,
       recorded: false,
       duplicate: true,
-      status: duplicateRows[0]?.status || (signal.strongSignal ? "SUSPICIOUS" : "CLEAN"),
+      status: duplicateRows[0]?.status || "SUSPICIOUS",
       eventType: signal.eventType,
       strongSignal: signal.strongSignal,
       occurrenceCount: 1,
@@ -1334,9 +1228,9 @@ async function recordForensicWatchEvent({
     return {
       available: true,
       recorded: false,
-      status: signal.strongSignal ? "SUSPICIOUS" : "CLEAN",
-      eventType: signal.strongSignal ? signal.eventType : "advisory",
-      strongSignal: Boolean(signal.strongSignal),
+      status: "SUSPICIOUS",
+      eventType: signal.eventType,
+      strongSignal: signal.strongSignal,
       error: error?.message || "watchlist insert failed",
     };
   }
@@ -1863,129 +1757,7 @@ async function runAzureReferenceGeometryComparison(targetAzureLayout, bank, sele
   }
 }
 
-// =====================================================
-// JPEG-SPECIFIC PADDLEOCR PIPELINE
-// =====================================================
-// JPEGs often arrive from Telegram/browser uploads as extensionless /tmp files.
-// PaddleOCR's SDK uses the filename/format when submitting the file, so an
-// extensionless JPEG can be rejected even though its bytes are valid. We create
-// a real .jpg OCR-only copy, orient it, and normalize its long edge to 2400px.
-// The original raster is never replaced and is still used by forensic layers.
-async function runPaddleOCRForJPEG(filePath) {
-  if (!filePath) {
-    return { text:'', confidence:0, success:false, regions:[], error:'JPEG OCR filePath missing.' };
-  }
-
-  let sourceHash = null;
-  let sourceMeta = null;
-  let sourceBuffer = null;
-  try {
-    sourceBuffer = await fs.readFile(filePath);
-    sourceHash = createHash('sha256').update(sourceBuffer).digest('hex');
-    sourceMeta = await sharp(sourceBuffer).metadata();
-  } catch (error) {
-    console.warn('PADDLEOCR JPEG PREP HATASI:', error?.message || error);
-    return { text:'', confidence:0, success:false, regions:[], error:error?.message || String(error) };
-  }
-
-  if (String(sourceMeta?.format || '').toLowerCase() !== 'jpeg') {
-    return runPaddleOCRRaw(filePath);
-  }
-
-  const cacheKey = `jpeg-ocr-v1:${sourceHash}`;
-  let prep = paddleJPEGPreprocessCache.get(cacheKey);
-  try {
-    if (!prep) {
-      const rawWidth = Number(sourceMeta?.width || 0);
-      const rawHeight = Number(sourceMeta?.height || 0);
-      const orientation = Number(sourceMeta?.orientation || 1);
-      const orientedWidth = [5,6,7,8].includes(orientation) ? rawHeight : rawWidth;
-      const orientedHeight = [5,6,7,8].includes(orientation) ? rawWidth : rawHeight;
-      if (!orientedWidth || !orientedHeight) throw new Error('JPEG_METADATA_DIMENSIONS_UNAVAILABLE');
-
-      const outputPath = `/tmp/verifydoc-paddle-jpeg-${sourceHash.slice(0,24)}.jpg`;
-      const out = await sharp(sourceBuffer)
-        .rotate()
-        .resize({ width:2400, height:2400, fit:'inside', withoutEnlargement:false })
-        .jpeg({ quality:92, chromaSubsampling:'4:4:4', progressive:false })
-        .toFile(outputPath);
-
-      prep = {
-        outputPath,
-        sourceWidth: orientedWidth,
-        sourceHeight: orientedHeight,
-        outputWidth: Number(out.width || 0),
-        outputHeight: Number(out.height || 0),
-      };
-      paddleJPEGPreprocessCache.set(cacheKey, prep);
-
-      console.log('PADDLEOCR JPEG NORMALIZED:', JSON.stringify({
-        sourceWidth: orientedWidth,
-        sourceHeight: orientedHeight,
-        outputWidth: prep.outputWidth,
-        outputHeight: prep.outputHeight,
-        longEdge: Math.max(prep.outputWidth, prep.outputHeight),
-        quality:92,
-        chromaSubsampling:'4:4:4'
-      }));
-    } else {
-      console.log('PADDLEOCR JPEG NORMALIZED CACHE HIT:', prep.outputPath);
-    }
-
-    const ocr = await runPaddleOCRRaw(prep.outputPath);
-    if (!ocr?.success) return ocr;
-
-    // PaddleOCR boxes are in the normalized OCR raster. Map them back to the
-    // original oriented JPEG coordinate system so every downstream semantic
-    // ROI continues to refer to the original forensic image.
-    const sx = prep.sourceWidth / Math.max(1, prep.outputWidth);
-    const sy = prep.sourceHeight / Math.max(1, prep.outputHeight);
-    const regions = Array.isArray(ocr.regions) ? ocr.regions.map((item) => {
-      const r = item?.region;
-      if (!r) return item;
-      return {
-        ...item,
-        region: {
-          ...r,
-          x1: Number(r.x1) * sx,
-          y1: Number(r.y1) * sy,
-          x2: Number(r.x2) * sx,
-          y2: Number(r.y2) * sy,
-          sourceWidth: prep.sourceWidth,
-          sourceHeight: prep.sourceHeight,
-          ocrWidth: prep.outputWidth,
-          ocrHeight: prep.outputHeight,
-          coordinateSpace: 'original-oriented-jpeg'
-        }
-      };
-    }) : [];
-
-    return {
-      ...ocr,
-      regions,
-      preprocessing: {
-        engine:'jpeg-ocr-preprocess-v1',
-        sourceFormat:'jpeg',
-        sourceWidth:prep.sourceWidth,
-        sourceHeight:prep.sourceHeight,
-        ocrWidth:prep.outputWidth,
-        ocrHeight:prep.outputHeight,
-        longEdge:Math.max(prep.outputWidth, prep.outputHeight),
-        quality:92,
-        chromaSubsampling:'4:4:4',
-        mappedToOriginal:true
-      }
-    };
-  } catch (error) {
-    console.warn('PADDLEOCR JPEG HATASI:', error?.message || error);
-    return {
-      text:'', confidence:0, success:false, regions:[],
-      error:error?.message || String(error)
-    };
-  }
-}
-
-async function runPaddleOCRRaw(
+async function runPaddleOCR(
 filePath
 ) {
 
@@ -2425,21 +2197,6 @@ try {
 }
 
 }
-// Public OCR entry point. JPEG is routed through the dedicated normalized
-// pipeline; PDF/PNG/other inputs keep the existing raw Paddle path.
-async function runPaddleOCR(filePath) {
-  if (!filePath) return runPaddleOCRRaw(filePath);
-  try {
-    const meta = await sharp(filePath).metadata();
-    const format = String(meta?.format || '').toLowerCase();
-    if (format === 'jpeg') return runPaddleOCRForJPEG(filePath);
-  } catch (error) {
-    // If Sharp cannot inspect the input, preserve the existing raw OCR fallback.
-    console.warn('PADDLEOCR FORMAT TESPİTİ FALLBACK:', error?.message || error);
-  }
-  return runPaddleOCRRaw(filePath);
-}
-
 let ocrWorker = null;
 async function getOCRWorker() {
 if (!ocrWorker) {
@@ -2659,11 +2416,11 @@ const NEGATIVE_SAMPLE_MAP = {
     "isbankasi/fake200000.jpg",
   ],
   qnb: ["qnb/qnb5000.jpg", "qnb/qnbfakeiban.jpg"],
-  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vak#U0131f3500fake.jpg"],
+  vakifbank: ["vakifbank/sahte-1.jpg", "vakifbank/vakıf3500fake.jpg"],
   yapikredi: [
-    "yap#U0131kredi/sahte-1.jpg",
-    "yap#U0131kredi/fakeyapi10000.jpg",
-    "yap#U0131kredi/yapifakeiban.jpg",
+    "yapıkredi/sahte-1.jpg",
+    "yapıkredi/fakeyapi10000.jpg",
+    "yapıkredi/yapifakeiban.jpg",
   ],
   ziraat: [
     "ziraat/sahte-1.jpg",
@@ -6792,11 +6549,6 @@ async function getReferenceAmountAnchor(bank) {
           yNorm: r.y1 / height,
           widthNorm: Math.max(0.001, (r.x2-r.x1) / width),
           heightNorm: Math.max(0.001, (r.y2-r.y1) / height),
-          // Keep the reference OCR value only as a glyph-alignment hint.
-          // It is NEVER used as a literal-value authenticity signal.
-          text: best?.candidate?.text && best.candidate.text !== '__RASTER_AMOUNT_BOX__'
-            ? String(best.candidate.text).trim()
-            : null,
           referenceFile: path.basename(referencePath),
         });
       } catch (error) {
@@ -6824,10 +6576,6 @@ async function getReferenceAmountAnchor(bank) {
         width: Math.max(...entries.map(x => x.widthNorm)) - Math.min(...entries.map(x => x.widthNorm)),
         height: Math.max(...entries.map(x => x.heightNorm)) - Math.min(...entries.map(x => x.heightNorm)),
       },
-      // Reference text is diagnostic only. If multiple trusted references exist,
-      // prefer the first usable value rather than turning literal amount content
-      // into the reference score.
-      text: entries.find(x => x.text)?.text || null,
       source: 'trusted-telegram-raster-ensemble-v16.1-explicit-amount-label-fallback',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
@@ -13683,420 +13431,6 @@ console.log("AMOUNT FORENSICS STRONG CACHED:", fileFingerprint);
 return finalForensics;
 }
 
-
-// =====================================================
-// AMOUNT REFERENCE RENDER FORENSICS V1
-// =====================================================
-// Purpose:
-//   Compare the TARGET amount ROI against the trusted Enpara amount ROI
-//   using render-level statistics, not literal amount text.
-//
-// This is deliberately independent from Amount Forensics V3:
-//   - V3 asks whether characters inside the TARGET agree with each other.
-//   - This layer asks whether the TARGET amount render looks compatible
-//     with the trusted reference rendering and/or closer to known fakes.
-//
-// It is a corroboration signal. It never declares a document fake alone.
-async function analyzeAmountReferenceRenderForensics({
-  targetPath,
-  targetRegion,
-  referencePath,
-  referenceAmountField,
-  targetAmountText = null,
-  negativeSamples = [],
-}) {
-  const unavailable = (reason) => ({
-    available: false,
-    engine: "amount-reference-render-forensics-v1",
-    status: "unknown",
-    severity: "none",
-    score: 0,
-    reason,
-  });
-
-  if (!targetPath || !targetRegion || !referencePath || !referenceAmountField) {
-    return unavailable("missing-target-reference-or-amount-anchor");
-  }
-
-  try {
-    const pickVisualPath = (input) => {
-      if (Array.isArray(input)) {
-        return input.find((p) => /\.(png|jpe?g|webp)$/i.test(String(p))) || input[0] || null;
-      }
-      return input;
-    };
-
-    const loadRaster = async (input) => {
-      const p = pickVisualPath(input);
-      if (!p) return null;
-      const ext = path.extname(String(p)).toLowerCase();
-      if (ext === ".pdf") {
-        const rendered = await renderPdfPagePng(p, 1, 2.8);
-        return rendered?.buffer || null;
-      }
-      return await fs.readFile(p);
-    };
-
-    const targetBuffer = await loadRaster(targetPath);
-    const referenceBuffer = await loadRaster(referencePath);
-    if (!targetBuffer || !referenceBuffer) return unavailable("image-load-failed");
-
-    const targetMeta = await sharp(targetBuffer).metadata();
-    const referenceMeta = await sharp(referenceBuffer).metadata();
-    const tw = Number(targetMeta.width || 0);
-    const th = Number(targetMeta.height || 0);
-    const rw = Number(referenceMeta.width || 0);
-    const rh = Number(referenceMeta.height || 0);
-    if (!tw || !th || !rw || !rh) return unavailable("image-metadata-unavailable");
-
-    const validBox = (b, normalized = false) => {
-      if (!b || typeof b !== "object") return null;
-
-      // Target amountForensics.region uses absolute x1/y1/x2/y2 pixels.
-      // Trusted reference amount anchors use xNorm/yNorm/widthNorm/heightNorm.
-      // Normalize both representations here so the render engine never
-      // silently fails because the reference anchor schema differs.
-      if (normalized && [b.xNorm, b.yNorm, b.widthNorm, b.heightNorm].every(Number.isFinite)) {
-        const x1 = Number(b.xNorm);
-        const y1 = Number(b.yNorm);
-        const x2 = x1 + Number(b.widthNorm);
-        const y2 = y1 + Number(b.heightNorm);
-        return x2 > x1 && y2 > y1 ? { x1, y1, x2, y2 } : null;
-      }
-
-      const x1 = Number(b?.x1), y1 = Number(b?.y1), x2 = Number(b?.x2), y2 = Number(b?.y2);
-      return [x1, y1, x2, y2].every(Number.isFinite) && x2 > x1 && y2 > y1
-        ? { x1, y1, x2, y2 }
-        : null;
-    };
-
-    const cropFromPixels = async (buffer, meta, box, normalized = false) => {
-      const b = validBox(box, normalized);
-      if (!b) return null;
-      const W = Number(meta.width), H = Number(meta.height);
-      const x1 = normalized ? b.x1 * W : b.x1;
-      const y1 = normalized ? b.y1 * H : b.y1;
-      const x2 = normalized ? b.x2 * W : b.x2;
-      const y2 = normalized ? b.y2 * H : b.y2;
-      const left = Math.max(0, Math.floor(x1));
-      const top = Math.max(0, Math.floor(y1));
-      const width = Math.min(W - left, Math.max(3, Math.ceil(x2 - x1)));
-      const height = Math.min(H - top, Math.max(3, Math.ceil(y2 - y1)));
-      if (width < 3 || height < 3) return null;
-
-      return sharp(buffer)
-        .grayscale()
-        .extract({ left, top, width, height })
-        .raw()
-        .toBuffer({ resolveWithObject: true });
-    };
-
-    // OCR/amountForensics region coordinates may belong to the original-oriented
-    // upload dimensions while forensicTargetPath can be a normalized/rendered
-    // raster. Scale the absolute target ROI into the actual raster dimensions.
-    const targetSourceWidth = Number(targetRegion?.sourceWidth || 0);
-    const targetSourceHeight = Number(targetRegion?.sourceHeight || 0);
-    const targetRegionScaled = (targetSourceWidth > 0 && targetSourceHeight > 0)
-      ? {
-          ...targetRegion,
-          x1: Number(targetRegion.x1) * (tw / targetSourceWidth),
-          x2: Number(targetRegion.x2) * (tw / targetSourceWidth),
-          y1: Number(targetRegion.y1) * (th / targetSourceHeight),
-          y2: Number(targetRegion.y2) * (th / targetSourceHeight),
-        }
-      : targetRegion;
-
-    const targetRaw = await cropFromPixels(targetBuffer, targetMeta, targetRegionScaled, false);
-    const refRaw = await cropFromPixels(referenceBuffer, referenceMeta, referenceAmountField, true);
-    if (!targetRaw || !refRaw) return unavailable("amount-roi-crop-failed");
-
-    // V15.9: CONTENT-INDEPENDENT RENDER SIGNATURE
-    // The trusted reference is a render/pixel baseline, not a literal amount
-    // baseline. Amount length/content must not dominate the reference score.
-    const signature = (raw) => {
-      const W = Number(raw.info?.width || 0);
-      const H = Number(raw.info?.height || 0);
-      if (!W || !H || !raw.data?.length) return null;
-      const pixels = W * H;
-      const gray = raw.data;
-
-      // V15.10: small Telegram/source ROIs can contain anti-aliased glyphs
-      // whose upper strokes are lighter than the old fixed 185 threshold.
-      // Adapt to the ROI luminance tail while keeping conservative bounds.
-      const sample = [];
-      const step = Math.max(1, Math.floor(pixels / 2500));
-      for (let i = 0; i < pixels; i += step) sample.push(Number(gray[i] || 0));
-      sample.sort((a, b) => a - b);
-      const pct = (q) => sample.length
-        ? sample[Math.min(sample.length - 1, Math.max(0, Math.floor((sample.length - 1) * q)))]
-        : 255;
-      const p10 = pct(0.10);
-      const p90 = pct(0.90);
-      const adaptiveThreshold = p10 + (p90 - p10) * 0.35;
-      const threshold = Math.max(185, Math.min(246, adaptiveThreshold));
-      const mask = new Uint8Array(pixels);
-      for (let i = 0; i < pixels; i++) if (Number(gray[i] || 0) < threshold) mask[i] = 1;
-      let foregroundPixels = 0;
-      for (let i = 0; i < pixels; i++) foregroundPixels += mask[i];
-
-      const seen = new Uint8Array(pixels);
-      const qx = new Int32Array(pixels);
-      const qy = new Int32Array(pixels);
-      const comps = [];
-      for (let sy = 0; sy < H; sy++) {
-        for (let sx = 0; sx < W; sx++) {
-          const si = sy * W + sx;
-          if (!mask[si] || seen[si]) continue;
-          let head = 0, tail = 0;
-          qx[tail] = sx; qy[tail] = sy; tail++; seen[si] = 1;
-          let minX = sx, maxX = sx, minY = sy, maxY = sy, area = 0, perimeter = 0;
-          while (head < tail) {
-            const cx = qx[head], cy = qy[head++];
-            area++;
-            minX = Math.min(minX, cx); maxX = Math.max(maxX, cx);
-            minY = Math.min(minY, cy); maxY = Math.max(maxY, cy);
-            for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
-              const nx = cx + dx, ny = cy + dy;
-              if (nx < 0 || ny < 0 || nx >= W || ny >= H) { perimeter++; continue; }
-              const ni = ny * W + nx;
-              if (!mask[ni]) perimeter++;
-              else if (!seen[ni]) { seen[ni] = 1; qx[tail] = nx; qy[tail] = ny; tail++; }
-            }
-          }
-          const cw = maxX - minX + 1;
-          const ch = maxY - minY + 1;
-          if (area >= 5 && ch >= 5 && ch <= H * 0.80 && cw <= W * 0.35) {
-            comps.push({ minX, maxX, minY, maxY, width:cw, height:ch, area, perimeter });
-          }
-        }
-      }
-      if (comps.length < 2) {
-        console.log("AMOUNT RENDER SIGNATURE EXTRACTION DEBUG:", JSON.stringify({
-          width: W, height: H, p10: Number(p10.toFixed(2)), p90: Number(p90.toFixed(2)),
-          threshold: Number(threshold.toFixed(2)), foregroundPixels,
-          foregroundRatio: Number((foregroundPixels / Math.max(1, pixels)).toFixed(4)),
-          componentCount: comps.length, stage: "component-count"
-        }));
-        return null;
-      }
-      comps.sort((a,b) => a.minX - b.minX || a.minY - b.minY);
-      const median = (arr) => {
-        const v = arr.filter(Number.isFinite).sort((a,b)=>a-b);
-        if (!v.length) return 0;
-        const m = Math.floor(v.length/2);
-        return v.length % 2 ? v[m] : (v[m-1] + v[m])/2;
-      };
-      const mad = (arr) => {
-        const v = arr.filter(Number.isFinite);
-        const m = median(v);
-        return median(v.map(x => Math.abs(x-m)));
-      };
-      const medianH0 = median(comps.map(c=>c.height));
-      const glyphs = comps.filter(c => c.height >= Math.max(5, medianH0 * 0.55)).slice(0, 80);
-      if (glyphs.length < 2) {
-        console.log("AMOUNT RENDER SIGNATURE EXTRACTION DEBUG:", JSON.stringify({
-          width: W, height: H, p10: Number(p10.toFixed(2)), p90: Number(p90.toFixed(2)),
-          threshold: Number(threshold.toFixed(2)), foregroundPixels,
-          foregroundRatio: Number((foregroundPixels / Math.max(1, pixels)).toFixed(4)),
-          componentCount: comps.length, glyphCount: glyphs.length, stage: "glyph-count"
-        }));
-        return null;
-      }
-      const inkTop = Math.min(...glyphs.map(c=>c.minY));
-      const inkBottom = Math.max(...glyphs.map(c=>c.maxY));
-      const inkHeight = Math.max(1, inkBottom - inkTop + 1);
-      const widthHeight = glyphs.map(c=>c.width/Math.max(1,c.height));
-      const fill = glyphs.map(c=>c.area/Math.max(1,c.width*c.height));
-      const stroke = glyphs.map(c=>c.area/Math.max(1,c.perimeter*c.perimeter));
-      const centerY = glyphs.map(c=>((c.minY+c.maxY)/2-inkTop)/inkHeight);
-      const gaps = [];
-      for (let i=1;i<glyphs.length;i++) gaps.push((glyphs[i].minX-glyphs[i-1].maxX-1)/Math.max(1,medianH0));
-      const edge = [];
-      const buckets = [0,0,0,0];
-      let bucketN=0;
-      for (const c of glyphs) {
-        let e=0,n=0;
-        for (let y=c.minY;y<=c.maxY;y++) {
-          for (let x=c.minX;x<=c.maxX;x++) {
-            const i=y*W+x, v=Number(gray[i]||0);
-            if (v<230) {
-              n++;
-              if (x>c.minX && Math.abs(v-Number(gray[i-1]||0))>12) e++;
-              if (y>c.minY && Math.abs(v-Number(gray[i-W]||0))>12) e++;
-              buckets[v<64?0:v<128?1:v<200?2:3]++; bucketN++;
-            }
-          }
-        }
-        if (n) edge.push(e/n);
-      }
-      return {
-        glyphCount:glyphs.length,
-        threshold:Number(threshold.toFixed(2)),
-        foregroundRatio:Number((foregroundPixels / Math.max(1, pixels)).toFixed(4)),
-        glyphWidthHeight:median(widthHeight), glyphWidthHeightMad:mad(widthHeight),
-        glyphFill:median(fill), glyphFillMad:mad(fill),
-        strokeProxy:median(stroke), strokeProxyMad:mad(stroke),
-        verticalCenter:median(centerY), verticalCenterMad:mad(centerY),
-        spacingToHeight:median(gaps), spacingMad:mad(gaps),
-        edgeDensity:median(edge), edgeDensityMad:mad(edge),
-        grayDistribution:bucketN ? buckets.map(x=>x/bucketN) : [0,0,0,0],
-        // Diagnostic only; never used in reference compatibility.
-        legacyAspect:W/Math.max(1,H), legacyInkRatio:pixels?mask.reduce((a,v)=>a+v,0)/pixels:0,
-      };
-    };
-
-    const targetSig = signature(targetRaw);
-    const referenceSig = signature(refRaw);
-    if (!targetSig || !referenceSig) return unavailable("signature-extraction-failed");
-
-    // Relative distances are intentionally tolerant. The reference may be a
-    // clean raster while the target passed through Telegram/JPEG/resizing.
-    const metricDefs = [
-      ["glyphWidthHeight", 0.16, 0.10],
-      ["glyphFill", 0.16, 0.10],
-      ["strokeProxy", 0.20, 0.010],
-      ["verticalCenter", 0.08, 0.08],
-      ["spacingToHeight", 0.12, 0.16],
-      ["edgeDensity", 0.14, 0.12],
-      ["glyphWidthHeightMad", 0.04, 0.08],
-      ["glyphFillMad", 0.04, 0.08],
-      ["strokeProxyMad", 0.06, 0.004],
-    ];
-
-    const distanceBetween = (a, b) => {
-      let total = 0, weightTotal = 0;
-      const details = {};
-      for (const [key, weight, tolerance] of metricDefs) {
-        const av = Number(a?.[key]), bv = Number(b?.[key]);
-        if (!Number.isFinite(av) || !Number.isFinite(bv)) continue;
-        const scale = Math.max(Number(tolerance), Math.abs(bv) * 0.65, 0.0001);
-        const d = Math.abs(av - bv) / scale;
-        details[key] = Number(d.toFixed(4));
-        total += Math.min(3, d) * weight;
-        weightTotal += weight;
-      }
-      // Antialiasing/compression distribution is useful, but deliberately low-weight.
-      if (Array.isArray(a?.grayDistribution) && Array.isArray(b?.grayDistribution)) {
-        const gd = a.grayDistribution.reduce((sum,v,i)=>sum+Math.abs(Number(v||0)-Number(b.grayDistribution[i]||0)),0)/2;
-        details.grayDistribution = Number(gd.toFixed(4));
-        total += Math.min(1, gd) * 0.05;
-        weightTotal += 0.05;
-      }
-      return { distance: weightTotal ? total / weightTotal : 99, details };
-    };
-
-    const targetToReference = distanceBetween(targetSig, referenceSig);
-
-    let sameCharacterGlyphDistance = null;
-    try {
-      const targetText = String(targetAmountText || '').trim();
-      const referenceText = String(referenceAmountField?.text || '').trim();
-      if (targetText && referenceText) {
-        const targetGlyphs = await rfNumericGlyphSequence(
-          targetBuffer, targetRegionScaled, { width: tw, height: th }, targetText
-        );
-        const refBox = {
-          x1: Number(referenceAmountField.xNorm || 0) * rw,
-          y1: Number(referenceAmountField.yNorm || 0) * rh,
-          x2: (Number(referenceAmountField.xNorm || 0) + Number(referenceAmountField.widthNorm || 0)) * rw,
-          y2: (Number(referenceAmountField.yNorm || 0) + Number(referenceAmountField.heightNorm || 0)) * rh,
-        };
-        const referenceGlyphs = await rfNumericGlyphSequence(
-          referenceBuffer, refBox, { width: rw, height: rh }, referenceText
-        );
-        sameCharacterGlyphDistance = rfNumericGlyphDistance(targetGlyphs, referenceGlyphs);
-      }
-    } catch {}
-    if (Number.isFinite(sameCharacterGlyphDistance)) {
-      // Same-character glyph evidence is highly relevant to font/raster identity,
-      // but it must not dominate the content-independent style baseline.
-      targetToReference.distance = Number(Math.min(3, targetToReference.distance * 0.82 + sameCharacterGlyphDistance * 0.18).toFixed(4));
-      targetToReference.details.sameCharacterGlyphDistance = Number(sameCharacterGlyphDistance.toFixed(4));
-    }
-
-    const fakeDistances = [];
-    for (const sample of Array.isArray(negativeSamples) ? negativeSamples.slice(0, 12) : []) {
-      try {
-        const fakeBuffer = await loadRaster(sample.path);
-        if (!fakeBuffer) continue;
-        const fakeMeta = await sharp(fakeBuffer).metadata();
-        const fakeRaw = await cropFromPixels(fakeBuffer, fakeMeta, referenceAmountField, true);
-        if (!fakeRaw) continue;
-        const fakeSig = signature(fakeRaw);
-        if (!fakeSig) continue;
-        const d = distanceBetween(targetSig, fakeSig);
-        fakeDistances.push({
-          fileName: sample.fileName || path.basename(sample.path || ""),
-          distance: Number(d.distance.toFixed(4)),
-          details: d.details,
-        });
-      } catch {}
-    }
-
-    fakeDistances.sort((a, b) => a.distance - b.distance);
-    const bestFake = fakeDistances[0] || null;
-    const fakeAffinityMargin = bestFake
-      ? Number((targetToReference.distance - bestFake.distance).toFixed(4))
-      : 0;
-
-    // Fake-population affinity is retained as a diagnostic measurement only.
-    // A generic resemblance to a known fake is not evidence that this document
-    // was manipulated; risk promotion is gated later by localized evidence.
-    const fakeAffinityStrong = Boolean(
-      bestFake &&
-      fakeAffinityMargin >= 0.16 &&
-      bestFake.distance <= 0.95
-    );
-
-    const referenceAnomaly = targetToReference.distance >= 0.85;
-    const strongAnomaly = referenceAnomaly;
-    const compatibilityScore = Math.max(
-      0,
-      Math.min(100, Math.round(100 - targetToReference.distance * 55))
-    );
-
-    const status = strongAnomaly
-      ? "anomaly"
-      : targetToReference.distance <= 0.65
-        ? "pass"
-        : "unknown";
-
-    return {
-      available: true,
-      engine: "amount-reference-render-forensics-v1",
-      status,
-      severity: strongAnomaly ? "strong" : status === "pass" ? "none" : "moderate",
-      score: strongAnomaly ? Math.max(60, Math.min(100, Math.round((targetToReference.distance * 45) + (fakeAffinityMargin * 90)))) : 0,
-      referenceCompatibilityScore: compatibilityScore,
-      referenceDistance: Number(targetToReference.distance.toFixed(4)),
-      bestFakeDistance: bestFake ? bestFake.distance : null,
-      fakeAffinityMargin,
-      fakeAffinityStrong,
-      referenceAnchor: {
-        xNorm: Number(referenceAmountField.xNorm || 0),
-        yNorm: Number(referenceAmountField.yNorm || 0),
-        widthNorm: Number(referenceAmountField.widthNorm || 0),
-        heightNorm: Number(referenceAmountField.heightNorm || 0),
-      },
-      targetSignature: targetSig,
-      referenceSignature: referenceSig,
-      sameCharacterGlyphDistance: Number.isFinite(sameCharacterGlyphDistance) ? Number(sameCharacterGlyphDistance.toFixed(4)) : null,
-      scoringModel: 'content-independent-glyph-render-v15.9',
-
-      bestFake: bestFake ? bestFake.fileName : null,
-      comparedFakeCount: fakeDistances.length,
-      evidence: strongAnomaly
-        ? "Tutar ROI'sinde doğrulanmış lokal manipülasyon bulgusu var."
-        : status === "pass"
-          ? "Tutar ROI'sinin render karakteristiği güvenilir Enpara referansıyla uyumlu; bilinen sahte popülasyonuna anlamlı yakınlık oluşmadı."
-          : "Tutar ROI'si referanstan farklı; sahte örnek benzerliği yalnızca tanı amaçlıdır ve tek başına manipülasyon kanıtı sayılmaz.",
-    };
-  } catch (error) {
-    console.warn("AMOUNT REFERENCE RENDER FORENSICS HATASI:", error?.message || error);
-    return unavailable(error?.message || String(error));
-  }
-}
-
 // =====================================================
 // JSON RESPONSE
 // =====================================================
@@ -16429,7 +15763,6 @@ let referenceForensics = null;
 let referenceVisualAdjudication = null;
 let negativeSampleForensics = null;
 let pixelForensics = null;
-let differentialImageForensics = null;
 let advancedForensics = null;
 let paintOverForensics = null;
 let paintOverForensicsV2 = null;
@@ -16618,454 +15951,6 @@ if ((type === "image" || type === "pdf") && bank) {
 }
 
 // =====================================================
-// AMOUNT REFERENCE RENDER FORENSICS V1
-// =====================================================
-// This is deliberately evaluated after the trusted reference and negative
-// population are loaded. It prevents V4 from promoting a localized amount
-// pattern merely because the target resembles the fake population in generic
-// raster/noise cells.
-if ((type === "image" || type === "pdf") && bank && reference && amountForensics?.region) {
-  try {
-    const amountReferenceAnchor = await getReferenceAmountAnchor(bank);
-    if (amountReferenceAnchor) {
-      const amountNegativeSamples = await loadNegativeSampleFiles(bank);
-      const amountRenderForensics = await analyzeAmountReferenceRenderForensics({
-        targetPath: forensicTargetPath,
-        targetRegion: amountForensics.region,
-        referencePath: getVisualReferencePath(reference),
-        referenceAmountField: amountReferenceAnchor,
-        targetAmountText: amountForensics?.selectedAmountText || amountForensics?.amountText || result?.documentData?.amount || null,
-        negativeSamples: amountNegativeSamples,
-      });
-      amountForensics.referenceRenderForensics = amountRenderForensics;
-      console.log("AMOUNT REFERENCE RENDER FORENSICS V1:", JSON.stringify(amountRenderForensics));
-    } else {
-      console.warn("AMOUNT REFERENCE RENDER FORENSICS: trusted amount anchor unavailable");
-    }
-  } catch (error) {
-    console.warn("AMOUNT REFERENCE RENDER FORENSICS HATASI:", error?.message || error);
-  }
-}
-
-// =====================================================
-// DIFFERENTIAL IMAGE FORENSICS V3
-// NORMAL = trusted reference population; TAMPER = known-negative population.
-// This layer measures local raster/texture/chroma direction, not document text.
-// It is deliberately separate from global negativeSimilarity and legacy scores.
-// =====================================================
-async function runDifferentialImageForensics({ targetPath, referencePath, negativeSamples = [], type = 'image', semanticRois = null }) {
-  const unavailable = (reason) => ({ available:false, engine:'differential-image-forensics-v3-local-semantic-noise', reason });
-  if (!targetPath || !referencePath || !Array.isArray(negativeSamples) || !negativeSamples.length) {
-    return unavailable('missing-target-reference-or-negative-population');
-  }
-  try {
-    const load = async (input) => {
-      const ext = path.extname(String(input)).toLowerCase();
-      if (ext === '.pdf') {
-        const rendered = await renderPdfPagePng(input, 1, 2.8);
-        return rendered?.buffer || null;
-      }
-      return await fs.readFile(input);
-    };
-
-    const W=256, H=256, grid=16, cell=W/grid;
-    const descriptor = async (buf, box=null) => {
-      const src = sharp(buf).removeAlpha();
-      const meta = await src.metadata();
-      const sw=Number(meta.width||0), sh=Number(meta.height||0);
-      let crop = src;
-      if (box && sw && sh) {
-        const x1=Math.max(0,Math.min(sw-1,Math.round(Number(box.x1)*sw)));
-        const y1=Math.max(0,Math.min(sh-1,Math.round(Number(box.y1)*sh)));
-        const x2=Math.max(x1+1,Math.min(sw,Math.round(Number(box.x2)*sw)));
-        const y2=Math.max(y1+1,Math.min(sh,Math.round(Number(box.y2)*sh)));
-        crop = crop.extract({left:x1,top:y1,width:x2-x1,height:y2-y1});
-      }
-      const {data,info}=await crop.resize(W,H,{fit:'fill'}).raw().toBuffer({resolveWithObject:true});
-      const out=[];
-      for(let gy=0;gy<grid;gy++) for(let gx=0;gx<grid;gx++) {
-        const vals=[], grads=[], chrom=[];
-        for(let y=gy*cell;y<(gy+1)*cell;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
-          const i=(y*info.width+x)*info.channels;
-          const r=data[i]||0,g=data[i+1]??r,b=data[i+2]??r;
-          vals.push(.299*r+.587*g+.114*b); chrom.push(Math.abs(r-g)+Math.abs(g-b));
-          if(x<((gx+1)*cell-1)){
-            const j=(y*info.width+x+1)*info.channels;
-            grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]??0)-(data[i+1]??0)));
-          }
-        }
-        for(let y=gy*cell;y<(gy+1)*cell-1;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
-          const i=(y*info.width+x)*info.channels, j=((y+1)*info.width+x)*info.channels;
-          grads.push(Math.abs((data[j]||0)-(data[i]||0))+.5*Math.abs((data[j+1]??0)-(data[i+1]??0)));
-        }
-        const mean=vals.reduce((a,b)=>a+b,0)/Math.max(1,vals.length);
-        const variance=vals.reduce((a,b)=>a+(b-mean)**2,0)/Math.max(1,vals.length);
-        const gm=grads.reduce((a,b)=>a+b,0)/Math.max(1,grads.length);
-        const cm=chrom.reduce((a,b)=>a+b,0)/Math.max(1,chrom.length);
-        out.push({lumaStd:Math.sqrt(variance),edge:gm,chroma:cm,luminance:mean});
-      }
-      return out;
-    };
-
-    // Noise residual is deliberately measured on a BACKGROUND RING around the
-    // semantic value box, not on the glyphs themselves. This reduces the
-    // natural text-content difference between genuine and fake samples.
-    const noiseRingDescriptor = async (buf, box=null) => {
-      const src = sharp(buf).removeAlpha();
-      const meta = await src.metadata();
-      const sw=Number(meta.width||0), sh=Number(meta.height||0);
-      if (!sw || !sh) return null;
-
-      const bx1=Math.max(0,Math.min(sw-1,Number(box?.x1||0)*sw));
-      const by1=Math.max(0,Math.min(sh-1,Number(box?.y1||0)*sh));
-      const bx2=Math.max(bx1+1,Math.min(sw,Number(box?.x2||1)*sw));
-      const by2=Math.max(by1+1,Math.min(sh,Number(box?.y2||1)*sh));
-      const bw=bx2-bx1, bh=by2-by1;
-      const padX=Math.max(10,Math.min(sw*.22,bw*1.35));
-      const padY=Math.max(10,Math.min(sh*.22,bh*2.0));
-      const left=Math.max(0,Math.floor(bx1-padX));
-      const top=Math.max(0,Math.floor(by1-padY));
-      const right=Math.min(sw,Math.ceil(bx2+padX));
-      const bottom=Math.min(sh,Math.ceil(by2+padY));
-      const cw=Math.max(2,right-left), ch=Math.max(2,bottom-top);
-
-      const basePipeline=sharp(buf).removeAlpha().extract({left,top,width:cw,height:ch}).resize(W,H,{fit:'fill'}).grayscale();
-      const smoothPipeline=basePipeline.clone().blur(1);
-      const [base,smooth]=await Promise.all([
-        basePipeline.raw().toBuffer({resolveWithObject:true}),
-        smoothPipeline.raw().toBuffer({resolveWithObject:true})
-      ]);
-
-      const maskX1=((bx1-left)/cw)*W;
-      const maskY1=((by1-top)/ch)*H;
-      const maskX2=((bx2-left)/cw)*W;
-      const maskY2=((by2-top)/ch)*H;
-      const dilateX=Math.max(2,(maskX2-maskX1)*0.10);
-      const dilateY=Math.max(2,(maskY2-maskY1)*0.22);
-      const mx1=Math.max(0,maskX1-dilateX), my1=Math.max(0,maskY1-dilateY);
-      const mx2=Math.min(W,maskX2+dilateX), my2=Math.min(H,maskY2+dilateY);
-
-      const out=[];
-      for(let gy=0;gy<grid;gy++) for(let gx=0;gx<grid;gx++) {
-        const residuals=[];
-        for(let y=gy*cell;y<(gy+1)*cell;y++) for(let x=gx*cell;x<(gx+1)*cell;x++) {
-          if(x>=mx1 && x<mx2 && y>=my1 && y<my2) continue;
-          const i=y*base.info.width+x;
-          const a=Number(base.data[i]||0), b=Number(smooth.data[i]||0);
-          residuals.push(Math.abs(a-b));
-        }
-        // If a very small ring cell is mostly masked, use a neutral zero rather
-        // than leaking glyph energy into the background estimate.
-        const meanResidual=residuals.length ? residuals.reduce((a,b)=>a+b,0)/residuals.length : 0;
-        const sorted=residuals.slice().sort((a,b)=>a-b);
-        const med=sorted.length ? sorted[Math.floor(sorted.length/2)] : 0;
-        const mad=sorted.length ? sorted.reduce((s,v)=>s+Math.abs(v-med),0)/sorted.length : 0;
-        out.push({noiseResidual:meanResidual,noiseMad:mad,sampleCount:residuals.length});
-      }
-      return out;
-    };
-
-    const [tb,rb]=await Promise.all([load(targetPath),load(Array.isArray(referencePath)?referencePath[0]:referencePath)]);
-    if(!tb||!rb) return unavailable('image-load-failed');
-    const refMeta=await sharp(rb).metadata();
-    const targetMeta=await sharp(tb).metadata();
-    const refW=Number(refMeta.width||0), refH=Number(refMeta.height||0);
-    const targetW=Number(targetMeta.width||0), targetH=Number(targetMeta.height||0);
-    if(!refW||!refH||!targetW||!targetH) return unavailable('image-metadata-unavailable');
-
-    const fields=['amount','recipientName','recipientIban'];
-    const fieldsOut={};
-    const heatmapOut={};
-    let anyStrong=false;
-    let anyLimited=false;
-
-    const medianOf=(arr)=>{const a=arr.filter(Number.isFinite).slice().sort((x,y)=>x-y);return a.length?a[Math.floor(a.length/2)]:0;};
-    const meanOf=(arr)=>arr.length?arr.reduce((s,v)=>s+v,0)/arr.length:0;
-    const robustMedian=(arr)=>{
-      const a=arr.filter(Number.isFinite).slice().sort((x,y)=>x-y);
-      return a.length?a[Math.floor(a.length/2)]:0;
-    };
-    const robustMad=(arr)=>{
-      const clean=arr.filter(Number.isFinite);
-      if(!clean.length)return 0;
-      const med=robustMedian(clean);
-      return robustMedian(clean.map(v=>Math.abs(v-med)));
-    };
-    const robustZ=(value, center, mad, floor=0.25)=>{
-      const scale=Math.max(floor,1.4826*Math.abs(Number(mad)||0));
-      return Math.abs(Number(value)-Number(center))/scale;
-    };
-    const clamp01=(v)=>Math.max(0,Math.min(1,Number(v)||0));
-    const heatColor=(value)=>{
-      const t=clamp01(value);
-      const stops=[[0,245,245,245],[0.25,220,235,255],[0.5,255,235,150],[0.75,255,165,80],[1,205,45,45]];
-      for(let i=1;i<stops.length;i++){
-        if(t<=stops[i][0]){
-          const a=stops[i-1],b=stops[i],u=(t-a[0])/Math.max(1e-9,b[0]-a[0]);
-          return `rgb(${Math.round(a[1]+(b[1]-a[1])*u)},${Math.round(a[2]+(b[2]-a[2])*u)},${Math.round(a[3]+(b[3]-a[3])*u)})`;
-        }
-      }
-      return 'rgb(205,45,45)';
-    };
-    const heatmapSvg=(title,values)=>{
-      const safe=Array.from({length:grid*grid},(_,i)=>clamp01(values?.[i]));
-      const rects=safe.map((v,i)=>{
-        const gx=i%grid,gy=Math.floor(i/grid);
-        return `<rect x=\"${gx*16}\" y=\"${gy*16}\" width=\"16\" height=\"16\" fill=\"${heatColor(v)}\"/>`;
-      }).join('');
-      return `<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"256\" height=\"280\" viewBox=\"0 0 256 280\"><rect width=\"256\" height=\"280\" fill=\"white\"/><text x=\"8\" y=\"16\" font-family=\"Arial,sans-serif\" font-size=\"12\" fill=\"#111\">${String(title).replace(/[&<>\"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[m]))}</text><g transform=\"translate(0,24)\">${rects}<rect x=\"0\" y=\"0\" width=\"256\" height=\"256\" fill=\"none\" stroke=\"#666\"/></g><text x=\"8\" y=\"272\" font-family=\"Arial,sans-serif\" font-size=\"10\" fill=\"#555\">0 = normal/low deviation · 1 = high localized deviation/consensus</text></svg>`;
-    };
-    const buildHeatmaps=async(field,targetNoise,referenceNoise,td,rd,spatialTileCounts,sampleCount)=>{
-      const refResiduals=referenceNoise.map(v=>Number(v?.noiseResidual)).filter(Number.isFinite);
-      const refMads=referenceNoise.map(v=>Number(v?.noiseMad)).filter(Number.isFinite);
-      const refResidualCenter=robustMedian(refResiduals);
-      const refResidualMad=Math.max(0.05,robustMad(refResiduals));
-      const refMadCenter=robustMedian(refMads);
-      const refMadMad=Math.max(0.05,robustMad(refMads));
-      const noiseValues=targetNoise.map((v,i)=>{
-        const r=referenceNoise[i];
-        const rz=robustZ(Number(v?.noiseResidual),Number(r?.noiseResidual),refResidualMad,0.18);
-        const mz=robustZ(Number(v?.noiseMad),Number(r?.noiseMad),refMadMad,0.10);
-        const absoluteZ=Math.max(rz,mz);
-        const targetBaselineZ=robustZ(Number(v?.noiseResidual),refResidualCenter,refResidualMad,0.18);
-        return clamp01(Math.max(absoluteZ/6,targetBaselineZ/6));
-      });
-      const componentValues=td.map((t,i)=>{
-        const r=rd[i]||{};
-        const edge=Math.abs(Number(t?.edge)-Number(r?.edge))/Math.max(0.75,Math.abs(Number(r?.edge))*0.12);
-        const stroke=Math.abs(Number(t?.lumaStd)-Number(r?.lumaStd))/Math.max(0.75,Math.abs(Number(r?.lumaStd))*0.12);
-        const lum=Math.abs(Number(t?.luminance)-Number(r?.luminance))/Math.max(0.75,Math.abs(Number(r?.luminance))*0.12);
-        const chroma=Math.abs(Number(t?.chroma)-Number(r?.chroma))/Math.max(0.75,Math.abs(Number(r?.chroma))*0.12);
-        return clamp01(Math.max(edge,stroke,lum,chroma)/6);
-      });
-      const consensusValues=(spatialTileCounts||new Array(grid*grid).fill(0)).map(v=>sampleCount?clamp01(Number(v)/sampleCount):0);
-      const dir=`/tmp/verifydoc-heatmaps-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-      await fs.mkdir(dir,{recursive:true});
-      const specs=[
-        {kind:'noiseResidual',title:`${field} · Noise residual / MAD`,values:noiseValues},
-        {kind:'referenceDifference',title:`${field} · Target vs genuine reference`,values:componentValues},
-        {kind:'knownFakeConsensus',title:`${field} · Known-fake spatial consensus`,values:consensusValues}
-      ];
-      const artifacts=[];
-      for(const spec of specs){
-        const svg=heatmapSvg(spec.title,spec.values);
-        const fileName=`${field}-${spec.kind}.svg`;
-        const outputPath=path.join(dir,fileName);
-        await fs.writeFile(outputPath,svg,'utf8');
-        artifacts.push({kind:spec.kind,format:'svg',path:outputPath,width:256,height:280,values:spec.values});
-      }
-      return {
-        available:true,
-        field,
-        grid:'16x16',
-        backgroundRing:true,
-        textMaskExcluded:true,
-        mad:{referenceResidualMedian:refResidualCenter,referenceResidualMAD:refResidualMad,referenceNoiseMADMedian:refMadCenter,referenceNoiseMADMAD:refMadMad},
-        artifacts
-      };
-    };
-
-    for(const field of fields){
-      const pair=semanticRois?.[field];
-      if(!pair?.target || !pair?.reference){
-        fieldsOut[field]={available:false,reason:'semantic-roi-unavailable',sampleCount:negativeSamples.length};
-        continue;
-      }
-      const normBox=(box,width,height)=>{
-        const x1=Number(box?.x1),y1=Number(box?.y1),x2=Number(box?.x2),y2=Number(box?.y2);
-        if(![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1)return null;
-        return {x1:x1/Math.max(1,width),y1:y1/Math.max(1,height),x2:x2/Math.max(1,width),y2:y2/Math.max(1,height)};
-      };
-      const targetNorm=normBox(pair.target,targetW,targetH);
-      const refNorm=normBox(pair.reference,refW,refH);
-      if(!refNorm||!targetNorm){
-        fieldsOut[field]={available:false,reason:'invalid-semantic-roi',sampleCount:negativeSamples.length};
-        continue;
-      }
-
-      const td=await descriptor(tb,targetNorm), rd=await descriptor(rb,refNorm);
-      const targetNoise=await noiseRingDescriptor(tb,targetNorm);
-      const referenceNoise=await noiseRingDescriptor(rb,refNorm);
-      if(!targetNoise || !referenceNoise){
-        fieldsOut[field]={available:false,reason:'noise-descriptor-unavailable',sampleCount:negativeSamples.length};
-        continue;
-      }
-
-      const agreements=[];
-      const patternComponents={edge:0,stroke:0,luminance:0,raster:0,noise:0};
-      const spatialTileCounts=new Array(grid*grid).fill(0);
-      const componentKeys=[['edge','edge'],['stroke','lumaStd'],['luminance','luminance'],['raster','chroma']];
-
-      for(const sample of negativeSamples.slice(0,12)){
-        let fb; try{fb=await load(sample.path);}catch(e){fb=null;}
-        if(!fb)continue;
-        let fd, fakeNoise;
-        try{fd=await descriptor(fb,refNorm); fakeNoise=await noiseRingDescriptor(fb,refNorm);}catch(e){fd=null;fakeNoise=null;}
-        if(!fd || !fakeNoise)continue;
-
-        let matchedComponents=[];
-        for(const [label,key] of componentKeys){
-          const targetD=[],fakeD=[],referenceD=[];
-          for(let i=0;i<td.length;i++){
-            const t=Number(td[i]?.[key]), r=Number(rd[i]?.[key]), f=Number(fd[i]?.[key]);
-            if(![t,r,f].every(Number.isFinite))continue;
-            const scale=Math.max(0.75,Math.abs(r)*0.12,Math.abs(f)*0.12,Math.abs(t)*0.06);
-            targetD.push(Math.abs(t-r)/scale); fakeD.push(Math.abs(t-f)/scale); referenceD.push(Math.abs(f-r)/scale);
-          }
-          const tMed=medianOf(targetD), fMed=medianOf(fakeD), rMed=medianOf(referenceD);
-          const matched=tMed>=1.15 && fMed+0.12<tMed && rMed>=0.45;
-          if(matched){matchedComponents.push(label);patternComponents[label]++;}
-        }
-
-        // Noise is evaluated tile-by-tile. A sample only corroborates the
-        // pattern when the target is farther from genuine than from this fake
-        // in the same background-ring cells.
-        const matchedNoiseTiles=[];
-        for(let i=0;i<targetNoise.length;i++){
-          const t=Number(targetNoise[i]?.noiseResidual), r=Number(referenceNoise[i]?.noiseResidual), f=Number(fakeNoise[i]?.noiseResidual);
-          const tm=Number(targetNoise[i]?.noiseMad), rm=Number(referenceNoise[i]?.noiseMad), fm=Number(fakeNoise[i]?.noiseMad);
-          if(![t,r,f,tm,rm,fm].every(Number.isFinite)) continue;
-          const residualScale=Math.max(0.18,Math.abs(r)*0.25,Math.abs(f)*0.25,Math.abs(t)*0.12);
-          const madScale=Math.max(0.10,Math.abs(rm)*0.35,Math.abs(fm)*0.35,Math.abs(tm)*0.15);
-          const residualTarget=Math.abs(t-r)/residualScale;
-          const residualFake=Math.abs(t-f)/residualScale;
-          const madTarget=Math.abs(tm-rm)/madScale;
-          const madFake=Math.abs(tm-fm)/madScale;
-          const matched=(residualTarget>=1.20 && residualFake+0.15<residualTarget) || (madTarget>=1.20 && madFake+0.15<madTarget);
-          if(matched) matchedNoiseTiles.push(i);
-        }
-        if(matchedNoiseTiles.length>=2){
-          patternComponents.noise++;
-          for(const idx of matchedNoiseTiles) spatialTileCounts[idx]++;
-        }
-        agreements.push({
-          sample:sample.fileName,
-          agreementCount:matchedComponents.length,
-          componentCount:5,
-          matchedComponents,
-          matchedNoiseTileCount:matchedNoiseTiles.length,
-          matched:matchedComponents.length>=1,
-          noiseMatched:matchedNoiseTiles.length>=2,
-          noiseTileIndices:matchedNoiseTiles.slice(0,40)
-        });
-      }
-
-      const sampleCount=agreements.length;
-      const agreementCount=agreements.filter(x=>x.matched).length;
-      const ratio=sampleCount?agreementCount/sampleCount:0;
-      const noiseAgreementCount=agreements.filter(x=>x.noiseMatched).length;
-      const noiseRatio=sampleCount?noiseAgreementCount/sampleCount:0;
-      const spatialThreshold=sampleCount>=3 ? Math.ceil(sampleCount*0.5) : sampleCount===2 ? 2 : 2;
-      const spatialConsensusTiles=spatialTileCounts.filter(x=>x>=spatialThreshold).length;
-      const maxSpatialAgreement=spatialTileCounts.length ? Math.max(...spatialTileCounts) : 0;
-      const spatialConsensusRatio=sampleCount ? maxSpatialAgreement/sampleCount : 0;
-
-      // Existing component agreement is intentionally NOT sufficient anymore.
-      // A promoted localized pattern needs repeated noise corroboration in the
-      // same local cells. This is the key guard against 4/4 edge/stroke/luma
-      // matches that are merely consequences of different text glyphs.
-      const componentStrong = sampleCount>=3 ? agreementCount>=2 && ratio>=0.5 : sampleCount===2 ? agreementCount===2 : false;
-      const noiseStrong = sampleCount>=3
-        ? noiseAgreementCount>=2 && noiseRatio>=0.5 && spatialConsensusTiles>=2 && spatialConsensusRatio>=0.5
-        : sampleCount===2
-          ? noiseAgreementCount===2 && spatialConsensusTiles>=2 && spatialConsensusRatio>=1
-          : false;
-      const strong=componentStrong && noiseStrong;
-      const strength=strong?'strong':(agreementCount||noiseAgreementCount)?'limited':'none';
-      if(strong)anyStrong=true; else if(agreementCount||noiseAgreementCount)anyLimited=true;
-
-      try {
-        heatmapOut[field]=await buildHeatmaps(field,targetNoise,referenceNoise,td,rd,spatialTileCounts,sampleCount);
-      } catch (heatmapError) {
-        heatmapOut[field]={available:false,reason:heatmapError?.message||String(heatmapError)};
-        console.warn('DIFFERENTIAL HEATMAP HATASI:',field,heatmapError?.message||heatmapError);
-      }
-
-      fieldsOut[field]={
-        available:true,
-        targetVsGenuine:{
-          components:componentKeys.map(([label,key])=>({component:label,key,target:meanOf(td.map(v=>Number(v[key]))),reference:meanOf(rd.map(v=>Number(v[key])))})),
-          noise:{
-            targetMean:meanOf(targetNoise.map(v=>Number(v.noiseResidual))),
-            referenceMean:meanOf(referenceNoise.map(v=>Number(v.noiseResidual))),
-            targetMAD:meanOf(targetNoise.map(v=>Number(v.noiseMad))),
-            referenceMAD:meanOf(referenceNoise.map(v=>Number(v.noiseMad)))
-          }
-        },
-        sampleAgreement:agreements,
-        agreementCount,
-        agreementRatio:Number(ratio.toFixed(3)),
-        patternComponents,
-        heatmap:heatmapOut[field] || {available:false,reason:'not-generated'},
-        noisePattern:{
-          agreementCount:noiseAgreementCount,
-          agreementRatio:Number(noiseRatio.toFixed(3)),
-          spatialConsensusTiles,
-          maxSpatialAgreement,
-          spatialConsensusRatio:Number(spatialConsensusRatio.toFixed(3)),
-          matchedTileCounts:spatialTileCounts.map((count,index)=>({tile:index,count})).filter(x=>x.count>0).sort((a,b)=>b.count-a.count).slice(0,20)
-        },
-        strength,
-        finalPromotionAllowed:strong,
-        promotionReason:strong
-          ? 'repeated-component-plus-background-noise-pattern-in-same-local-cells'
-          : 'component-agreement-without-sufficient-local-noise-spatial-corroboration'
-      };
-    }
-
-    const primaryStrongFields=['amount','recipientName'].filter(field=>fieldsOut[field]?.finalPromotionAllowed===true);
-    const advisoryStrongFields=['recipientIban'].filter(field=>fieldsOut[field]?.finalPromotionAllowed===true);
-    const promotableStrong=primaryStrongFields.length>0;
-    const out={
-      available:true,
-      engine:'differential-image-forensics-v3-local-semantic-noise',
-      normalSampleCount:1,
-      tamperSampleCount:negativeSamples.length,
-      fields:fieldsOut,
-      heatmaps:heatmapOut,
-      heatmapPolicy:'visualization-only-no-risk-promotion',
-      anyStrongLocalizedPattern:promotableStrong,
-      anyLimitedLocalizedPattern:anyLimited,
-      primaryStrongFields,
-      advisoryStrongFields,
-      policy:'adaptive-local-semantic-pattern-v3-noise-spatial-corroboration'
-    };
-    console.log('DIFFERENTIAL IMAGE FORENSICS V3 START');
-    console.log('DIFFERENTIAL IMAGE FORENSICS V3:',JSON.stringify(out));
-    console.log('DIFFERENTIAL IMAGE FORENSICS V3 END');
-    return out;
-  } catch(error){
-    console.warn('DIFFERENTIAL IMAGE FORENSICS V3 HATASI:',error?.message||error);
-    return unavailable(error?.message||String(error));
-  }
-}
-
-// Differential normal-vs-tamper image layer. Legacy/global negative similarity
-// remains diagnostic and is never used as this layer's evidence.
-if ((type === "image" || type === "pdf") && bank && reference) {
-  try {
-    const diffNegatives = await loadNegativeSampleFiles(bank);
-    const differentialSemanticRois = await getMathSemanticRois({
-      amountForensics,
-      referenceForensics,
-      targetOCR: paddleImageOCR,
-      bank,
-      referencePath: getVisualReferencePath(reference),
-    });
-    differentialImageForensics = await runDifferentialImageForensics({
-      targetPath: forensicTargetPath,
-      referencePath: getVisualReferencePath(reference),
-      negativeSamples: diffNegatives,
-      type,
-      semanticRois: differentialSemanticRois,
-    });
-  } catch (error) {
-    console.warn("DIFFERENTIAL IMAGE FORENSICS V3 HATASI:", error?.message || error);
-    differentialImageForensics = { available:false, engine:'differential-image-forensics-v3-local-semantic-noise', reason:error?.message || String(error) };
-  }
-}
-
-// =====================================================
 // MATHEMATICAL FORENSICS V1
 // =====================================================
 // Independent mathematical fingerprint. It compares the target against
@@ -17078,8 +15963,6 @@ if (type === "image" || type === "pdf") {
       paddleOcrText,
       paddleImageOCR?.text || ""
     ].filter(Boolean).join("\n");
-    let mathematicalNegativeSamples = [];
-    try { mathematicalNegativeSamples = await loadNegativeSampleFiles(bank); } catch {}
     mathematicalForensics = await runMathematicalForensics({
       targetPath: forensicTargetPath,
       targetText: mathText,
@@ -17088,8 +15971,7 @@ if (type === "image" || type === "pdf") {
       referencePath: reference?.path || null,
       targetOCR: paddleImageOCR,
       amountForensics,
-      referenceForensics,
-      negativeSamples: mathematicalNegativeSamples
+      referenceForensics
     });
     console.log("MATHEMATICAL FORENSICS V1.2:", JSON.stringify(mathematicalForensics));
   } catch (error) {
@@ -19103,43 +17985,9 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     if (unique.length) lines.push('', '🔴 FARKLAR', ...unique.map(x => `• ${x.title}: ${x.detail}`));
     if (infoUnique.length) lines.push('', '🟡 ÖLÇÜLEN GEOMETRİK / GÖRÜNTÜSEL FARKLAR', ...infoUnique.map(x => `• ${x.title}: ${x.detail}`));
     if (!unique.length && !infoUnique.length) lines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
-    // Global mathematical / negative-like similarity is diagnostic only.
-    // Do not expose it in the normal user-facing report; it is too sensitive
-    // to resolution, crop and delivery/compression history.
-    const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
-    const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
-    // V15.12: A clean/compatible trusted-reference comparison suppresses
-    // negative-sample/local-raster chatter from the user-facing report.
-    // Negative samples remain diagnostic in backend logs, but they must not
-    // contradict a clean reference result (e.g. genuine 350 TL).
-    const cleanTrustedReference = Boolean(
-      !unique.length &&
-      !infoUnique.length &&
-      (fusion?.referenceBaselineAvailable === true || fusion?.referenceLike === true) &&
-      fusion?.negativeLike !== true &&
-      fusion?.knownNegative?.corroborated !== true
-    );
-    if (strongFields.length && !cleanTrustedReference) {
-      const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
-      const sampleCounts = strongFields.map((field) => {
-        const row = diff?.fields?.[field];
-        return Number(row?.agreementCount || 0);
-      });
-      const sampleTotal = Number(diff?.tamperSampleCount || 0);
-      lines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
-        `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
-        `• Sahte örnek uyumu: ${sampleCounts.length === 1 ? `${sampleCounts[0]}/${sampleTotal}` : strongFields.map((f, i) => `${fieldLabels[f] || f} ${sampleCounts[i]}/${sampleTotal}`).join(', ')}`
-      );
-    } else if (diff?.available === true && !cleanTrustedReference) {
-      lines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
-        '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
-    }
-    console.log('V15.12 USER REPORT NEGATIVE-PATTERN GATE:', JSON.stringify({
-      cleanTrustedReference,
-      strongFields,
-      exposed: Boolean(strongFields.length && !cleanTrustedReference),
-      reason: cleanTrustedReference ? 'trusted-reference-clean' : 'reference-not-clean-or-negative-corroborated'
-    }));
+    if (fusion?.referenceLike) lines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
+    else if (fusion?.negativeLike) lines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
+    else lines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
     return {
       ...(deterministicReport || detailedDeterministicReport || aiReport || {}),
       available: true,
@@ -19234,59 +18082,6 @@ if (openSourceForensics) {
 
 if (pixelForensics) {
   result.pixelForensics = pixelForensics;
-}
-if (differentialImageForensics) result.differentialImageForensics = differentialImageForensics;
-
-// =====================================================
-// V4 EVIDENCE FUSION — LOCAL PATTERN / MATRIX EVIDENCE
-// =====================================================
-// Keep raw matrix/differential measurements available for diagnostics, but
-// adjudicate only repeated critical-ROI patterns. Global negative similarity
-// is deliberately excluded from this evidence tier.
-if (differentialImageForensics?.available === true) {
-  const diff = differentialImageForensics;
-  const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı', recipientIban: 'Alıcı IBAN' };
-  const fieldEvidence = {};
-  for (const field of ['amount', 'recipientName', 'recipientIban']) {
-    const row = diff.fields?.[field];
-    if (!row?.available) continue;
-    fieldEvidence[field] = {
-      field,
-      label: fieldLabels[field],
-      sampleCount: Number(row.sampleAgreement?.length || 0),
-      agreementCount: Number(row.agreementCount || 0),
-      agreementRatio: Number(row.agreementRatio || 0),
-      patternComponents: row.patternComponents || {},
-      noisePattern: row.noisePattern || null,
-      promotionReason: row.promotionReason || null,
-      strength: row.strength || 'none',
-      finalPromotionAllowed: row.finalPromotionAllowed === true,
-      advisoryOnly: field === 'recipientIban',
-    };
-  }
-  const primaryStrongFields = Array.isArray(diff.primaryStrongFields) ? diff.primaryStrongFields : [];
-  const anyStrong = primaryStrongFields.length > 0;
-  const strongEvidence = primaryStrongFields.map((field) => fieldEvidence[field]).filter(Boolean);
-  result.localPatternEvidence = {
-    available: true,
-    policy: diff.policy || 'adaptive-local-semantic-pattern-v3-noise-spatial-corroboration',
-    knownFakeSamples: Number(diff.tamperSampleCount || 0),
-    fields: fieldEvidence,
-    primaryStrongFields,
-    advisoryStrongFields: Array.isArray(diff.advisoryStrongFields) ? diff.advisoryStrongFields : [],
-    anyStrongLocalizedPattern: anyStrong,
-    evidenceLevel: anyStrong ? 'LEVEL_1_STRONG' : 'LEVEL_4_DIAGNOSTIC',
-    finalPromotionAllowed: anyStrong,
-  };
-  result.evidenceFusion = {
-    ...(result.evidenceFusion || {}),
-    level1LocalizedKnownFakePattern: anyStrong,
-    level1Fields: strongEvidence,
-    level4GlobalNegativeLike: false,
-    finalPromotionAllowed: anyStrong,
-    policy: 'v4-local-pattern-evidence-fusion',
-  };
-  console.log('V4 LOCAL PATTERN EVIDENCE FUSION:', JSON.stringify(result.evidenceFusion));
 }
 
 if (advancedForensics) {
@@ -21328,38 +20123,9 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   if (!unique.length && !infoUnique.length) {
     userLines.push('', '🟢 Belirgin bir fark tespit edilmedi.');
   }
-  // Global mathematical / negative-like similarity is diagnostic only and
-  // intentionally omitted from the normal user-facing report.
-  const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
-  const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
-  // V15.12: Keep negative/local-raster evidence out of the user report when
-  // the trusted-reference comparison itself is clean. This is intentionally
-  // a UI/report gate only; raw forensic evidence remains available in logs.
-  const cleanTrustedReference = Boolean(
-    !unique.length &&
-    !infoUnique.length &&
-    (mathFusion?.referenceBaselineAvailable === true || mathFusion?.referenceLike === true) &&
-    mathFusion?.negativeLike !== true &&
-    mathFusion?.knownNegative?.corroborated !== true
-  );
-  if (strongFields.length && !cleanTrustedReference) {
-    const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
-    const sampleTotal = Number(diff?.tamperSampleCount || 0);
-    const agreements = strongFields.map((field) => `${fieldLabels[field] || field} ${Number(diff?.fields?.[field]?.agreementCount || 0)}/${sampleTotal}`);
-    userLines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
-      `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
-      `• Sahte örnek uyumu: ${agreements.join(', ')}`);
-  } else if (diff?.available === true && !cleanTrustedReference) {
-    userLines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
-      '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
-  }
-
-  console.log('V15.12 USER REPORT NEGATIVE-PATTERN GATE:', JSON.stringify({
-    cleanTrustedReference,
-    strongFields,
-    exposed: Boolean(strongFields.length && !cleanTrustedReference),
-    reason: cleanTrustedReference ? 'trusted-reference-clean' : 'reference-not-clean-or-negative-corroborated'
-  }));
+  if (referenceLike) userLines.push('', '🟢 Genel matematiksel değerlendirme: referansla uyumlu.');
+  else if (negativeLike) userLines.push('', '🔴 Genel matematiksel değerlendirme: negatif örneklere daha yakın.');
+  else userLines.push('', '🟡 Genel matematiksel değerlendirme: kararsız / ek kanıt gerekli.');
 
   return {
     headline: unique.length
@@ -22047,156 +20813,49 @@ if (!controlledAmountCorroborated) {
   result.categories = finalDeterministicRisk.categories;
 }
 
-// Mathematical fingerprint policy V2:
-// Whole-document/global reference-vs-negative similarity is diagnostic only.
-// It must never promote the final risk by itself because page resolution,
-// aspect ratio, crop and delivery history can legitimately move global raster
-// statistics. Final mathematical promotion is driven by semantic ROI population
-// evidence below: target ROI vs trusted reference ROI vs known-fake ROI set.
-const semanticNegativeRowsForRisk = Object.entries(result?.mathematicalForensics?.semanticNegativeAffinity || {})
-  .map(([field, row]) => ({ field, ...row }))
-  .filter(row => row.available && Number.isFinite(Number(row.negativeAffinityDelta)));
-const strongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
-  Number(row.sampleCount || 0) >= 2 &&
-  Number(row.negativeAffinityDelta || 0) >= 1.25 &&
-  Number(row.medianDistance || 99) <= 5.5
-);
-const veryStrongSemanticNegativeForRisk = semanticNegativeRowsForRisk.filter(row =>
-  Number(row.sampleCount || 0) >= 2 &&
-  Number(row.negativeAffinityDelta || 0) >= 2.25 &&
-  Number(row.medianDistance || 99) <= 5.5
-);
-const mathSemanticNegativeAffinity = strongSemanticNegativeForRisk.length > 0;
+// Mathematical fingerprint is intentionally a corroborating signal, not an
+// automatic authenticity verdict. Require a reasonably sized baseline and
+// either a strong reference outlier or a clear known-negative affinity.
+const mathReference = result?.mathematicalForensics?.reference;
+const mathNegative = result?.mathematicalForensics?.negative;
+const mathReferenceReliable = ['medium', 'high'].includes(String(mathReference?.bestMatch?.profile?.reliability || ''));
+const mathNegativeReliable = ['medium', 'high'].includes(String(mathNegative?.bestMatch?.profile?.reliability || ''));
+const mathReferenceOutlier =
+  result?.mathematicalForensics?.available === true &&
+  mathReferenceReliable &&
+  Number(mathReference?.bestMatch?.robustDistance || 0) >= 2.5;
+const mathNegativeAffinity =
+  result?.mathematicalForensics?.available === true &&
+  mathNegativeReliable &&
+  Number(mathNegative?.bestMatch?.similarityScore || 0) >= 70 &&
+  Number(result?.mathematicalForensics?.differential?.negativeMinusReference || 0) >= 10;
 
-if (mathSemanticNegativeAffinity) {
+if (mathReferenceOutlier) {
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 48)
+  };
+}
+
+if (mathNegativeAffinity) {
   finalRiskScore = Math.max(finalRiskScore, 46);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 60)
   };
-  console.log('SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
-    fields: strongSemanticNegativeForRisk.map(x => x.field),
-    deltas: strongSemanticNegativeForRisk.map(x => ({field:x.field, delta:x.negativeAffinityDelta, samples:x.sampleCount})),
-    appliedFloor: 46
-  }));
 }
 
-if (veryStrongSemanticNegativeForRisk.length >= 2) {
+if (mathReferenceOutlier && mathNegativeAffinity) {
   finalRiskScore = Math.max(finalRiskScore, 60);
   result.categories = {
     ...(result.categories || {}),
     editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 65)
   };
-  console.log('VERY STRONG SEMANTIC NEGATIVE ROI RISK PROMOTION:', JSON.stringify({
-    fields: veryStrongSemanticNegativeForRisk.map(x => x.field),
-    appliedFloor: 60
-  }));
 }
 
 // AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
-
-// V4: repeated localized known-fake pattern is a real evidence tier.
-// Apply the promotion to the canonical result score AFTER all legacy/math
-// promotions. Previously this floor was written only to the local
-// `finalRiskScore` variable, while the safety gate still read the stale
-// `result.overallRisk`, causing Enpara 1000 (4/4 strong) to fall back to 23.
-const v4LocalPatternStrong = result?.localPatternEvidence?.available === true &&
-  result?.localPatternEvidence?.finalPromotionAllowed === true &&
-  Array.isArray(result?.localPatternEvidence?.primaryStrongFields) &&
-  result.localPatternEvidence.primaryStrongFields.length > 0;
-
-const v4PromotedFields = v4LocalPatternStrong
-  ? result.localPatternEvidence.primaryStrongFields
-  : [];
-
-const v4AmountPatternStrong = v4PromotedFields.includes("amount");
-const amountReferenceRender = result?.amountForensics?.referenceRenderForensics || null;
-const localizedPaintOver = result?.paintOverForensicsV2?.available === true
-  ? result.paintOverForensicsV2
-  : (paintOverForensics || result?.paintOverForensics || null);
-
-// A negative-sample match is not independent proof of editing. Require an
-// existing manipulation-specific sensor before any localized pattern can
-// cross the final suspicious threshold.
-const localizedPaintOverStrong = Boolean(
-  localizedPaintOver?.available === true &&
-  Number(localizedPaintOver?.score || 0) >= 75 &&
-  Number(localizedPaintOver?.metrics?.supportSignals || 0) >= 3 &&
-  Number(localizedPaintOver?.metrics?.amountSupport || 0) >= 20
-);
-const independentManipulationEvidence = Boolean(
-  localizedPaintOverStrong ||
-  result?.openSourceForensics?.copyMove?.severity === "strong" &&
-    result?.openSourceForensics?.strongCorroboration === true ||
-  __controlledAmountPromotion?.eligible === true
-);
-
-// V15.5: A repeated known-fake pattern in the amount ROI is NOT sufficient by
-// itself. The same ROI must also fail the genuine-reference render check and
-// independently point toward the negative population. This specifically
-// prevents the known-good 350 TL Telegram/JPEG case from being promoted by
-// the same 4/4 edge/stroke/luminance/noise pattern seen in manipulated files.
-const amountReferenceRenderCorroborated = Boolean(
-  amountReferenceRender?.available === true &&
-  amountReferenceRender?.status === "anomaly" &&
-  Number(amountReferenceRender?.score || 0) >= 60 &&
-  independentManipulationEvidence
-);
-
-const v4PromotionAllowed =
-  v4LocalPatternStrong &&
-  (
-    !v4AmountPatternStrong ||
-    amountReferenceRenderCorroborated
-  );
-
-if (v4PromotionAllowed) {
-  const promotedFields = v4PromotedFields;
-  finalRiskScore = Math.max(finalRiskScore, 46);
-  result.categories = {
-    ...(result.categories || {}),
-    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 65),
-  };
-  result.overallRisk = finalRiskScore;
-  result.riskLabel = getRiskLabel(finalRiskScore);
-  result.evidenceFusion = {
-    ...(result.evidenceFusion || {}),
-    level1Applied: true,
-    promotedFields,
-    appliedRiskFloor: 46,
-    amountReferenceRenderCorroborated,
-  };
-  console.log('V4 LOCAL PATTERN RISK PROMOTION:', JSON.stringify({
-    fields: promotedFields,
-    appliedFloor: 46,
-    knownFakeSamples: result.localPatternEvidence.knownFakeSamples,
-    amountReferenceRenderCorroborated,
-    amountReferenceRenderScore: Number(amountReferenceRender?.score || 0),
-    amountReferenceCompatibility: Number(amountReferenceRender?.referenceCompatibilityScore || 0),
-    amountFakeAffinityMargin: Number(amountReferenceRender?.fakeAffinityMargin || 0),
-  }));
-} else if (v4LocalPatternStrong && v4AmountPatternStrong) {
-  result.evidenceFusion = {
-    ...(result.evidenceFusion || {}),
-    level1Applied: false,
-    promotedFields: [],
-    appliedRiskFloor: 0,
-    amountReferenceRenderCorroborated,
-    suppressionReason: "amount-known-fake-pattern-without-genuine-reference-render-corroboration",
-  };
-  console.log('V4 LOCAL PATTERN PROMOTION SUPPRESSED:', JSON.stringify({
-    fields: v4PromotedFields,
-    amountReferenceRenderCorroborated,
-    amountReferenceRender: amountReferenceRender ? {
-      status: amountReferenceRender.status,
-      score: amountReferenceRender.score,
-      referenceCompatibilityScore: amountReferenceRender.referenceCompatibilityScore,
-      fakeAffinityMargin: amountReferenceRender.fakeAffinityMargin,
-      fakeAffinityStrong: amountReferenceRender.fakeAffinityStrong,
-    } : null,
-  }));
-}
 
 
 // =====================================================
@@ -22218,30 +20877,6 @@ informationCheck;
 // =====================================================
 // ANA SKOR
 // =====================================================
-
-// Legacy raster/amount/paint-over signals cannot independently cross the suspicious
-// threshold anymore. A new local normal-vs-tamper corroboration is required.
-// This specifically prevents genuine references with generic raster differences
-// from becoming suspicious merely because an old sensor scored high.
-const diffStrong = differentialImageForensics?.available === true &&
-  differentialImageForensics?.anyStrongLocalizedPattern === true;
-if (!diffStrong && Number(result.overallRisk || 0) >= 46) {
-  result.overallRisk = 45;
-  result.riskLabel = getRiskLabel(45);
-  console.log('DIFFERENTIAL FORENSICS SAFETY GATE: legacy-only risk capped below suspicious threshold');
-}
-
-// FINAL DIFFERENTIAL SAFETY GATE: after every legacy/math promotion has run,
-// do not allow an image document to become suspicious without the new local
-// NORMAL-vs-TAMPER corroboration. This keeps legacy sensors diagnostic.
-const finalDiffStrong = differentialImageForensics?.available === true &&
-  differentialImageForensics?.anyStrongLocalizedPattern === true &&
-  independentManipulationEvidence;
-if (!finalDiffStrong && Number(result.overallRisk || 0) >= 46) {
-  result.overallRisk = 45;
-  result.riskLabel = getRiskLabel(45);
-  console.log('DIFFERENTIAL FORENSICS FINAL GATE: no localized tamper corroboration; risk capped at 45');
-}
 
 const finalScore =
 Number(
@@ -22331,43 +20966,14 @@ if (paddleCriticalFailure) {
 // Bu kayıt analiz kullanımını engellemez.
 // Amaç: düşük overallRisk skoruna rağmen gerçekten somut bir forensic
 // fark bulunduğunda olayı veritabanında kaybetmemek.
-// V15.13 WATCHLIST HARD INVARIANT:
-// Watchlist status is never allowed to independently contradict the canonical
-// FINAL SUSPICIOUS decision. Independent corroboration is required as well.
-const finalIndependentCorroboration = Boolean(
-  independentManipulationEvidence ||
-  result?.openSourceForensics?.strongCorroboration === true ||
-  result?.evidenceFusion?.amountReferenceRenderCorroborated === true ||
-  result?.mathematicalForensics?.independentNegativeCorroboration === true
-);
-
-const watchlistEligible = Boolean(
-  finalSuspicious === true &&
-  finalIndependentCorroboration === true
-);
-
-const forensicWatchlist = watchlistEligible
-  ? await recordForensicWatchEvent({
-      result,
-      type,
-      bank: bank || null,
-      fileFingerprint,
-      telegramUserId,
-      telegramUsername,
-    })
-  : {
-      available: forensicWatchlistConfigReady(),
-      recorded: false,
-      duplicate: false,
-      status: finalSuspicious ? null : "CLEAN",
-      eventType: finalSuspicious ? null : "advisory",
-      strongSignal: false,
-      immediateFinancialBlacklist: false,
-      occurrenceCount: 0,
-      reason: finalSuspicious
-        ? "final-suspicious-without-independent-corroboration"
-        : "final-suspicious-false"
-    };
+const forensicWatchlist = await recordForensicWatchEvent({
+  result,
+  type,
+  bank: bank || null,
+  fileFingerprint,
+  telegramUserId,
+  telegramUsername,
+});
 
 // İç karar kaynağını API cevabına taşımıyoruz.
 delete result.__watchlistOriginalAmountConsistency;
