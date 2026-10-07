@@ -19017,18 +19017,34 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     // to resolution, crop and delivery/compression history.
     const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
     const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
-    if (strongFields.length) {
+    const amountRender = result?.amountForensics?.referenceRenderForensics || null;
+    const amountPatternCorroborated = Boolean(
+      amountRender?.available === true &&
+      amountRender?.status === 'anomaly' &&
+      Number(amountRender?.score || 0) >= 60 &&
+      amountRender?.fakeAffinityStrong === true
+    );
+    const displayStrongFields = strongFields.filter(field => field !== 'amount' || amountPatternCorroborated);
+    const suppressedAmountPattern = strongFields.includes('amount') && !amountPatternCorroborated;
+
+    if (displayStrongFields.length) {
       const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
-      const sampleCounts = strongFields.map((field) => {
+      const sampleCounts = displayStrongFields.map((field) => {
         const row = diff?.fields?.[field];
         return Number(row?.agreementCount || 0);
       });
       const sampleTotal = Number(diff?.tamperSampleCount || 0);
       lines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
-        `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
-        `• Sahte örnek uyumu: ${sampleCounts.length === 1 ? `${sampleCounts[0]}/${sampleTotal}` : strongFields.map((f, i) => `${fieldLabels[f] || f} ${sampleCounts[i]}/${sampleTotal}`).join(', ')}`
+        `• ${displayStrongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
+        `• Sahte örnek uyumu: ${sampleCounts.length === 1 ? `${sampleCounts[0]}/${sampleTotal}` : displayStrongFields.map((f, i) => `${fieldLabels[f] || f} ${sampleCounts[i]}/${sampleTotal}`).join(', ')}`
       );
-    } else if (diff?.available === true) {
+    }
+    if (suppressedAmountPattern) {
+      lines.push('', '🟡 LOKAL ÖRÜNTÜ BENZERLİĞİ',
+        '• Tutar bölgesinde bilinen sahte örneklerle benzer lokal raster özellikleri ölçüldü.',
+        '• Ancak bu benzerlik bağımsız referans-render / sahte-popülasyon doğrulamasıyla desteklenmedi; tek başına manipülasyon kanıtı olarak değerlendirilmedi.');
+    }
+    if (!displayStrongFields.length && !suppressedAmountPattern && diff?.available === true) {
       lines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
         '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
     }
@@ -21224,14 +21240,30 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
   // intentionally omitted from the normal user-facing report.
   const diff = differentialImageForensics?.available === true ? differentialImageForensics : null;
   const strongFields = Array.isArray(diff?.primaryStrongFields) ? diff.primaryStrongFields : [];
-  if (strongFields.length) {
+  const amountRender = result?.amountForensics?.referenceRenderForensics || null;
+  const amountPatternCorroborated = Boolean(
+    amountRender?.available === true &&
+    amountRender?.status === 'anomaly' &&
+    Number(amountRender?.score || 0) >= 60 &&
+    amountRender?.fakeAffinityStrong === true
+  );
+  const displayStrongFields = strongFields.filter(field => field !== 'amount' || amountPatternCorroborated);
+  const suppressedAmountPattern = strongFields.includes('amount') && !amountPatternCorroborated;
+
+  if (displayStrongFields.length) {
     const fieldLabels = { amount: 'Tutar', recipientName: 'Alıcı adı' };
     const sampleTotal = Number(diff?.tamperSampleCount || 0);
-    const agreements = strongFields.map((field) => `${fieldLabels[field] || field} ${Number(diff?.fields?.[field]?.agreementCount || 0)}/${sampleTotal}`);
+    const agreements = displayStrongFields.map((field) => `${fieldLabels[field] || field} ${Number(diff?.fields?.[field]?.agreementCount || 0)}/${sampleTotal}`);
     userLines.push('', '🔴 LOKAL SAHTE ÖRÜNTÜSÜ',
-      `• ${strongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
+      `• ${displayStrongFields.map(f => fieldLabels[f] || f).join(' ve ')} bölgesinde bilinen sahte örneklerde tekrar eden lokal raster örüntüsü tespit edildi.`,
       `• Sahte örnek uyumu: ${agreements.join(', ')}`);
-  } else if (diff?.available === true) {
+  }
+  if (suppressedAmountPattern) {
+    userLines.push('', '🟡 LOKAL ÖRÜNTÜ BENZERLİĞİ',
+      '• Tutar bölgesinde bilinen sahte örneklerle benzer lokal raster özellikleri ölçüldü.',
+      '• Ancak bu benzerlik bağımsız referans-render / sahte-popülasyon doğrulamasıyla desteklenmedi; tek başına manipülasyon kanıtı olarak değerlendirilmedi.');
+  }
+  if (!displayStrongFields.length && !suppressedAmountPattern && diff?.available === true) {
     userLines.push('', '🟢 LOKAL SAHTE ÖRÜNTÜSÜ BULUNMADI',
       '• Ölçülen lokal raster farkları bilinen sahte örneklerde yeterince tekrarlanmadı; final sonuca dahil edilmedi.');
   }
