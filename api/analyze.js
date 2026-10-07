@@ -17000,20 +17000,6 @@ if (referenceVisualAdjudication) {
 }
 if (mathematicalForensics) {
   result.mathematicalForensics = mathematicalForensics;
-  const criticalRows = Array.isArray(mathematicalForensics?.criticalRoiMismatches)
-    ? mathematicalForensics.criticalRoiMismatches.filter(x => x?.strong)
-    : [];
-  result.criticalRoiSignal = {
-    available: Boolean(mathematicalForensics?.available),
-    active: criticalRows.length > 0,
-    fields: criticalRows.map(x => x.field),
-    findings: criticalRows.map(x => ({
-      field: x.field,
-      globalStrongDifferentCount: Number(x.globalStrongDifferentCount || 0),
-      globalMaxDistance: Number(x.globalMaxDistance || 0),
-      roiMeanDistance: Number(x.roiMeanDistance || 0)
-    }))
-  };
 }
 if (negativeSampleForensics) {
   result.negativeSampleForensics = negativeSampleForensics;
@@ -17107,60 +17093,6 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
     ? buildHumanReadableReferenceVisualAdjudicationReport(referenceVisualAdjudication)
     : null;
 
-  // =============================================================
-  // V1.2.2 CRITICAL ROI -> USER-FACING REFERENCE REPORT
-  // =============================================================
-  // Mathematical 16x16 anomalies are not user-facing by themselves.
-  // If a strong global cell overlaps one of the semantic critical fields,
-  // however, the reference section MUST NOT say "Belirgin bir fark yok".
-  // Keep the signal deterministic, localized and conservative.
-  const buildCriticalRoiReferenceReport = (math) => {
-    const rows = Array.isArray(math?.criticalRoiMismatches)
-      ? math.criticalRoiMismatches.filter(x => x?.strong)
-      : [];
-    if (!rows.length) return null;
-
-    const fieldLabel = (field) => ({
-      amount: 'Tutar',
-      recipientIban: 'Alıcı IBAN',
-      recipientName: 'Alıcı Adı / Ünvanı'
-    }[String(field)] || String(field || 'Kritik alan'));
-
-    const findings = rows.slice(0, 3).map((row) => {
-      const label = fieldLabel(row.field);
-      const strongCells = Number(row.globalStrongDifferentCount || 0);
-      const distance = Number(row.globalMaxDistance || 0);
-      const roiDistance = Number(row.roiMeanDistance || 0);
-      return {
-        priority: 0,
-        title: `KRİTİK ALAN — ${label}`,
-        detail: `${label} alanına denk gelen ${strongCells || 1} hücrede referansa göre güçlü matematiksel farklılık tespit edildi (maks. hücre mesafesi: ${distance.toFixed(2)}${roiDistance ? `, ROI ort.: ${roiDistance.toFixed(2)}` : ''}). Bu, kritik alanda belirgin görüntüsel/frekanssal uyumsuzluk sinyalidir; tek başına kesin sahtecilik kararı değildir.`,
-        kind: 'critical-roi-mismatch',
-        confidence: Math.min(99, Math.max(90, Math.round(70 + distance * 3))),
-        field: row.field,
-        criticalRoi: true,
-        strong: true
-      };
-    });
-
-    return {
-      available: true,
-      engine: 'mathematical-forensics-v1.2.2-critical-roi-user-report',
-      findings,
-      differenceCount: findings.length,
-      strongDifferenceCount: findings.length,
-      status: 'critical-roi-mismatch',
-      userText: [
-        '🔎 REFERANS KARŞILAŞTIRMASI',
-        '',
-        '🔴 KRİTİK ALAN UYUMSUZLUĞU',
-        ...findings.map(x => `• ${x.title}: ${x.detail}`)
-      ].join('\n')
-    };
-  };
-
-  const criticalRoiReferenceReport = buildCriticalRoiReferenceReport(mathematicalForensics);
-
   // V64: Tek bir nihai referans bulgu listesi kullan. V63'te V48 raporu
   // muhafazakâr eşleştirme nedeniyle boş kalabildiği halde, aynı çalışmada
   // ayrıntılı deterministic rapor veya görsel adjudicator somut bir lokal
@@ -17205,7 +17137,6 @@ if (referenceForensics || layoutForensics?.available || referenceVisualAdjudicat
   };
 
   const humanForensicReport = mergeReferenceReports([
-    criticalRoiReferenceReport,
     deterministicReport,
     detailedDeterministicReport,
     aiReport
@@ -19711,44 +19642,6 @@ const controlledAmountCorroborated =
   paintOverV152Score >= 75 &&
   paintOverV152Signals >= 3 &&
   paintOverV152AmountSupport >= 20;
-
-// V1.2.2: A strong semantic critical-ROI mismatch is not allowed to be
-// silently diluted into a clean result. It remains conservative when alone,
-// but when independently corroborated (most importantly by the trusted
-// Amount Forensics signal) it gets a moderate-risk floor.
-const strongCriticalRoiRows = Array.isArray(result?.mathematicalForensics?.criticalRoiMismatches)
-  ? result.mathematicalForensics.criticalRoiMismatches.filter(x => x?.strong)
-  : [];
-const criticalRoiIndependentSupport = strongCriticalRoiRows.some(row =>
-  (String(row?.field) === 'amount' && strongAmountSignal) ||
-  (String(row?.field) !== 'amount' && (
-    strongAzureSignal ||
-    meaningfulPixelReferenceSignal ||
-    Number(negativeSampleForensics?.bestMatchScore || 0) >= 70
-  ))
-);
-
-if (strongCriticalRoiRows.length) {
-  result.criticalRoiSignal = {
-    ...(result.criticalRoiSignal || {}),
-    available: true,
-    active: true,
-    independentlyCorroborated: criticalRoiIndependentSupport,
-    fields: strongCriticalRoiRows.map(x => x.field),
-  };
-  if (criticalRoiIndependentSupport) {
-    finalRiskScore = Math.max(finalRiskScore, 46);
-    result.categories = {
-      ...(result.categories || {}),
-      editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 55),
-    };
-    console.log('V1.2.2 CRITICAL ROI CORROBORATION FLOOR:', JSON.stringify({
-      fields: strongCriticalRoiRows.map(x => x.field),
-      appliedFloor: 46,
-      independentSupport: criticalRoiIndependentSupport,
-    }));
-  }
-}
 
 if (controlledAmountCorroborated) {
   // Reuse the pipeline's existing suspicious threshold. This is a
