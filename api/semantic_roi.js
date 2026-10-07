@@ -20,11 +20,7 @@ export function recipientNameLabel(value) {
   if (/^(MUSTERI|GONDEREN|GONDERICI)(?: |$)/.test(label)) return null;
 
   const compact = label.replace(/\s+/g, '');
-  // Enpara/FAST variants can render the beneficiary label as "Alıcı",
-  // "Alıcı Adı", "Alıcı Adı Soyadı", "Alıcı İsim/Unvan" or
-  // "Alıcı Ünvanı". Do not accept "Alıcı Banka/Hesap/IBAN" here.
-  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADISOYAD|ADISOYADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI|ISIMUNVAN|ISIMUNVANI))?$/.test(compact)) return 'recipientName';
-  if (/^(?:ALICI|ALACAKLI)(?:ADI|ADISOYAD|ADSOYAD|UNVAN|ISIM|ISIMUNVAN)(?:UNVANI|SOYADI)?$/.test(compact)) return 'recipientName';
+  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADISOYAD|ADISOYADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI))?$/.test(compact)) return 'recipientName';
   if (/^(?:BENEFICIARY|BENEFICIARYNAME|PAYEE|PAYEENAME|RECEIVER|RECEIVERNAME|LEHDAR|LEHDARADI|LEHDARUNVANI)$/.test(compact)) return 'recipientName';
   return null;
 }
@@ -54,8 +50,65 @@ export function sameTurkishIban(a, b) {
   return hasTurkishIbanShape(a) && hasTurkishIbanShape(b) && normalizeTurkishIban(a) === normalizeTurkishIban(b);
 }
 
-export function shouldSuppressIbanLayoutMismatch(field, referenceValue, targetValue) {
-  return field === 'recipientIban' && sameTurkishIban(referenceValue, targetValue);
+export function shouldSuppressIbanLayoutMismatch(field, referenceValue, targetValue, context = {}) {
+  if (field !== 'recipientIban') return false;
+
+  // Exact logical IBAN equality is the strongest suppression rule.
+  if (sameTurkishIban(referenceValue, targetValue)) return true;
+
+  // V1.6.4 LINE-WRAP GUARD:
+  // A long beneficiary name can push an inline IBAN onto the next OCR line.
+  // That changes absolute Y geometry without changing the document structure.
+  // Suppress only when the geometry strongly explains the shift; do not use
+  // this guard when the IBAN itself is known to be different.
+  const box = (v) => {
+    const r = v?.region || v;
+    if (!r) return null;
+    const x1=Number(r.x1), y1=Number(r.y1), x2=Number(r.x2), y2=Number(r.y2);
+    if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1) return null;
+    return {x1,y1,x2,y2,w:x2-x1,h:y2-y1,cx:(x1+x2)/2,cy:(y1+y2)/2};
+  };
+
+  const nt=box(context.recipientNameTarget);
+  const nr=box(context.recipientNameReference);
+  const it=box(context.recipientIbanTarget);
+  const ir=box(context.recipientIbanReference);
+  if (!nt || !nr || !it || !ir) return false;
+
+  // If both values are known and are valid Turkish IBANs, never hide a real
+  // value change behind a layout explanation.
+  const refIban = normalizeTurkishIban(referenceValue);
+  const tarIban = normalizeTurkishIban(targetValue);
+  if (hasTurkishIbanShape(referenceValue) && hasTurkishIbanShape(targetValue) && refIban !== tarIban) return false;
+
+  const targetNameBottom = nt.y2;
+  const targetIbanTop = it.y1;
+  const referenceNameBottom = nr.y2;
+  const referenceIbanTop = ir.y1;
+  const nameH = Math.max(6, nt.h, nr.h);
+
+  // Target IBAN box becoming materially taller is a strong indicator that the
+  // IBAN was wrapped across two OCR/image lines.
+  const heightRatio = it.h / Math.max(1, ir.h);
+  const likelyWrapped = heightRatio >= 1.45 || it.h >= nameH * 1.65;
+
+  // The target IBAN begins at/just below the beneficiary-name line, while the
+  // reference IBAN remains on the original inline line.
+  const targetNearName = targetIbanTop >= nt.y1 - nameH * 0.35 &&
+    targetIbanTop <= nt.y2 + nameH * 2.2;
+  const referenceInline = Math.abs(referenceIbanTop - nr.y1) <= nameH * 1.25;
+
+  // The relative name→IBAN relationship must remain plausible.
+  const targetGap = Math.max(0, targetIbanTop - targetNameBottom);
+  const referenceGap = Math.max(0, referenceIbanTop - referenceNameBottom);
+  const gapDelta = Math.abs(targetGap - referenceGap);
+
+  return Boolean(
+    likelyWrapped &&
+    targetNearName &&
+    referenceInline &&
+    gapDelta <= nameH * 2.5
+  );
 }
 
 function boxOf(item) {
@@ -65,102 +118,6 @@ function boxOf(item) {
   return [x1, y1, x2, y2].every(Number.isFinite) && x2 > x1 && y2 > y1
     ? { x1, y1, x2, y2 }
     : null;
-}
-
-
-
-/**
- * V1.5.4: Enpara often returns the entire beneficiary block as one OCR region,
- * e.g. `ALICI UNVANI: Sudenaz Özel ALICI IBAN: TR...`.
- * A resolver that only looks at the first colon cannot recover either value.
- * Split known recipient labels inside the same OCR region and derive a tight
- * sub-box from the character span. This is geometry-first: OCR label matching
- * is used only to locate semantic anchors; the ROI itself is the value span.
- */
-export function resolveRecipientInlineSegments(item) {
-  const raw = String(item?.text || '').trim();
-  const parent = boxOf(item);
-  if (!raw || !parent) return [];
-
-  const labelAlternatives = [
-    'ALICI\\s+(?:UNVANI|UNVAN|ADI\\s+SOYADI|ADI|ISMI|ISIM\\s*[/]\\s*UNVAN)',
-    'ALACAKLI\\s+(?:UNVANI|UNVAN|ADI\\s+SOYADI|ADI|ISMI|ISIM\\s*[/]\\s*UNVAN)',
-    'BENEFICIARY\\s+NAME', 'PAYEE\\s+NAME', 'RECEIVER\\s+NAME',
-    'ALICI\\s+(?:IBAN|HESAP(?:\\s+(?:NO|NUMARASI|IBAN))?|BANKA(?:\\s+(?:IBAN|NO|NUMARASI))?)',
-    'ALACAKLI\\s+(?:IBAN|HESAP(?:\\s+(?:NO|NUMARASI|IBAN))?|BANKA(?:\\s+(?:IBAN|NO|NUMARASI))?)',
-    'BENEFICIARY\\s+(?:IBAN|ACCOUNT(?:\\s+NUMBER)?|BANK(?:\\s+IBAN)?)',
-    'PAYEE\\s+(?:IBAN|ACCOUNT(?:\\s+NUMBER)?|BANK(?:\\s+IBAN)?)',
-    'RECEIVER\\s+(?:IBAN|ACCOUNT(?:\\s+NUMBER)?|BANK(?:\\s+IBAN)?)',
-  ];
-  const re = new RegExp(`(?:^|(?<=\\s))(${labelAlternatives.join('|')})(?=\\s*[:：]?)`, 'giu');
-  const matches = [];
-  let m;
-  while ((m = re.exec(raw))) {
-    const labelText = String(m[1] || '').trim();
-    const normalized = normalizeSemanticLabel(labelText);
-    const field = recipientIbanLabel(normalized) ? 'recipientIban'
-      : recipientNameLabel(normalized) ? 'recipientName' : null;
-    if (!field) continue;
-    matches.push({ start: m.index + (m[0].length - m[1].length), end: re.lastIndex, labelText, field });
-  }
-  if (!matches.length) return [];
-
-  const makeSubBox = (start, end) => {
-    const totalW = Math.max(1, parent.x2 - parent.x1);
-    const n = Math.max(1, raw.length);
-    const x1 = parent.x1 + totalW * Math.max(0, Math.min(1, start / n));
-    const x2 = parent.x1 + totalW * Math.max(0, Math.min(1, end / n));
-    return { x1, y1: parent.y1, x2: Math.max(x1 + 2, x2), y2: parent.y2 };
-  };
-
-  const out = [];
-  for (let i = 0; i < matches.length; i++) {
-    const current = matches[i];
-    const next = matches[i + 1];
-    let valueStart = current.end;
-    while (valueStart < raw.length && /[\s:：]/u.test(raw[valueStart])) valueStart++;
-    let valueEnd = next ? next.start : raw.length;
-    while (valueEnd > valueStart && /[\s:：,;]+/u.test(raw[valueEnd - 1])) valueEnd--;
-    const value = raw.slice(valueStart, valueEnd).trim();
-    if (!value) continue;
-
-    let valueText = value;
-    if (current.field === 'recipientIban') {
-      const normalizedIban = normalizeTurkishIban(value);
-      if (!hasTurkishIbanShape(normalizedIban)) continue;
-      valueText = normalizedIban;
-    } else {
-      // Reject transaction vocabulary or a second label accidentally absorbed
-      // into the value. Names must remain human/company-name shaped.
-      const words = value.split(/\s+/).filter(Boolean);
-      const canonical = normalizeSemanticLabel(value);
-      const action = /(?:^|\s)(?:GIDEN|FAST|EFT|HAVALE|TRANSFER|ISLEM|TUTAR|PARA|CINSI|IBAN|HESAP|BANKA|SORGU|NO)(?:$|\s)/u.test(canonical);
-      const alphaTokenCount = words.filter(w => w.replace(/[^A-ZÇĞİÖŞÜa-zçğıöşü]/giu, '').length >= 2).length;
-      // OCR can turn a glyph into a digit (e.g. Gök -> G6k). Once the
-      // semantic label is trusted, do not reject the ROI solely because one
-      // character is misrecognized. Reject only numeric/action-like content.
-      if (action || alphaTokenCount < 2 || words.length < 2 || words.length > 6) continue;
-    }
-
-    // Tighten the ROI to the value characters, not the whole parent OCR line.
-    // Keep a tiny horizontal padding so glyph edges are not clipped.
-    const valueBox = makeSubBox(valueStart, valueEnd);
-    const pad = Math.min(6, Math.max(1, (valueBox.x2 - valueBox.x1) * 0.025));
-    valueBox.x1 = Math.max(parent.x1, valueBox.x1 - pad);
-    valueBox.x2 = Math.min(parent.x2, valueBox.x2 + pad);
-    out.push({
-      text: valueText,
-      valueText,
-      field: current.field,
-      labelText: current.labelText,
-      region: valueBox,
-      parentRegion: { ...parent },
-      score: 180,
-      criticalROI: true,
-      resolver: 'semantic-inline-multi-label-v154',
-    });
-  }
-  return out;
 }
 
 /** Resolve a line-wrapped Turkish IBAN into one logical value and union ROI. */
