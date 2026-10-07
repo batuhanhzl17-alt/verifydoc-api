@@ -14039,10 +14039,9 @@ async function analyzeAmountReferenceRenderForensics({
       ? Number((targetToReference.distance - bestFake.distance).toFixed(4))
       : 0;
 
-    // A target is suspicious only when it is materially unlike the genuine
-    // amount rendering AND the negative population independently points in
-    // the same direction. This is the key anti-false-positive gate for real
-    // Telegram/JPEG documents such as the known-good 350 TL case.
+    // Fake-population affinity is retained as a diagnostic measurement only.
+    // A generic resemblance to a known fake is not evidence that this document
+    // was manipulated; risk promotion is gated later by localized evidence.
     const fakeAffinityStrong = Boolean(
       bestFake &&
       fakeAffinityMargin >= 0.16 &&
@@ -14050,7 +14049,7 @@ async function analyzeAmountReferenceRenderForensics({
     );
 
     const referenceAnomaly = targetToReference.distance >= 0.85;
-    const strongAnomaly = referenceAnomaly && fakeAffinityStrong;
+    const strongAnomaly = referenceAnomaly;
     const compatibilityScore = Math.max(
       0,
       Math.min(100, Math.round(100 - targetToReference.distance * 55))
@@ -14087,10 +14086,10 @@ async function analyzeAmountReferenceRenderForensics({
       bestFake: bestFake ? bestFake.fileName : null,
       comparedFakeCount: fakeDistances.length,
       evidence: strongAnomaly
-        ? "Tutar ROI'si güvenilir Enpara referans renderından belirgin şekilde ayrılıyor ve aynı ROI'de bilinen sahte örneklerin render karakteristiğine bağımsız olarak daha yakın."
+        ? "Tutar ROI'sinde doğrulanmış lokal manipülasyon bulgusu var."
         : status === "pass"
           ? "Tutar ROI'sinin render karakteristiği güvenilir Enpara referansıyla uyumlu; bilinen sahte popülasyonuna anlamlı yakınlık oluşmadı."
-          : "Tutar ROI'si için referans render farkı ölçüldü ancak tek başına güçlü sahtecilik yönü oluşturacak bağımsız negatif korelasyon oluşmadı.",
+          : "Tutar ROI'si referanstan farklı; sahte örnek benzerliği yalnızca tanı amaçlıdır ve tek başına manipülasyon kanıtı sayılmaz.",
     };
   } catch (error) {
     console.warn("AMOUNT REFERENCE RENDER FORENSICS HATASI:", error?.message || error);
@@ -22114,22 +22113,32 @@ const v4PromotedFields = v4LocalPatternStrong
 const v4AmountPatternStrong = v4PromotedFields.includes("amount");
 const amountReferenceRender = result?.amountForensics?.referenceRenderForensics || null;
 
+// A negative-sample match is not independent proof of editing. Require an
+// existing manipulation-specific sensor before any localized pattern can
+// cross the final suspicious threshold.
+const localizedPaintOverStrong = Boolean(
+  paintOverV152?.available === true &&
+  Number(paintOverV152?.score || 0) >= 75 &&
+  Number(paintOverV152?.metrics?.supportSignals || 0) >= 3 &&
+  Number(paintOverV152?.metrics?.amountSupport || 0) >= 20
+);
+const independentManipulationEvidence = Boolean(
+  localizedPaintOverStrong ||
+  result?.openSourceForensics?.copyMove?.severity === "strong" &&
+    result?.openSourceForensics?.strongCorroboration === true ||
+  __controlledAmountPromotion?.eligible === true
+);
+
 // V15.5: A repeated known-fake pattern in the amount ROI is NOT sufficient by
 // itself. The same ROI must also fail the genuine-reference render check and
 // independently point toward the negative population. This specifically
 // prevents the known-good 350 TL Telegram/JPEG case from being promoted by
 // the same 4/4 edge/stroke/luminance/noise pattern seen in manipulated files.
-// V15.13 HARD INVARIANT:
-// Amount render corroboration can ONLY come from the final V15.11
-// fake-affinity decision. No legacy score/reference signal may override it.
-const amountReferenceRenderFakeAffinityStrong =
-  amountReferenceRender?.fakeAffinityStrong === true;
-
 const amountReferenceRenderCorroborated = Boolean(
   amountReferenceRender?.available === true &&
   amountReferenceRender?.status === "anomaly" &&
   Number(amountReferenceRender?.score || 0) >= 60 &&
-  amountReferenceRenderFakeAffinityStrong
+  independentManipulationEvidence
 );
 
 const v4PromotionAllowed =
@@ -22223,7 +22232,8 @@ if (!diffStrong && Number(result.overallRisk || 0) >= 46) {
 // do not allow an image document to become suspicious without the new local
 // NORMAL-vs-TAMPER corroboration. This keeps legacy sensors diagnostic.
 const finalDiffStrong = differentialImageForensics?.available === true &&
-  differentialImageForensics?.anyStrongLocalizedPattern === true;
+  differentialImageForensics?.anyStrongLocalizedPattern === true &&
+  independentManipulationEvidence;
 if (!finalDiffStrong && Number(result.overallRisk || 0) >= 46) {
   result.overallRisk = 45;
   result.riskLabel = getRiskLabel(45);
@@ -22322,8 +22332,7 @@ if (paddleCriticalFailure) {
 // Watchlist status is never allowed to independently contradict the canonical
 // FINAL SUSPICIOUS decision. Independent corroboration is required as well.
 const finalIndependentCorroboration = Boolean(
-  result?.amountForensics?.referenceRenderForensics?.fakeAffinityStrong === true ||
-  result?.negativeSampleForensics?.strongCorroboration === true ||
+  independentManipulationEvidence ||
   result?.openSourceForensics?.strongCorroboration === true ||
   result?.evidenceFusion?.amountReferenceRenderCorroborated === true ||
   result?.mathematicalForensics?.independentNegativeCorroboration === true
