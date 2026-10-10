@@ -1,10 +1,10 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-07T23:29:53.349Z",
+  "generatedAt": "2026-10-10T02:44:17.974Z",
   "algorithm": "VerifyDoc Mathematical Forensics V1",
   "reference": {
     "version": "MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE",
-    "generatedAt": "2026-10-07T23:29:53.363Z",
+    "generatedAt": "2026-10-10T02:44:17.989Z",
     "featureKeys": [
       "luminanceMean",
       "luminanceStd",
@@ -674,9 +674,9 @@
           }
         ]
       },
-      "enpara::UNKNOWN": {
+      "enpara::DEKONT": {
         "bank": "enpara",
-        "family": "UNKNOWN",
+        "family": "DEKONT",
         "sampleCount": 5,
         "sourceFormats": [
           "jpeg",
@@ -1000,9 +1000,9 @@
           }
         ]
       },
-      "garanti::UNKNOWN": {
+      "garanti::FAST": {
         "bank": "garanti",
-        "family": "UNKNOWN",
+        "family": "FAST",
         "sampleCount": 10,
         "sourceFormats": [
           "png",
@@ -3712,148 +3712,148 @@
       "ziraat::FAST": {
         "bank": "ziraat",
         "family": "FAST",
-        "sampleCount": 7,
+        "sampleCount": 2,
         "sourceFormats": [
           "jpeg",
           "png"
         ],
         "featureStats": {
           "luminanceMean": {
-            "mean": 239.9769003731864,
-            "std": 14.402147960190286,
-            "median": 245.8396759033203,
-            "mad": 4.8506927490234375,
-            "min": 206.1179962158203,
+            "mean": 250.6045684814453,
+            "std": 0.0858001708984375,
+            "median": 250.6045684814453,
+            "mad": 0.0858001708984375,
+            "min": 250.51876831054688,
             "max": 250.69036865234375
           },
           "luminanceStd": {
-            "mean": 35.59656345344264,
-            "std": 23.37461124968457,
-            "median": 28.1047394674937,
-            "mad": 7.636136175434203,
+            "mean": 17.322821721227847,
+            "std": 0.2700422883162439,
+            "median": 17.322821721227847,
+            "mad": 0.2700422883162439,
             "min": 17.052779432911603,
-            "max": 90.44771912349978
+            "max": 17.59286400954409
           },
           "entropy": {
-            "mean": 2.3198407316502374,
-            "std": 0.7208312478236056,
-            "median": 2.1243395740041544,
-            "mad": 0.694934265145547,
+            "mean": 1.4150306043202798,
+            "std": 0.014374704538327565,
+            "median": 1.4150306043202798,
+            "mad": 0.014374704538327565,
             "min": 1.4006558997819523,
-            "max": 3.407216170409143
+            "max": 1.4294053088586074
           },
           "edgeDensity": {
-            "mean": 0.1502971577371726,
-            "std": 0.054849400253344005,
-            "median": 0.14625829251658504,
-            "mad": 0.06368962737925477,
+            "mean": 0.08241366482732965,
+            "std": 0.00015500031000061781,
+            "median": 0.08241366482732965,
+            "mad": 0.00015500031000061781,
             "min": 0.08225866451732904,
-            "max": 0.23260896521793042
+            "max": 0.08256866513733027
           },
           "meanGradient": {
-            "mean": 7.2861664411168166,
-            "std": 2.8496309982079313,
-            "median": 7.171391779381192,
-            "mad": 3.2747740150999203,
+            "mean": 3.4770844585080187,
+            "std": 0.02783340599528006,
+            "median": 3.4770844585080187,
+            "mad": 0.02783340599528006,
             "min": 3.449251052512739,
-            "max": 11.26762746671124
+            "max": 3.504917864503299
           },
           "laplacianVariance": {
-            "mean": 2592.762121578089,
-            "std": 1335.483172952262,
-            "median": 2678.4200351380196,
-            "mad": 1661.515954049818,
+            "mean": 903.0203049221664,
+            "std": 29.112297837032884,
+            "median": 903.0203049221664,
+            "mad": 29.112297837032884,
             "min": 873.9080070851335,
-            "max": 4446.346487692976
+            "max": 932.1326027591992
           },
           "darkPixelRatio": {
-            "mean": 0.025514875139508928,
-            "std": 0.06001325519144567,
-            "median": 0.000946044921875,
-            "mad": 0.0008087158203125,
+            "mean": 0.00009918212890625,
+            "std": 0.00003814697265625,
+            "median": 0.00009918212890625,
+            "mad": 0.00003814697265625,
             "min": 0.00006103515625,
-            "max": 0.1725006103515625
+            "max": 0.0001373291015625
           },
           "brightPixelRatio": {
-            "mean": 0.8459886823381696,
-            "std": 0.07220480483844374,
-            "median": 0.8741912841796875,
-            "mad": 0.0528564453125,
-            "min": 0.71466064453125,
+            "mean": 0.9265289306640625,
+            "std": 0.000518798828125,
+            "median": 0.9265289306640625,
+            "mad": 0.000518798828125,
+            "min": 0.9260101318359375,
             "max": 0.9270477294921875
           },
           "dctLowEnergy": {
-            "mean": 17671.5671236677,
-            "std": 10191.76726789059,
-            "median": 15031.939264767556,
-            "mad": 9518.29666306312,
+            "mean": 5678.5350120632165,
+            "std": 206.9271645266508,
+            "median": 5678.5350120632165,
+            "mad": 206.9271645266508,
             "min": 5471.607847536566,
-            "max": 34970.5018195379
+            "max": 5885.462176589867
           },
           "dctMidEnergy": {
-            "mean": 14125.60093713105,
-            "std": 7336.7927481465595,
-            "median": 13528.51155907577,
-            "mad": 8287.173717264777,
+            "mean": 4627.176959667041,
+            "std": 157.0871326612496,
+            "median": 4627.176959667041,
+            "mad": 157.0871326612496,
             "min": 4470.089827005791,
-            "max": 25441.990186100127
+            "max": 4784.264092328291
           },
           "dctHighEnergy": {
-            "mean": 6407.367897627587,
-            "std": 3680.001162285033,
-            "median": 5696.141389757192,
-            "mad": 3822.5655757157892,
+            "mean": 1857.8368258771725,
+            "std": 15.73898816423025,
+            "median": 1857.8368258771725,
+            "mad": 15.73898816423025,
             "min": 1842.0978377129422,
-            "max": 12129.23467242273
+            "max": 1873.5758140414027
           },
           "dctHighRatio": {
-            "mean": 0.16493088139092293,
-            "std": 0.032696575541516074,
-            "median": 0.16127125217803817,
-            "mad": 0.02678823081478987,
-            "min": 0.10087234971091502,
-            "max": 0.20808810523487156
+            "mean": 0.1527428865155116,
+            "std": 0.001722168452718248,
+            "median": 0.1527428865155116,
+            "mad": 0.001722168452718248,
+            "min": 0.15102071806279335,
+            "max": 0.15446505496822985
           },
           "blockinessHorizontal": {
-            "mean": 1.1492153291797247,
-            "std": 0.22390171676087692,
-            "median": 1.1213372180279204,
-            "mad": 0.06164265085892362,
-            "min": 0.9381584724845147,
-            "max": 1.662322575672245
+            "mean": 1.0119695869326384,
+            "std": 0.04772498023635835,
+            "median": 1.0119695869326384,
+            "mad": 0.04772498023635835,
+            "min": 0.9642446066962801,
+            "max": 1.0596945671689968
           },
           "blockinessVertical": {
-            "mean": 1.0550596569626856,
-            "std": 0.13056261089157747,
-            "median": 1.0795855967533885,
-            "mad": 0.09263309911741646,
-            "min": 0.8791763709491207,
-            "max": 1.2662400913280194
+            "mean": 1.0868987459915285,
+            "std": 0.007313149238139971,
+            "median": 1.0868987459915285,
+            "mad": 0.007313149238139971,
+            "min": 1.0795855967533885,
+            "max": 1.0942118952296684
           }
         },
         "jpeg": {
-          "sampleCount": 6,
+          "sampleCount": 1,
           "estimatedQuality": {
-            "mean": 77.91666666666667,
-            "std": 4.207301853788112,
+            "mean": 75.5,
+            "std": 0,
             "median": 75.5,
             "mad": 0,
             "min": 75.5,
-            "max": 87
+            "max": 75.5
           },
           "quantizationMean": {
-            "mean": 27.926339285714285,
-            "std": 12.8404732315483,
-            "median": 36.234375,
-            "mad": 0,
+            "mean": 18.1171875,
+            "std": 18.1171875,
+            "median": 18.1171875,
+            "mad": 18.1171875,
             "min": 0,
             "max": 36.234375
           },
           "quantizationStd": {
-            "mean": 11.894749344514993,
-            "std": 5.465046352655475,
-            "median": 15.42205678280828,
-            "mad": 0,
+            "mean": 7.71102839140414,
+            "std": 7.71102839140414,
+            "median": 7.71102839140414,
+            "mad": 7.71102839140414,
             "min": 0,
             "max": 15.42205678280828
           }
@@ -3864,6 +3864,162 @@
             "source": "references/jpg/ziraat-fast.jpg",
             "sourceFormat": "jpeg"
           },
+          {
+            "id": "reference:references/ziraat-fast.pdf",
+            "source": "references/ziraat-fast.pdf",
+            "sourceFormat": "png"
+          }
+        ]
+      },
+      "ziraat::UNKNOWN": {
+        "bank": "ziraat",
+        "family": "UNKNOWN",
+        "sampleCount": 5,
+        "sourceFormats": [
+          "jpeg"
+        ],
+        "featureStats": {
+          "luminanceMean": {
+            "mean": 235.7258331298828,
+            "std": 15.071070402315751,
+            "median": 240.75999450683594,
+            "mad": 5.079681396484375,
+            "min": 206.1179962158203,
+            "max": 246.62220764160156
+          },
+          "luminanceStd": {
+            "mean": 42.906060146328564,
+            "std": 24.039377398486323,
+            "median": 34.10507211716947,
+            "mad": 6.000332649675769,
+            "min": 26.13189438055197,
+            "max": 90.44771912349978
+          },
+          "entropy": {
+            "mean": 2.68176478258222,
+            "std": 0.5185484980903202,
+            "median": 2.80296408781092,
+            "mad": 0.6042520825982227,
+            "min": 2.062312497404584,
+            "max": 3.407216170409143
+          },
+          "edgeDensity": {
+            "mean": 0.17745055490110978,
+            "std": 0.0403888024082779,
+            "median": 0.15005580011160022,
+            "mad": 0.012028024056048109,
+            "min": 0.1380277760555521,
+            "max": 0.23260896521793042
+          },
+          "meanGradient": {
+            "mean": 8.809799234160336,
+            "std": 1.8008738347811157,
+            "median": 8.52987523517007,
+            "mad": 1.8959393401120064,
+            "min": 6.633935895058064,
+            "max": 11.26762746671124
+          },
+          "laplacianVariance": {
+            "mean": 3268.658848240458,
+            "std": 947.4466048726906,
+            "median": 2778.1355632711266,
+            "mad": 677.6793973587946,
+            "min": 2100.456165912332,
+            "max": 4446.346487692976
+          },
+          "darkPixelRatio": {
+            "mean": 0.03568115234375,
+            "std": 0.06841410938826328,
+            "median": 0.001312255859375,
+            "mad": 0.0005950927734375,
+            "min": 0.0007171630859375,
+            "max": 0.1725006103515625
+          },
+          "brightPixelRatio": {
+            "mean": 0.8137725830078125,
+            "std": 0.06054973180245468,
+            "median": 0.8137664794921875,
+            "mad": 0.0604248046875,
+            "min": 0.71466064453125,
+            "max": 0.878448486328125
+          },
+          "dctLowEnergy": {
+            "mean": 22468.779968309496,
+            "std": 8053.413049796342,
+            "median": 24550.235927830676,
+            "mad": 9518.29666306312,
+            "min": 12460.545994624175,
+            "max": 34970.5018195379
+          },
+          "dctMidEnergy": {
+            "mean": 17924.970528116653,
+            "std": 4982.6535001831935,
+            "median": 16490.93733616429,
+            "mad": 4143.209053261766,
+            "min": 12347.728282902524,
+            "max": 25441.990186100127
+          },
+          "dctHighEnergy": {
+            "mean": 8227.180326327752,
+            "std": 2714.454351265999,
+            "median": 8534.547883208324,
+            "mad": 2838.4064934511325,
+            "min": 4770.149428528011,
+            "max": 12129.23467242273
+          },
+          "dctHighRatio": {
+            "mean": 0.16980607934108746,
+            "std": 0.037580841989510685,
+            "median": 0.18805948299282804,
+            "mad": 0.02002862224204352,
+            "min": 0.10087234971091502,
+            "max": 0.20808810523487156
+          },
+          "blockinessHorizontal": {
+            "mean": 1.204113626078559,
+            "std": 0.2423330771315728,
+            "median": 1.1425034990850627,
+            "mad": 0.021166281057142244,
+            "min": 0.9381584724845147,
+            "max": 1.662322575672245
+          },
+          "blockinessVertical": {
+            "mean": 1.0423240213511482,
+            "std": 0.1525652424267711,
+            "median": 0.9948274487718353,
+            "mad": 0.11565107782271455,
+            "min": 0.8791763709491207,
+            "max": 1.2662400913280194
+          }
+        },
+        "jpeg": {
+          "sampleCount": 5,
+          "estimatedQuality": {
+            "mean": 78.4,
+            "std": 4.454211490264018,
+            "median": 75.5,
+            "mad": 0,
+            "min": 75.5,
+            "max": 87
+          },
+          "quantizationMean": {
+            "mean": 31.85,
+            "std": 6.756697704292201,
+            "median": 36.234375,
+            "mad": 0,
+            "min": 18.7890625,
+            "max": 36.234375
+          },
+          "quantizationStd": {
+            "mean": 13.568237725759332,
+            "std": 2.868356495027504,
+            "median": 15.42205678280828,
+            "mad": 0,
+            "min": 8.016001726273,
+            "max": 15.42205678280828
+          }
+        },
+        "samples": [
           {
             "id": "reference:references/jpg/ziraat-fast2.jpg",
             "source": "references/jpg/ziraat-fast2.jpg",
@@ -3888,11 +4044,6 @@
             "id": "reference:references/jpg/ziraat-fast6.jpg",
             "source": "references/jpg/ziraat-fast6.jpg",
             "sourceFormat": "jpeg"
-          },
-          {
-            "id": "reference:references/ziraat-fast.pdf",
-            "source": "references/ziraat-fast.pdf",
-            "sourceFormat": "png"
           }
         ]
       },
@@ -4817,7 +4968,7 @@
   },
   "negative": {
     "version": "MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE",
-    "generatedAt": "2026-10-07T23:29:53.364Z",
+    "generatedAt": "2026-10-10T02:44:17.989Z",
     "featureKeys": [
       "luminanceMean",
       "luminanceStd",
@@ -4835,9 +4986,9 @@
       "blockinessVertical"
     ],
     "profiles": {
-      "enpara::UNKNOWN": {
+      "enpara::DEKONT": {
         "bank": "enpara",
-        "family": "UNKNOWN",
+        "family": "DEKONT",
         "sampleCount": 4,
         "sourceFormats": [
           "jpeg"
@@ -5006,9 +5157,9 @@
           }
         ]
       },
-      "garanti::UNKNOWN": {
+      "garanti::FAST": {
         "bank": "garanti",
-        "family": "UNKNOWN",
+        "family": "FAST",
         "sampleCount": 2,
         "sourceFormats": [
           "jpeg"
@@ -5638,6 +5789,155 @@
           }
         ]
       },
+      "isbankasi::ACCOUNT_STATEMENT": {
+        "bank": "isbankasi",
+        "family": "ACCOUNT_STATEMENT",
+        "sampleCount": 1,
+        "sourceFormats": [
+          "png"
+        ],
+        "featureStats": {
+          "luminanceMean": {
+            "mean": 248.91224670410156,
+            "std": 0,
+            "median": 248.91224670410156,
+            "mad": 0,
+            "min": 248.91224670410156,
+            "max": 248.91224670410156
+          },
+          "luminanceStd": {
+            "mean": 20.342906302552752,
+            "std": 0,
+            "median": 20.342906302552752,
+            "mad": 0,
+            "min": 20.342906302552752,
+            "max": 20.342906302552752
+          },
+          "entropy": {
+            "mean": 1.5996468064546696,
+            "std": 0,
+            "median": 1.5996468064546696,
+            "mad": 0,
+            "min": 1.5996468064546696,
+            "max": 1.5996468064546696
+          },
+          "edgeDensity": {
+            "mean": 0.07869365738731478,
+            "std": 0,
+            "median": 0.07869365738731478,
+            "mad": 0,
+            "min": 0.07869365738731478,
+            "max": 0.07869365738731478
+          },
+          "meanGradient": {
+            "mean": 3.491455093041117,
+            "std": 0,
+            "median": 3.491455093041117,
+            "mad": 0,
+            "min": 3.491455093041117,
+            "max": 3.491455093041117
+          },
+          "laplacianVariance": {
+            "mean": 830.4767189534379,
+            "std": 0,
+            "median": 830.4767189534379,
+            "mad": 0,
+            "min": 830.4767189534379,
+            "max": 830.4767189534379
+          },
+          "darkPixelRatio": {
+            "mean": 0.0000152587890625,
+            "std": 0,
+            "median": 0.0000152587890625,
+            "mad": 0,
+            "min": 0.0000152587890625,
+            "max": 0.0000152587890625
+          },
+          "brightPixelRatio": {
+            "mean": 0.8953704833984375,
+            "std": 0,
+            "median": 0.8953704833984375,
+            "mad": 0,
+            "min": 0.8953704833984375,
+            "max": 0.8953704833984375
+          },
+          "dctLowEnergy": {
+            "mean": 6806.394401100128,
+            "std": 0,
+            "median": 6806.394401100128,
+            "mad": 0,
+            "min": 6806.394401100128,
+            "max": 6806.394401100128
+          },
+          "dctMidEnergy": {
+            "mean": 3569.2228053676236,
+            "std": 0,
+            "median": 3569.2228053676236,
+            "mad": 0,
+            "min": 3569.2228053676236,
+            "max": 3569.2228053676236
+          },
+          "dctHighEnergy": {
+            "mean": 1983.6080132588202,
+            "std": 0,
+            "median": 1983.6080132588202,
+            "mad": 0,
+            "min": 1983.6080132588202,
+            "max": 1983.6080132588202
+          },
+          "dctHighRatio": {
+            "mean": 0.16049614583386518,
+            "std": 0,
+            "median": 0.16049614583386518,
+            "mad": 0,
+            "min": 0.16049614583386518,
+            "max": 0.16049614583386518
+          },
+          "blockinessHorizontal": {
+            "mean": 1.1947874849969355,
+            "std": 0,
+            "median": 1.1947874849969355,
+            "mad": 0,
+            "min": 1.1947874849969355,
+            "max": 1.1947874849969355
+          },
+          "blockinessVertical": {
+            "mean": 0.686379618605429,
+            "std": 0,
+            "median": 0.686379618605429,
+            "mad": 0,
+            "min": 0.686379618605429,
+            "max": 0.686379618605429
+          }
+        },
+        "jpeg": {
+          "sampleCount": 0,
+          "estimatedQuality": null,
+          "quantizationMean": {
+            "mean": 0,
+            "std": 0,
+            "median": 0,
+            "mad": 0,
+            "min": 0,
+            "max": 0
+          },
+          "quantizationStd": {
+            "mean": 0,
+            "std": 0,
+            "median": 0,
+            "mad": 0,
+            "min": 0,
+            "max": 0
+          }
+        },
+        "samples": [
+          {
+            "id": "negative:negative_samples/isbankasi/sahte-hesap-ozeti-1.pdf",
+            "source": "negative_samples/isbankasi/sahte-hesap-ozeti-1.pdf",
+            "sourceFormat": "png"
+          }
+        ]
+      },
       "qnb::UNKNOWN": {
         "bank": "qnb",
         "family": "UNKNOWN",
@@ -6007,7 +6307,7 @@
       "id": "reference:references/enpara.jpg",
       "label": "reference",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "references/enpara.jpg",
       "renderedFromPdf": false
     },
@@ -6015,7 +6315,7 @@
       "id": "reference:references/enpara.pdf",
       "label": "reference",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "references/enpara.pdf",
       "renderedFromPdf": true
     },
@@ -6031,7 +6331,7 @@
       "id": "reference:references/garanti.pdf",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/garanti.pdf",
       "renderedFromPdf": true
     },
@@ -6039,7 +6339,7 @@
       "id": "reference:references/garanti2.pdf",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/garanti2.pdf",
       "renderedFromPdf": true
     },
@@ -6047,7 +6347,7 @@
       "id": "reference:references/garanti33.pdf",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/garanti33.pdf",
       "renderedFromPdf": true
     },
@@ -6175,7 +6475,7 @@
       "id": "reference:references/jpg/enpara2.jpg",
       "label": "reference",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "references/jpg/enpara2.jpg",
       "renderedFromPdf": false
     },
@@ -6183,7 +6483,7 @@
       "id": "reference:references/jpg/enpara3.jpg",
       "label": "reference",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "references/jpg/enpara3.jpg",
       "renderedFromPdf": false
     },
@@ -6191,7 +6491,7 @@
       "id": "reference:references/jpg/enpara4.jpg",
       "label": "reference",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "references/jpg/enpara4.jpg",
       "renderedFromPdf": false
     },
@@ -6199,7 +6499,7 @@
       "id": "reference:references/jpg/garanti.jpg",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/garanti.jpg",
       "renderedFromPdf": false
     },
@@ -6207,7 +6507,7 @@
       "id": "reference:references/jpg/garanti2.jpg",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/garanti2.jpg",
       "renderedFromPdf": false
     },
@@ -6215,7 +6515,7 @@
       "id": "reference:references/jpg/garanti3.jpg",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/garanti3.jpg",
       "renderedFromPdf": false
     },
@@ -6223,7 +6523,7 @@
       "id": "reference:references/jpg/garanti4.jpg",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/garanti4.jpg",
       "renderedFromPdf": false
     },
@@ -6231,7 +6531,7 @@
       "id": "reference:references/jpg/garanti5.jpg",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/garanti5.jpg",
       "renderedFromPdf": false
     },
@@ -6239,7 +6539,7 @@
       "id": "reference:references/jpg/garanti6.jpg",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/garanti6.jpg",
       "renderedFromPdf": false
     },
@@ -6247,7 +6547,7 @@
       "id": "reference:references/jpg/garanti7.jpg",
       "label": "reference",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/garanti7.jpg",
       "renderedFromPdf": false
     },
@@ -6535,7 +6835,7 @@
       "id": "reference:references/jpg/ziraat-fast2.jpg",
       "label": "reference",
       "bank": "ziraat",
-      "family": "FAST",
+      "family": "UNKNOWN",
       "source": "references/jpg/ziraat-fast2.jpg",
       "renderedFromPdf": false
     },
@@ -6543,7 +6843,7 @@
       "id": "reference:references/jpg/ziraat-fast3.jpg",
       "label": "reference",
       "bank": "ziraat",
-      "family": "FAST",
+      "family": "UNKNOWN",
       "source": "references/jpg/ziraat-fast3.jpg",
       "renderedFromPdf": false
     },
@@ -6551,7 +6851,7 @@
       "id": "reference:references/jpg/ziraat-fast4.jpg",
       "label": "reference",
       "bank": "ziraat",
-      "family": "FAST",
+      "family": "UNKNOWN",
       "source": "references/jpg/ziraat-fast4.jpg",
       "renderedFromPdf": false
     },
@@ -6559,7 +6859,7 @@
       "id": "reference:references/jpg/ziraat-fast5.jpg",
       "label": "reference",
       "bank": "ziraat",
-      "family": "FAST",
+      "family": "UNKNOWN",
       "source": "references/jpg/ziraat-fast5.jpg",
       "renderedFromPdf": false
     },
@@ -6567,7 +6867,7 @@
       "id": "reference:references/jpg/ziraat-fast6.jpg",
       "label": "reference",
       "bank": "ziraat",
-      "family": "FAST",
+      "family": "UNKNOWN",
       "source": "references/jpg/ziraat-fast6.jpg",
       "renderedFromPdf": false
     },
@@ -6735,7 +7035,7 @@
       "id": "negative:negative_samples/enpara/fake.3000.jpg",
       "label": "negative",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "negative_samples/enpara/fake.3000.jpg",
       "renderedFromPdf": false
     },
@@ -6743,7 +7043,7 @@
       "id": "negative:negative_samples/enpara/fake.8000.jpg",
       "label": "negative",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "negative_samples/enpara/fake.8000.jpg",
       "renderedFromPdf": false
     },
@@ -6751,7 +7051,7 @@
       "id": "negative:negative_samples/enpara/fake.iban.jpg",
       "label": "negative",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "negative_samples/enpara/fake.iban.jpg",
       "renderedFromPdf": false
     },
@@ -6759,7 +7059,7 @@
       "id": "negative:negative_samples/enpara/fake.iban2.jpg",
       "label": "negative",
       "bank": "enpara",
-      "family": "UNKNOWN",
+      "family": "DEKONT",
       "source": "negative_samples/enpara/fake.iban2.jpg",
       "renderedFromPdf": false
     },
@@ -6767,7 +7067,7 @@
       "id": "negative:negative_samples/garanti/fake.amount-1000.jpg",
       "label": "negative",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "negative_samples/garanti/fake.amount-1000.jpg",
       "renderedFromPdf": false
     },
@@ -6775,7 +7075,7 @@
       "id": "negative:negative_samples/garanti/fake.iban.change.jpg",
       "label": "negative",
       "bank": "garanti",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "negative_samples/garanti/fake.iban.change.jpg",
       "renderedFromPdf": false
     },
@@ -6818,6 +7118,14 @@
       "family": "UNKNOWN",
       "source": "negative_samples/isbankasi/fake200000.jpg",
       "renderedFromPdf": false
+    },
+    {
+      "id": "negative:negative_samples/isbankasi/sahte-hesap-ozeti-1.pdf",
+      "label": "negative",
+      "bank": "isbankasi",
+      "family": "ACCOUNT_STATEMENT",
+      "source": "negative_samples/isbankasi/sahte-hesap-ozeti-1.pdf",
+      "renderedFromPdf": true
     },
     {
       "id": "negative:negative_samples/qnb/qnb5000.jpg",
