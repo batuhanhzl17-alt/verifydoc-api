@@ -317,7 +317,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     !/(sirano|fisno|islemno|referans|hesapno|musterino|iban|kartno|vergino)/.test(amountFieldLabel);
   let amountReferenceBox = amountFieldIsTyped ? boxFrom(amountField).reference : null;
   let amountReferenceResolver = amountReferenceBox ? 'typed-reference-amount-field' : null;
-  if (!amountReferenceBox && bank) {
+  if (!amountReferenceBox && bank && !/enpara/i.test(String(bank || ''))) {
     try {
       const anchor = await getReferenceAmountAnchor(bank);
       // Trusted anchor is allowed only as a last resort, after the typed
@@ -483,7 +483,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   }
 
   const fingerprint = await extractMathematicalFingerprint(targetPath, { regions: targetRegions });
-  const family = inferDocumentFamily(fileName, targetText);
+  const family = inferDocumentFamily(fileName, targetText, bank);
   const reference = compareAgainstBaseline(fingerprint, baseline.reference, bank, family);
   const negative = compareAgainstBaseline(fingerprint, baseline.negative, bank, family);
 
@@ -16195,7 +16195,7 @@ prepTasks.push((async () => {
       const arg = await runAzureReferenceGeometryComparison(
         al,
         bank,
-        getVisualReferencePath(reference)
+        Array.isArray(getVisualReferencePath(reference)) ? getVisualReferencePath(reference)[0] : getVisualReferencePath(reference)
       );
       console.log("AZURE REFERENCE GEOMETRY:", JSON.stringify(arg));
       return { kind:"azure", azureLayout:al, azureReferenceGeometry:arg };
@@ -16739,7 +16739,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePath(reference)
+      Array.isArray(getVisualReferencePath(reference)) ? getVisualReferencePath(reference)[0] : getVisualReferencePath(reference)
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
   } catch (error) {
@@ -17907,8 +17907,11 @@ if (String(bank||'').toLowerCase().includes('ziraat')) {
     ziraatAmountSpacing=measureZiraatAmountSpacing(azureLayout,bank,Number(targetMeta.width)||0);
   } catch(error) { console.warn('ZİRAAT TUTAR ARALIK ÖLÇÜMÜ ATLANDI:',error?.message||error); }
 }
+if (String(bank||'').toLowerCase().includes('ziraat')) {
+  result.ziraatAmountSpacing = ziraatAmountSpacing;
+  console.log('ZIRAAT AMOUNT SPACING MEASUREMENT:', JSON.stringify(ziraatAmountSpacing));
+}
 if(ziraatAmountSpacing.available){
-  result.ziraatAmountSpacing=ziraatAmountSpacing;
   if(ziraatAmountSpacing.warning&&result?.checks){
     const existing=result.checks.layoutIntegrity||{};
     const evidence=`Ziraat yatay boşlukları: ":"→tutar ${Number(ziraatAmountSpacing.colonToAmountPx).toFixed(2)} px (<2) ve tutar→TRY ${Number(ziraatAmountSpacing.amountToTryPx).toFixed(2)} px (>7).`;
@@ -17918,8 +17921,11 @@ if(ziraatAmountSpacing.available){
 
 let garantiAmountContrast={available:false,status:'MEASUREMENT_UNAVAILABLE'};
 if(String(bank||'').toLowerCase().includes('garanti')) garantiAmountContrast=await measureGarantiAmountContrast(forensicTargetPath,amountForensics?.region);
-if(garantiAmountContrast.available){
+if(String(bank||'').toLowerCase().includes('garanti')) {
   result.garantiAmountContrast=garantiAmountContrast;
+  console.log('GARANTI AMOUNT CONTRAST MEASUREMENT:', JSON.stringify(garantiAmountContrast));
+}
+if(garantiAmountContrast.available){
   if(garantiAmountContrast.warning&&result?.checks){
     const existing=result.checks.amountConsistency||{};
     const evidence=`Garanti tutar kontrastı ${Number(garantiAmountContrast.contrast).toFixed(1)}/255 (zemin medyanı ${garantiAmountContrast.backgroundMedianGray}, rakam medyanı ${garantiAmountContrast.inkMedianGray}); uyarı eşiği >100.`;
@@ -17941,11 +17947,17 @@ if(String(bank||'').toLowerCase().includes('denizbank')){
       const evidence=`DenizBank tutar rakamlarının mevcut karakter doluluk metriği referansa göre %${(ratio*100).toFixed(1)}; uyarı eşiği %85 altı.`;
       result.checks.fontConsistency={...existing,status:'warning',score:Math.max(Number(existing.score)||0,25),evidence:[String(existing.evidence||'').trim(),evidence].filter(Boolean).join(' ')};
     }
+  } else {
+    result.denizbankAmountWeight={available:false,status:'REFERENCE_AMOUNT_PROFILE_UNAVAILABLE',threshold:0.85};
   }
+  console.log('DENIZBANK AMOUNT WEIGHT MEASUREMENT:', JSON.stringify(result.denizbankAmountWeight));
 }
 
+if(String(bank||'').toLowerCase().includes('enpara')) {
+  result.enparaVerticalDistance=enparaVerticalGapMeasurement||{available:false,status:'LAYOUT_UNAVAILABLE',threshold:28.5};
+  console.log('ENPARA VERTICAL DISTANCE MEASUREMENT:', JSON.stringify(result.enparaVerticalDistance));
+}
 if(enparaVerticalGapMeasurement?.available){
-  result.enparaVerticalDistance=enparaVerticalGapMeasurement;
   if(enparaVerticalGapMeasurement.warning&&result?.checks){
     const existing=result.checks.layoutIntegrity||{};
     const evidence=`Enpara Para Cinsi Tutar→Tutar dikey boşluğu ${Number(enparaVerticalGapMeasurement.normalizedDistance).toFixed(2)}/1000; uyarı eşiği 28,5 altı.`;
@@ -19462,16 +19474,22 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
   let referenceOCR = null;
   try {
     if (referenceInfo?.path && targetOCR?.success) {
-      const refBuffer = await fs.readFile(referenceInfo.path);
-      const doc = await pdfToImg(refBuffer, {scale: 2});
-      let firstImage = null;
-      for await (const image of doc) { firstImage = image; break; }
-      if (firstImage) {
-        const refPath = `/tmp/verifydoc-v48-ref-${createHash('sha1').update(refBuffer).digest('hex').slice(0,12)}.png`;
-        await fs.writeFile(refPath, firstImage);
-        referenceOCR = await runPaddleOCR(refPath);
+      if (path.extname(referenceInfo.path).toLowerCase() === '.pdf') {
+        const refBuffer = await fs.readFile(referenceInfo.path);
+        const doc = await pdfToImg(refBuffer, {scale: 2});
+        let firstImage = null;
+        for await (const image of doc) { firstImage = image; break; }
+        if (firstImage) {
+          const refPath = `/tmp/verifydoc-v48-ref-${createHash('sha1').update(refBuffer).digest('hex').slice(0,12)}.png`;
+          await fs.writeFile(refPath, firstImage);
+          referenceOCR = await runPaddleOCR(refPath);
+        }
+        if (doc?.destroy) await doc.destroy();
+      } else {
+        // This engine also receives image-only trusted references. Do not feed
+        // JPG bytes to the PDF renderer; run PaddleOCR directly on the raster.
+        referenceOCR = await runPaddleOCR(referenceInfo.path);
       }
-      if (doc?.destroy) await doc.destroy();
     }
   } catch (e) {
     console.warn('V48 REFERENCE OCR HATASI:', e?.message || e);
