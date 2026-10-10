@@ -723,8 +723,12 @@ export function compareAgainstBaseline(fingerprint, baseline, bank, family='unkn
   if (!baseline?.profiles) return { available:false, reason:'baseline-missing' };
   const candidates = Object.values(baseline.profiles).filter(p => p.bank === bank);
   if (!candidates.length) return { available:false, reason:'bank-profile-missing', bank };
-  const exact = candidates.find(p => p.family === family);
-  const pool = exact ? [exact, ...candidates.filter(p => p !== exact)] : candidates;
+  // Transaction families are not interchangeable. In particular, a generic
+  // UNKNOWN profile must not silently become a CREDIT_CARD/FAST/EFT baseline.
+  const pool = candidates.filter(p => p.family === family);
+  if (!pool.length) {
+    return { available:false, reason:'family-profile-missing', bank, requestedFamily:family, availableFamilies:[...new Set(candidates.map(p=>p.family))] };
+  }
   const comparisons = pool.map(p => ({...compareFingerprint(fingerprint,p), family:p.family})).filter(x=>x.available);
   comparisons.sort((a,b)=>b.similarityScore-a.similarityScore);
   const best = comparisons[0] || null;
@@ -734,10 +738,10 @@ export function compareAgainstBaseline(fingerprint, baseline, bank, family='unkn
 export function inferDocumentFamily(name='', text='') {
   const s = `${name} ${text}`.toLocaleLowerCase('tr-TR');
   if (/hesap[-_ ]?hareket|hesap[-_ ]?ozeti/.test(s)) return 'ACCOUNT_STATEMENT';
-  if (/nakit avans|kk1|kredi kart/.test(s)) return 'CREDIT_CARD';
-  if (/havale|hvl/.test(s)) return 'HAVALE';
-  if (/fast/.test(s)) return 'FAST';
+  if (/giden\s+fast|fast\s+(mesaj|sorgu|islem|ucreti)|hesaptan\s+fast|\bfast\b/.test(s)) return 'FAST';
   if (/eft/.test(s)) return 'EFT';
+  if (/havale|hvl/.test(s)) return 'HAVALE';
+  if (/nakit avans|kk1|kredi kart/.test(s)) return 'CREDIT_CARD';
   if (/e[- ]?dekont|dekont/.test(s)) return 'DEKONT';
   return 'UNKNOWN';
 }
