@@ -4,7 +4,7 @@ import path from 'path';
 import { createRequire } from 'module';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { pathToFileURL } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { extractMathematicalFingerprint, buildBaseline, inferDocumentFamily } from './api/mathematical_forensics_v1.6.3.js';
 
 const execFileAsync = promisify(execFile);
@@ -26,7 +26,7 @@ async function loadPdfJs() {
   return pdfjsPromise;
 }
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname));
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
 const REFS = path.join(ROOT, 'references');
 const NEG = path.join(ROOT, 'negative_samples');
 const OUT = path.join(ROOT, 'mathematical_forensics_baseline.json');
@@ -41,7 +41,15 @@ function inferBank(p) {
   for (const [needle, bank] of bankAliases) if (s.includes(needle)) return bank;
   return path.basename(path.dirname(p)).toLocaleLowerCase('tr-TR').replace(/[^a-z0-9]/g,'') || 'unknown';
 }
-function inferFamilyFromPath(p) { return inferDocumentFamily(path.basename(p), ''); }
+function inferFamilyFromPath(p, bank) {
+  const base = path.basename(p);
+  const inferred = inferDocumentFamily(base, '', bank);
+  if (inferred === 'ACCOUNT_STATEMENT') return inferred;
+  // The current Garanti reference and known-negative populations are the
+  // FAST receipt family, but most filenames do not encode that label.
+  if (bank === 'garanti') return 'FAST';
+  return inferred;
+}
 
 async function walk(dir) {
   const out = [];
@@ -62,7 +70,11 @@ async function renderPdfFirstPage(buf) {
     try {
       // Fixed-resolution Poppler rendering avoids local pdfjs/canvas version
       // differences and stays close to the runtime's approximately 1.6x raster.
-      await execFileAsync('pdftoppm', ['-f', '1', '-l', '1', '-r', '120', '-png', '-singlefile', input, output], { timeout:30000, maxBuffer:8 * 1024 * 1024 });
+      await execFileAsync('pdftoppm', ['-f', '1', '-l', '1', '-r', '120', '-png', '-singlefile', input, output], {
+        timeout:60000,
+        maxBuffer:64 * 1024 * 1024,
+        env:{...process.env, XDG_CACHE_HOME:os.tmpdir()},
+      });
       return await fs.readFile(`${output}.png`);
     } catch (popplerError) {
       if (popplerError?.code !== 'ENOENT') throw popplerError;
@@ -98,7 +110,7 @@ async function addFiles(files, label) {
     if (!['.jpg','.jpeg','.png','.pdf'].includes(ext)) continue;
     try {
       const bank = inferBank(file);
-      const family = inferFamilyFromPath(file);
+      const family = inferFamilyFromPath(file, bank);
       const { fingerprint, renderedFromPdf } = await fingerprintFile(file);
       samples.push({
         id: `${label}:${path.relative(ROOT,file).replaceAll(path.sep,'/')}`,
