@@ -735,9 +735,13 @@ export function compareAgainstBaseline(fingerprint, baseline, bank, family='unkn
   return { available:Boolean(best), bank, requestedFamily:family, bestMatch:best, candidates:comparisons.slice(0,8), profileCount:candidates.length };
 }
 
-export function inferDocumentFamily(name='', text='') {
+export function inferDocumentFamily(name='', text='', bank='') {
   const s = `${name} ${text}`.toLocaleLowerCase('tr-TR');
   if (/hesap[-_ ]?hareket|hesap[-_ ]?ozeti/.test(s)) return 'ACCOUNT_STATEMENT';
+  // Enpara references are generic bank receipt templates. FAST/EFT wording
+  // describes the payment rail inside the receipt, not a separate Enpara
+  // document family. Keep target and baseline family assignment consistent.
+  if (String(bank || '').toLocaleLowerCase('tr-TR').replace(/[^a-z]/g, '') === 'enpara') return 'DEKONT';
   if (/giden\s+fast|fast\s+(mesaj|sorgu|islem|ucreti)|hesaptan\s+fast|\bfast\b/.test(s)) return 'FAST';
   if (/eft/.test(s)) return 'EFT';
   if (/havale|hvl/.test(s)) return 'HAVALE';
