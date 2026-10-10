@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-10T02:44:17.974Z",
+  "generatedAt": "2026-10-10T12:42:51.898Z",
   "algorithm": "VerifyDoc Mathematical Forensics V1",
   "reference": {
     "version": "MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE",
@@ -344,183 +344,6 @@
           {
             "id": "reference:references/jpg/akbank3.jpg",
             "source": "references/jpg/akbank3.jpg",
-            "sourceFormat": "jpeg"
-          }
-        ]
-      },
-      "denizbank::UNKNOWN": {
-        "bank": "denizbank",
-        "family": "UNKNOWN",
-        "sampleCount": 5,
-        "sourceFormats": [
-          "png",
-          "jpeg"
-        ],
-        "featureStats": {
-          "luminanceMean": {
-            "mean": 248.37855529785156,
-            "std": 2.02260629151403,
-            "median": 248.83303833007812,
-            "mad": 2.4674530029296875,
-            "min": 245.9669189453125,
-            "max": 251.48146057128906
-          },
-          "luminanceStd": {
-            "mean": 19.727481383726147,
-            "std": 5.696518949372043,
-            "median": 17.79102885682603,
-            "mad": 4.456309126606504,
-            "min": 13.334719730219527,
-            "max": 26.59307187148167
-          },
-          "entropy": {
-            "mean": 2.456472413169949,
-            "std": 0.4041053546001248,
-            "median": 2.697833859600488,
-            "mad": 0.13803044482947824,
-            "min": 1.7877630832705453,
-            "max": 2.835864304429966
-          },
-          "edgeDensity": {
-            "mean": 0.06428792857585715,
-            "std": 0.020346497196769196,
-            "median": 0.07356314712629425,
-            "mad": 0.011144522289044584,
-            "min": 0.03884307768615537,
-            "max": 0.08470766941533883
-          },
-          "meanGradient": {
-            "mean": 3.4065211123473715,
-            "std": 1.053110505898914,
-            "median": 4.149723027007949,
-            "mad": 0.23196808261550395,
-            "min": 2.016189478892277,
-            "max": 4.3816911096234525
-          },
-          "laplacianVariance": {
-            "mean": 763.1467634312618,
-            "std": 183.74707107761967,
-            "median": 840.9839264656907,
-            "mad": 128.84442619101458,
-            "min": 538.7671895334181,
-            "max": 969.8283526567053
-          },
-          "darkPixelRatio": {
-            "mean": 0.002301025390625,
-            "std": 0.002626274758711997,
-            "median": 0.000213623046875,
-            "mad": 0.0001068115234375,
-            "min": 0.0001068115234375,
-            "max": 0.0056304931640625
-          },
-          "brightPixelRatio": {
-            "mean": 0.90494384765625,
-            "std": 0.03574778429622824,
-            "median": 0.9015655517578125,
-            "mad": 0.0140228271484375,
-            "min": 0.849456787109375,
-            "max": 0.9608612060546875
-          },
-          "dctLowEnergy": {
-            "mean": 7467.182053702915,
-            "std": 3273.533676699302,
-            "median": 6473.684498785019,
-            "mad": 2700.74734407072,
-            "min": 3772.937154714299,
-            "max": 11490.591511280016
-          },
-          "dctMidEnergy": {
-            "mean": 3627.9374803771507,
-            "std": 996.4883824926422,
-            "median": 4090.6600380769296,
-            "mad": 540.4510423402035,
-            "min": 2167.607546296098,
-            "max": 4631.111080417133
-          },
-          "dctHighEnergy": {
-            "mean": 1845.6295381855573,
-            "std": 505.1525696380851,
-            "median": 1932.4085148958627,
-            "mad": 363.78431515835723,
-            "min": 1029.037034266445,
-            "max": 2443.8219155610627
-          },
-          "dctHighRatio": {
-            "mean": 0.14812340175132824,
-            "std": 0.024102179629836504,
-            "median": 0.13666951771591826,
-            "mad": 0.013995317511818525,
-            "min": 0.12267420020409973,
-            "max": 0.19179356377570408
-          },
-          "blockinessHorizontal": {
-            "mean": 0.9342635835188974,
-            "std": 0.10502439902085957,
-            "median": 0.939410745507161,
-            "mad": 0.0449824266291986,
-            "min": 0.7522166179984072,
-            "max": 1.073261889781078
-          },
-          "blockinessVertical": {
-            "mean": 1.1740366549973065,
-            "std": 0.23759040435701848,
-            "median": 1.183728713935296,
-            "mad": 0.2236891747690426,
-            "min": 0.8628615492245295,
-            "max": 1.4895151729149305
-          }
-        },
-        "jpeg": {
-          "sampleCount": 4,
-          "estimatedQuality": {
-            "mean": 75.375,
-            "std": 2.301494079940246,
-            "median": 75.5,
-            "mad": 1.5,
-            "min": 72,
-            "max": 78.5
-          },
-          "quantizationMean": {
-            "mean": 28.8578125,
-            "std": 14.666667739405737,
-            "median": 36.234375,
-            "mad": 3.828125,
-            "min": 0,
-            "max": 40.0625
-          },
-          "quantizationStd": {
-            "mean": 12.299335040204049,
-            "std": 6.250562727135816,
-            "median": 15.42205678280828,
-            "mad": 1.6714882984965804,
-            "min": 0,
-            "max": 17.09354508130486
-          }
-        },
-        "samples": [
-          {
-            "id": "reference:references/denizbank.pdf",
-            "source": "references/denizbank.pdf",
-            "sourceFormat": "png"
-          },
-          {
-            "id": "reference:references/jpg/denizbank.jpg",
-            "source": "references/jpg/denizbank.jpg",
-            "sourceFormat": "jpeg"
-          },
-          {
-            "id": "reference:references/jpg/denizbank2.jpg",
-            "source": "references/jpg/denizbank2.jpg",
-            "sourceFormat": "jpeg"
-          },
-          {
-            "id": "reference:references/jpg/denizbank3.jpg",
-            "source": "references/jpg/denizbank3.jpg",
-            "sourceFormat": "jpeg"
-          },
-          {
-            "id": "reference:references/jpg/denizbank4.jpg",
-            "source": "references/jpg/denizbank4.jpg",
             "sourceFormat": "jpeg"
           }
         ]
@@ -4963,6 +4786,183 @@
             "sourceFormat": "png"
           }
         ]
+      },
+      "denizbank::FAST": {
+        "bank": "denizbank",
+        "family": "FAST",
+        "sampleCount": 5,
+        "sourceFormats": [
+          "png",
+          "jpeg"
+        ],
+        "featureStats": {
+          "luminanceMean": {
+            "mean": 248.37855529785156,
+            "std": 2.02260629151403,
+            "median": 248.83303833007812,
+            "mad": 2.4674530029296875,
+            "min": 245.9669189453125,
+            "max": 251.48146057128906
+          },
+          "luminanceStd": {
+            "mean": 19.727481383726147,
+            "std": 5.696518949372043,
+            "median": 17.79102885682603,
+            "mad": 4.456309126606504,
+            "min": 13.334719730219527,
+            "max": 26.59307187148167
+          },
+          "entropy": {
+            "mean": 2.456472413169949,
+            "std": 0.4041053546001248,
+            "median": 2.697833859600488,
+            "mad": 0.13803044482947824,
+            "min": 1.7877630832705453,
+            "max": 2.835864304429966
+          },
+          "edgeDensity": {
+            "mean": 0.06428792857585715,
+            "std": 0.020346497196769196,
+            "median": 0.07356314712629425,
+            "mad": 0.011144522289044584,
+            "min": 0.03884307768615537,
+            "max": 0.08470766941533883
+          },
+          "meanGradient": {
+            "mean": 3.4065211123473715,
+            "std": 1.053110505898914,
+            "median": 4.149723027007949,
+            "mad": 0.23196808261550395,
+            "min": 2.016189478892277,
+            "max": 4.3816911096234525
+          },
+          "laplacianVariance": {
+            "mean": 763.1467634312618,
+            "std": 183.74707107761967,
+            "median": 840.9839264656907,
+            "mad": 128.84442619101458,
+            "min": 538.7671895334181,
+            "max": 969.8283526567053
+          },
+          "darkPixelRatio": {
+            "mean": 0.002301025390625,
+            "std": 0.002626274758711997,
+            "median": 0.000213623046875,
+            "mad": 0.0001068115234375,
+            "min": 0.0001068115234375,
+            "max": 0.0056304931640625
+          },
+          "brightPixelRatio": {
+            "mean": 0.90494384765625,
+            "std": 0.03574778429622824,
+            "median": 0.9015655517578125,
+            "mad": 0.0140228271484375,
+            "min": 0.849456787109375,
+            "max": 0.9608612060546875
+          },
+          "dctLowEnergy": {
+            "mean": 7467.182053702915,
+            "std": 3273.533676699302,
+            "median": 6473.684498785019,
+            "mad": 2700.74734407072,
+            "min": 3772.937154714299,
+            "max": 11490.591511280016
+          },
+          "dctMidEnergy": {
+            "mean": 3627.9374803771507,
+            "std": 996.4883824926422,
+            "median": 4090.6600380769296,
+            "mad": 540.4510423402035,
+            "min": 2167.607546296098,
+            "max": 4631.111080417133
+          },
+          "dctHighEnergy": {
+            "mean": 1845.6295381855573,
+            "std": 505.1525696380851,
+            "median": 1932.4085148958627,
+            "mad": 363.78431515835723,
+            "min": 1029.037034266445,
+            "max": 2443.8219155610627
+          },
+          "dctHighRatio": {
+            "mean": 0.14812340175132824,
+            "std": 0.024102179629836504,
+            "median": 0.13666951771591826,
+            "mad": 0.013995317511818525,
+            "min": 0.12267420020409973,
+            "max": 0.19179356377570408
+          },
+          "blockinessHorizontal": {
+            "mean": 0.9342635835188974,
+            "std": 0.10502439902085957,
+            "median": 0.939410745507161,
+            "mad": 0.0449824266291986,
+            "min": 0.7522166179984072,
+            "max": 1.073261889781078
+          },
+          "blockinessVertical": {
+            "mean": 1.1740366549973065,
+            "std": 0.23759040435701848,
+            "median": 1.183728713935296,
+            "mad": 0.2236891747690426,
+            "min": 0.8628615492245295,
+            "max": 1.4895151729149305
+          }
+        },
+        "jpeg": {
+          "sampleCount": 4,
+          "estimatedQuality": {
+            "mean": 75.375,
+            "std": 2.301494079940246,
+            "median": 75.5,
+            "mad": 1.5,
+            "min": 72,
+            "max": 78.5
+          },
+          "quantizationMean": {
+            "mean": 28.8578125,
+            "std": 14.666667739405737,
+            "median": 36.234375,
+            "mad": 3.828125,
+            "min": 0,
+            "max": 40.0625
+          },
+          "quantizationStd": {
+            "mean": 12.299335040204049,
+            "std": 6.250562727135816,
+            "median": 15.42205678280828,
+            "mad": 1.6714882984965804,
+            "min": 0,
+            "max": 17.09354508130486
+          }
+        },
+        "samples": [
+          {
+            "id": "reference:references/denizbank.pdf",
+            "source": "references/denizbank.pdf",
+            "sourceFormat": "png"
+          },
+          {
+            "id": "reference:references/jpg/denizbank.jpg",
+            "source": "references/jpg/denizbank.jpg",
+            "sourceFormat": "jpeg"
+          },
+          {
+            "id": "reference:references/jpg/denizbank2.jpg",
+            "source": "references/jpg/denizbank2.jpg",
+            "sourceFormat": "jpeg"
+          },
+          {
+            "id": "reference:references/jpg/denizbank3.jpg",
+            "source": "references/jpg/denizbank3.jpg",
+            "sourceFormat": "jpeg"
+          },
+          {
+            "id": "reference:references/jpg/denizbank4.jpg",
+            "source": "references/jpg/denizbank4.jpg",
+            "sourceFormat": "jpeg"
+          }
+        ]
       }
     }
   },
@@ -6291,7 +6291,7 @@
       "id": "reference:references/denizbank.pdf",
       "label": "reference",
       "bank": "denizbank",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/denizbank.pdf",
       "renderedFromPdf": true
     },
@@ -6443,7 +6443,7 @@
       "id": "reference:references/jpg/denizbank.jpg",
       "label": "reference",
       "bank": "denizbank",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/denizbank.jpg",
       "renderedFromPdf": false
     },
@@ -6451,7 +6451,7 @@
       "id": "reference:references/jpg/denizbank2.jpg",
       "label": "reference",
       "bank": "denizbank",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/denizbank2.jpg",
       "renderedFromPdf": false
     },
@@ -6459,7 +6459,7 @@
       "id": "reference:references/jpg/denizbank3.jpg",
       "label": "reference",
       "bank": "denizbank",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/denizbank3.jpg",
       "renderedFromPdf": false
     },
@@ -6467,7 +6467,7 @@
       "id": "reference:references/jpg/denizbank4.jpg",
       "label": "reference",
       "bank": "denizbank",
-      "family": "UNKNOWN",
+      "family": "FAST",
       "source": "references/jpg/denizbank4.jpg",
       "renderedFromPdf": false
     },
