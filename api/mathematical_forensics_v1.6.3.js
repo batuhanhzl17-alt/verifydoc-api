@@ -738,6 +738,10 @@ export function compareAgainstBaseline(fingerprint, baseline, bank, family='unkn
 export function inferDocumentFamily(name='', text='', bank='') {
   const s = `${name} ${text}`.toLocaleLowerCase('tr-TR');
   if (/hesap[-_ ]?hareket|hesap[-_ ]?ozeti/.test(s)) return 'ACCOUNT_STATEMENT';
+  // Garanti payment receipts share the same printed receipt template across
+  // FAST, EFT and account-to-account transfers. Compare those together while
+  // keeping account statements as their own family.
+  if (String(bank || '').toLocaleLowerCase('tr-TR').replace(/[^a-z]/g, '') === 'garanti') return 'DEKONT';
   // Enpara references are generic bank receipt templates. FAST/EFT wording
   // describes the payment rail inside the receipt, not a separate Enpara
   // document family. Keep target and baseline family assignment consistent.
