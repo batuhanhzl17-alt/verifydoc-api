@@ -45,11 +45,10 @@ function inferFamilyFromPath(p, bank) {
   const base = path.basename(p);
   const inferred = inferDocumentFamily(base, '', bank);
   if (inferred === 'ACCOUNT_STATEMENT') return inferred;
-  // The current Garanti and DenizBank reference populations (and any
-  // matching-bank negatives) are FAST receipts, but filenames usually do not
-  // encode that label.
-  // Account-statement files are identified above and remain a separate family.
-  if (bank === 'garanti' || bank === 'denizbank') return 'FAST';
+  // Garanti transfer rails share one receipt layout; preserve statements as
+  // a separate family. DenizBank's supplied receipt corpus is FAST.
+  if (bank === 'garanti') return 'DEKONT';
+  if (bank === 'denizbank') return 'FAST';
   return inferred;
 }
 
