@@ -1563,7 +1563,7 @@ function measureZiraatAmountSpacing(layout, bank, imageWidth) {
 
 // Garanti: median grayscale of amount ink versus light pixels in the same
 // amount ROI and its immediate margin. Luminance difference is 0..255.
-async function measureGarantiAmountContrast(imagePath, region) {
+async function measureGarantiAmountContrast(imagePath, region, amountText = '') {
   if(!imagePath||!region)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
   try{
     const meta=await sharp(imagePath).metadata(),pw=Number(meta.width)||0,ph=Number(meta.height)||0;
@@ -1575,11 +1575,33 @@ async function measureGarantiAmountContrast(imagePath, region) {
     if(width<3||height<3)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
     const {data}=await sharp(imagePath).extract({left,top,width,height}).grayscale().raw().toBuffer({resolveWithObject:true});
     const ink=[],background=[];
-    for(const gray of data){if(gray<=160)ink.push(gray);else if(gray>=200)background.push(gray);}
-    if(ink.length<4||background.length<12)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
+    const maskWidth=width,maskHeight=height,visited=new Uint8Array(maskWidth*maskHeight),components=[];
+    const threshold=160;
+    for(let sy=0;sy<maskHeight;sy++)for(let sx=0;sx<maskWidth;sx++){
+      const start=sy*maskWidth+sx;
+      if(visited[start]||data[start]>threshold)continue;
+      visited[start]=1;const stack=[start];let minX=sx,maxX=sx,minY=sy,maxY=sy,pixels=[];
+      while(stack.length){const idx=stack.pop(),x=idx%maskWidth,y=Math.floor(idx/maskWidth);pixels.push(idx);if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
+        for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){if(!dx&&!dy)continue;const nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=maskWidth||ny>=maskHeight)continue;const ni=ny*maskWidth+nx;if(!visited[ni]&&data[ni]<=threshold){visited[ni]=1;stack.push(ni);}}
+      }
+      const box={minX,maxX,minY,maxY,height:maxY-minY+1};
+      // Restrict candidates to character-sized components inside the OCR
+      // amount box. Decimal punctuation and the minus sign are too short.
+      const amountTop=Math.max(0,Math.floor(y1-top)),amountBottom=Math.min(height,Math.ceil(y2-top));
+      if(box.height>=Math.max(3,(amountBottom-amountTop)*0.42)&&maxX+left>=x1&&minX+left<x2&&maxY+top>=y1&&minY+top<y2)components.push({box,pixels});
+    }
+    components.sort((a,b)=>a.box.minX-b.box.minX);
+    const digitCount=(String(amountText).match(/\d/g)||[]).length;
+    const digitComponents=digitCount>0?components.slice(0,digitCount):components;
+    for(const component of digitComponents)for(const idx of component.pixels){const gray=data[idx];if(gray<=200)ink.push(gray);}
+    // Background is sampled from the amount box plus its immediate margin.
+    for(let yy=0;yy<height;yy++)for(let xx=0;xx<width;xx++){
+      const gray=data[yy*width+xx];if(gray>=200)background.push(gray);
+    }
+    if(ink.length<4||background.length<12||!digitComponents.length)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
     const median=values=>{values.sort((a,b)=>a-b);return values[Math.floor(values.length/2)];};
     const inkMedianGray=median(ink),backgroundMedianGray=median(background),contrast=backgroundMedianGray-inkMedianGray;
-    return{available:true,inkMedianGray,backgroundMedianGray,contrast,threshold:100,warning:contrast>100,status:contrast>100?'GARANTI_AMOUNT_CONTRAST_HIGH':'NORMAL',method:'same-amount-box median light-background gray minus amount-ink median gray; grayscale 0-255',sampleCounts:{ink:ink.length,background:background.length}};
+    return{available:true,inkMedianGray,backgroundMedianGray,contrast,threshold:115,warning:contrast>115,status:contrast>115?'GARANTI_AMOUNT_CONTRAST_HIGH':'NORMAL',method:'median grayscale of digit glyph pixels minus median light background in same amount ROI and immediate margin; punctuation, sign and currency glyphs excluded; grayscale 0-255',sampleCounts:{digitInk:ink.length,background:background.length,digitComponents:digitComponents.length}};
   }catch(error){console.warn('GARANTI TUTAR KONTRAST ÖLÇÜMÜ ATLANDI:',error?.message||error);return{available:false,status:'MEASUREMENT_UNAVAILABLE'};}
 }
 
@@ -17920,7 +17942,7 @@ if(ziraatAmountSpacing.available){
 }
 
 let garantiAmountContrast={available:false,status:'MEASUREMENT_UNAVAILABLE'};
-if(String(bank||'').toLowerCase().includes('garanti')) garantiAmountContrast=await measureGarantiAmountContrast(forensicTargetPath,amountForensics?.region);
+if(String(bank||'').toLowerCase().includes('garanti')) garantiAmountContrast=await measureGarantiAmountContrast(forensicTargetPath,amountForensics?.region,amountForensics?.selectedAmountText||amountForensics?.amountText||'');
 if(String(bank||'').toLowerCase().includes('garanti')) {
   result.garantiAmountContrast=garantiAmountContrast;
   console.log('GARANTI AMOUNT CONTRAST MEASUREMENT:', JSON.stringify(garantiAmountContrast));
@@ -17928,7 +17950,7 @@ if(String(bank||'').toLowerCase().includes('garanti')) {
 if(garantiAmountContrast.available){
   if(garantiAmountContrast.warning&&result?.checks){
     const existing=result.checks.amountConsistency||{};
-    const evidence=`Garanti tutar kontrastı ${Number(garantiAmountContrast.contrast).toFixed(1)}/255 (zemin medyanı ${garantiAmountContrast.backgroundMedianGray}, rakam medyanı ${garantiAmountContrast.inkMedianGray}); uyarı eşiği >100.`;
+    const evidence=`Garanti tutar rakam kontrastı ${Number(garantiAmountContrast.contrast).toFixed(1)}/255 (zemin medyanı ${garantiAmountContrast.backgroundMedianGray}, rakam medyanı ${garantiAmountContrast.inkMedianGray}); uyarı eşiği >115.`;
     result.checks.amountConsistency={...existing,status:'warning',score:Math.max(Number(existing.score)||0,25),evidence:[String(existing.evidence||'').trim(),evidence].filter(Boolean).join(' ')};
   }
 }
