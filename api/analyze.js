@@ -1449,6 +1449,173 @@ function normalizeAzureLayoutResult(payload) {
   };
 }
 
+// Enpara-specific vertical spacing rule. Measure the OCR line-box gap between the
+// "Para Cinsi Tutar" header row and the first amount/currency row beneath it,
+// then normalize against the page height (1000 units). This is diagnostic
+// evidence only; missing or ambiguous OCR geometry must not create a warning.
+function measureEnparaAmountVerticalGap(layout, bank) {
+  if (!layout?.available || !String(bank || '').toLowerCase().includes('enpara')) {
+    return { available: false, warning: false, status: 'MEASUREMENT_UNAVAILABLE' };
+  }
+  const pages = new Map((layout.pages || []).map((p) => [Number(p.pageNumber) || 1, p]));
+  const lines = Array.isArray(layout.lines) ? layout.lines : [];
+  const normalize = (value) => String(value || '').toLocaleLowerCase('tr-TR').replace(/[^a-z0-9çğıöşü]/gi, '');
+  const headers = lines.filter((line) => normalize(line.text).includes('paracinsitutar'));
+  const amountPattern = /(?:^|\s)(?:\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2}))(?:\s|$)/;
+  const currencyPattern = /(?:^|\s)(?:TL|TRY)(?:\s|$)/i;
+  const candidates = [];
+
+  for (const header of headers) {
+    const headerBox = header.box;
+    const page = pages.get(Number(header.pageNumber) || 1);
+    const pageHeight = Number(page?.height) || 0;
+    if (!headerBox || !pageHeight) continue;
+    const below = lines.filter((line) => {
+      if ((Number(line.pageNumber) || 1) !== (Number(header.pageNumber) || 1) || !line.box) return false;
+      if (Number(line.box.y1) < Number(headerBox.y2)) return false;
+      const text = String(line.text || '');
+      return amountPattern.test(text) && currencyPattern.test(text);
+    }).sort((a, b) => Number(a.box.y1) - Number(b.box.y1));
+    const value = below[0];
+    if (!value) continue;
+    const gapPx = Math.max(0, Number(value.box.y1) - Number(headerBox.y2));
+    const normalizedDistance = (gapPx / pageHeight) * 1000;
+    if (!Number.isFinite(normalizedDistance)) continue;
+    candidates.push({
+      pageNumber: Number(header.pageNumber) || 1,
+      headerText: String(header.text || ''),
+      valueText: String(value.text || ''),
+      gapPx,
+      pageHeight,
+      normalizedDistance,
+    });
+  }
+
+  if (!candidates.length) {
+    return { available: false, warning: false, status: 'MEASUREMENT_UNAVAILABLE' };
+  }
+  candidates.sort((a, b) => a.pageNumber - b.pageNumber);
+  const measurement = candidates[0];
+  return {
+    available: true,
+    ...measurement,
+    threshold: 28.5,
+    warning: measurement.normalizedDistance < 28.5,
+    status: measurement.normalizedDistance < 28.5
+      ? 'ENPARA_VERTICAL_DISTANCE_LOW'
+      : 'NORMAL',
+  };
+}
+
+function measureZiraatAmountSpacing(layout, bank, imageWidth) {
+  if (!layout?.available || !String(bank || '').toLowerCase().includes('ziraat') || !(imageWidth > 0)) {
+    return { available: false, warning: false, status: 'MEASUREMENT_UNAVAILABLE' };
+  }
+  const pages = new Map((layout.pages || []).map((page) => [Number(page.pageNumber) || 1, page]));
+  const words = Array.isArray(layout.words) ? layout.words : [];
+  const amountRe = /^-?\d[\d.,]*$/;
+  const currencyRe = /^(?:TL|TRY|₺)$/i;
+  const measurements = [];
+  for (const amount of words.filter((word) => amountRe.test(String(word.text || '').trim()))) {
+    const pageNo = Number(amount.pageNumber) || 1;
+    const page = pages.get(pageNo);
+    const pageWidth = Number(page?.width) || 0;
+    if (!pageWidth || !amount.box) continue;
+    const scaleX = imageWidth / pageWidth;
+    const samePage = words.filter((word) => (Number(word.pageNumber) || 1) === pageNo && word.box);
+    const amountCenterY = (Number(amount.box.y1) + Number(amount.box.y2)) / 2;
+    const amountHeight = Math.max(1, Number(amount.box.y2) - Number(amount.box.y1));
+    const aligned = (word) => {
+      const cy = (Number(word.box.y1) + Number(word.box.y2)) / 2;
+      const h = Math.max(1, Number(word.box.y2) - Number(word.box.y1));
+      return Math.abs(cy - amountCenterY) <= Math.max(amountHeight, h) * 0.65;
+    };
+    const currency = samePage.filter((word) => currencyRe.test(String(word.text || '').trim()) && aligned(word) && Number(word.box.x1) >= Number(amount.box.x2))
+      .sort((a, b) => Number(a.box.x1) - Number(b.box.x1))[0];
+    if (!currency) continue;
+    const leftWords = samePage.filter((word) => aligned(word) && Number(word.box.x2) <= Number(amount.box.x1))
+      .sort((a, b) => Number(b.box.x2) - Number(a.box.x2));
+    let colonRight = null;
+    let amountLabelFound = false;
+    for (let leftIndex = 0; leftIndex < leftWords.length; leftIndex++) {
+      const word = leftWords[leftIndex];
+      const text = String(word.text || '').trim();
+      if (text === ':' || /:$/.test(text)) {
+        const labelText = leftWords.slice(leftIndex + 1, leftIndex + 4).map((item) => String(item.text || '')).join(' ');
+        if (/tutar[ıi]?/i.test(labelText) || /tutar[ıi]?:$/i.test(text)) {
+          colonRight = Number(word.box.x2);
+          amountLabelFound = true;
+        }
+        break;
+      }
+      if (leftIndex > 2) break;
+    }
+    if (!amountLabelFound || !Number.isFinite(colonRight)) continue;
+    const colonToAmountPx = (Number(amount.box.x1) - colonRight) * scaleX;
+    const amountToTryPx = (Number(currency.box.x1) - Number(amount.box.x2)) * scaleX;
+    if (!Number.isFinite(colonToAmountPx) || !Number.isFinite(amountToTryPx)) continue;
+    measurements.push({
+      amountText: String(amount.text || ''),
+      currencyText: String(currency.text || ''),
+      colonToAmountPx,
+      amountToTryPx,
+      warning: colonToAmountPx < 2 && amountToTryPx > 7,
+      pageNumber: pageNo,
+    });
+  }
+  if (!measurements.length) return { available: false, warning: false, status: 'MEASUREMENT_UNAVAILABLE' };
+  const measurement = measurements.sort((a, b) => a.pageNumber - b.pageNumber)[0];
+  return { available: true, ...measurement, status: measurement.warning ? 'ZIRAAT_AMOUNT_SPACING' : 'NORMAL' };
+}
+
+async function measureGarantiAmountContrast(imagePath, region) {
+  if (!imagePath || !region) return { available: false, status: 'MEASUREMENT_UNAVAILABLE' };
+  try {
+    const meta = await sharp(imagePath).metadata();
+    const pageWidth = Number(meta.width) || 0, pageHeight = Number(meta.height) || 0;
+    if (!pageWidth || !pageHeight) return { available: false, status: 'MEASUREMENT_UNAVAILABLE' };
+    const rx1 = Number(region.x1), ry1 = Number(region.y1), rx2 = Number(region.x2), ry2 = Number(region.y2);
+    if (![rx1, ry1, rx2, ry2].every(Number.isFinite) || rx2 <= rx1 || ry2 <= ry1) {
+      return { available: false, status: 'MEASUREMENT_UNAVAILABLE' };
+    }
+    // Keep the sampling area local to the amount box while adding a small
+    // surrounding margin so its light background has enough pixels to estimate.
+    const mx = Math.max(2, Math.round((rx2 - rx1) * 0.12));
+    const my = Math.max(2, Math.round((ry2 - ry1) * 0.22));
+    const left = Math.max(0, Math.floor(rx1 - mx)), top = Math.max(0, Math.floor(ry1 - my));
+    const width = Math.min(pageWidth - left, Math.ceil(rx2 - rx1 + mx * 2));
+    const height = Math.min(pageHeight - top, Math.ceil(ry2 - ry1 + my * 2));
+    if (width < 3 || height < 3) return { available: false, status: 'MEASUREMENT_UNAVAILABLE' };
+    const { data } = await sharp(imagePath).extract({ left, top, width, height }).grayscale().raw().toBuffer({ resolveWithObject: true });
+    const ink = [], background = [];
+    for (const value of data) {
+      if (value <= 160) ink.push(value);
+      else if (value >= 200) background.push(value);
+    }
+    if (ink.length < 4 || background.length < 12) return { available: false, status: 'MEASUREMENT_UNAVAILABLE' };
+    const median = (values) => {
+      values.sort((a, b) => a - b);
+      return values[Math.floor(values.length / 2)];
+    };
+    const inkMedian = median(ink), backgroundMedian = median(background);
+    const contrast = backgroundMedian - inkMedian;
+    return {
+      available: true,
+      inkMedianGray: inkMedian,
+      backgroundMedianGray: backgroundMedian,
+      contrast,
+      threshold: 100,
+      warning: contrast > 100,
+      status: contrast > 100 ? 'GARANTI_AMOUNT_CONTRAST_HIGH' : 'NORMAL',
+      method: 'median-light-background-minus-median-amount-ink; grayscale 0-255',
+      sampleCounts: { ink: ink.length, background: background.length },
+    };
+  } catch (error) {
+    console.warn('GARANTI TUTAR KONTRAST ÖLÇÜMÜ ATLANDI:', error?.message || error);
+    return { available: false, status: 'MEASUREMENT_UNAVAILABLE' };
+  }
+}
+
 async function runAzureDocumentLayout(filePath) {
   const cfg = getAzureDocumentIntelligenceConfig();
   if (!cfg) {
@@ -9729,6 +9896,8 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             valueSharedCharacters:Array.isArray(sameValueGlyph?.sharedCharacters)?sameValueGlyph.sharedCharacters:[],
             valueRepeatedHighDistanceGlyphCount:Number(sameValueGlyph?.highCount)||0,
             valueRepeatedStrongDistanceGlyphCount:Number(sameValueGlyph?.strongCount)||0,
+            valueReferenceMedianFillRatio:Number.isFinite(Number(refValueChar?.medianCharacterFillRatio))?Number(refValueChar.medianCharacterFillRatio):null,
+            valueTargetMedianFillRatio:Number.isFinite(Number(tarValueChar?.medianCharacterFillRatio))?Number(tarValueChar.medianCharacterFillRatio):null,
             internalStyleFinding:internalStyleFinding?{...internalStyleFinding}:null,
             rasterNormalization:'luma-jpeg-q90-444-v15.4.3',
             labelReferenceProfile:{characterWidthToHeight:Number(refChar.characterWidthToHeight?.toFixed?.(4) ?? refChar.characterWidthToHeight),characterFillRatio:Number(refChar.characterFillRatio?.toFixed?.(4) ?? refChar.characterFillRatio),characterGapToHeight:Number(refChar.characterGapToHeight?.toFixed?.(4) ?? refChar.characterGapToHeight),diacriticCount:Number(refChar.diacriticCount||0)},
@@ -15791,6 +15960,7 @@ let multimodalReceiptEvidence = null;
 let semanticEvidenceFusion = null;
 let azureLayout = null;
 let azureReferenceGeometry = null;
+let enparaVerticalGapMeasurement = null;
 
 // PDF'yi de görüntü tabanlı forensic hattına sok.
 // OpenAI için orijinal PDF korunur; OCR/geometry/visual forensic için ilk sayfa
@@ -16089,6 +16259,7 @@ for (const pr of prepResults) {
   } else if (pr.kind === "azure") {
     azureLayout = pr.azureLayout;
     azureReferenceGeometry = pr.azureReferenceGeometry;
+    enparaVerticalGapMeasurement = measureEnparaAmountVerticalGap(azureLayout, bank);
   } else if (pr.kind === "template") {
     referenceTemplateAnalysis = pr.referenceTemplateAnalysis;
   }
@@ -17755,6 +17926,95 @@ if (multimodalReceiptEvidence) {
 // Deterministik yapısal geometri sinyali AI çıktısından bağımsızdır.
 if (layoutForensics?.available && result?.checks) {
   result.checks.layoutIntegrity = layoutForensics.check;
+}
+
+// Bank-specific user-requested measurements remain warnings, never standalone
+// fraud verdicts. The Ziraat rule requires both horizontal spacing conditions.
+let ziraatAmountSpacing = { available: false, warning: false, status: 'MEASUREMENT_UNAVAILABLE' };
+if (String(bank || '').toLowerCase().includes('ziraat')) {
+  try {
+    const targetMeta = await sharp(forensicTargetPath).metadata();
+    ziraatAmountSpacing = measureZiraatAmountSpacing(azureLayout, bank, Number(targetMeta.width) || 0);
+  } catch (error) {
+    console.warn('ZİRAAT TUTAR ARALIK ÖLÇÜMÜ ATLANDI:', error?.message || error);
+  }
+}
+if (ziraatAmountSpacing.available) {
+  result.ziraatAmountSpacing = ziraatAmountSpacing;
+  if (ziraatAmountSpacing.warning && result?.checks) {
+    const existing = result.checks.layoutIntegrity || {};
+    const evidence = `Ziraat tutar yatay aralıkları: ":"→tutar ${Number(ziraatAmountSpacing.colonToAmountPx).toFixed(2)} px (<2) ve tutar→TRY ${Number(ziraatAmountSpacing.amountToTryPx).toFixed(2)} px (>7).`;
+    result.checks.layoutIntegrity = {
+      ...existing,
+      status: 'warning',
+      score: Math.max(Number(existing.score) || 0, 25),
+      evidence: [String(existing.evidence || '').trim(), evidence].filter(Boolean).join(' '),
+    };
+  }
+}
+
+let garantiAmountContrast = { available: false, status: 'MEASUREMENT_UNAVAILABLE' };
+if (String(bank || '').toLowerCase().includes('garanti')) {
+  garantiAmountContrast = await measureGarantiAmountContrast(forensicTargetPath, amountForensics?.region);
+}
+if (garantiAmountContrast.available) {
+  result.garantiAmountContrast = garantiAmountContrast;
+  if (garantiAmountContrast.warning && result?.checks) {
+    const existing = result.checks.amountConsistency || {};
+    const evidence = `Garanti tutar kontrastı ${Number(garantiAmountContrast.contrast).toFixed(1)}/255 (açık zemin medyanı ${garantiAmountContrast.backgroundMedianGray}, tutar mürekkebi medyanı ${garantiAmountContrast.inkMedianGray}); uyarı eşiği >100.`;
+    result.checks.amountConsistency = {
+      ...existing,
+      status: 'warning',
+      score: Math.max(Number(existing.score) || 0, 25),
+      evidence: [String(existing.evidence || '').trim(), evidence].filter(Boolean).join(' '),
+    };
+  }
+}
+
+if (String(bank || '').toLowerCase().includes('denizbank')) {
+  const amountProfiles = (referenceForensics?.typographyFieldProfiles || []).filter((profile) =>
+    String(profile?.field || '').replace(/:value$/i, '') === 'amount'
+  );
+  const relativeFillRatios = amountProfiles.map((profile) => {
+    const ref = Number(profile.valueReferenceMedianFillRatio);
+    const target = Number(profile.valueTargetMedianFillRatio);
+    return Number.isFinite(ref) && ref > 0 && Number.isFinite(target) ? target / ref : null;
+  }).filter(Number.isFinite);
+  if (relativeFillRatios.length) {
+    const relativeFillRatio = rfMedian(relativeFillRatios);
+    result.denizbankAmountWeight = {
+      available: true,
+      referenceRelativeFillRatio: relativeFillRatio,
+      threshold: 0.85,
+      warning: relativeFillRatio < 0.85,
+      status: relativeFillRatio < 0.85 ? 'DENIZBANK_AMOUNT_WEIGHT_LOW' : 'NORMAL',
+      metric: 'current rfCharacterMetrics medianCharacterFillRatio; target/reference',
+    };
+    if (relativeFillRatio < 0.85 && result?.checks) {
+      const existing = result.checks.fontConsistency || {};
+      const evidence = `DenizBank tutar rakamlarının mevcut karakter doluluk metriği, referansa göre %${(relativeFillRatio * 100).toFixed(1)}; uyarı eşiği %85 altı.`;
+      result.checks.fontConsistency = {
+        ...existing,
+        status: 'warning',
+        score: Math.max(Number(existing.score) || 0, 25),
+        evidence: [String(existing.evidence || '').trim(), evidence].filter(Boolean).join(' '),
+      };
+    }
+  }
+}
+
+if (enparaVerticalGapMeasurement?.available) {
+  result.enparaVerticalDistance = enparaVerticalGapMeasurement;
+  if (enparaVerticalGapMeasurement.warning && result?.checks) {
+    const existing = result.checks.layoutIntegrity || {};
+    const warningEvidence = `Enpara dikey boşluk ölçümü: ${Number(enparaVerticalGapMeasurement.normalizedDistance).toFixed(2)}/1000; uyarı eşiği 28.5. Başlık: "${enparaVerticalGapMeasurement.headerText}"; alt satır: "${enparaVerticalGapMeasurement.valueText}".`;
+    result.checks.layoutIntegrity = {
+      ...existing,
+      status: 'warning',
+      score: Math.max(Number(existing.score) || 0, 25),
+      evidence: [String(existing.evidence || '').trim(), warningEvidence].filter(Boolean).join(' '),
+    };
+  }
 }
 
 function preserveAmount(value) {
