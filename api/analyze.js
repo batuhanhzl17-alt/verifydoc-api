@@ -203,7 +203,64 @@ function resolveMathSemanticValueBox(regions, field) {
   return best ? {text:best.value,region:best.region,score:best.score,resolver:best.resolver} : null;
 }
 
-async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, bank = null, referencePath = null } = {}) {
+function resolveTypedAmountRegionFromOcr(ocrResult) {
+  const rows=(Array.isArray(ocrResult?.regions)?ocrResult.regions:[]).filter(r=>r?.region&&[r.region.x1,r.region.y1,r.region.x2,r.region.y2].every(v=>Number.isFinite(Number(v))));
+  const norm=v=>String(v||'').toLocaleLowerCase('tr-TR').normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/ı/g,'i').replace(/[^a-z0-9]/g,'');
+  const excluded=/(masraf|komisyon|ucret|bsmv|vergi|iban|hesap|sira|fis|referans|sorgu|tarih|saat|telefon|musteri|kart)/;
+  const labels=rows.map(row=>({row,text:String(row.text||'').trim(),key:norm(row.text)})).filter(x=>x.text.length<=64&&!excluded.test(x.key)&&/(paracinsitutar|(?:islem|eft|fast|havale|transfer|odeme)?tutari?|amount|transactionamount)/.test(x.key));
+  const money=/(?:^|[^\d])[-+]?\s*(?:₺\s*)?\d{1,3}(?:[., ]\d{3})*(?:[,.]\d{2})(?:\s*(?:TL|TRY|₺))?(?:$|[^\d])/i;
+  const candidates=rows.map(row=>({row,text:String(row.text||'').trim(),match:String(row.text||'').match(money)})).filter(x=>x.match&&!excluded.test(norm(x.text)));
+  const scored=[];
+  for(const label of labels){
+    const lr=label.row.region,lh=Math.max(6,Number(lr.y2)-Number(lr.y1)),lcx=(Number(lr.x1)+Number(lr.x2))/2,lcy=(Number(lr.y1)+Number(lr.y2))/2;
+    for(const candidate of candidates){
+      const inline=candidate.row===label.row;
+      const cr=candidate.row.region,ch=Math.max(6,Number(cr.y2)-Number(cr.y1)),ccx=(Number(cr.x1)+Number(cr.x2))/2,ccy=(Number(cr.y1)+Number(cr.y2))/2;
+      const gapX=Number(cr.x1)-Number(lr.x2),gapY=Number(cr.y1)-Number(lr.y2),sameLine=Math.abs(ccy-lcy)<=Math.max(lh,ch)*1.35;
+      const right=!inline&&sameLine&&gapX>=-lh&&gapX<=Math.max(280,lh*20);
+      const below=!inline&&!sameLine&&gapY>=-lh*.25&&gapY<=Math.max(100,lh*6)&&ccx>=Number(lr.x1)-lh&&ccx<=Number(lr.x2)+Math.max(320,lh*20);
+      if(inline&&!/(?:tutar|amount)/.test(label.key))continue;
+      if(!inline&&!right&&!below)continue;
+      const valueHasCurrency=/(?:TL|TRY|₺)/i.test(candidate.text),decimal=/\d[.,]\d{2}/.test(candidate.text);
+      const score=(label.key.includes('paracinsitutar')?40:label.key.includes('islemtutar')||label.key.includes('efttutar')||label.key.includes('fasttutar')||label.key.includes('havaletutar')?32:20)+(inline?26:right?24:12)+(valueHasCurrency?8:0)+(decimal?8:0)-Math.abs(ccy-lcy)/Math.max(1,lh)*2-Math.max(0,gapX)/Math.max(1,lh)*.03;
+      scored.push({score,label,candidate,relation:inline?'inline-typed-amount':right?'same-line-right':'below-label'});
+    }
+  }
+  scored.sort((a,b)=>b.score-a.score);
+  const best=scored[0];
+  if(!best||best.score<28)return null;
+  let region=best.candidate.row.region;
+  if(best.candidate.row===best.label.row&&best.candidate.match?.index>=0){
+    const text=best.candidate.text,total=Math.max(1,text.length),start=best.candidate.match.index,end=start+best.candidate.match[0].length,w=Number(region.x2)-Number(region.x1);
+    region={...region,x1:Number(region.x1)+w*start/total,x2:Number(region.x1)+w*end/total};
+  }
+  return {region,text:best.candidate.text,label:best.label.text,score:Number(best.score.toFixed(2)),resolver:`typed-ocr-amount-${best.relation}-v1`};
+}
+
+async function measureMedianDigitFillRatio(imagePath, box, amountText='') {
+  if(!imagePath||!box)return{available:false,reason:'missing-image-or-typed-amount-box'};
+  try{
+    const meta=await sharp(imagePath).metadata(),left=Math.max(0,Math.floor(Number(box.x1))),top=Math.max(0,Math.floor(Number(box.y1))),right=Math.min(Number(meta.width)||0,Math.ceil(Number(box.x2))),bottom=Math.min(Number(meta.height)||0,Math.ceil(Number(box.y2)));
+    const width=right-left,height=bottom-top;if(width<3||height<3)return{available:false,reason:'invalid-amount-box'};
+    const {data}=await sharp(imagePath).extract({left,top,width,height}).grayscale().raw().toBuffer({resolveWithObject:true});
+    const seen=new Uint8Array(width*height),components=[];
+    for(let y=0;y<height;y++)for(let x=0;x<width;x++){
+      const start=y*width+x;if(seen[start]||data[start]>160)continue;seen[start]=1;const stack=[start];let minX=x,maxX=x,minY=y,maxY=y,area=0;
+      while(stack.length){const i=stack.pop(),cx=i%width,cy=Math.floor(i/width);area++;minX=Math.min(minX,cx);maxX=Math.max(maxX,cx);minY=Math.min(minY,cy);maxY=Math.max(maxY,cy);
+        for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){if(!dx&&!dy)continue;const nx=cx+dx,ny=cy+dy;if(nx<0||ny<0||nx>=width||ny>=height)continue;const ni=ny*width+nx;if(!seen[ni]&&data[ni]<=160){seen[ni]=1;stack.push(ni);}}
+      }
+      const ch=maxY-minY+1;if(ch>=Math.max(3,height*.42))components.push({minX,maxX,minY,maxY,area,fill:area/((maxX-minX+1)*ch)});
+    }
+    components.sort((a,b)=>a.minX-b.minX);
+    const digitCount=(String(amountText).match(/\d/g)||[]).length;
+    const selected=digitCount?components.slice(0,digitCount):components;
+    if(selected.length<2)return{available:false,reason:'too-few-digit-components',componentCount:selected.length,digitCount};
+    const ratios=selected.map(c=>c.fill).sort((a,b)=>a-b),median=ratios[Math.floor(ratios.length/2)];
+    return{available:true,medianDigitFillRatio:Number(median.toFixed(6)),digitComponentCount:selected.length,requestedDigitCount:digitCount||null,threshold:160};
+  }catch(error){return{available:false,reason:error?.message||'digit-fill-measurement-error'};}
+}
+
+async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, bank = null, fileName = '', referencePath = null } = {}) {
   const rois = {};
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
@@ -317,84 +374,51 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     !/(sirano|fisno|islemno|referans|hesapno|musterino|iban|kartno|vergino)/.test(amountFieldLabel);
   let amountReferenceBox = amountFieldIsTyped ? boxFrom(amountField).reference : null;
   let amountReferenceResolver = amountReferenceBox ? 'typed-reference-amount-field' : null;
-  if (!amountReferenceBox && bank && !/enpara/i.test(String(bank || ''))) {
+  let referenceTypedAmount = null;
+  let targetTypedAmount = resolveTypedAmountRegionFromOcr(targetOCR);
+  if (!amountReferenceBox && referencePath) {
+    try {
+      const refOcr = await runPaddleOCR(referencePath);
+      referenceTypedAmount = resolveTypedAmountRegionFromOcr(refOcr);
+      if (referenceTypedAmount) {
+        amountReferenceBox = referenceTypedAmount.region;
+        amountReferenceResolver = referenceTypedAmount.resolver;
+        console.log('MATH TYPED AMOUNT ROI RESOLVED:', JSON.stringify({bank,reference:path.basename(referencePath),label:referenceTypedAmount.label,value:referenceTypedAmount.text,box:amountReferenceBox,score:referenceTypedAmount.score,resolver:amountReferenceResolver}));
+      }
+    } catch (error) {
+      console.warn('MATH TYPED AMOUNT OCR HATASI:', error?.message || error);
+    }
+  }
+  // Geometry ensembles are only a fallback after explicit typed OCR. Reject
+  // high-spread ensembles (for example footer text mixed with a value header).
+  if (!amountReferenceBox && bank) {
     try {
       const anchor = await getReferenceAmountAnchor(bank);
-      // Trusted anchor is allowed only as a last resort, after the typed
-      // anchor builder has already rejected non-money numeric fields.
-      if (anchor && referencePath && String(anchor.source || '').includes('amount')) {
+      const spread=anchor?.spread||{};
+      const quality=anchor&&Number(spread.x||0)<=0.12&&Number(spread.y||0)<=0.08&&Number(spread.width||0)<=0.10&&Number(spread.height||0)<=0.05;
+      if (quality && referencePath && String(anchor.source || '').includes('amount')) {
         let meta;
         if (path.extname(referencePath).toLowerCase() === '.pdf') {
           const raw = await fs.readFile(referencePath);
           const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
           const rendered = await renderPdfPagePng(pdf, 1, 1.8);
           meta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
-        } else {
-          meta = await sharp(referencePath).metadata();
-        }
+        } else meta = await sharp(referencePath).metadata();
         if (meta?.width && meta?.height) {
-          amountReferenceBox = {
-            x1: Number(anchor.xNorm) * Number(meta.width),
-            y1: Number(anchor.yNorm) * Number(meta.height),
-            x2: (Number(anchor.xNorm) + Number(anchor.widthNorm)) * Number(meta.width),
-            y2: (Number(anchor.yNorm) + Number(anchor.heightNorm)) * Number(meta.height),
-          };
-          amountReferenceResolver = 'trusted-reference-amount-anchor';
+          amountReferenceBox = {x1:Number(anchor.xNorm)*Number(meta.width),y1:Number(anchor.yNorm)*Number(meta.height),x2:(Number(anchor.xNorm)+Number(anchor.widthNorm))*Number(meta.width),y2:(Number(anchor.yNorm)+Number(anchor.heightNorm))*Number(meta.height)};
+          amountReferenceResolver = 'low-spread-reference-amount-anchor';
         }
+      } else if (anchor) {
+        console.warn('MATH AMOUNT ANCHOR REJECTED:',JSON.stringify({bank,reason:'typed-ocr-unavailable-or-anchor-spread-too-high',spread}));
       }
-    } catch (error) {
-      console.warn('MATH AMOUNT ANCHOR FALLBACK HATASI:', error?.message || error);
-    }
+    } catch (error) { console.warn('MATH AMOUNT ANCHOR FALLBACK HATASI:', error?.message || error); }
   }
-  // Enpara image templates place the primary value under the table heading
-  // "Para Cinsi Tutar". Resolve only this explicit header/value relationship
-  // when older reference profiles have no typed amount box.
-  if (!amountReferenceBox && /enpara/i.test(String(bank || '')) && referencePath) {
-    try {
-      const refOcr = await runPaddleOCR(referencePath);
-      const rows = (Array.isArray(refOcr?.regions) ? refOcr.regions : [])
-        .filter(r => r?.region && [r.region.x1,r.region.y1,r.region.x2,r.region.y2].every(v => Number.isFinite(Number(v))));
-      const normalizeOcr = value => normalizeField(String(value || ''));
-      const header = rows
-        .filter(r => /paracinsitutar/.test(normalizeOcr(r.text)))
-        .sort((a,b) => Number(b.score || 0)-Number(a.score || 0))[0];
-      if (header) {
-        const hr = header.region;
-        const headerY = (Number(hr.y1)+Number(hr.y2))/2;
-        const headerX = (Number(hr.x1)+Number(hr.x2))/2;
-        const meta = await sharp(referencePath).metadata();
-        const candidates = rows.filter(r => {
-          const text = String(r.text || '').trim();
-          const digits = (text.match(/\d/g) || []).length;
-          const rr = r.region;
-          const cx = (Number(rr.x1)+Number(rr.x2))/2;
-          const cy = (Number(rr.y1)+Number(rr.y2))/2;
-          const dy = cy-headerY;
-          return digits >= 2 && /\d/.test(text) &&
-            !/(iban|sira|fis|referans|sorgu|tarih|saat|hesap|telefon)/i.test(text) &&
-            dy > 0 && dy <= Number(meta?.height || 0)*0.14 && cx >= headerX;
-        }).map(r => {
-          const rr = r.region;
-          const cx = (Number(rr.x1)+Number(rr.x2))/2;
-          const cy = (Number(rr.y1)+Number(rr.y2))/2;
-          return { row:r, score:Math.abs(cy-headerY)/Math.max(1,Number(meta?.height||1)) + Math.abs(cx-headerX)/Math.max(1,Number(meta?.width||1))*0.35 };
-        }).sort((a,b)=>a.score-b.score);
-        const best = candidates[0]?.row;
-        if (best) {
-          amountReferenceBox = best.region;
-          amountReferenceResolver = 'enpara-para-cinsi-tutar-header-value-v1';
-          console.log('MATH ENPARA TYPED AMOUNT ROI RESOLVED:', JSON.stringify({ header:header.text, value:best.text, sourceBox:amountReferenceBox, resolver:amountReferenceResolver }));
-        }
-      }
-    } catch (error) {
-      console.warn('MATH ENPARA AMOUNT ROI OCR FALLBACK HATASI:', error?.message || error);
-    }
-  }
-  const amountTargetBox = amountForensics?.region || (amountFieldIsTyped ? boxFrom(amountField).target : null);
+  const amountTargetBox = amountForensics?.available===true&&amountForensics?.region ? amountForensics.region : (amountFieldIsTyped ? boxFrom(amountField).target : targetTypedAmount?.region || null);
   if (amountTargetBox && amountReferenceBox) {
-    rois.amount = { target: amountTargetBox, reference: amountReferenceBox, source: amountForensics?.region ? 'trusted-amount-forensics+' + (amountReferenceResolver || 'typed-reference') : amountReferenceResolver };
+    rois.amount = { target: amountTargetBox, reference: amountReferenceBox, source: amountForensics?.available===true&&amountForensics?.region ? 'validated-amount-forensics+' + (amountReferenceResolver || 'typed-reference') : amountReferenceResolver, targetText:amountForensics?.selectedAmountText||targetTypedAmount?.text||null, referenceText:referenceTypedAmount?.text||null };
+    console.log('MATH AMOUNT ROI PAIR:',JSON.stringify({bank,targetText:rois.amount.targetText,referenceText:rois.amount.referenceText,targetBox:amountTargetBox,referenceBox:amountReferenceBox,source:rois.amount.source}));
   } else {
-    console.warn('MATH AMOUNT ROI SKIPPED: NO VALID TYPED REFERENCE AMOUNT BOX');
+    console.warn('MATH AMOUNT ROI SKIPPED:',JSON.stringify({bank,targetAvailable:Boolean(amountTargetBox),referenceAvailable:Boolean(amountReferenceBox),targetResolver:amountForensics?.available===true?'amount-forensics':targetTypedAmount?.resolver||null,referenceResolver:amountReferenceResolver||null}));
   }
 
   let recipientName = findField('recipientName');
@@ -489,6 +513,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
 
   let roiForensics = null;
   let semanticReferenceMeasurements = null;
+  let amountInkProfiles = null;
   let global16x16 = { available: false, reason: 'reference-unavailable' };
   if (referencePath) {
     try {
@@ -551,6 +576,18 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     } catch (error) {
       roiForensics = { available: false, status: 'roi-error', error: error?.message || String(error) };
     }
+  }
+
+  if(semanticRois.amount&&referencePath){
+    const pair=semanticRois.amount;
+    const [targetProfile,referenceProfile]=await Promise.all([
+      measureMedianDigitFillRatio(targetPath,pair.target,pair.targetText||amountForensics?.selectedAmountText||amountForensics?.amountText||''),
+      measureMedianDigitFillRatio(referencePath,pair.reference,pair.referenceText||'')
+    ]);
+    const ratio=targetProfile.available&&referenceProfile.available&&referenceProfile.medianDigitFillRatio>0
+      ?targetProfile.medianDigitFillRatio/referenceProfile.medianDigitFillRatio:null;
+    amountInkProfiles={available:Number.isFinite(ratio),target:targetProfile,reference:referenceProfile,referenceRelativeFillRatio:Number.isFinite(ratio)?Number(ratio.toFixed(6)):null,source:pair.source||'typed-amount-roi-pair'};
+    console.log('MATH TYPED AMOUNT DIGIT FILL PROFILES:',JSON.stringify(amountInkProfiles));
   }
 
   // V1.6.2.1: an unavailable baseline is NOT similarity=0.
@@ -700,6 +737,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     // reference-side recipientName / recipientIban / amount ROIs were
     // measured mathematically when their boxes were available.
     semanticReferenceMeasurements,
+    amountInkProfiles,
     roi16x16: roiForensics,
     roiSummary: {
       available: roiRows.length > 0,
@@ -1501,25 +1539,42 @@ function normalizeAzureLayoutResult(payload) {
 function measureEnparaAmountVerticalGap(layout, bank) {
   if (!layout?.available || !String(bank || '').toLowerCase().includes('enpara')) return { available:false, warning:false, status:'MEASUREMENT_UNAVAILABLE' };
   const pages = new Map((layout.pages || []).map(p => [Number(p.pageNumber) || 1, p]));
-  const lines = Array.isArray(layout.lines) ? layout.lines : [];
+  const words = Array.isArray(layout.words) ? layout.words.filter(w=>w?.box) : [];
   const normalize = value => String(value || '').toLocaleLowerCase('tr-TR').replace(/[^a-z0-9çğıöşü]/gi, '');
-  const headers = lines.filter(line => normalize(line.text).includes('paracinsitutar'));
-  const amountPattern = /(?:^|\s)(?:\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2}))(?:\s|$)/;
-  const currencyPattern = /(?:^|\s)(?:TL|TRY)(?:\s|$)/i;
+  const amountPattern = /^-?\d[\d.,]*$/;
+  const currencyPattern = /^(?:TL|TRY|₺)$/i;
+  const rows=[];
+  for(const pageNo of pages.keys()){
+    const pageWords=words.filter(w=>(Number(w.pageNumber)||1)===pageNo).sort((a,b)=>Number(a.box.y1)-Number(b.box.y1)||Number(a.box.x1)-Number(b.box.x1));
+    const clusters=[];
+    for(const word of pageWords){
+      const b=word.box,h=Math.max(1,Number(b.y2)-Number(b.y1)),cy=(Number(b.y1)+Number(b.y2))/2;
+      let row=clusters.find(r=>Math.abs(cy-r.cy)<=Math.max(h,r.height)*0.62);
+      if(!row){row={pageNumber:pageNo,words:[],cy,height:h,box:{...b}};clusters.push(row);}
+      row.words.push(word);row.cy=(row.cy*(row.words.length-1)+cy)/row.words.length;row.height=Math.max(row.height,h);
+      row.box={x1:Math.min(row.box.x1,b.x1),y1:Math.min(row.box.y1,b.y1),x2:Math.max(row.box.x2,b.x2),y2:Math.max(row.box.y2,b.y2)};
+    }
+    for(const row of clusters){row.words.sort((a,b)=>Number(a.box.x1)-Number(b.box.x1));row.text=row.words.map(w=>String(w.text||'').trim()).filter(Boolean).join(' ');rows.push(row);}
+  }
+  const headers=rows.filter(row=>normalize(row.text).includes('paracinsitutar'));
   const found = [];
   for (const header of headers) {
     const pageNo = Number(header.pageNumber) || 1, page = pages.get(pageNo), hb = header.box;
     const pageHeight = Number(page?.height) || 0;
     if (!hb || !pageHeight) continue;
-    const value = lines.filter(line => (Number(line.pageNumber) || 1) === pageNo && line.box &&
-      Number(line.box.y1) >= Number(hb.y2) && amountPattern.test(String(line.text || '')) && currencyPattern.test(String(line.text || '')))
-      .sort((a,b) => Number(a.box.y1)-Number(b.box.y1))[0];
+    const titleWord=header.words.filter(w=>/^tutar$/i.test(normalize(w.text))).sort((a,b)=>Number(b.box.x1)-Number(a.box.x1))[0];
+    const titleX=titleWord?(Number(titleWord.box.x1)+Number(titleWord.box.x2))/2:(Number(hb.x1)+Number(hb.x2))/2;
+    const value=rows.filter(row=>row.pageNumber===pageNo&&row.box.y1>=hb.y2&&row.box.y1-hb.y2<=pageHeight*.16&&
+      row.words.some(w=>amountPattern.test(String(w.text||'').trim()))&&row.words.some(w=>currencyPattern.test(String(w.text||'').trim())))
+      .map(row=>{const amountWord=row.words.find(w=>amountPattern.test(String(w.text||'').trim()));const amountX=amountWord?(Number(amountWord.box.x1)+Number(amountWord.box.x2))/2:(Number(row.box.x1)+Number(row.box.x2))/2;return{...row,amountX,columnDelta:Math.abs(amountX-titleX)/Math.max(1,Number(page.width)||1)}})
+      .filter(row=>row.amountX>=titleX-(Number(page.width)||0)*.08&&row.columnDelta<.22)
+      .sort((a,b)=>Number(a.box.y1)-Number(b.box.y1))[0];
     if (!value) continue;
     const gapPx = Math.max(0, Number(value.box.y1)-Number(hb.y2));
     const normalizedDistance = gapPx/pageHeight*1000;
-    if (Number.isFinite(normalizedDistance)) found.push({pageNumber:pageNo,headerText:String(header.text||''),valueText:String(value.text||''),gapPx,pageHeight,normalizedDistance});
+    if (Number.isFinite(normalizedDistance)) found.push({pageNumber:pageNo,headerText:String(header.text||''),valueText:String(value.text||''),headerBox:hb,valueBox:value.box,gapPx,pageHeight,normalizedDistance,matcher:'azure-word-row-header-value-currency-v2'});
   }
-  if (!found.length) return {available:false,warning:false,status:'MEASUREMENT_UNAVAILABLE'};
+  if (!found.length) return {available:false,warning:false,status:'MEASUREMENT_UNAVAILABLE',reason:'typed-header-or-below-value-row-not-found',headerCount:headers.length,wordCount:words.length};
   const measurement = found.sort((a,b)=>a.pageNumber-b.pageNumber)[0];
   return {available:true,...measurement,threshold:28.5,warning:measurement.normalizedDistance<28.5,status:measurement.normalizedDistance<28.5?'ENPARA_VERTICAL_DISTANCE_LOW':'NORMAL'};
 }
@@ -17961,9 +18016,11 @@ if(String(bank||'').toLowerCase().includes('denizbank')){
     const ref=Number(profile.valueReferenceMedianFillRatio),target=Number(profile.valueTargetMedianFillRatio);
     return Number.isFinite(ref)&&ref>0&&Number.isFinite(target)?target/ref:null;
   }).filter(Number.isFinite);
+  const typedRoiRatio=Number(mathematicalForensics?.amountInkProfiles?.referenceRelativeFillRatio);
+  if(!ratios.length&&mathematicalForensics?.amountInkProfiles?.available&&Number.isFinite(typedRoiRatio))ratios.push(typedRoiRatio);
   if(ratios.length){
     const ratio=rfMedian(ratios);
-    result.denizbankAmountWeight={available:true,referenceRelativeFillRatio:ratio,threshold:0.85,warning:ratio<0.85,status:ratio<0.85?'DENIZBANK_AMOUNT_WEIGHT_LOW':'NORMAL',metric:'current reference-forensics median character fill ratio; target/reference'};
+    result.denizbankAmountWeight={available:true,referenceRelativeFillRatio:ratio,threshold:0.85,warning:ratio<0.85,status:ratio<0.85?'DENIZBANK_AMOUNT_WEIGHT_LOW':'NORMAL',metric:amountProfiles.length?'reference-forensics median character fill ratio; target/reference':'median digit-component fill ratio from validated typed OCR ROI; target/reference',source:amountProfiles.length?'referenceForensics.typographyFieldProfiles':'mathematicalForensics.amountInkProfiles'};
     if(ratio<0.85&&result?.checks){
       const existing=result.checks.fontConsistency||{};
       const evidence=`DenizBank tutar rakamlarının mevcut karakter doluluk metriği referansa göre %${(ratio*100).toFixed(1)}; uyarı eşiği %85 altı.`;
