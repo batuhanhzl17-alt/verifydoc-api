@@ -742,6 +742,10 @@ export function inferDocumentFamily(name='', text='', bank='') {
   // FAST, EFT and account-to-account transfers. Compare those together while
   // keeping account statements as their own family.
   if (String(bank || '').toLocaleLowerCase('tr-TR').replace(/[^a-z]/g, '') === 'garanti') return 'DEKONT';
+  // DenizBank receipt layouts are shared across FAST/EFT/HAVALE wording; the
+  // supplied trusted raster references are stored as FAST, so normalize every
+  // DenizBank payment receipt to that family for stable baseline lookup.
+  if (String(bank || '').toLocaleLowerCase('tr-TR').replace(/[^a-z]/g, '') === 'denizbank') return 'FAST';
   // Enpara references are generic bank receipt templates. FAST/EFT wording
   // describes the payment rail inside the receipt, not a separate Enpara
   // document family. Keep target and baseline family assignment consistent.
