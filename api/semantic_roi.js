@@ -93,7 +93,10 @@ export function resolveRecipientInlineSegments(row) {
     const trIndex = full.search(/TR\d/i);
     const ibanText = trIndex >= 0 ? full.slice(trIndex).trim() : '';
     if (hasTurkishIbanShape(ibanText)) {
-      addSegment('recipientIban', start, start + full.length, ibanText, full.slice(0, Math.max(0,trIndex)).trim(), 175);
+      // The ROI must cover the IBAN value itself, not its label plus value.
+      // Otherwise downstream raster comparisons include different label text
+      // and shift the box relative to the reference value region.
+      addSegment('recipientIban', start + trIndex, start + full.length, ibanText, full.slice(0, Math.max(0,trIndex)).trim(), 175);
     }
   }
 
