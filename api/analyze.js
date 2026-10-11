@@ -797,6 +797,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     // Compact semantic measurement view. This explicitly proves that the
     // reference-side recipientName / recipientIban / amount ROIs were
     // measured mathematically when their boxes were available.
+    semanticRois,
     semanticReferenceMeasurements,
     amountInkProfiles,
     roi16x16: roiForensics,
@@ -16182,6 +16183,7 @@ let paintOverForensicsV2 = null;
 let openSourceForensics = null;
 let fontForensics = null;
 let mathematicalForensics = null;
+let resolvedAmountRoiEvidence = null;
 let multimodalReceiptEvidence = null;
 let semanticEvidenceFusion = null;
 let azureLayout = null;
@@ -16418,6 +16420,36 @@ if (type === "image" || type === "pdf") {
     mathematicalForensics = { available: false, status: "error", error: error?.message || String(error) };
   }
 }
+
+// Share the same typed amount box with downstream measurements. Previously
+// contrast and semantic fusion only read amountForensics, even when the typed
+// same-line resolver had already found a valid amount box.
+const mathAmountPair = mathematicalForensics?.semanticRois?.amount || null;
+resolvedAmountRoiEvidence = amountForensics?.region
+  ? {
+      ...amountForensics,
+      available: true,
+      region: amountForensics.region,
+      selectedAmountText: amountForensics.selectedAmountText || amountForensics.amountText || mathAmountPair?.targetText || null,
+      resolver: amountForensics.selectionMethod || "amount-forensics-typed-label",
+    }
+  : mathAmountPair?.target
+    ? {
+        available: true,
+        status: "typed-roi-only",
+        region: mathAmountPair.target,
+        selectedAmountText: mathAmountPair.targetText || null,
+        resolver: mathAmountPair.source || "typed-ocr-amount-same-line-right-v1",
+      }
+    : null;
+console.log("CRITICAL AMOUNT ROI HANDOFF V1:", JSON.stringify({
+  available: Boolean(resolvedAmountRoiEvidence?.region),
+  source: resolvedAmountRoiEvidence?.resolver || null,
+  text: resolvedAmountRoiEvidence?.selectedAmountText || null,
+  region: resolvedAmountRoiEvidence?.region || null,
+  referenceRegionAvailable: Boolean(mathAmountPair?.reference),
+  skipReason: resolvedAmountRoiEvidence?.region ? null : (amountForensics?.evidence || mathematicalForensics?.status || "typed-amount-roi-unavailable"),
+}));
 
 // V63 SPEED: Azure, referans şablonu ve lokal referans karşılaştırması
 // birbirinden bağımsız hazırlık işleridir; mümkün olduğunca paralel yürütülür.
@@ -18164,8 +18196,8 @@ if (multimodalReceiptEvidence) {
           ? {text:r.text,region:r.region,resolver,validated:true}
           : null;
       })(),
-      amount: amountForensics?.available===true&&amountForensics?.region
-        ? {text:amountForensics.selectedAmountText||amountForensics.amountText||null,region:amountForensics.region,resolver:amountForensics.selectionMethod||'amount-forensics-typed-label',validated:true}
+      amount: resolvedAmountRoiEvidence?.region
+        ? {text:resolvedAmountRoiEvidence.selectedAmountText||null,region:resolvedAmountRoiEvidence.region,resolver:resolvedAmountRoiEvidence.resolver||'shared-typed-amount-roi-v1',validated:true}
         : null,
     },
   });
@@ -18210,7 +18242,7 @@ if(ziraatAmountSpacing.available){
 }
 
 let garantiAmountContrast={available:false,status:'MEASUREMENT_UNAVAILABLE'};
-if(String(bank||'').toLowerCase().includes('garanti')) garantiAmountContrast=await measureGarantiAmountContrast(forensicTargetPath,amountForensics?.region,amountForensics?.selectedAmountText||amountForensics?.amountText||'');
+if(String(bank||'').toLowerCase().includes('garanti')) garantiAmountContrast=await measureGarantiAmountContrast(forensicTargetPath,resolvedAmountRoiEvidence?.region,resolvedAmountRoiEvidence?.selectedAmountText||'');
 if(String(bank||'').toLowerCase().includes('garanti')) {
   result.garantiAmountContrast=garantiAmountContrast;
   console.log('GARANTI AMOUNT CONTRAST MEASUREMENT:', JSON.stringify(garantiAmountContrast));
