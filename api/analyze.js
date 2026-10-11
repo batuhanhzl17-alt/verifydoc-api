@@ -254,7 +254,10 @@ async function measureMedianDigitFillRatio(imagePath, box, amountText='') {
     components.sort((a,b)=>a.minX-b.minX);
     const digitCount=(String(amountText).match(/\d/g)||[]).length;
     const selected=digitCount?components.slice(0,digitCount):components;
-    if(selected.length<2)return{available:false,reason:'too-few-digit-components',componentCount:selected.length,digitCount};
+    // A partial set of connected components is not a valid per-digit profile.
+    // OCR boxes often contain touching glyphs or low-resolution scans; never
+    // publish a ratio from only a subset of the requested amount digits.
+    if(selected.length<2|| (digitCount>0&&selected.length!==digitCount))return{available:false,reason:selected.length<2?'too-few-digit-components':'incomplete-digit-components',componentCount:selected.length,digitCount,threshold:160};
     const ratios=selected.map(c=>c.fill).sort((a,b)=>a-b),median=ratios[Math.floor(ratios.length/2)];
     return{available:true,medianDigitFillRatio:Number(median.toFixed(6)),digitComponentCount:selected.length,requestedDigitCount:digitCount||null,threshold:160};
   }catch(error){return{available:false,reason:error?.message||'digit-fill-measurement-error'};}
@@ -1629,34 +1632,23 @@ async function measureGarantiAmountContrast(imagePath, region, amountText = '') 
     const width=Math.min(pw-left,Math.ceil(x2-x1+2*mx)),height=Math.min(ph-top,Math.ceil(y2-y1+2*my));
     if(width<3||height<3)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
     const {data}=await sharp(imagePath).extract({left,top,width,height}).grayscale().raw().toBuffer({resolveWithObject:true});
+    // Use a local Otsu threshold over the amount crop. Connected-component
+    // filtering was too brittle for scanned/small text and often returned no
+    // character components even when the typed OCR ROI was valid.
+    const hist=new Uint32Array(256);for(const gray of data)hist[gray]++;
+    const total=data.length;let sum=0;for(let i=0;i<256;i++)sum+=i*hist[i];
+    let sumB=0,wB=0,bestVariance=-1,threshold=0;
+    for(let i=0;i<255;i++){
+      wB+=hist[i];if(!wB)continue;const wF=total-wB;if(!wF)break;
+      sumB+=i*hist[i];const mB=sumB/wB,mF=(sum-sumB)/wF;
+      const variance=wB*wF*(mB-mF)*(mB-mF);if(variance>bestVariance){bestVariance=variance;threshold=i;}
+    }
     const ink=[],background=[];
-    const maskWidth=width,maskHeight=height,visited=new Uint8Array(maskWidth*maskHeight),components=[];
-    const threshold=160;
-    for(let sy=0;sy<maskHeight;sy++)for(let sx=0;sx<maskWidth;sx++){
-      const start=sy*maskWidth+sx;
-      if(visited[start]||data[start]>threshold)continue;
-      visited[start]=1;const stack=[start];let minX=sx,maxX=sx,minY=sy,maxY=sy,pixels=[];
-      while(stack.length){const idx=stack.pop(),x=idx%maskWidth,y=Math.floor(idx/maskWidth);pixels.push(idx);if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
-        for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){if(!dx&&!dy)continue;const nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=maskWidth||ny>=maskHeight)continue;const ni=ny*maskWidth+nx;if(!visited[ni]&&data[ni]<=threshold){visited[ni]=1;stack.push(ni);}}
-      }
-      const box={minX,maxX,minY,maxY,height:maxY-minY+1};
-      // Restrict candidates to character-sized components inside the OCR
-      // amount box. Decimal punctuation and the minus sign are too short.
-      const amountTop=Math.max(0,Math.floor(y1-top)),amountBottom=Math.min(height,Math.ceil(y2-top));
-      if(box.height>=Math.max(3,(amountBottom-amountTop)*0.42)&&maxX+left>=x1&&minX+left<x2&&maxY+top>=y1&&minY+top<y2)components.push({box,pixels});
-    }
-    components.sort((a,b)=>a.box.minX-b.box.minX);
-    const digitCount=(String(amountText).match(/\d/g)||[]).length;
-    const digitComponents=digitCount>0?components.slice(0,digitCount):components;
-    for(const component of digitComponents)for(const idx of component.pixels){const gray=data[idx];if(gray<=200)ink.push(gray);}
-    // Background is sampled from the amount box plus its immediate margin.
-    for(let yy=0;yy<height;yy++)for(let xx=0;xx<width;xx++){
-      const gray=data[yy*width+xx];if(gray>=200)background.push(gray);
-    }
-    if(ink.length<4||background.length<12||!digitComponents.length)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
+    for(const gray of data){if(gray<=threshold)ink.push(gray);else background.push(gray);}
+    if(ink.length<8||background.length<Math.max(20,Math.floor(total*.05)))return{available:false,status:'MEASUREMENT_UNAVAILABLE',reason:'insufficient-foreground-or-background-pixels',threshold,inkPixelCount:ink.length,backgroundPixelCount:background.length};
     const median=values=>{values.sort((a,b)=>a-b);return values[Math.floor(values.length/2)];};
     const inkMedianGray=median(ink),backgroundMedianGray=median(background),contrast=backgroundMedianGray-inkMedianGray;
-    return{available:true,inkMedianGray,backgroundMedianGray,contrast,threshold:115,warning:contrast>115,status:contrast>115?'GARANTI_AMOUNT_CONTRAST_HIGH':'NORMAL',method:'median grayscale of digit glyph pixels minus median light background in same amount ROI and immediate margin; punctuation, sign and currency glyphs excluded; grayscale 0-255',sampleCounts:{digitInk:ink.length,background:background.length,digitComponents:digitComponents.length}};
+    return{available:true,inkMedianGray,backgroundMedianGray,contrast,threshold:115,warning:contrast>115,status:contrast>115?'GARANTI_AMOUNT_CONTRAST_HIGH':'NORMAL',method:'local Otsu foreground/background split; median foreground grayscale subtracted from median background grayscale in the typed amount ROI and immediate margin; grayscale 0-255',sampleCounts:{foreground:ink.length,background:background.length},segmentationThreshold:threshold,amountText:String(amountText||'')};
   }catch(error){console.warn('GARANTI TUTAR KONTRAST ÖLÇÜMÜ ATLANDI:',error?.message||error);return{available:false,status:'MEASUREMENT_UNAVAILABLE'};}
 }
 
