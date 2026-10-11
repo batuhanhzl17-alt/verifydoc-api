@@ -1,10 +1,10 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-10T13:03:40.668Z",
+  "generatedAt": "2026-10-10T13:21:35.774Z",
   "algorithm": "VerifyDoc Mathematical Forensics V1",
   "reference": {
     "version": "MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE",
-    "generatedAt": "2026-10-10T13:03:40.673Z",
+    "generatedAt": "2026-10-10T13:21:35.786Z",
     "featureKeys": [
       "luminanceMean",
       "luminanceStd",
@@ -4968,7 +4968,7 @@
   },
   "negative": {
     "version": "MATH-FORENSICS-V1.2.1-16X16-CRITICAL-ROI-GATE",
-    "generatedAt": "2026-10-10T13:03:40.673Z",
+    "generatedAt": "2026-10-10T13:21:35.787Z",
     "featureKeys": [
       "luminanceMean",
       "luminanceStd",
