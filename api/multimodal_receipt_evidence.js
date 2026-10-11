@@ -102,30 +102,40 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
   return { available: true, status: 'ok', model: response.model || model, evidence };
 }
 
-export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primaryDocumentData }) {
+export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primaryDocumentData, semanticFieldRegions = {} }) {
   if (evidenceResult?.available !== true || !evidenceResult.evidence) {
     return { available: false, status: evidenceResult?.status || 'multimodal-unavailable', fields: {} };
   }
   const evidence = evidenceResult.evidence;
-  const ocrText = String(paddleOCR?.text || '');
   const primary = primaryDocumentData || {};
   const mappings = {
-    recipientName: { ocr: ocrText, primary: primary.recipientName },
-    recipientIBAN: { ocr: ocrText, primary: primary.recipientIban },
-    amount: { ocr: ocrText, primary: primary.amount },
+    recipientName: { primary: primary.recipientName },
+    recipientIBAN: { primary: primary.recipientIban },
+    amount: { primary: primary.amount },
   };
   const fields = {};
   for (const field of Object.keys(mappings)) {
     const visual = evidence[field] || {};
     const value = String(visual.text || '').trim();
     const key = normalize(value, field);
-    const ocr = String(mappings[field].ocr || '');
+    const fieldRegion = semanticFieldRegions[field] || null;
+    const ocrValue = String(fieldRegion?.text || '').trim();
     const primaryText = String(mappings[field].primary || '').trim();
-    const ocrAgreement = Boolean(key && normalize(ocr, field).includes(key));
+    // Never search a critical value in the entire OCR transcript. A value is
+    // comparable only after the bank-neutral semantic ROI resolver has tied
+    // it to this field's label and returned the corresponding typed value box.
+    const ocrComparable = fieldRegion?.validated === true && Boolean(ocrValue);
+    const ocrAgreement = Boolean(ocrComparable && key && normalize(ocrValue, field) === key);
     const primaryAgreement = Boolean(key && primaryText && normalize(primaryText, field) === key);
     fields[field] = {
       visualEvidence: visual,
-      paddleOCRAgreement: ocrAgreement ? 'agreement' : value ? 'not-found-or-disagreement' : 'unavailable',
+      paddleOCRAgreement: !value || !ocrComparable ? 'unavailable' : (ocrAgreement ? 'agreement' : 'disagreement'),
+      paddleOCRFieldEvidence: ocrComparable ? {
+        value: ocrValue,
+        resolver: fieldRegion.resolver || null,
+        region: fieldRegion.region || null,
+        associationValidated: true,
+      } : null,
       primaryAnalysisAgreement: primaryAgreement ? 'agreement' : value && primaryText ? 'disagreement' : 'unavailable',
       evidenceOnly: true,
     };
