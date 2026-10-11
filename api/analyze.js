@@ -110,8 +110,35 @@ function isSemanticRecipientNameCandidate(value) {
 }
 
 function resolveMathSemanticValueBox(regions, field) {
-  const rows = Array.isArray(regions) ? regions.filter(x => x?.region && String(x.text || '').trim()) : [];
-  if (!rows.length) return null;
+  const sourceRows = Array.isArray(regions) ? regions.filter(x => x?.region && String(x.text || '').trim()) : [];
+  if (!sourceRows.length) return null;
+  // PaddleOCR may split labelled values into token boxes. Add line aggregates
+  // for label parsing while retaining original boxes for value-only candidates.
+  const heights = sourceRows.map(x => Number(x.region.y2)-Number(x.region.y1)).filter(x=>Number.isFinite(x)&&x>0).sort((a,b)=>a-b);
+  const medianHeight = heights.length ? heights[Math.floor(heights.length/2)] : 12;
+  const rowTolerance = Math.max(4, medianHeight * 0.75);
+  const groupedRows = [];
+  for (const item of [...sourceRows].sort((a,b)=>Number(a.region.y1)-Number(b.region.y1)||Number(a.region.x1)-Number(b.region.x1))) {
+    const y = Number(item.region.y1);
+    let group = groupedRows.find(g=>Math.abs(g.y-y)<=rowTolerance);
+    if (!group) { group={y,items:[]}; groupedRows.push(group); }
+    group.items.push(item);
+  }
+  const lineRows = groupedRows.filter(g=>g.items.length>1).map(g=>{
+    const items=[...g.items].sort((a,b)=>Number(a.region.x1)-Number(b.region.x1));
+    return {
+      text:items.map(x=>String(x.text||'').trim()).filter(Boolean).join(' '),
+      region:{
+        x1:Math.min(...items.map(x=>Number(x.region.x1))),
+        y1:Math.min(...items.map(x=>Number(x.region.y1))),
+        x2:Math.max(...items.map(x=>Number(x.region.x2))),
+        y2:Math.max(...items.map(x=>Number(x.region.y2))),
+      },
+      confidence:items.reduce((s,x)=>s+(Number(x.confidence)||0),0)/items.length,
+      _semanticLineAggregate:true,
+    };
+  });
+  const rows = [...sourceRows, ...lineRows];
   const box = (x) => {
     const r=x?.region||x;
     const x1=Number(r?.x1),y1=Number(r?.y1),x2=Number(r?.x2),y2=Number(r?.y2);
@@ -142,6 +169,15 @@ function resolveMathSemanticValueBox(regions, field) {
   // V1.5.4: PaddleOCR may return the whole Enpara beneficiary block as one
   // region, e.g. `ALICI UNVANI: Sudenaz Özel ALICI IBAN: TR...`. Resolve the
   // embedded semantic segments before falling back to label-neighbor geometry.
+  const isBlockingSemanticLabel = (item,currentField) => {
+    const text=String(item?.text||'');
+    if(currentField==='recipientName'&&recipientIbanLabel(text))return true;
+    if(currentField==='recipientIban'&&recipientNameLabel(text))return true;
+    try{
+      const key=referenceFieldRuleForText(text)?.key;
+      return Boolean(key&&key!==currentField&&key!=='generic');
+    }catch{return false;}
+  };
   const inlineSemanticRows = [];
   for (const row of rows) {
     const segments = resolveRecipientInlineSegments(row);
@@ -194,6 +230,16 @@ function resolveMathSemanticValueBox(regions, field) {
       const belowXLimit=Math.min(Math.max(180,lh*18),pageRight*.35);
       const below=belowGap>=-lh*.35 && belowGap<Math.max(170,lh*6) && Math.abs(((rb.x1+rb.x2)/2)-((lb.x1+lb.x2)/2))<belowXLimit;
       if(!sameLine&&!below) continue;
+      const candidateCenterX=(rb.x1+rb.x2)/2;
+      const interveningLabel=rows.some(other=>{
+        if(other===label||other===row||!isBlockingSemanticLabel(other,field))return false;
+        const ob=box(other);if(!ob)return false;
+        const oy=Math.min(lb.y2,ob.y2)-Math.max(lb.y1,ob.y1);
+        const betweenOnLine=oy>=-lh*.45&&ob.x1>=lb.x2-lh*.25&&ob.x1<candidateCenterX&&rb.y1<=lb.y2+lh;
+        const betweenBelow=ob.y1>=lb.y2-lh*.25&&ob.y1<rb.y1&&Math.abs(((ob.x1+ob.x2)/2)-((lb.x1+lb.x2)/2))<belowXLimit;
+        return betweenOnLine||betweenBelow;
+      });
+      if(interveningLabel)continue;
       const cost=(sameLine?Math.max(0,rb.x1-lb.x2)/lh:4+Math.max(0,belowGap)/lh) + Math.abs(((rb.y1+rb.y2)/2)-((lb.y1+lb.y2)/2))/lh*.25;
       const score=120-cost*8+(sameLine?25:0);
       solutions.push({value:text,region:rb,score,resolver:field==='recipientIban'?'semantic-label-neighbor-iban-v1':'semantic-label-neighbor-name-v1'});
@@ -3705,7 +3751,7 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     ? Math.max(0, Math.min(100, Math.round(layoutScore)))
     : 0;
   const referenceLayoutScore = Number(forensic?.layoutForensics?.score);
-  const structuralLayoutRisk = Number.isFinite(referenceLayoutScore)
+  let structuralLayoutRisk = Number.isFinite(referenceLayoutScore)
     ? Math.max(0, Math.min(100, Math.round(referenceLayoutScore)))
     : 0;
 
@@ -3799,17 +3845,19 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
       : 0;
     if (promoted) editingRisk = Math.max(editingRisk, promoted);
   }
-  // If the reference engine has a high-confidence semantic local-gap anomaly,
-  // make it visible in the editing category even when the other visual signals
-  // are quiet. Require a strong anomaly score and a healthy reference match.
+  // A repeated, strongly localized reference gap belongs to layout risk.
+  // Require multi-reference support and good affine alignment before promotion.
   const anchorResidual = Number(forensic?.referenceForensics?.references?.[0]?.referenceQuality?.anchorMedianResidual);
+  const reliableSpacing = (Array.isArray(forensic?.referenceForensics?.spacingAnomalies) ? forensic.referenceForensics.spacingAnomalies : [])
+    .filter(x => Number(x?.score) >= 85 && Number(x?.ensembleMedianScore) >= 85 && Number(x?.referenceCountForPair) >= 3);
   if (
     forensic?.referenceForensics?.available === true &&
     forensic?.referenceForensics?.severity === 'strong' &&
     Number.isFinite(referenceMaxSpacing) && referenceMaxSpacing >= 85 &&
+    reliableSpacing.length > 0 &&
     (!Number.isFinite(anchorResidual) || anchorResidual <= 0.06)
   ) {
-    editingRisk = Math.max(editingRisk, 85);
+    structuralLayoutRisk = Math.max(structuralLayoutRisk, Math.min(85, Math.round(Math.max(...reliableSpacing.map(x=>Number(x.score)||0)))));
   }
 
   const categories = {
@@ -18218,6 +18266,20 @@ if (multimodalReceiptEvidence) {
 // Deterministik yapısal geometri sinyali AI çıktısından bağımsızdır.
 if (layoutForensics?.available && result?.checks) {
   result.checks.layoutIntegrity = layoutForensics.check;
+}
+const reliableReferenceSpacingRows = (Array.isArray(referenceForensics?.spacingAnomalies) ? referenceForensics.spacingAnomalies : [])
+  .filter(x => Number(x?.score) >= 85 && Number(x?.ensembleMedianScore) >= 85 && Number(x?.referenceCountForPair) >= 3);
+if (result?.checks && referenceForensics?.available === true && reliableReferenceSpacingRows.length) {
+  const existing = result.checks.layoutIntegrity || {};
+  const strongest = Math.max(...reliableReferenceSpacingRows.map(x => Number(x.score) || 0));
+  const pairs = reliableReferenceSpacingRows.map(x => `${x.beforeLabel || x.beforeField} → ${x.afterLabel || x.afterField}`).join('; ');
+  const evidence = `Güvenilir referans eşleştirmelerinde dikey yerleşim aralığı farkı ölçüldü (en yüksek ${strongest}/100; destek ${Math.max(...reliableReferenceSpacingRows.map(x => Number(x.referenceCountForPair) || 0))} referans): ${pairs}.`;
+  result.checks.layoutIntegrity = {
+    ...existing,
+    status: 'warning',
+    score: Math.max(Number(existing.score) || 0, Math.min(85, Math.round(strongest))),
+    evidence: [String(existing.evidence || '').trim(), evidence].filter(Boolean).join(' '),
+  };
 }
 
 // Bank-specific measured indicators add warnings to their related check only;
