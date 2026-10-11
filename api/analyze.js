@@ -168,6 +168,7 @@ function resolveMathSemanticValueBox(regions, field) {
   const labels=rows.filter(isLabel);
   if(!labels.length) return null;
   const solutions=[];
+  const pageRight=Math.max(...rows.map(r=>Number(r.region?.x2)||0));
   for(const label of labels){
     const lb=box(label); if(!lb) continue;
     const raw=String(label.text||'');
@@ -185,9 +186,11 @@ function resolveMathSemanticValueBox(regions, field) {
       const valid=field==='recipientName'?nameLike(text):ibanLike(text);
       if(!valid) continue;
       const overlapY=Math.min(lb.y2,rb.y2)-Math.max(lb.y1,rb.y1);
-      const sameLine=overlapY>=-lh*.45 && rb.x1>=lb.x1-lh*.5 && rb.x1-lb.x2<Math.max(420,lh*18);
+      const sameLineLimit=Math.min(Math.max(120,lh*18),pageRight*.45);
+      const sameLine=overlapY>=-lh*.45 && rb.x1>=lb.x1-lh*.5 && rb.x1-lb.x2<sameLineLimit;
       const belowGap=rb.y1-lb.y2;
-      const below=belowGap>=-lh*.35 && belowGap<Math.max(170,lh*6) && Math.abs(((rb.x1+rb.x2)/2)-((lb.x1+lb.x2)/2))<Math.max(500,lh*18);
+      const belowXLimit=Math.min(Math.max(180,lh*18),pageRight*.35);
+      const below=belowGap>=-lh*.35 && belowGap<Math.max(170,lh*6) && Math.abs(((rb.x1+rb.x2)/2)-((lb.x1+lb.x2)/2))<belowXLimit;
       if(!sameLine&&!below) continue;
       const cost=(sameLine?Math.max(0,rb.x1-lb.x2)/lh:4+Math.max(0,belowGap)/lh) + Math.abs(((rb.y1+rb.y2)/2)-((lb.y1+lb.y2)/2))/lh*.25;
       const score=120-cost*8+(sameLine?25:0);
@@ -200,7 +203,13 @@ function resolveMathSemanticValueBox(regions, field) {
   }
   solutions.sort((a,b)=>Number(b.score)-Number(a.score));
   const best=solutions[0];
-  return best ? {text:best.value,region:best.region,score:best.score,resolver:best.resolver} : null;
+  if(!best||Number(best.score)<70)return null;
+  const runnerUp=solutions.find(x=>norm(x.value)!==norm(best.value));
+  const margin=runnerUp?Number(best.score)-Number(runnerUp.score):null;
+  // If two different values are nearly as close to the label, leave the field
+  // unresolved. A guessed recipient or IBAN box is worse than missing data.
+  if(margin!==null&&margin<8)return null;
+  return {text:best.value,region:best.region,score:Number(best.score.toFixed(2)),margin:margin===null?null:Number(margin.toFixed(2)),candidateCount:solutions.length,resolver:best.resolver};
 }
 
 function resolveTypedAmountRegionFromOcr(ocrResult) {
@@ -208,7 +217,9 @@ function resolveTypedAmountRegionFromOcr(ocrResult) {
   const norm=v=>String(v||'').toLocaleLowerCase('tr-TR').normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/ı/g,'i').replace(/[^a-z0-9]/g,'');
   const excluded=/(masraf|komisyon|ucret|bsmv|vergi|iban|hesap|sira|fis|referans|sorgu|tarih|saat|telefon|musteri|kart)/;
   const labels=rows.map(row=>({row,text:String(row.text||'').trim(),key:norm(row.text)})).filter(x=>x.text.length<=64&&!excluded.test(x.key)&&/(paracinsitutar|(?:islem|eft|fast|havale|transfer|odeme)?tutari?|amount|transactionamount)/.test(x.key));
-  const money=/(?:^|[^\d])[-+]?\s*(?:₺\s*)?\d{1,3}(?:[., ]\d{3})*(?:[,.]\d{2})(?:\s*(?:TL|TRY|₺))?(?:$|[^\d])/i;
+  // Accept Turkish (1.234,56), international (1,234.56), and ungrouped
+  // decimals. Reject malformed OCR such as `1,000,00` (likely `1.000,00`).
+  const money=/(?:^|[^\d])[-+]?\s*(?:₺\s*)?(?:(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}|(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2})(?:\s*(?:TL|TRY|₺))?(?:$|[^\d])/i;
   const candidates=rows.map(row=>({row,text:String(row.text||'').trim(),match:String(row.text||'').match(money)})).filter(x=>x.match&&!excluded.test(norm(x.text)));
   const scored=[];
   for(const label of labels){
@@ -237,8 +248,35 @@ function resolveTypedAmountRegionFromOcr(ocrResult) {
   return {region,text:best.candidate.text,label:best.label.text,score:Number(best.score.toFixed(2)),resolver:`typed-ocr-amount-${best.relation}-v1`};
 }
 
+async function rereadTypedAmountCrop(imagePath,imageSize,ocrResult){
+  const rows=Array.isArray(ocrResult?.regions)?ocrResult.regions:[];
+  const excluded=/(masraf|komisyon|ucret|bsmv|vergi|iban|hesap|sira|fis|referans|sorgu|tarih|musteri|kart)/i;
+  const labels=rows.filter(r=>r?.region&&!excluded.test(String(r.text||''))&&/\btutar\b|amount/i.test(String(r.text||'')));
+  if(!labels.length)return null;
+  const label=labels.sort((a,b)=>Number(b.confidence||0)-Number(a.confidence||0))[0].region;
+  const h=Math.max(8,Number(label.y2)-Number(label.y1));
+  const left=Math.max(0,Math.floor(Number(label.x1)-h*2)),top=Math.max(0,Math.floor(Number(label.y1)-h*1.5));
+  const right=Math.min(imageSize.width,Number(imageSize.width)),bottom=Math.min(imageSize.height,Math.ceil(Number(label.y2)+h*4));
+  const width=right-left,height=bottom-top;if(width<24||height<16)return null;
+  const upscale=Math.min(2,2200/width),cropPath=path.join('/tmp',`verifydoc-amount-crop-${Date.now()}-${Math.random().toString(36).slice(2,8)}.png`);
+  try{
+    await sharp(imagePath).extract({left,top,width,height}).resize({width:Math.max(1,Math.round(width*upscale))}).png().toFile(cropPath);
+    const cropOcr=await runPaddleOCR(cropPath),resolved=resolveTypedAmountRegionFromOcr(cropOcr);
+    if(!resolved?.region)return null;
+    const mapped={...resolved,region:{...resolved.region,
+      x1:left+Number(resolved.region.x1)/upscale,y1:top+Number(resolved.region.y1)/upscale,
+      x2:left+Number(resolved.region.x2)/upscale,y2:top+Number(resolved.region.y2)/upscale},
+      resolver:`${resolved.resolver}+target-crop-reread-v1`};
+    console.log('AMOUNT FIELD CROP REREAD:',JSON.stringify({available:true,box:mapped.region,score:mapped.score,resolver:mapped.resolver,scale:upscale}));
+    return mapped;
+  }catch(error){console.warn('AMOUNT FIELD CROP REREAD FAILED:',error?.message||error);return null;}
+  finally{try{await fs.unlink(cropPath)}catch{}}
+}
+
 async function measureMedianDigitFillRatio(imagePath, box, amountText='') {
   if(!imagePath||!box)return{available:false,reason:'missing-image-or-typed-amount-box'};
+  const digitCount=(String(amountText).match(/\d/g)||[]).length;
+  if(!digitCount)return{available:false,reason:'typed-amount-text-unavailable'};
   try{
     const meta=await sharp(imagePath).metadata(),left=Math.max(0,Math.floor(Number(box.x1))),top=Math.max(0,Math.floor(Number(box.y1))),right=Math.min(Number(meta.width)||0,Math.ceil(Number(box.x2))),bottom=Math.min(Number(meta.height)||0,Math.ceil(Number(box.y2)));
     const width=right-left,height=bottom-top;if(width<3||height<3)return{available:false,reason:'invalid-amount-box'};
@@ -252,8 +290,7 @@ async function measureMedianDigitFillRatio(imagePath, box, amountText='') {
       const ch=maxY-minY+1;if(ch>=Math.max(3,height*.42))components.push({minX,maxX,minY,maxY,area,fill:area/((maxX-minX+1)*ch)});
     }
     components.sort((a,b)=>a.minX-b.minX);
-    const digitCount=(String(amountText).match(/\d/g)||[]).length;
-    const selected=digitCount?components.slice(0,digitCount):components;
+    const selected=components.slice(0,digitCount);
     // A partial set of connected components is not a valid per-digit profile.
     // OCR boxes often contain touching glyphs or low-resolution scans; never
     // publish a ratio from only a subset of the requested amount digits.
@@ -263,7 +300,7 @@ async function measureMedianDigitFillRatio(imagePath, box, amountText='') {
   }catch(error){return{available:false,reason:error?.message||'digit-fill-measurement-error'};}
 }
 
-async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, bank = null, fileName = '', referencePath = null } = {}) {
+async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, targetPath = null, bank = null, fileName = '', referencePath = null } = {}) {
   const rois = {};
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
   const profiles = Array.isArray(referenceForensics?.typographyFieldProfiles)
@@ -379,6 +416,12 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   let amountReferenceResolver = amountReferenceBox ? 'typed-reference-amount-field' : null;
   let referenceTypedAmount = null;
   let targetTypedAmount = resolveTypedAmountRegionFromOcr(targetOCR);
+  if(!targetTypedAmount&&targetPath){
+    try{
+      const meta=await sharp(targetPath).metadata();
+      if(meta?.width&&meta?.height)targetTypedAmount=await rereadTypedAmountCrop(targetPath,{width:meta.width,height:meta.height},targetOCR);
+    }catch(error){console.warn('AMOUNT FIELD CROP METADATA ERROR:',error?.message||error);}
+  }
   if (!amountReferenceBox && referencePath) {
     try {
       const refOcr = await runPaddleOCR(referencePath);
@@ -478,7 +521,20 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   console.log('MATH SEMANTIC ROI RESOLVER V1.5.4:', JSON.stringify({
     fields: fields.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     profiles: profiles.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
-    resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => [k, {target:Boolean(v?.target), reference:Boolean(v?.reference), source:v?.source || 'semantic-field'}])),
+    resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => {
+      const targetCandidate=targetSemanticRegions[k],referenceCandidate=referenceSemanticRegions[k];
+      return [k, {
+        status:v?.target&&v?.reference?'matched':'incomplete',
+        target:Boolean(v?.target),reference:Boolean(v?.reference),
+        targetBox:v?.target||null,referenceBox:v?.reference||null,
+        source:v?.source || 'semantic-field',
+        targetResolver:targetCandidate?.resolver||null,referenceResolver:referenceCandidate?.resolver||null,
+        targetMatchScore:Number.isFinite(Number(targetCandidate?.score))?Number(targetCandidate.score):null,
+        referenceMatchScore:Number.isFinite(Number(referenceCandidate?.score))?Number(referenceCandidate.score):null,
+        targetCandidateCount:Number.isFinite(Number(targetCandidate?.candidateCount))?Number(targetCandidate.candidateCount):null,
+        referenceCandidateCount:Number.isFinite(Number(referenceCandidate?.candidateCount))?Number(referenceCandidate.candidateCount):null,
+      }];
+    })),
   }));
 
   return rois;
@@ -491,7 +547,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   const baseline = await loadMathematicalBaseline();
   if (!baseline) return { available: false, status: "baseline-unavailable" };
 
-  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, targetOCR, bank, referencePath });
+  const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, targetOCR, targetPath, bank, referencePath });
   const ibanProfile = (Array.isArray(referenceForensics?.typographyFieldProfiles) ? referenceForensics.typographyFieldProfiles : [])
     .find(profile => {
       const field = String(profile?.field || '').replace(/:value$/i, '');
@@ -9025,16 +9081,21 @@ function rfMedianSigned(values){
 }
 
 function rfFitAffine(points) {
-  // Separate x/y linear fit: target = scale * reference + offset.
+  // Robust Theil-Sen fit per axis: target = scale * reference + offset.
+  // OCR may misplace one field box (or match a duplicate label); least-squares
+  // lets that single outlier distort the page-wide scale and every gap score.
   if (!points || points.length < 2) return null;
   const fit=(axis)=>{
     const xs=points.map(p=>p.ref[axis]), ys=points.map(p=>p.tar[axis]);
-    const mx=rfMedianSigned(xs), my=rfMedianSigned(ys);
-    let num=0,den=0;
-    for(let i=0;i<xs.length;i++){num+=(xs[i]-mx)*(ys[i]-my);den+=(xs[i]-mx)**2;}
-    const scale=den>1e-8?num/den:1;
-    const offset=my-scale*mx;
-    return {scale:Math.max(.45,Math.min(2.5,scale)),offset};
+    const slopes=[];
+    for(let i=0;i<xs.length;i++)for(let j=i+1;j<xs.length;j++){
+      const dx=xs[j]-xs[i];if(Math.abs(dx)<1e-5)continue;
+      slopes.push((ys[j]-ys[i])/dx);
+    }
+    const rawScale=slopes.length?rfMedianSigned(slopes):1;
+    const scale=Math.max(.45,Math.min(2.5,rawScale));
+    const offset=rfMedianSigned(xs.map((x,i)=>ys[i]-scale*x));
+    return {scale,offset};
   };
   return {x:fit('x'),y:fit('y')};
 }
@@ -9060,12 +9121,18 @@ function rfFieldLabelText(label){
 // - Customer/recipient names = semantic inline/relative value ROI only.
 // - Dynamic transaction IDs are never treated as literal-value mismatches.
 // - V15.2, Amount Forensics and Known-Fake layers remain untouched.
-function resolveSemanticGeometryFallbackV152(field, referenceCandidate, targetRows, referenceRows) {
+function resolveSemanticGeometryFallbackV152(field, referenceCandidate, targetRows, referenceRows, targetDimensions = null, referenceDimensions = null) {
   if (!referenceCandidate || !Array.isArray(targetRows) || !targetRows.length) return null;
   const boxOf=(b)=>{const r=b?.region||b;if(!r)return null;const x1=Number(r.x1),y1=Number(r.y1),x2=Number(r.x2),y2=Number(r.y2);return [x1,y1,x2,y2].every(Number.isFinite)&&x2>x1&&y2>y1?{x1,y1,x2,y2}:null};
   const size=(rows)=>{const xs=rows.flatMap(r=>[Number(r?.region?.x1),Number(r?.region?.x2)]).filter(Number.isFinite);const ys=rows.flatMap(r=>[Number(r?.region?.y1),Number(r?.region?.y2)]).filter(Number.isFinite);return {w:xs.length?Math.max(...xs):0,h:ys.length?Math.max(...ys):0};};
   const refBox=boxOf(referenceCandidate); if(!refBox)return null;
-  const rs=size(referenceRows||[]),ts=size(targetRows||[]); if(!rs.w||!rs.h||!ts.w||!ts.h)return null;
+  // Use actual raster/page dimensions when available. Max OCR coordinates are
+  // content-dependent, so a footer or missing OCR line must not change the
+  // normalized position used to match recipient fields.
+  const inferredRef=size(referenceRows||[]),inferredTarget=size(targetRows||[]);
+  const rs={w:Number(referenceDimensions?.width)||inferredRef.w,h:Number(referenceDimensions?.height)||inferredRef.h};
+  const ts={w:Number(targetDimensions?.width)||inferredTarget.w,h:Number(targetDimensions?.height)||inferredTarget.h};
+  if(!rs.w||!rs.h||!ts.w||!ts.h)return null;
   const rn={x:(refBox.x1+refBox.x2)/(2*rs.w),y:(refBox.y1+refBox.y2)/(2*rs.h),w:(refBox.x2-refBox.x1)/rs.w,h:(refBox.y2-refBox.y1)/rs.h};
   const norm=v=>String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğışöüıİ]/g,c=>({ç:'c',ğ:'g',ı:'i',İ:'i',ş:'s',ö:'o',ü:'u'}[c]||c));
   const stop=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
@@ -9073,7 +9140,47 @@ function resolveSemanticGeometryFallbackV152(field, referenceCandidate, targetRo
   const ibanLike=v=>/^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
   const valid=field==='recipientName'?nameLike:ibanLike;
   const scored=targetRows.filter(r=>r?.region&&valid(r.text)).map(r=>{const b=boxOf(r),n={x:(b.x1+b.x2)/(2*ts.w),y:(b.y1+b.y2)/(2*ts.h),w:(b.x2-b.x1)/ts.w,h:(b.y2-b.y1)/ts.h};const d=Math.hypot(n.x-rn.x,n.y-rn.y),sd=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,rn.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,rn.h)));return {r,d,sd,score:100-d*180-sd*18};}).sort((a,b)=>b.score-a.score);
-  const best=scored[0];return best&&best.score>=55?{text:String(best.r.text).trim(),region:best.r.region,score:Number(best.score.toFixed(2)),resolver:`reference-geometry-${field}-v152`}:null;
+  const best=scored[0],second=scored.find(x=>String(x.r.text||'').replace(/[^a-z0-9]/gi,'').toLowerCase()!==String(best?.r?.text||'').replace(/[^a-z0-9]/gi,'').toLowerCase());
+  const margin=second?best.score-second.score:null;
+  // Choose the best geometrically aligned candidate; keep its rank and margin
+  // for the caller's diagnostics rather than rejecting a useful best match.
+  return best&&best.score>=55?{text:String(best.r.text).trim(),region:best.r.region,score:Number(best.score.toFixed(2)),margin:margin===null?null:Number(margin.toFixed(2)),candidateCount:scored.length,resolver:`reference-geometry-${field}-v153-page-normalized`}:null;
+}
+
+async function rereadSemanticFieldCrop(targetPath, targetSize, ocrResult, field) {
+  const rows=Array.isArray(ocrResult?.regions)?ocrResult.regions:[];
+  const labelRows=rows.filter(row=>{
+    const text=String(row?.text||'').trim();
+    if(field==='recipientName')return recipientNameLabel(text)||(()=>{try{return referenceFieldRuleForText(text)?.key==='recipientName'}catch{return false}})();
+    return recipientIbanLabel(text)||(()=>{try{return referenceFieldRuleForText(text)?.key==='recipientIban'}catch{return false}})();
+  }).filter(row=>row?.region).sort((a,b)=>Number(b.confidence||0)-Number(a.confidence||0));
+  if(!labelRows.length)return null;
+  const label=labelRows[0].region;
+  const lh=Math.max(8,Number(label.y2)-Number(label.y1));
+  const left=Math.max(0,Math.floor(Number(label.x1)-lh*2));
+  const right=Math.min(targetSize.width,Math.ceil(targetSize.width));
+  const top=Math.max(0,Math.floor(Number(label.y1)-lh*2));
+  const bottom=Math.min(targetSize.height,Math.ceil(Number(label.y2)+lh*4));
+  const width=right-left,height=bottom-top;
+  if(width<24||height<16)return null;
+  const upscale=Math.min(2,2200/width);
+  const cropPath=path.join('/tmp',`verifydoc-semroi-${field}-${Date.now()}-${Math.random().toString(36).slice(2,8)}.png`);
+  try{
+    await sharp(targetPath).extract({left,top,width,height}).resize({width:Math.max(1,Math.round(width*upscale))}).png().toFile(cropPath);
+    const cropOcr=await runPaddleOCR(cropPath);
+    if(!cropOcr?.success)return null;
+    const resolved=resolveMathSemanticValueBox(cropOcr.regions||[],field);
+    if(!resolved?.region)return null;
+    const mapped={...resolved,region:{...resolved.region,
+      x1:left+Number(resolved.region.x1)/upscale,y1:top+Number(resolved.region.y1)/upscale,
+      x2:left+Number(resolved.region.x2)/upscale,y2:top+Number(resolved.region.y2)/upscale},
+      resolver:`${resolved.resolver}+target-crop-reread-v1`};
+    console.log('SEMANTIC FIELD CROP REREAD:',JSON.stringify({field,available:true,box:mapped.region,score:mapped.score,candidateCount:mapped.candidateCount,scale:upscale}));
+    return mapped;
+  }catch(error){
+    console.warn('SEMANTIC FIELD CROP REREAD FAILED:',JSON.stringify({field,error:error?.message||String(error)}));
+    return null;
+  }finally{try{await fs.unlink(cropPath)}catch{}}
 }
 
 async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedReferencePath = null, amountForensics = null, referenceAmountFieldArg = null) {
@@ -9458,6 +9565,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
             type:'vertical-field-spacing',
             beforeField:a.field,afterField:b.field,
             beforeLabel:a.label,afterLabel:b.label,
+            referenceColumnNorm:Number(a.rp.x.toFixed(4)),
             referenceGapNorm:Number(refGap.toFixed(5)),
             targetGapNorm:Number(tarGap.toFixed(5)),
             expectedTargetGapNorm:Number(expectedGap.toFixed(5)),
@@ -10045,7 +10153,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
         const referenceQuality={matchedFields:fieldResults.length,anchorCount:anchors.length,anchorMedianResidual:Number(anchorMedian.toFixed(5)),globalStyleBaseline:Number((globalStyleBaseline||0).toFixed(5))};
         referenceResults.push({
-          file:path.basename(referencePath),fieldCount:fieldResults.length,
+          file:path.basename(referencePath),rasterSize:refSize,fieldCount:fieldResults.length,
           styleScore:rfClamp100(rfMedian(fieldResults.map(x=>x.styleScore))),
           localAnomalyScore:rfClamp100(suspiciousFields.length*18+strongSpacing.length*18),
           suspiciousFieldCount:suspiciousFields.length,suspiciousFields:[...new Set(suspiciousFields.map(x=>x.field))],
@@ -10184,7 +10292,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
 
     const spacingGroups=new Map();
     for(const ref of referenceResults)for(const a of ref.spacingAnomalies||[]){
-      const k=`${a.beforeField}|${a.afterField}|${String(a.beforeLabel||'').toLocaleLowerCase('tr-TR')}|${String(a.afterLabel||'').toLocaleLowerCase('tr-TR')}`;
+      // OCR spelling variants of the same semantic pair should aggregate into
+      // one finding. Retain separate columns as independent observations.
+      const k=`${a.beforeField}|${a.afterField}|${Math.round(Number(a.referenceColumnNorm||0)*10)}`;
       if(!spacingGroups.has(k))spacingGroups.set(k,[]);spacingGroups.get(k).push(a);
     }
     const spacingAnomalies=[];
@@ -10196,14 +10306,26 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     }
 
     const semanticValueRegions = {};
+    const semanticValueReferenceSizes = {};
     for (const key of ['recipientName','recipientIban']) {
-      const candidates = referenceResults.map(r=>r?.semanticValueRegions?.[key]).filter(Boolean);
-      if (candidates.length) semanticValueRegions[key] = candidates[0];
+      const source = referenceResults.find(r=>r?.semanticValueRegions?.[key]);
+      if (source) {
+        semanticValueRegions[key] = source.semanticValueRegions[key];
+        semanticValueReferenceSizes[key] = source.rasterSize || null;
+      }
     }
     const targetSemanticRegions = {
       recipientName: resolveMathSemanticValueBox(targetOCR?.regions || [], 'recipientName'),
       recipientIban: resolveMathSemanticValueBox(targetOCR?.regions || [], 'recipientIban'),
     };
+    // Re-read only the unresolved recipient field, anchored at its explicit
+    // OCR label. Keep the original full-page OCR and use the crop result only
+    // when it resolves a typed name/IBAN ROI.
+    for(const field of ['recipientName','recipientIban']){
+      if(targetSemanticRegions[field])continue;
+      const reread=await rereadSemanticFieldCrop(targetPath,targetSize,targetOCR,field);
+      if(reread)targetSemanticRegions[field]=reread;
+    }
     // V1.5.2: Enpara can expose the beneficiary value without a clean OCR
     // "ALICI" label on the target. If the trusted reference semantic ROI is
     // known, resolve the target by normalized geometry, but ONLY among strict
@@ -10213,7 +10335,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       const refCandidate=semanticValueRegions[field];
       if (!refCandidate) continue;
       const referenceRowsForFallback = referenceResults.flatMap(r => Array.isArray(r?.ocrRegions) ? r.ocrRegions : []);
-      const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],referenceRowsForFallback);
+      const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],referenceRowsForFallback,targetSize,semanticValueReferenceSizes[field]);
       if (fallback) targetSemanticRegions[field]=fallback;
     }
 
