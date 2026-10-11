@@ -93,6 +93,22 @@ async function loadMathematicalBaseline() {
 }
 
 
+function isSemanticRecipientNameCandidate(value) {
+  const text=String(value||'').trim();
+  if(!text||/\d/.test(text))return false;
+  const tokens=text.split(/\s+/).filter(Boolean);
+  if(tokens.length<2||tokens.length>14||!tokens.every(w=>/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]+$/.test(w)))return false;
+  const token=v=>String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğıöüış]/g,c=>({ç:'c',ğ:'g',ı:'i',ö:'o',ü:'u',ş:'s'}[c]||c)).replace(/[^a-z0-9]/g,'').toUpperCase();
+  const words=tokens.map(token);
+  const transactionWords=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','IBAN','HESAP','FIS','REFERANS','SORGU','SIRA','NUMARA','NUMARASI']);
+  if(words.some(w=>transactionWords.has(w)))return false;
+  const companyWords=new Set(['TICARET','LIMITED','LIMIT','SIRKET','SIRKETI','SANAYI','ANONIM','STI','LTD','AS','HOLDING','HOLDINGS','ITHALAT','IHRACAT','PAZARLAMA','LOJISTIK','TURIZM','OTOMOTIV','MUHENDISLIK','INSAAT']);
+  const corporate=words.some(w=>companyWords.has(w));
+  const core=words.filter(w=>w.length>=2&&!companyWords.has(w)&&w!=='VE');
+  if(corporate)return core.length>=1;
+  return tokens.length<=6&&tokens.every(w=>w.length>=2)&&core.length>=2;
+}
+
 function resolveMathSemanticValueBox(regions, field) {
   const rows = Array.isArray(regions) ? regions.filter(x => x?.region && String(x.text || '').trim()) : [];
   if (!rows.length) return null;
@@ -109,23 +125,7 @@ function resolveMathSemanticValueBox(regions, field) {
     'PARA','CINSI','TL','TRY','USD','EUR','GBP','FIS','FIS NO','REFERANS','REFERANS NO','MUSTERI','MUSTERI NO',
     'VERGI','VERGI NO','MERSIS','TICARET','TICARET SICIL','KOMISYON','MASRAF','UCRET','TOPLAM','CEP SUBE'
   ]);
-  const nameLike = (v) => {
-    const t=String(v||'').trim();
-    if(!t || /\d/.test(t)) return false;
-    const canonical=norm(t).replace(/[^a-z0-9çğıöşü\s]/gi,' ').replace(/\s+/g,' ').trim();
-    if(!canonical || NAME_STOPWORDS.has(canonical)) return false;
-    const words=t.split(/\s+/).filter(Boolean);
-    if(words.length<2 || words.length>6) return false;
-    if(words.some(w=>w.length<2 || !/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]+$/.test(w))) return false;
-    // A semantic name must contain at least two plausible alphabetic tokens and
-    // must not be composed only of transaction/action vocabulary. This blocks
-    // false positives such as "GIDEN FAST EFT" while preserving names like
-    // "Sudenaz Özel" and multi-word company/person names.
-    const actionWords=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
-    const upper=words.map(w=>norm(w).toUpperCase());
-    if(upper.filter(w=>actionWords.has(w)).length>=1) return false;
-    return upper.filter(w=>/^[A-ZÇĞİÖŞÜ]{2,}$/.test(w)).length>=2;
-  };
+  const nameLike = isSemanticRecipientNameCandidate;
   const ibanLike = (v) => /^TR\s*\d{2}(?:[\s-]*[0-9A-Z]){22,}$/i.test(String(v||'')) || /^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
   const isLabel = (item) => {
     if (!item) return false;
@@ -3783,16 +3783,15 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   if (Number.isFinite(advancedForensicsScore) && forensic?.advancedForensics?.available === true) {
     editingRisk = Math.max(editingRisk, Math.min(70, Math.round(advancedForensicsScore * 0.70)));
   }
-  // Paint-Over V1: promote only multi-signal LOCAL evidence. A single residual,
-  // grayscale channel match, or Telegram/JPEG artifact is never enough.
+  // Only baseline-calibrated V2 evidence can affect risk. V1 is retained as a
+  // raw diagnostic and must never be promoted when the genuine baseline is absent.
   const paintOverV2 = forensic?.paintOverForensicsV2;
-  const paintOverV1 = forensic?.paintOverForensics || forensic?.paintOverForensicsV1;
-  const paintOverScore = Number(paintOverV2?.score ?? paintOverV1?.score);
-  const paintOverSignals = Number(paintOverV2?.metrics?.supportSignals ?? paintOverV1?.metrics?.supportSignals) || 0;
-  const paintOverMultiSignal = paintOverV2?.available === true
-    ? (String(paintOverV2?.severity || '').toLowerCase() === 'strong' || String(paintOverV2?.severity || '').toLowerCase() === 'moderate')
-    : paintOverV1?.metrics?.multiSignal === true;
-  if (Number.isFinite(paintOverScore) && forensic?.paintOverForensics?.available === true && paintOverMultiSignal) {
+  const paintOverScore = Number(paintOverV2?.score);
+  const paintOverSignals = Number(paintOverV2?.metrics?.supportSignals) || 0;
+  const paintOverBaselineAvailable = paintOverV2?.metrics?.telegramBaseline?.available === true;
+  const paintOverMultiSignal = paintOverBaselineAvailable &&
+    (String(paintOverV2?.severity || '').toLowerCase() === 'strong' || String(paintOverV2?.severity || '').toLowerCase() === 'moderate');
+  if (Number.isFinite(paintOverScore) && paintOverV2?.available === true && paintOverBaselineAvailable && paintOverMultiSignal) {
     const promoted = paintOverSignals >= 3 && paintOverScore >= 75 ? 75
       : paintOverSignals >= 3 && paintOverScore >= 60 ? 65
       : paintOverSignals >= 2 && paintOverScore >= 50 ? 55
@@ -5394,7 +5393,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       samples: genuineVectors.map(x => ({ file: path.basename(x.path), path: x.path, rawScore: x.vector.rawScore }))
     }));
     const baselineScores=genuineVectors.map(x=>x.vector.rawScore);
-    const baselineAvailable=baselineScores.length>=1;
+    const baselineAvailable=baselineScores.length>=2;
     const baselineCalibrationQuality = genuineVectors.length >= 3 ? 'multi-sample' : genuineVectors.length === 2 ? 'two-sample' : genuineVectors.length === 1 ? 'single-sample' : 'unavailable';
     const baselineMedian=robustMedian(baselineScores);
     const baselineMad=robustMad(baselineScores,baselineMedian);
@@ -5461,14 +5460,16 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
     // 1) raw local signal is first calibrated against genuine Telegram data;
     // 2) known-fake similarity can corroborate it;
     // 3) Amount Forensics is corroboration only, never +10/+25 to PaintOver.
-    let calibrated=baselineAvailable?telegramAdjusted:clamp100(target.rawScore);
-    if(fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
-    else if(fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
+    // Fail closed for risk when there are not enough genuine references to
+    // calibrate the raw local signal. Preserve rawScore for diagnostics only.
+    let calibrated=baselineAvailable?telegramAdjusted:0;
+    if(baselineAvailable && fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
+    else if(baselineAvailable && fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
 
     // Amount Forensics can lift a borderline calibrated result only when the
     // image-local signal already survives Telegram calibration. It is not added
     // as a fixed support score.
-    if(amountStrong && calibrated>=45) calibrated=clamp100(calibrated+Math.min(18,amountScore*.18));
+    if(baselineAvailable && amountStrong && calibrated>=45) calibrated=clamp100(calibrated+Math.min(18,amountScore*.18));
 
     const strong=calibrated>=75 && (
       target.supportSignals>=3 ||
@@ -5482,6 +5483,8 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       available:true,
       engine,
       version:'V2',
+      calibrated:baselineAvailable,
+      status:baselineAvailable?'calibrated':'baseline-unavailable',
       score:Math.round(calibrated),
       rawScore:target.rawScore,
       severity,
@@ -5494,7 +5497,9 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
         knownFakePattern:{available:negativeVectors.length>0,sampleCount:negativeVectors.length,bestSimilarity:Number(bestNegativeSimilarity.toFixed(4)),score:fakePatternScore==null?null:Math.round(fakePatternScore),matches:negativeSimilarities.slice(0,5)},
         amountForensics:{score:Math.round(amountScore),strong:amountStrong,usedAsFixedSupport:false}
       },
-      evidence: strong
+      evidence: !baselineAvailable
+        ? 'Yeterli genuine referans baseline bulunmadığı için ham sinyal risk puanı olarak kullanılmadı.'
+        : strong
         ? 'Telegram baseline kalibrasyonundan sonra lokal Paint-Over sinyali yüksek kaldı ve bağımsız desteklerle güçlendi.'
         : moderate
           ? 'Telegram etkisi kalibrasyona dahil edildi; kalan lokal sinyal orta düzeyde ve ek corroborating bulgu gerektiriyor.'
@@ -9171,7 +9176,7 @@ function resolveSemanticGeometryFallbackV152(field, referenceCandidate, targetRo
   const rn={x:(refBox.x1+refBox.x2)/(2*rs.w),y:(refBox.y1+refBox.y2)/(2*rs.h),w:(refBox.x2-refBox.x1)/rs.w,h:(refBox.y2-refBox.y1)/rs.h};
   const norm=v=>String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğışöüıİ]/g,c=>({ç:'c',ğ:'g',ı:'i',İ:'i',ş:'s',ö:'o',ü:'u'}[c]||c));
   const stop=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
-  const nameLike=v=>{const t=String(v||'').trim();if(!t||/\d/.test(t))return false;const ws=t.split(/\s+/).filter(Boolean);if(ws.length<2||ws.length>6)return false;const up=ws.map(w=>norm(w).toUpperCase());if(up.some(w=>stop.has(w)))return false;return ws.every(w=>/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]{2,}$/.test(w));};
+  const nameLike=isSemanticRecipientNameCandidate;
   const ibanLike=v=>/^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
   const valid=field==='recipientName'?nameLike:ibanLike;
   const scored=targetRows.filter(r=>r?.region&&valid(r.text)).map(r=>{const b=boxOf(r),n={x:(b.x1+b.x2)/(2*ts.w),y:(b.y1+b.y2)/(2*ts.h),w:(b.x2-b.x1)/ts.w,h:(b.y2-b.y1)/ts.h};const d=Math.hypot(n.x-rn.x,n.y-rn.y),sd=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,rn.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,rn.h)));return {r,d,sd,score:100-d*180-sd*18};}).sort((a,b)=>b.score-a.score);
@@ -13593,14 +13598,34 @@ repeatedCharacterAnalysis.available = repeatedCharacterAnalysis.strongGroups.len
 console.warn("AYNI KARAKTER ANALİZİ HATASI:", error?.message || error);
 }
 
-const anomalyScores = features.map((feature) => {
-const inkDiff = relativeOutlier(feature.inkRatio, medInk);
-const ink200Diff = relativeOutlier(feature.inkRatio200, medInk200);
-const ink160Diff = relativeOutlier(feature.inkRatio160, medInk160);
-const darkDiff = relativeOutlier(feature.darkness, medDark);
-const edgeDiff = relativeOutlier(feature.edgeDensity, medEdge);
-const widthDiff = relativeOutlier(feature.width, medWidth);
-const heightDiff = relativeOutlier(feature.height, medHeight);
+// Compare a glyph only with repetitions of the same digit. Comparing every
+// glyph against one global median treats commas, decimal points, and naturally
+// different digits (for example 3 versus 0) as anomalies.
+const typedGlyphs=[...cleanAmountText(candidate.text).replace(/(?:TL|TRY|EUR|USD|GBP|₺|€|\$|£)/gi,'').replace(/\s+/g,'')].filter(char=>/[0-9.,]/.test(char));
+const typedDigits=typedGlyphs.filter(char=>/[0-9]/.test(char));
+let alignedGlyphRows=[];
+if(features.length===typedGlyphs.length){
+  alignedGlyphRows=features.map((feature,index)=>({feature,char:typedGlyphs[index],position:index}));
+}else if(features.length===typedDigits.length){
+  alignedGlyphRows=features.map((feature,index)=>({feature,char:typedDigits[index],position:index}));
+}
+const repeatedDigitCounts=new Map();
+for(const row of alignedGlyphRows)if(/[0-9]/.test(row.char))repeatedDigitCounts.set(row.char,(repeatedDigitCounts.get(row.char)||0)+1);
+const comparableGlyphRows=alignedGlyphRows.filter(row=>(repeatedDigitCounts.get(row.char)||0)>=2);
+const glyphGroups=new Map();
+for(const row of comparableGlyphRows){if(!glyphGroups.has(row.char))glyphGroups.set(row.char,[]);glyphGroups.get(row.char).push(row);}
+const metricKeys=['inkRatio','inkRatio200','inkRatio160','darkness','edgeDensity','width','height'];
+const anomalyScores = comparableGlyphRows.map((row) => {
+const group=glyphGroups.get(row.char)||[];
+const center=Object.fromEntries(metricKeys.map(key=>[key,median(group.map(x=>x.feature[key]))]));
+const feature=row.feature;
+const inkDiff = relativeOutlier(feature.inkRatio, center.inkRatio);
+const ink200Diff = relativeOutlier(feature.inkRatio200, center.inkRatio200);
+const ink160Diff = relativeOutlier(feature.inkRatio160, center.inkRatio160);
+const darkDiff = relativeOutlier(feature.darkness, center.darkness);
+const edgeDiff = relativeOutlier(feature.edgeDensity, center.edgeDensity);
+const widthDiff = relativeOutlier(feature.width, center.width);
+const heightDiff = relativeOutlier(feature.height, center.height);
 
 let votes = 0;
 if (inkDiff >= 0.22) votes++;
@@ -13612,6 +13637,8 @@ if (widthDiff >= 0.18) votes++;
 if (heightDiff >= 0.12) votes++;
 
 return {
+char:row.char,
+position:row.position,
 votes,
 inkDiff,
 ink200Diff,
@@ -13623,29 +13650,25 @@ heightDiff,
 };
 });
 
-const maxScore = Math.max(...anomalyScores.map((x) => x.votes));
+const maxScore = Math.max(0,...anomalyScores.map((x) => x.votes));
 const maxIndex = anomalyScores.findIndex((x) => x.votes === maxScore);
 const maxAnomaly = anomalyScores[maxIndex] || null;
 
 const maxInkDifference = Math.max(
-...features.map((x) => relativeOutlier(x.inkRatio, medInk))
+...anomalyScores.map(x=>x.inkDiff),0
 );
 const maxStrokeProxyDifference = Math.max(
-...features.map((x) => Math.max(
-relativeOutlier(x.inkRatio200, medInk200),
-relativeOutlier(x.inkRatio160, medInk160),
-relativeOutlier(x.width, medWidth)
-))
+...anomalyScores.map(x=>Math.max(x.ink200Diff,x.ink160Diff,x.widthDiff)),0
 );
 const maxEdgeDifference = Math.max(
-...features.map((x) => relativeOutlier(x.edgeDensity, medEdge))
+...anomalyScores.map(x=>x.edgeDiff),0
 );
 const maxDarkDifference = Math.max(
-...features.map((x) => relativeOutlier(x.darkness, medDark))
+...anomalyScores.map(x=>x.darkDiff),0
 );
 
 const anomalousCount = anomalyScores.filter((x) => x.votes >= 3).length;
-const anomalyRatio = features.length ? anomalousCount / features.length : 0;
+const anomalyRatio = anomalyScores.length ? anomalousCount / anomalyScores.length : 0;
 
 // Özellikle tek bir karakterin diğerlerinden ayrılması değerlidir.
 // Çok sayıda karakter aynı şekilde değişmişse bunun belge/render etkisi
@@ -13667,7 +13690,7 @@ Number(group.differences.dark) || 0
 ) >= 0.12)
 );
 
-let status = "pass";
+let status = comparableGlyphRows.length ? "pass" : "unknown";
 let severity = "none";
 let score = 0;
 
@@ -13707,7 +13730,7 @@ score = 65;
 }
 
 const outlierFeature =
-maxIndex >= 0 ? features[maxIndex] : null;
+maxIndex >= 0 ? {...alignedGlyphRows.find(x=>x.position===anomalyScores[maxIndex]?.position)?.feature,character:anomalyScores[maxIndex]?.char,characterPosition:anomalyScores[maxIndex]?.position} : null;
 
 let evidence;
 if (status === "warning") {
@@ -13715,10 +13738,12 @@ const repeatedText = repeatedCharacterAnalysis.strongGroups.length
 ? ` Aynı rakam tekrarları içinde ${repeatedCharacterAnalysis.strongGroups.length} lokal farklılık da tespit edildi.`
 : "";
 evidence =
-`Tutar alanında ${features.length} karakter bölgesi karşılaştırıldı. ${maxScore} ayrı mikro-görsel özellik aynı karakter bölgesinde diğer karakterlerden ayrıştı.${repeatedText} En belirgin fark; ink/stroke yoğunluğu, kenar yapısı veya karakter geometrisinde lokalize bir tutarsızlık olarak ölçüldü. Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
+`Tutar alanında yalnızca aynı rakam türlerinin tekrar eden bölgeleri karşılaştırıldı (${comparableGlyphRows.length} rakam; virgül/nokta karşılaştırma dışı). ${maxScore} mikro-görsel özellik aynı rakamın bir bölgesinde diğer tekrarlarından ayrıştı.${repeatedText} Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
+} else if(status === "unknown") {
+evidence = "Tutar bulundu ancak aynı türden tekrarlanan rakamlar güvenilir biçimde hizalanamadığı için lokal karakter tutarlılığı ölçülemedi; noktalama işaretleri rakam anomalisi olarak değerlendirilmedi.";
 } else {
 evidence =
-`Tutar alanında ${features.length} karakter bölgesi ${estimatedCharacterSlots ? "geometrik slotlar üzerinden yaklaşık olarak " : ""}mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
+`Tutar alanında aynı türden tekrarlanan rakam bölgeleri karşılaştırıldı (${comparableGlyphRows.length} rakam; virgül/nokta karşılaştırma dışı); lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
 }
 
 console.log(
@@ -13730,6 +13755,8 @@ templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
 templatePositionScore: candidate.templateScore || 0,
 characterCount: features.length,
+digitComparableCount: comparableGlyphRows.length,
+punctuationExcluded: typedGlyphs.filter(char=>/[.,]/.test(char)).length,
 estimatedCharacterSlots,
 maxScore,
 maxInkDifference,
@@ -18615,8 +18642,13 @@ if (pixelForensics) {
 if (advancedForensics) {
   result.advancedForensics = advancedForensics;
 }
-if (paintOverForensics) {
-  result.paintOverForensics = paintOverForensics;
+const canonicalPaintOverForensics = paintOverForensicsV2?.available === true
+  ? paintOverForensicsV2
+  : paintOverForensics;
+if (canonicalPaintOverForensics) {
+  // Keep the compatibility alias aligned with the baseline-calibrated result.
+  // V1 remains available only under the explicitly diagnostic V1 property.
+  result.paintOverForensics = canonicalPaintOverForensics;
 }
 
 if (amountForensics) {
@@ -21097,16 +21129,29 @@ if (advancedForensics?.available) {
     referenceToneScore: advancedForensics.metrics?.amountReferenceTone?.reference?.score || 0
   }));
 }
-if (paintOverForensics?.available) {
+if (canonicalPaintOverForensics?.available) {
   console.log("PAINT-OVER FORENSICS SUMMARY:", JSON.stringify({
+    source: canonicalPaintOverForensics === paintOverForensicsV2
+      ? (paintOverForensicsV2.metrics?.telegramBaseline?.available === true ? 'baseline-calibrated-v2' : 'baseline-unavailable-score-zero')
+      : 'uncalibrated-v1-fallback',
+    score: canonicalPaintOverForensics.score,
+    rawScore: canonicalPaintOverForensics.rawScore ?? canonicalPaintOverForensics.score,
+    severity: canonicalPaintOverForensics.severity,
+    baseline: canonicalPaintOverForensics.metrics?.telegramBaseline || null,
+    channelResidualScore: canonicalPaintOverForensics.metrics?.featureScores?.channelResidual ?? canonicalPaintOverForensics.metrics?.channelResidualScore ?? 0,
+    lumaResidualScore: canonicalPaintOverForensics.metrics?.featureScores?.lumaResidual ?? canonicalPaintOverForensics.metrics?.lumaResidualScore ?? 0,
+    edgeScore: canonicalPaintOverForensics.metrics?.featureScores?.edge ?? canonicalPaintOverForensics.metrics?.edgeScore ?? 0,
+    textureScore: canonicalPaintOverForensics.metrics?.featureScores?.texture ?? canonicalPaintOverForensics.metrics?.textureScore ?? 0,
+    corroboratingSignals: canonicalPaintOverForensics.metrics?.supportSignals ?? 0,
+    amountSupport: canonicalPaintOverForensics.metrics?.amountSupport ?? 0
+  }));
+}
+if (paintOverForensics?.available && paintOverForensicsV2?.available === true) {
+  console.log("PAINT-OVER RAW DIAGNOSTIC V1:", JSON.stringify({
     score: paintOverForensics.score,
     severity: paintOverForensics.severity,
-    channelResidualScore: paintOverForensics.metrics?.channelResidualScore || 0,
-    lumaResidualScore: paintOverForensics.metrics?.lumaResidualScore || 0,
-    edgeScore: paintOverForensics.metrics?.edgeScore || 0,
-    textureScore: paintOverForensics.metrics?.textureScore || 0,
-    corroboratingSignals: paintOverForensics.metrics?.supportSignals || 0,
-    amountSupport: paintOverForensics.metrics?.amountSupport || 0
+    roi: paintOverForensics.roi,
+    note: 'Uncalibrated diagnostic only; not the canonical Paint-Over score.'
   }));
 }
 
@@ -21233,7 +21278,7 @@ const strongPixelReferenceSignal =
 const paintOverForV152 =
   result?.paintOverForensicsV2?.available === true
     ? result.paintOverForensicsV2
-    : (paintOverForensics || result?.paintOverForensics || null);
+    : null;
 const paintOverV152Score = Number(paintOverForV152?.score || 0);
 const paintOverV152Signals = Number(paintOverForV152?.metrics?.supportSignals || 0);
 const paintOverV152AmountSupport = Number(paintOverForV152?.metrics?.amountSupport || 0);
