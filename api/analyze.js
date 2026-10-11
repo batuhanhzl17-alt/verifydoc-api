@@ -154,6 +154,8 @@ function resolveMathSemanticValueBox(regions, field) {
   if (inlineSemanticRows.length) {
     inlineSemanticRows.sort((a,b)=>Number(b.score||0)-Number(a.score||0));
     const bestInline = inlineSemanticRows[0];
+    const competingInline = inlineSemanticRows.find(x => norm(x.text)!==norm(bestInline.text));
+    if (competingInline && Number(bestInline.score||0)-Number(competingInline.score||0)<12) return null;
     return {
       text: bestInline.text,
       region: bestInline.region,
@@ -245,7 +247,7 @@ function resolveTypedAmountRegionFromOcr(ocrResult) {
     const text=best.candidate.text,total=Math.max(1,text.length),start=best.candidate.match.index,end=start+best.candidate.match[0].length,w=Number(region.x2)-Number(region.x1);
     region={...region,x1:Number(region.x1)+w*start/total,x2:Number(region.x1)+w*end/total};
   }
-  return {region,text:best.candidate.text,label:best.label.text,score:Number(best.score.toFixed(2)),resolver:`typed-ocr-amount-${best.relation}-v1`};
+  return {region,text:best.candidate.text,label:best.label.text,labelRegion:best.label.row.region,score:Number(best.score.toFixed(2)),resolver:`typed-ocr-amount-${best.relation}-v1`};
 }
 
 async function rereadTypedAmountCrop(imagePath,imageSize,ocrResult){
@@ -2763,7 +2765,7 @@ async function loadNegativeSampleFiles(bank) {
   return out;
 }
 
-async function runNegativeSampleComparison({ targetPath, negativeSamples = [], bank = null }) {
+async function runNegativeSampleComparison({ targetPath, negativeSamples = [], bank = null, amountForensics = null, targetOCR = null }) {
   if (!targetPath || !Array.isArray(negativeSamples) || !negativeSamples.length) return null;
 
   const loadImage = async (filePath) => {
@@ -2777,16 +2779,47 @@ async function runNegativeSampleComparison({ targetPath, negativeSamples = [], b
 
   const targetBuffer = await loadImage(targetPath);
   if (!targetBuffer) return null;
-  const targetJpeg = await sharp(targetBuffer).jpeg({ quality: 98 }).toBuffer();
-  const targetImage = `data:image/jpeg;base64,${targetJpeg.toString("base64")}`;
+  const targetMeta=await sharp(targetBuffer).metadata();
+  const targetTyped=amountForensics?.region
+    ? {region:amountForensics.region,text:amountForensics.selectedAmountText||amountForensics.amountText||'',resolver:'validated-amount-forensics',labelRegion:resolveTypedAmountRegionFromOcr(targetOCR)?.labelRegion||null}
+    : resolveTypedAmountRegionFromOcr(targetOCR);
+  if(!targetTyped?.region||!targetMeta.width||!targetMeta.height){
+    return {available:false,status:'typed-target-amount-roi-unavailable',engine:'known-negative-sample-local-signature-v2'};
+  }
+  const makeAmountCrop=async(buffer,meta,typed)=>{
+    const a=typed?.region,l=typed?.labelRegion;
+    if(!a||!meta?.width||!meta?.height)return null;
+    const h=Math.max(6,Number(a.y2)-Number(a.y1));
+    const left=Math.max(0,Math.floor(Math.min(Number(a.x1),l?Number(l.x1):Number(a.x1))-h*1.25));
+    const top=Math.max(0,Math.floor(Math.min(Number(a.y1),l?Number(l.y1):Number(a.y1))-h*1.1));
+    const right=Math.min(Number(meta.width),Math.ceil(Math.max(Number(a.x2),l?Number(l.x2):Number(a.x2))+h*1.25));
+    const bottom=Math.min(Number(meta.height),Math.ceil(Math.max(Number(a.y2),l?Number(l.y2):Number(a.y2))+h*1.1));
+    const width=right-left,height=bottom-top;
+    if(width<12||height<6||width>Number(meta.width)*.72)return null;
+    const jpeg=await sharp(buffer).extract({left,top,width,height}).jpeg({quality:98}).toBuffer();
+    return {image:`data:image/jpeg;base64,${jpeg.toString('base64')}`,box:{x1:left,y1:top,x2:right,y2:bottom},value:typed.text||null};
+  };
+  const targetCrop=await makeAmountCrop(targetBuffer,targetMeta,targetTyped);
+  if(!targetCrop)return {available:false,status:'typed-target-amount-roi-invalid',engine:'known-negative-sample-local-signature-v2'};
   const results = [];
 
   for (const sample of negativeSamples.slice(0, 6)) {
     try {
       const sampleBuffer = await loadImage(sample.path);
       if (!sampleBuffer) continue;
-      const sampleJpeg = await sharp(sampleBuffer).jpeg({ quality: 98 }).toBuffer();
-      const sampleImage = `data:image/jpeg;base64,${sampleJpeg.toString("base64")}`;
+      const samplePath=path.join('/tmp',`verifydoc-negative-ocr-${Date.now()}-${Math.random().toString(36).slice(2,8)}.png`);
+      let sampleTyped=null,sampleCrop=null,sampleMeta=null;
+      try{
+        await sharp(sampleBuffer).png().toFile(samplePath);
+        const sampleOcr=await runPaddleOCR(samplePath);
+        sampleTyped=resolveTypedAmountRegionFromOcr(sampleOcr);
+        sampleMeta=await sharp(sampleBuffer).metadata();
+        sampleCrop=await makeAmountCrop(sampleBuffer,sampleMeta,sampleTyped);
+      }finally{try{await fs.unlink(samplePath)}catch{}}
+      // A negative example is comparable only when its own typed amount label
+      // and value ROI were resolved. Never let a whole-page/template likeness
+      // generate claims about TUTAR or YALNIZ.
+      if(!sampleCrop){results.push({sample:sample.fileName,matchScore:0,findings:[],status:'typed-sample-amount-roi-unavailable',targetRegion:targetCrop.box,sampleRegion:null});continue;}
 
       const response = await openai.responses.create({
         model: "gpt-5.6-terra",
@@ -2797,29 +2830,30 @@ BANKA: ${bank || "belirtilmedi"}
 TARGET = su anda incelenen belge.
 NEGATIVE SAMPLE = daha once manipule edilmis oldugu bilinen ornek.
 
-Amac: TARGET'in NEGATIVE SAMPLE ile ayni veya cok benzer LOKAL manipülasyon izlerini tasiyip tasimadigini degerlendir.
+Amac: yalnizca TARGET ve NEGATIVE SAMPLE icindeki TUTAR alanina ait eslenmis yakin planlari karsilastir.
 
 Kurallar:
 1. Isim, tutar, IBAN, tarih, islem numarasi ve diger dinamik degerlerin farkli olmasi tek basina eslesme degildir.
 2. NEGATIVE SAMPLE guvenilir referans degildir; onun icerigini TARGET'a dayatma.
-3. Yalnizca ayni tur lokal duzenleme, ekleme, silme veya yeniden yazma izi goruluyorsa eslesme ver.
-4. Font, stroke, baseline, karakter rasteri, lokal arka plan bozulmasi, kopyala-yapistir izi ve belirli bir alanin cevresinden ayrismasi gibi birden fazla birlikte gorulen guclu isarete oncelik ver.
-5. Fotograf acisi, JPEG sikistirmasi, cozunurluk, global bulaniklik ve genel render farklarini eslesme sayma.
-6. Tek bir belirsiz karakter veya OCR farki yeterli degildir.
+3. Bu yakin planlar farkli belgelerin TUTAR satirlaridir; tutar rakamlari ve degerler dogal olarak farkli olabilir.
+4. Yalnizca harf/rakam degerinden bagimsiz, birden fazla ayni lokal duzenleme izi acikca goruluyorsa eslesme ver.
+5. Tek basina font sablonu, bosluk, tutar uzunlugu, TL eki veya genel render farki eslesme degildir.
+6. YALNIZ, adres, IBAN, banka veya baska alan hakkinda bulgu uretme; bu alanlar bu istekte gosterilmiyor.
 7. Emin degilsen matchScore dusuk tut ve findings bos birak.
-8. Kesin sahte karari verme. Bu katman yalnizca bilinen manipülasyon ornegiyle benzerlik arar.
+8. Kesin sahte karari verme; hedef ROI ve ornek ROI kutulari sistem tarafindan eslestirilmistir.
 
 Yalnizca JSON dondur.` },
-          { type: "input_text", text: "TARGET" },
-          { type: "input_image", image_url: targetImage, detail: "high" },
+          { type: "input_text", text: `TARGET TUTAR ROI; OCR=${targetCrop.value||'okunamadi'}; BOX=${JSON.stringify(targetCrop.box)}` },
+          { type: "input_image", image_url: targetCrop.image, detail: "high" },
           { type: "input_text", text: `NEGATIVE SAMPLE: ${sample.fileName}` },
-          { type: "input_image", image_url: sampleImage, detail: "high" },
+          { type: "input_text", text: `NEGATIVE SAMPLE TUTAR ROI; OCR=${sampleCrop.value||'okunamadi'}; BOX=${JSON.stringify(sampleCrop.box)}` },
+          { type: "input_image", image_url: sampleCrop.image, detail: "high" },
         ] }],
         text: { format: { type: "json_schema", name: "verifydoc_negative_sample_comparison", strict: true, schema: {
           type: "object", properties: {
             matchScore: { type: "integer", minimum: 0, maximum: 100 },
             findings: { type: "array", maxItems: 5, items: { type: "object", properties: {
-              field: { type: "string" }, issueType: { type: "string", enum: ["typography", "layout", "local-render", "mixed"] },
+              field: { type: "string", enum: ["TUTAR"] }, issueType: { type: "string", enum: ["typography", "layout", "local-render", "mixed"] },
               confidence: { type: "integer", minimum: 0, maximum: 100 }, evidence: { type: "string" }
             }, required: ["field", "issueType", "confidence", "evidence"], additionalProperties: false } }
           }, required: ["matchScore", "findings"], additionalProperties: false
@@ -2827,16 +2861,17 @@ Yalnizca JSON dondur.` },
       });
 
       const parsed = JSON.parse(response?.output_text || "{}");
-      results.push({ sample: sample.fileName, matchScore: Number(parsed.matchScore || 0), findings: Array.isArray(parsed.findings) ? parsed.findings : [] });
+      results.push({ sample: sample.fileName, matchScore: Number(parsed.matchScore || 0), findings: Array.isArray(parsed.findings) ? parsed.findings.filter(x=>x?.field==='TUTAR') : [], status:'paired-typed-amount-roi', targetRegion:targetCrop.box, sampleRegion:sampleCrop.box, targetAmount:targetCrop.value||null, sampleAmount:sampleCrop.value||null });
     } catch (error) {
       console.warn("NEGATIVE SAMPLE COMPARISON HATASI:", error?.message || error);
     }
   }
 
-  if (!results.length) return null;
-  results.sort((a, b) => b.matchScore - a.matchScore);
-  const best = results[0];
-  return { available: true, engine: "known-negative-sample-local-signature-v1", bank, sampleCount: results.length, bestMatchScore: best.matchScore, bestSample: best.sample, findings: best.findings.slice(0, 5), comparisons: results };
+  const comparable=results.filter(r=>r.status==='paired-typed-amount-roi');
+  if (!comparable.length) return {available:false,status:'no-typed-sample-amount-roi',engine:'known-negative-sample-local-signature-v2-typed-amount-roi',bank,comparisons:results};
+  comparable.sort((a, b) => b.matchScore - a.matchScore);
+  const best = comparable[0];
+  return { available: true, engine: "known-negative-sample-local-signature-v2-typed-amount-roi", bank, sampleCount: comparable.length, bestMatchScore: best.matchScore, bestSample: best.sample, findings: best.findings.slice(0, 5), targetRegion:targetCrop.box, targetAmount:targetCrop.value||null, comparisons: results };
 }
 
 const STATEMENT_REFERENCE_MAP = {
@@ -9142,9 +9177,12 @@ function resolveSemanticGeometryFallbackV152(field, referenceCandidate, targetRo
   const scored=targetRows.filter(r=>r?.region&&valid(r.text)).map(r=>{const b=boxOf(r),n={x:(b.x1+b.x2)/(2*ts.w),y:(b.y1+b.y2)/(2*ts.h),w:(b.x2-b.x1)/ts.w,h:(b.y2-b.y1)/ts.h};const d=Math.hypot(n.x-rn.x,n.y-rn.y),sd=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,rn.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,rn.h)));return {r,d,sd,score:100-d*180-sd*18};}).sort((a,b)=>b.score-a.score);
   const best=scored[0],second=scored.find(x=>String(x.r.text||'').replace(/[^a-z0-9]/gi,'').toLowerCase()!==String(best?.r?.text||'').replace(/[^a-z0-9]/gi,'').toLowerCase());
   const margin=second?best.score-second.score:null;
-  // Choose the best geometrically aligned candidate; keep its rank and margin
-  // for the caller's diagnostics rather than rejecting a useful best match.
-  return best&&best.score>=55?{text:String(best.r.text).trim(),region:best.r.region,score:Number(best.score.toFixed(2)),margin:margin===null?null:Number(margin.toFixed(2)),candidateCount:scored.length,resolver:`reference-geometry-${field}-v153-page-normalized`}:null;
+  // Geometry-only fallback is weaker than an explicit label/value pairing.
+  // Use it only when the best typed candidate is both close to the trusted
+  // reference position and clearly separated from other valid candidates.
+  if(best&&best.score>=68&&(margin===null||margin>=12))return{text:String(best.r.text).trim(),region:best.r.region,score:Number(best.score.toFixed(2)),margin:margin===null?null:Number(margin.toFixed(2)),candidateCount:scored.length,resolver:`reference-geometry-${field}-v153-page-normalized`};
+  console.log('SEMANTIC GEOMETRY FALLBACK UNRESOLVED:',JSON.stringify({field,candidateCount:scored.length,bestScore:best?Number(best.score.toFixed(2)):null,margin:margin===null?null:Number(margin.toFixed(2)),reason:!best?'no-typed-candidate':best.score<68?'weak-reference-position':'ambiguous-nearby-candidates'}));
+  return null;
 }
 
 async function rereadSemanticFieldCrop(targetPath, targetSize, ocrResult, field) {
@@ -16316,7 +16354,7 @@ if ((type === "image" || type === "pdf") && bank) {
   try {
     const negativeSamples = await loadNegativeSampleFiles(bank);
     if (negativeSamples.length) {
-      negativeSampleForensics = await runNegativeSampleComparison({ targetPath: forensicTargetPath, negativeSamples, bank });
+      negativeSampleForensics = await runNegativeSampleComparison({ targetPath: forensicTargetPath, negativeSamples, bank, amountForensics, targetOCR:paddleImageOCR });
       console.log("NEGATIVE SAMPLE FORENSICS:", JSON.stringify(negativeSampleForensics));
     }
   } catch (error) {
@@ -18080,8 +18118,42 @@ if (multimodalReceiptEvidence) {
     evidenceResult: multimodalReceiptEvidence,
     paddleOCR: paddleImageOCR,
     primaryDocumentData: result?.documentData,
+    semanticFieldRegions: {
+      recipientName: (() => {
+        const r=referenceForensics?.targetSemanticRegions?.recipientName;
+        const resolver=String(r?.resolver||'');
+        const direct=resolver.startsWith('semantic-');
+        const geometry=resolver.startsWith('reference-geometry-')&&Number(r?.score)>=82&&(r?.margin==null||Number(r.margin)>=15);
+        return r?.text&&r?.region&&(direct||geometry)
+          ? {text:r.text,region:r.region,resolver,validated:true}
+          : null;
+      })(),
+      recipientIBAN: (() => {
+        const r=referenceForensics?.targetSemanticRegions?.recipientIban;
+        const resolver=String(r?.resolver||'');
+        const direct=resolver.startsWith('semantic-');
+        const geometry=resolver.startsWith('reference-geometry-')&&Number(r?.score)>=82&&(r?.margin==null||Number(r.margin)>=15);
+        return r?.text&&r?.region&&(direct||geometry)
+          ? {text:r.text,region:r.region,resolver,validated:true}
+          : null;
+      })(),
+      amount: amountForensics?.available===true&&amountForensics?.region
+        ? {text:amountForensics.selectedAmountText||amountForensics.amountText||null,region:amountForensics.region,resolver:amountForensics.selectionMethod||'amount-forensics-typed-label',validated:true}
+        : null,
+    },
   });
   result.semanticEvidenceFusion = semanticEvidenceFusion;
+  console.log('SEMANTIC EVIDENCE FUSION V2 FIELD ROI:',JSON.stringify({
+    status:semanticEvidenceFusion.status,
+    fields:Object.fromEntries(Object.entries(semanticEvidenceFusion.fields||{}).map(([field,row])=>[field,{
+      visionValueAvailable:Boolean(String(row?.visualEvidence?.text||'').trim()),
+      paddleOCRAgreement:row?.paddleOCRAgreement||'unavailable',
+      paddleOCRResolver:row?.paddleOCRFieldEvidence?.resolver||null,
+      paddleOCRRegion:row?.paddleOCRFieldEvidence?.region||null,
+      associationValidated:row?.paddleOCRFieldEvidence?.associationValidated===true,
+      primaryAnalysisAgreement:row?.primaryAnalysisAgreement||'unavailable',
+    }]))
+  }));
 }
 
 // Deterministik yapısal geometri sinyali AI çıktısından bağımsızdır.
