@@ -52,7 +52,7 @@ const EVIDENCE_SCHEMA = {
 // Explicit per-bank guidance. These descriptions orient the reader but never
 // substitute for a visible label; unknown/variant layouts stay label-driven.
 const BANK_GUIDES = {
-  garanti: 'Garanti BBVA: FAST/EFT dekontlarında üstte müşteri ve alıcı kutuları, ortada işlem ayrıntıları, alt sağda ayrı TUTAR kutusu bulunabilir. Alıcı adı ALACAKLI/ALICI, alıcı IBAN ALACAKLI IBAN/ALICI IBAN etiketine bağlı olmalıdır.',
+  garanti: 'Garanti BBVA: FAST/EFT dekontlarında üst sağdaki SAYIN/adres paneli dekont alıcısını gösterebilir; işlem ayrıntılarındaki ALACAKLI/ALICI alanı da alıcıyı gösterebilir. Bu şablonda alıcı adı SAYIN başlığının hemen yanındaki addressee adından veya açık ALACAKLI/ALICI etiketinden alınabilir. Alıcı IBAN yalnız ALACAKLI IBAN/ALICI IBAN etiketine bağlıdır. Alt sağda ayrı TUTAR kutusu bulunabilir.',
   enpara: 'Enpara: İşlem tablosunda B/A, Para Cinsi, Tutar sütunları bulunabilir; tutar bu tablodaki işlem satırından alınır. Alttaki GİDEN FAST EFT açıklamasındaki EFT TUTARI veya ücret satırını tablo tutarıyla karıştırma.',
   ziraat: 'Ziraat Bankası: Hesaptan FAST/EFT dekontlarında üstte şube/işlem bilgisi, alıcı bilgileri ve altta işlem açıklamaları bulunabilir. İşlem tutarını yalnız görünür İşlem Tutarı/Tutar etiketinden; alıcı IBAN’ını Alıcı Hesap/Alıcı IBAN alanından al.',
   denizbank: 'DenizBank: FAST/EFT dekontlarında işlem tutarı ve bakiye/devir değerleri birlikte bulunabilir. Yalnız İşlem Tutarı/Tutar etiketine bağlı değeri al; bakiye veya kullanılabilir bakiye tutar değildir.',
@@ -67,7 +67,7 @@ const BANK_GUIDES = {
   kuveytturk: 'Kuveyt Türk: Transfer dekontunda işlem bilgileri ve alıcı bölümü olabilir. Yalnız görünür etiketle doğrulanan alıcı adı, alıcı IBAN, işlem tutarı ve işlem tarihini çıkar.',
 };
 const BANK_EXAMPLES = {
-  garanti: 'Few-shot Garanti örneği: “ALACAKLI: Ayşe Yılmaz”, “ALACAKLI IBAN: TR..” ve alt sağ kutuda “TUTAR: -1.500,00 TL” görünüyorsa ad, IBAN ve tutarı yalnız bu etiketlere bağla; tutar değeri dinamiktir.',
+  garanti: 'Few-shot Garanti örneği: üst sağdaki alıcı/adres kutusunda “SAYIN Ayşe Yılmaz” veya işlem ayrıntılarında “ALACAKLI: Ayşe Yılmaz” görünüyorsa alıcı adını bu metinle ilişkilendir; “ALACAKLI IBAN: TR..” alıcı IBAN’ıdır; alt sağ kutudaki “TUTAR: -1.500,00 TL” işlem tutarıdır. Sayın kutusundaki adresi adın parçası yapma; tutar değeri dinamiktir.',
   enpara: 'Few-shot Enpara örneği: tabloda “B/A | Para Cinsi | Tutar” başlığının altında “B | TL | 3.000,00” varsa amount yalnız 3.000,00’dır. Açıklama bölümündeki EFT TUTARI/ücret satırını tablo tutarı yerine kullanma; alıcı adı veya IBAN için açık alan etiketi yoksa null döndür.',
   ziraat: 'Few-shot Ziraat örneği: “İşlem Tutarı: 1.200,00 TRY”, “Alıcı Hesap: TR..” ve “Sayın: Ayşe Yılmaz” görülüyorsa yalnız bu açık bağları kullan; başlık/hesap sahibi bilgisini alıcı adı yerine koyma.',
   denizbank: 'Few-shot DenizBank örneği: “İşlem Tutarı: 1.200,00 TL” işlem tutarıdır; “Bakiye: 4.500,00 TL” amount değildir. Alıcı adı ve IBAN etiketleri görünmüyorsa null döndür.',
@@ -100,10 +100,11 @@ function normalizeLabel(value) {
     .replace(/[^A-Z0-9]+/g, ' ').trim();
 }
 
-function labelMatchesField(field, label) {
+function labelMatchesField(field, label, bank = null) {
   const text = normalizeLabel(label);
   if (!text) return false;
-  if (field === 'recipientName') return /^(ALICI|ALACAKLI|LEHDAR|BENEFICIARY|PAYEE|RECEIVER)( ADI| ISMI| UNVANI| AD SOYADI| NAME)?$/.test(text);
+  const bankKey = String(bank || '').toLocaleLowerCase('tr-TR').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ı/g, 'i').replace(/[^a-z0-9]/g, '');
+  if (field === 'recipientName') return (bankKey.startsWith('garanti') && text === 'SAYIN') || /^(ALICI|ALACAKLI|LEHDAR|BENEFICIARY|PAYEE|RECEIVER)( ADI| ISMI| UNVANI| AD SOYADI| NAME)?$/.test(text);
   if (field === 'recipientIBAN') return /^(ALICI|ALACAKLI|LEHDAR|BENEFICIARY|PAYEE|RECEIVER) (HESAP )?(IBAN|HESAP|HESAP NO|HESAP NUMARASI)$/.test(text);
   if (field === 'amount') return /^(ISLEM |EFT |FAST |GIDEN FAST |TRANSFER )?(ISLEM )?TUTAR(I)?$/.test(text) || /^B A PARA CINSI TUTAR$/.test(text) || /^PARA CINSI TUTAR$/.test(text) || /^TUTAR$/.test(text);
   return false;
@@ -222,7 +223,7 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
   const evidence = JSON.parse(response.output_text || '{}');
   for (const field of ['recipientName', 'recipientIBAN', 'amount']) {
     const row = evidence?.[field];
-    if (row?.text != null && !labelMatchesField(field, row?.labelText)) {
+    if (row?.text != null && !labelMatchesField(field, row?.labelText, bank)) {
       row.text = null; row.confidence = 0; row.semanticRelationship = 'label-not-validated-for-field';
     }
   }
