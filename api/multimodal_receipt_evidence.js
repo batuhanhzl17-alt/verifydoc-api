@@ -114,8 +114,13 @@ function fieldLabel(field, text) {
   if (field === 'recipientName') return Boolean(recipientNameLabel(prefix));
   if (field === 'recipientIBAN') return Boolean(recipientIbanLabel(prefix));
   if (field === 'amount') {
-    if (/(MASRAF|KOMISYON|ÜCRET|UCRET|VERGI|BSMV|TOPLAM|BAKIYE|KALAN)/i.test(raw)) return false;
-    return /TUTAR/.test(compact) && /(ISLEM|PARA|CINSI|ANA|GIDEN|TRANSFER|ODEME|TUTAR)/.test(compact);
+    const normalized = raw.toLocaleUpperCase('tr-TR')
+      .replace(/[İIı]/g, 'I').replace(/Ğ/g, 'G').replace(/Ü/g, 'U')
+      .replace(/Ş/g, 'S').replace(/Ö/g, 'O').replace(/Ç/g, 'C')
+      .replace(/[():.]/g, ' ').replace(/\s+/g, ' ').trim();
+    // Section headings such as "TUTAR BILGILERI" are not amount labels.
+    // Accept only known primary-amount labels, never fees, totals or balances.
+    return /^(?:TUTAR|TUTARI|ISLEM TUTAR|ISLEM TUTARI|ISLEM TUTAR TL|ISLEM TUTARI TL|ISLEM TUTAR TRY|ISLEM TUTARI TRY|ANA TUTAR|ANA TUTARI|GIDEN TUTAR|GIDEN TUTARI|GIDEN FAST TUTAR|GIDEN FAST TUTARI|GIDEN FAST EFT TUTAR|GIDEN FAST EFT TUTARI|GONDERILEN TUTAR|GONDERILEN TUTARI|GONDERILEN FAST TUTAR|GONDERILEN FAST TUTARI|TRANSFER TUTAR|TRANSFER TUTARI|ODEME TUTAR|ODEME TUTARI|PARA CINSI TUTAR|B A PARA CINSI TUTAR)$/.test(normalized);
   }
   return false;
 }
