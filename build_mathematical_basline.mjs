@@ -1,32 +1,22 @@
 import fs from 'fs/promises';
-import os from 'os';
 import path from 'path';
 import { createRequire } from 'module';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import { fileURLToPath, pathToFileURL } from 'url';
+import * as pdfjsLib from 'pdfjs-dist/build/pdf.mjs';
+import { pathToFileURL } from 'url';
 import { extractMathematicalFingerprint, buildBaseline, inferDocumentFamily } from './api/mathematical_forensics_v1.6.3.js';
 
-const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
 const canvasMod = require('@napi-rs/canvas');
 const createCanvas = canvasMod.createCanvas || canvasMod.default?.createCanvas;
-for (const key of ['ImageData', 'Path2D', 'DOMMatrix']) {
-  const value = canvasMod[key] || canvasMod.default?.[key];
-  if (typeof globalThis[key] === 'undefined' && value) globalThis[key] = value;
-}
-let pdfjsPromise = null;
-async function loadPdfJs() {
-  if (!pdfjsPromise) {
-    pdfjsPromise = import('pdfjs-dist/build/pdf.mjs').then(pdfjs => {
-      pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(require.resolve('pdfjs-dist/build/pdf.worker.mjs')).href;
-      return pdfjs;
-    });
-  }
-  return pdfjsPromise;
-}
+const ImageData = canvasMod.ImageData || canvasMod.default?.ImageData;
+const Path2D = canvasMod.Path2D || canvasMod.default?.Path2D;
+const DOMMatrix = canvasMod.DOMMatrix || canvasMod.default?.DOMMatrix;
+if (typeof globalThis.ImageData === 'undefined' && ImageData) globalThis.ImageData = ImageData;
+if (typeof globalThis.Path2D === 'undefined' && Path2D) globalThis.Path2D = Path2D;
+if (typeof globalThis.DOMMatrix === 'undefined' && DOMMatrix) globalThis.DOMMatrix = DOMMatrix;
+pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(require.resolve('pdfjs-dist/build/pdf.worker.mjs')).href;
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname));
 const REFS = path.join(ROOT, 'references');
 const NEG = path.join(ROOT, 'negative_samples');
 const OUT = path.join(ROOT, 'mathematical_forensics_baseline.json');
@@ -41,16 +31,7 @@ function inferBank(p) {
   for (const [needle, bank] of bankAliases) if (s.includes(needle)) return bank;
   return path.basename(path.dirname(p)).toLocaleLowerCase('tr-TR').replace(/[^a-z0-9]/g,'') || 'unknown';
 }
-function inferFamilyFromPath(p, bank) {
-  const base = path.basename(p);
-  const inferred = inferDocumentFamily(base, '', bank);
-  if (inferred === 'ACCOUNT_STATEMENT') return inferred;
-  // Garanti transfer rails share one receipt layout; preserve statements as
-  // a separate family. DenizBank's supplied receipt corpus is FAST.
-  if (bank === 'garanti') return 'DEKONT';
-  if (bank === 'denizbank') return 'FAST';
-  return inferred;
-}
+function inferFamilyFromPath(p) { return inferDocumentFamily(path.basename(p), ''); }
 
 async function walk(dir) {
   const out = [];
@@ -63,35 +44,12 @@ async function walk(dir) {
 }
 
 async function renderPdfFirstPage(buf) {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'verifydoc-baseline-'));
-  try {
-    const input = path.join(tempDir, 'input.pdf');
-    const output = path.join(tempDir, 'page');
-    await fs.writeFile(input, buf);
-    try {
-      // Fixed-resolution Poppler rendering avoids local pdfjs/canvas version
-      // differences and stays close to the runtime's approximately 1.6x raster.
-      await execFileAsync('pdftoppm', ['-f', '1', '-l', '1', '-r', '120', '-png', '-singlefile', input, output], {
-        timeout:60000,
-        maxBuffer:64 * 1024 * 1024,
-        env:{...process.env, XDG_CACHE_HOME:os.tmpdir()},
-      });
-      return await fs.readFile(`${output}.png`);
-    } catch (popplerError) {
-      if (popplerError?.code !== 'ENOENT') throw popplerError;
-      // Preserve the original dependency-based route on machines without
-      // Poppler; this uses the same canvas/PDF.js packages as the API.
-      const pdfjsLib = await loadPdfJs();
-      const pdf = await pdfjsLib.getDocument({ data:new Uint8Array(buf) }).promise;
-      const page = await pdf.getPage(1);
-      const viewport = page.getViewport({ scale:1.6 });
-      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
-      await page.render({ canvasContext:canvas.getContext('2d'), viewport }).promise;
-      return canvas.toBuffer('image/png');
-    }
-  } finally {
-    await fs.rm(tempDir, { recursive:true, force:true });
-  }
+  const pdf = await pdfjsLib.getDocument({ data:new Uint8Array(buf) }).promise;
+  const page = await pdf.getPage(1);
+  const viewport = page.getViewport({ scale:1.6 });
+  const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+  await page.render({ canvasContext:canvas.getContext('2d'), viewport }).promise;
+  return canvas.toBuffer('image/png');
 }
 
 async function fingerprintFile(filePath) {
@@ -111,7 +69,7 @@ async function addFiles(files, label) {
     if (!['.jpg','.jpeg','.png','.pdf'].includes(ext)) continue;
     try {
       const bank = inferBank(file);
-      const family = inferFamilyFromPath(file, bank);
+      const family = inferFamilyFromPath(file);
       const { fingerprint, renderedFromPdf } = await fingerprintFile(file);
       samples.push({
         id: `${label}:${path.relative(ROOT,file).replaceAll(path.sep,'/')}`,
