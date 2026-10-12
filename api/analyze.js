@@ -9288,6 +9288,20 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     // V15.4.3 typography-only normalization. Other forensic engines continue
     // to use the original targetBuffer unchanged.
     const targetTypographyBuffer = await rfTypographyRasterNormalize(targetBuffer);
+    const attachPageNormalizedRegion = (value, size) => {
+      if (!value?.region || !size?.width || !size?.height) return value;
+      const r = value.region;
+      return {
+        ...value,
+        normalizedRegion: {
+          x1: Number((r.x1 / size.width).toFixed(6)),
+          y1: Number((r.y1 / size.height).toFixed(6)),
+          x2: Number((r.x2 / size.width).toFixed(6)),
+          y2: Number((r.y2 / size.height).toFixed(6)),
+        },
+        coordinateSpace: 'page-normalized-0-to-1',
+      };
+    };
 
     const allReferencePaths = await getReferenceFiles(normalizedBank);
     const requestedReferencePaths = Array.isArray(selectedReferencePath)
@@ -9521,6 +9535,23 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         }
         const globalStyleBaseline=rfMedianSigned(stylePairs.map(p=>rfStyleResidual(p.a,p.b)));
 
+        // Resolve recipient value ROIs once from typed labels. The generic
+        // nearest-value resolver below can otherwise attach a nearby text box
+        // (for example a fee/description line) to recipientName/recipientIban.
+        // For these critical fields, a missing semantic ROI must stay missing.
+        const refRecipientValueRegions = {
+          recipientName: resolveMathSemanticValueBox(refRegions, 'recipientName'),
+          recipientIban: resolveMathSemanticValueBox(refRegions, 'recipientIban'),
+        };
+        const targetRecipientValueRegions = {
+          recipientName: resolveMathSemanticValueBox(targetRegions, 'recipientName'),
+          recipientIban: resolveMathSemanticValueBox(targetRegions, 'recipientIban'),
+        };
+        for (const key of ['recipientName', 'recipientIban']) {
+          refRecipientValueRegions[key] = attachPageNormalizedRegion(refRecipientValueRegions[key], refSize);
+          targetRecipientValueRegions[key] = attachPageNormalizedRegion(targetRecipientValueRegions[key], targetSize);
+        }
+
         const fieldResults=[];
         for(const m of matches){
           const key=m.rl.rule.key;
@@ -9530,7 +9561,11 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const tarStyle=tarLabelRegion?await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize):null;
           const rawStyle=rfStyleResidual(refStyle,tarStyle);
           const styleResidual=rfStyleResidual(refStyle,tarStyle,globalStyleBaseline);
-          const refValue=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
+          let refValue=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
+          if (key === 'recipientName' || key === 'recipientIban') {
+            refValue = refRecipientValueRegions[key] || null;
+            tarValue = targetRecipientValueRegions[key] || null;
+          }
           let valueRenderResidual=null;
           let valueGeometryResidual=null;
           if(refValue&&tarValue){
@@ -9963,6 +9998,14 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           let valueRefRaw=rfResolveCriticalValueRegionV127(refRegions,m.rl,key,{source:'semantic-typed-relative-v127'});
           let valueTarRaw=rfResolveCriticalValueRegionV127(targetRegions,m.tl,key,{source:'semantic-typed-relative-v127'});
 
+          // Recipient fields must use the same label-locked ROIs as the
+          // reference engine's value/geometry measurements. Do not fall back
+          // to a nearby generic text box when either side is unresolved.
+          if (semanticKey === 'recipientName' || semanticKey === 'recipientIban') {
+            valueRefRaw = refRecipientValueRegions[semanticKey] || null;
+            valueTarRaw = targetRecipientValueRegions[semanticKey] || null;
+          }
+
           // V1.2.7 AMOUNT HARD LOCK:
           // Amount Forensics is the authoritative target ROI. Never replace it
           // with a nearby OCR number. The trusted reference anchor supplies the
@@ -10219,13 +10262,14 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         }
 
         const semanticValueRegions = {
-          recipientName: resolveMathSemanticValueBox(refRegions, 'recipientName'),
-          recipientIban: resolveMathSemanticValueBox(refRegions, 'recipientIban'),
+          recipientName: refRecipientValueRegions.recipientName,
+          recipientIban: refRecipientValueRegions.recipientIban,
         };
         console.log('MATH REFERENCE SEMANTIC VALUE RESOLVER V1.5.4:', JSON.stringify({
           reference:path.basename(referencePath),
-          recipientName:semanticValueRegions.recipientName ? {box:semanticValueRegions.recipientName.region,resolver:semanticValueRegions.recipientName.resolver} : null,
-          recipientIban:semanticValueRegions.recipientIban ? {box:semanticValueRegions.recipientIban.region,resolver:semanticValueRegions.recipientIban.resolver} : null,
+          coordinateSpace:'page-normalized-0-to-1',
+          recipientName:semanticValueRegions.recipientName ? {box:semanticValueRegions.recipientName.region,normalizedBox:semanticValueRegions.recipientName.normalizedRegion||null,resolver:semanticValueRegions.recipientName.resolver} : null,
+          recipientIban:semanticValueRegions.recipientIban ? {box:semanticValueRegions.recipientIban.region,normalizedBox:semanticValueRegions.recipientIban.normalizedRegion||null,resolver:semanticValueRegions.recipientIban.resolver} : null,
         }));
 
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
@@ -10393,7 +10437,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     for(const rows of spacingGroups.values()){
       const med=rfMedianSigned(rows.map(x=>Number(x.score)).filter(Number.isFinite));
       const hits=rows.filter(x=>x.score>=55).length;
-      const keep=(rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45)||(rows.length===1&&med>=60);
+      // A single reference is not enough to claim a stable layout anomaly.
+      // Keep it in per-reference diagnostics, but require ensemble support for
+      // the consolidated finding consumed by reports and risk calculation.
+      const keep=rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45;
       if(keep)spacingAnomalies.push({...rows.sort((a,b)=>b.score-a.score)[0],ensembleMedianScore:rfClamp100(med),referenceCountForPair:rows.length});
     }
 
@@ -10429,6 +10476,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       const referenceRowsForFallback = referenceResults.flatMap(r => Array.isArray(r?.ocrRegions) ? r.ocrRegions : []);
       const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],referenceRowsForFallback,targetSize,semanticValueReferenceSizes[field]);
       if (fallback) targetSemanticRegions[field]=fallback;
+    }
+    for (const field of ['recipientName','recipientIban']) {
+      targetSemanticRegions[field] = attachPageNormalizedRegion(targetSemanticRegions[field], targetSize) || null;
     }
 
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
