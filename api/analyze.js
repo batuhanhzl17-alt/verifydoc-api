@@ -463,7 +463,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   }
   const amountTargetBox = amountForensics?.available===true&&amountForensics?.region ? amountForensics.region : (amountFieldIsTyped ? boxFrom(amountField).target : targetTypedAmount?.region || null);
   if (amountTargetBox && amountReferenceBox) {
-    rois.amount = { target: amountTargetBox, reference: amountReferenceBox, source: amountForensics?.available===true&&amountForensics?.region ? 'validated-amount-forensics+' + (amountReferenceResolver || 'typed-reference') : amountReferenceResolver, targetText:amountForensics?.selectedAmountText||targetTypedAmount?.text||null, referenceText:referenceTypedAmount?.text||null };
+    rois.amount = { target: amountTargetBox, reference: amountReferenceBox, source: amountForensics?.available===true&&amountForensics?.region ? 'validated-amount-forensics+' + (amountReferenceResolver || 'typed-reference') : amountReferenceResolver, targetText:amountForensics?.selectedAmountText||targetTypedAmount?.text||null, referenceText:referenceTypedAmount?.text||null, referenceResolver:amountReferenceResolver||null };
     console.log('MATH AMOUNT ROI PAIR:',JSON.stringify({bank,targetText:rois.amount.targetText,referenceText:rois.amount.referenceText,targetBox:amountTargetBox,referenceBox:amountReferenceBox,source:rois.amount.source}));
   } else {
     console.warn('MATH AMOUNT ROI SKIPPED:',JSON.stringify({bank,targetAvailable:Boolean(amountTargetBox),referenceAvailable:Boolean(amountReferenceBox),targetResolver:amountForensics?.available===true?'amount-forensics':targetTypedAmount?.resolver||null,referenceResolver:amountReferenceResolver||null}));
@@ -799,6 +799,14 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     // measured mathematically when their boxes were available.
     semanticReferenceMeasurements,
     amountInkProfiles,
+    typedAmountPair: semanticRois.amount ? {
+      targetText: semanticRois.amount.targetText || null,
+      targetBox: semanticRois.amount.target || null,
+      referenceText: semanticRois.amount.referenceText || null,
+      referenceBox: semanticRois.amount.reference || null,
+      source: semanticRois.amount.source || null,
+      referenceResolver: semanticRois.amount.referenceResolver || null,
+    } : null,
     roi16x16: roiForensics,
     roiSummary: {
       available: roiRows.length > 0,
@@ -16311,8 +16319,8 @@ bank
 );
 
 console.log(
-"AMOUNT FORENSICS:",
-JSON.stringify(amountForensics)
+"AMOUNT FORENSICS TARGET ROI RESOLVED:",
+JSON.stringify({available:amountForensics?.available===true,amountText:amountForensics?.selectedAmountText||amountForensics?.amountText||null,region:amountForensics?.region||null,selectionMethod:amountForensics?.selectionMethod||null})
 );
 
 }
@@ -16469,6 +16477,31 @@ if (type === "image" || type === "pdf") {
       amountForensics,
       referenceForensics
     });
+    // Merge the later typed reference-amount resolver into the primary amount
+    // evidence object. This keeps the target read and the trusted reference
+    // ROI/value together instead of leaving referenceAmountText misleadingly null.
+    const typedAmountPair = mathematicalForensics?.typedAmountPair;
+    if (amountForensics && typedAmountPair?.referenceText && typedAmountPair?.referenceBox) {
+      amountForensics.referenceAmountText = typedAmountPair.referenceText;
+      amountForensics.referenceRegion = typedAmountPair.referenceBox;
+      amountForensics.referenceAmountResolver = typedAmountPair.referenceResolver || null;
+      amountForensics.referenceRoiStatus = 'matched';
+      amountForensics.referenceComparison = {
+        source: typedAmountPair.source || null,
+        targetText: typedAmountPair.targetText || amountForensics.selectedAmountText || amountForensics.amountText || null,
+        targetRegion: typedAmountPair.targetBox || amountForensics.region || null,
+        referenceText: typedAmountPair.referenceText,
+        referenceRegion: typedAmountPair.referenceBox,
+        digitFillProfile: mathematicalForensics?.amountInkProfiles || null,
+        roiVisualComparison: mathematicalForensics?.semanticReferenceMeasurements?.amount?.comparison || null,
+      };
+      console.log('AMOUNT FORENSICS REFERENCE ROI MERGED:', JSON.stringify(amountForensics.referenceComparison));
+    } else if (amountForensics) {
+      amountForensics.referenceRoiStatus = 'unavailable';
+      amountForensics.referenceComparison = null;
+      console.log('AMOUNT FORENSICS REFERENCE ROI MERGED:', JSON.stringify({status:'unavailable',reason:typedAmountPair?.reason||'typed-reference-amount-not-resolved'}));
+    }
+    console.log('AMOUNT FORENSICS:', JSON.stringify(amountForensics));
     console.log("MATHEMATICAL FORENSICS V1.2:", JSON.stringify(mathematicalForensics));
   } catch (error) {
     console.warn("MATHEMATICAL FORENSICS V1 HATASI:", error?.message || error);
