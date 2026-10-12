@@ -6927,7 +6927,7 @@ const REFERENCE_FIELD_RULES = [
   { key: "date", patterns: [/işlem\s*tarihi/i, /islem\s*tarihi/i, /tarih/i, /date/i] },
   { key: "time", patterns: [/saat/i, /time/i] },
   { key: "transactionNo", patterns: [/işlem\s*(?:no|numarası|numarasi)/i, /islem\s*(?:no|numarasi)/i, /fiş\s*no/i, /fis\s*no/i, /referans\s*(?:no|numarası|numarasi)/i, /sorgu\s*no/i] },
-  { key: "accountNo", patterns: [/hesap\s*no/i, /hesap\s*numarası/i, /hesap\s*numarasi/i, /müşteri\s*no/i, /musteri\s*no/i] },
+  { key: "accountNo", patterns: [/hesap\s*no/i, /hesap\s*numarası/i, /hesap\s*numarasi/i, /müşteri\s*no/i, /musteri\s*no/i, /müşteri\s*numarası/i, /musteri\s*numarasi/i] },
   { key: "branch", patterns: [/şube/i, /sube/i] },
   { key: "taxNo", patterns: [/vergi\s*no/i, /vergi\s*numarası/i, /vergi\s*numarasi/i, /tckn/i] },
   { key: "description", patterns: [/açıklama/i, /aciklama/i, /description/i] },
@@ -9261,6 +9261,10 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const label = inline?.label || rfLabelPart(raw);
         const key = canonical?.key || rfGenericFieldKey(label);
         if (!key) continue;
+        // Compare only critical transaction fields. Whole-page visual analysis
+        // remains active; dynamic identifiers, dates and decorative rows are
+        // excluded from semantic matching and spacing checks.
+        if (!['amount', 'recipientName', 'recipientIban'].includes(String(key))) continue;
         // V12: A generic OCR string is not a field label merely because it is
         // text. Reject known/static/dynamic values (FAST text, bank names,
         // names, footer values, etc.) before they can enter the label matcher.
@@ -11400,6 +11404,11 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
     }
     const box = normalizeRegionBox(item.region, size);
     if (!box) continue;
+    // Blurry OCR fragments often look like two-word names (e.g. a damaged
+    // read of KOMISYON HESABI). Keep the template matcher conservative when
+    // Paddle's own confidence is low; the semantic resolver can still report
+    // an unresolved name instead of manufacturing a field placement match.
+    if (field === "recipientName" && Number(item.score) < 0.85) continue;
     if (referenceFieldRuleForText(sourceText) && item === sourceItem &&
         !referenceValueCompatible(field, text, item, regions)) continue;
 
@@ -11554,7 +11563,11 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
   }
 
   const matches = [];
+  // Limit per-field template checks to the transaction's critical values.
+  // Customer/branch/date/reference/sequence rows create noisy cross-field matches.
+  const scopedReferenceFields = new Set(["amount", "recipientName", "recipientIban", "iban"]);
   for (const [field, ref] of Object.entries(profile.fields)) {
+    if (!scopedReferenceFields.has(String(field))) continue;
     const size = pageSizes.get(0);
     if (!size?.width || !size?.height) continue;
 
@@ -14076,37 +14089,22 @@ Do not normalize these to ASCII unnecessarily.
 DOCUMENT ANALYSIS
 =====================================================
 
-Evaluate the document for signs of possible manipulation, inconsistency,
-editing, compositing, unusual typography, layout problems, or suspicious
-financial information.
+Evaluate only these requested areas:
+1. The bank receipt's overall visual appearance (page composition, logo,
+   major panels, typography/rendering consistency and obvious editing traces).
+2. The transaction amount, using only the visible transaction-amount label
+   and its attached value. Never substitute a fee, balance, customer number,
+   reference number, or sequence number.
+3. The recipient's full name, using only a visible recipient/beneficiary label.
+4. The recipient IBAN, using only a visible recipient/beneficiary IBAN label.
 
-Check these 25 areas:
-
-1. OCR/text consistency
-2. Font consistency
-3. Font size consistency
-4. Character spacing
-5. Line spacing
-6. Text alignment
-7. Baseline consistency
-8. Image compression artifacts
-9. Copy/paste regions
-10. Editing traces
-11. Photoshop-like manipulation artifacts
-12. AI-generated image indicators
-13. Logo/branding consistency
-14. Stamp consistency
-15. Signature consistency
-16. Date consistency
-17. Amount consistency
-18. Currency formatting
-19. IBAN formatting if visible
-20. SWIFT/BIC formatting if visible
-21. QR/barcode consistency if visible
-22. Overall layout integrity
-23. Missing or suspicious elements
-24. Document type consistency
-25. Image quality limitations
+Do not analyze or report customer/account numbers, sequence/receipt numbers,
+dates/times, sender identity, address, fees/commission, or other unrelated
+fields. Do not compare their locations or use them to create layout findings.
+The whole-page appearance check remains active, but field-level comparisons
+must be limited to the three critical transaction fields above.
+If a critical value cannot be tied to its own visible label and value region,
+return unknown/null instead of selecting a nearby or similarly shaped field.
 
 IMPORTANT AMOUNT CONSISTENCY:
 As part of the amountConsistency check, also verify whether
@@ -17632,10 +17630,9 @@ KOPYALAMA.
 DOCUMENT DATA
 =====================================================
 
-Aşağıdaki alanları YALNIZCA JPG / JPEG
+Aşağıdaki kapsamda YALNIZCA kritik işlem alanlarını JPG / JPEG
 görüntüsünden çıkar:
 
-documentData.senderName
 documentData.recipientName
 documentData.amount
 documentData.currency
@@ -17643,8 +17640,9 @@ documentData.iban
 
 Kurallar:
 
-- Yalnızca JPG / JPEG üzerinde gerçekten görülen bilgileri yaz.
+- Yalnızca bu kapsamda istenen alanları JPG / JPEG üzerinde gerçekten görülen bilgiden yaz.
 - Güvenilir şekilde okunamıyorsa null kullan.
+- senderName ve bu kapsam dışındaki alanları null bırak; bunları analiz etme.
 - IBAN'ı mümkünse standart biçimde yaz.
 - amount alanına yalnızca JPG / JPEG üzerinde görülen
 ana işlem tutarını yaz.
