@@ -93,52 +93,9 @@ async function loadMathematicalBaseline() {
 }
 
 
-function isSemanticRecipientNameCandidate(value) {
-  const text=String(value||'').trim();
-  if(!text||/\d/.test(text))return false;
-  const tokens=text.split(/\s+/).filter(Boolean);
-  if(tokens.length<2||tokens.length>14||!tokens.every(w=>/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]+$/.test(w)))return false;
-  const token=v=>String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğıöüış]/g,c=>({ç:'c',ğ:'g',ı:'i',ö:'o',ü:'u',ş:'s'}[c]||c)).replace(/[^a-z0-9]/g,'').toUpperCase();
-  const words=tokens.map(token);
-  const transactionWords=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','IBAN','HESAP','FIS','REFERANS','SORGU','SIRA','NUMARA','NUMARASI']);
-  if(words.some(w=>transactionWords.has(w)))return false;
-  const companyWords=new Set(['TICARET','LIMITED','LIMIT','SIRKET','SIRKETI','SANAYI','ANONIM','STI','LTD','AS','HOLDING','HOLDINGS','ITHALAT','IHRACAT','PAZARLAMA','LOJISTIK','TURIZM','OTOMOTIV','MUHENDISLIK','INSAAT']);
-  const corporate=words.some(w=>companyWords.has(w));
-  const core=words.filter(w=>w.length>=2&&!companyWords.has(w)&&w!=='VE');
-  if(corporate)return core.length>=1;
-  return tokens.length<=6&&tokens.every(w=>w.length>=2)&&core.length>=2;
-}
-
 function resolveMathSemanticValueBox(regions, field) {
-  const sourceRows = Array.isArray(regions) ? regions.filter(x => x?.region && String(x.text || '').trim()) : [];
-  if (!sourceRows.length) return null;
-  // PaddleOCR may split labelled values into token boxes. Add line aggregates
-  // for label parsing while retaining original boxes for value-only candidates.
-  const heights = sourceRows.map(x => Number(x.region.y2)-Number(x.region.y1)).filter(x=>Number.isFinite(x)&&x>0).sort((a,b)=>a-b);
-  const medianHeight = heights.length ? heights[Math.floor(heights.length/2)] : 12;
-  const rowTolerance = Math.max(4, medianHeight * 0.75);
-  const groupedRows = [];
-  for (const item of [...sourceRows].sort((a,b)=>Number(a.region.y1)-Number(b.region.y1)||Number(a.region.x1)-Number(b.region.x1))) {
-    const y = Number(item.region.y1);
-    let group = groupedRows.find(g=>Math.abs(g.y-y)<=rowTolerance);
-    if (!group) { group={y,items:[]}; groupedRows.push(group); }
-    group.items.push(item);
-  }
-  const lineRows = groupedRows.filter(g=>g.items.length>1).map(g=>{
-    const items=[...g.items].sort((a,b)=>Number(a.region.x1)-Number(b.region.x1));
-    return {
-      text:items.map(x=>String(x.text||'').trim()).filter(Boolean).join(' '),
-      region:{
-        x1:Math.min(...items.map(x=>Number(x.region.x1))),
-        y1:Math.min(...items.map(x=>Number(x.region.y1))),
-        x2:Math.max(...items.map(x=>Number(x.region.x2))),
-        y2:Math.max(...items.map(x=>Number(x.region.y2))),
-      },
-      confidence:items.reduce((s,x)=>s+(Number(x.confidence)||0),0)/items.length,
-      _semanticLineAggregate:true,
-    };
-  });
-  const rows = [...sourceRows, ...lineRows];
+  const rows = Array.isArray(regions) ? regions.filter(x => x?.region && String(x.text || '').trim()) : [];
+  if (!rows.length) return null;
   const box = (x) => {
     const r=x?.region||x;
     const x1=Number(r?.x1),y1=Number(r?.y1),x2=Number(r?.x2),y2=Number(r?.y2);
@@ -152,7 +109,23 @@ function resolveMathSemanticValueBox(regions, field) {
     'PARA','CINSI','TL','TRY','USD','EUR','GBP','FIS','FIS NO','REFERANS','REFERANS NO','MUSTERI','MUSTERI NO',
     'VERGI','VERGI NO','MERSIS','TICARET','TICARET SICIL','KOMISYON','MASRAF','UCRET','TOPLAM','CEP SUBE'
   ]);
-  const nameLike = isSemanticRecipientNameCandidate;
+  const nameLike = (v) => {
+    const t=String(v||'').trim();
+    if(!t || /\d/.test(t)) return false;
+    const canonical=norm(t).replace(/[^a-z0-9çğıöşü\s]/gi,' ').replace(/\s+/g,' ').trim();
+    if(!canonical || NAME_STOPWORDS.has(canonical)) return false;
+    const words=t.split(/\s+/).filter(Boolean);
+    if(words.length<2 || words.length>6) return false;
+    if(words.some(w=>w.length<2 || !/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]+$/.test(w))) return false;
+    // A semantic name must contain at least two plausible alphabetic tokens and
+    // must not be composed only of transaction/action vocabulary. This blocks
+    // false positives such as "GIDEN FAST EFT" while preserving names like
+    // "Sudenaz Özel" and multi-word company/person names.
+    const actionWords=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
+    const upper=words.map(w=>norm(w).toUpperCase());
+    if(upper.filter(w=>actionWords.has(w)).length>=1) return false;
+    return upper.filter(w=>/^[A-ZÇĞİÖŞÜ]{2,}$/.test(w)).length>=2;
+  };
   const ibanLike = (v) => /^TR\s*\d{2}(?:[\s-]*[0-9A-Z]){22,}$/i.test(String(v||'')) || /^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
   const isLabel = (item) => {
     if (!item) return false;
@@ -169,15 +142,6 @@ function resolveMathSemanticValueBox(regions, field) {
   // V1.5.4: PaddleOCR may return the whole Enpara beneficiary block as one
   // region, e.g. `ALICI UNVANI: Sudenaz Özel ALICI IBAN: TR...`. Resolve the
   // embedded semantic segments before falling back to label-neighbor geometry.
-  const isBlockingSemanticLabel = (item,currentField) => {
-    const text=String(item?.text||'');
-    if(currentField==='recipientName'&&recipientIbanLabel(text))return true;
-    if(currentField==='recipientIban'&&recipientNameLabel(text))return true;
-    try{
-      const key=referenceFieldRuleForText(text)?.key;
-      return Boolean(key&&key!==currentField&&key!=='generic');
-    }catch{return false;}
-  };
   const inlineSemanticRows = [];
   for (const row of rows) {
     const segments = resolveRecipientInlineSegments(row);
@@ -230,16 +194,6 @@ function resolveMathSemanticValueBox(regions, field) {
       const belowXLimit=Math.min(Math.max(180,lh*18),pageRight*.35);
       const below=belowGap>=-lh*.35 && belowGap<Math.max(170,lh*6) && Math.abs(((rb.x1+rb.x2)/2)-((lb.x1+lb.x2)/2))<belowXLimit;
       if(!sameLine&&!below) continue;
-      const candidateCenterX=(rb.x1+rb.x2)/2;
-      const interveningLabel=rows.some(other=>{
-        if(other===label||other===row||!isBlockingSemanticLabel(other,field))return false;
-        const ob=box(other);if(!ob)return false;
-        const oy=Math.min(lb.y2,ob.y2)-Math.max(lb.y1,ob.y1);
-        const betweenOnLine=oy>=-lh*.45&&ob.x1>=lb.x2-lh*.25&&ob.x1<candidateCenterX&&rb.y1<=lb.y2+lh;
-        const betweenBelow=ob.y1>=lb.y2-lh*.25&&ob.y1<rb.y1&&Math.abs(((ob.x1+ob.x2)/2)-((lb.x1+lb.x2)/2))<belowXLimit;
-        return betweenOnLine||betweenBelow;
-      });
-      if(interveningLabel)continue;
       const cost=(sameLine?Math.max(0,rb.x1-lb.x2)/lh:4+Math.max(0,belowGap)/lh) + Math.abs(((rb.y1+rb.y2)/2)-((lb.y1+lb.y2)/2))/lh*.25;
       const score=120-cost*8+(sameLine?25:0);
       solutions.push({value:text,region:rb,score,resolver:field==='recipientIban'?'semantic-label-neighbor-iban-v1':'semantic-label-neighbor-name-v1'});
@@ -843,7 +797,6 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     // Compact semantic measurement view. This explicitly proves that the
     // reference-side recipientName / recipientIban / amount ROIs were
     // measured mathematically when their boxes were available.
-    semanticRois,
     semanticReferenceMeasurements,
     amountInkProfiles,
     roi16x16: roiForensics,
@@ -3751,7 +3704,7 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
     ? Math.max(0, Math.min(100, Math.round(layoutScore)))
     : 0;
   const referenceLayoutScore = Number(forensic?.layoutForensics?.score);
-  let structuralLayoutRisk = Number.isFinite(referenceLayoutScore)
+  const structuralLayoutRisk = Number.isFinite(referenceLayoutScore)
     ? Math.max(0, Math.min(100, Math.round(referenceLayoutScore)))
     : 0;
 
@@ -3830,34 +3783,33 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   if (Number.isFinite(advancedForensicsScore) && forensic?.advancedForensics?.available === true) {
     editingRisk = Math.max(editingRisk, Math.min(70, Math.round(advancedForensicsScore * 0.70)));
   }
-  // Only baseline-calibrated V2 evidence can affect risk. V1 is retained as a
-  // raw diagnostic and must never be promoted when the genuine baseline is absent.
+  // Paint-Over V1: promote only multi-signal LOCAL evidence. A single residual,
+  // grayscale channel match, or Telegram/JPEG artifact is never enough.
   const paintOverV2 = forensic?.paintOverForensicsV2;
-  const paintOverScore = Number(paintOverV2?.score);
-  const paintOverSignals = Number(paintOverV2?.metrics?.supportSignals) || 0;
-  const paintOverBaselineAvailable = paintOverV2?.metrics?.telegramBaseline?.available === true;
-  const paintOverMultiSignal = paintOverBaselineAvailable &&
-    (String(paintOverV2?.severity || '').toLowerCase() === 'strong' || String(paintOverV2?.severity || '').toLowerCase() === 'moderate');
-  if (Number.isFinite(paintOverScore) && paintOverV2?.available === true && paintOverBaselineAvailable && paintOverMultiSignal) {
+  const paintOverV1 = forensic?.paintOverForensics || forensic?.paintOverForensicsV1;
+  const paintOverScore = Number(paintOverV2?.score ?? paintOverV1?.score);
+  const paintOverSignals = Number(paintOverV2?.metrics?.supportSignals ?? paintOverV1?.metrics?.supportSignals) || 0;
+  const paintOverMultiSignal = paintOverV2?.available === true
+    ? (String(paintOverV2?.severity || '').toLowerCase() === 'strong' || String(paintOverV2?.severity || '').toLowerCase() === 'moderate')
+    : paintOverV1?.metrics?.multiSignal === true;
+  if (Number.isFinite(paintOverScore) && forensic?.paintOverForensics?.available === true && paintOverMultiSignal) {
     const promoted = paintOverSignals >= 3 && paintOverScore >= 75 ? 75
       : paintOverSignals >= 3 && paintOverScore >= 60 ? 65
       : paintOverSignals >= 2 && paintOverScore >= 50 ? 55
       : 0;
     if (promoted) editingRisk = Math.max(editingRisk, promoted);
   }
-  // A repeated, strongly localized reference gap belongs to layout risk.
-  // Require multi-reference support and good affine alignment before promotion.
+  // If the reference engine has a high-confidence semantic local-gap anomaly,
+  // make it visible in the editing category even when the other visual signals
+  // are quiet. Require a strong anomaly score and a healthy reference match.
   const anchorResidual = Number(forensic?.referenceForensics?.references?.[0]?.referenceQuality?.anchorMedianResidual);
-  const reliableSpacing = (Array.isArray(forensic?.referenceForensics?.spacingAnomalies) ? forensic.referenceForensics.spacingAnomalies : [])
-    .filter(x => Number(x?.score) >= 85 && Number(x?.ensembleMedianScore) >= 85 && Number(x?.referenceCountForPair) >= 3);
   if (
     forensic?.referenceForensics?.available === true &&
     forensic?.referenceForensics?.severity === 'strong' &&
     Number.isFinite(referenceMaxSpacing) && referenceMaxSpacing >= 85 &&
-    reliableSpacing.length > 0 &&
     (!Number.isFinite(anchorResidual) || anchorResidual <= 0.06)
   ) {
-    structuralLayoutRisk = Math.max(structuralLayoutRisk, Math.min(85, Math.round(Math.max(...reliableSpacing.map(x=>Number(x.score)||0)))));
+    editingRisk = Math.max(editingRisk, 85);
   }
 
   const categories = {
@@ -5442,7 +5394,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       samples: genuineVectors.map(x => ({ file: path.basename(x.path), path: x.path, rawScore: x.vector.rawScore }))
     }));
     const baselineScores=genuineVectors.map(x=>x.vector.rawScore);
-    const baselineAvailable=baselineScores.length>=2;
+    const baselineAvailable=baselineScores.length>=1;
     const baselineCalibrationQuality = genuineVectors.length >= 3 ? 'multi-sample' : genuineVectors.length === 2 ? 'two-sample' : genuineVectors.length === 1 ? 'single-sample' : 'unavailable';
     const baselineMedian=robustMedian(baselineScores);
     const baselineMad=robustMad(baselineScores,baselineMedian);
@@ -5509,16 +5461,14 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
     // 1) raw local signal is first calibrated against genuine Telegram data;
     // 2) known-fake similarity can corroborate it;
     // 3) Amount Forensics is corroboration only, never +10/+25 to PaintOver.
-    // Fail closed for risk when there are not enough genuine references to
-    // calibrate the raw local signal. Preserve rawScore for diagnostics only.
-    let calibrated=baselineAvailable?telegramAdjusted:0;
-    if(baselineAvailable && fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
-    else if(baselineAvailable && fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
+    let calibrated=baselineAvailable?telegramAdjusted:clamp100(target.rawScore);
+    if(fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
+    else if(fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
 
     // Amount Forensics can lift a borderline calibrated result only when the
     // image-local signal already survives Telegram calibration. It is not added
     // as a fixed support score.
-    if(baselineAvailable && amountStrong && calibrated>=45) calibrated=clamp100(calibrated+Math.min(18,amountScore*.18));
+    if(amountStrong && calibrated>=45) calibrated=clamp100(calibrated+Math.min(18,amountScore*.18));
 
     const strong=calibrated>=75 && (
       target.supportSignals>=3 ||
@@ -5532,8 +5482,6 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       available:true,
       engine,
       version:'V2',
-      calibrated:baselineAvailable,
-      status:baselineAvailable?'calibrated':'baseline-unavailable',
       score:Math.round(calibrated),
       rawScore:target.rawScore,
       severity,
@@ -5546,9 +5494,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
         knownFakePattern:{available:negativeVectors.length>0,sampleCount:negativeVectors.length,bestSimilarity:Number(bestNegativeSimilarity.toFixed(4)),score:fakePatternScore==null?null:Math.round(fakePatternScore),matches:negativeSimilarities.slice(0,5)},
         amountForensics:{score:Math.round(amountScore),strong:amountStrong,usedAsFixedSupport:false}
       },
-      evidence: !baselineAvailable
-        ? 'Yeterli genuine referans baseline bulunmadığı için ham sinyal risk puanı olarak kullanılmadı.'
-        : strong
+      evidence: strong
         ? 'Telegram baseline kalibrasyonundan sonra lokal Paint-Over sinyali yüksek kaldı ve bağımsız desteklerle güçlendi.'
         : moderate
           ? 'Telegram etkisi kalibrasyona dahil edildi; kalan lokal sinyal orta düzeyde ve ek corroborating bulgu gerektiriyor.'
@@ -9225,7 +9171,7 @@ function resolveSemanticGeometryFallbackV152(field, referenceCandidate, targetRo
   const rn={x:(refBox.x1+refBox.x2)/(2*rs.w),y:(refBox.y1+refBox.y2)/(2*rs.h),w:(refBox.x2-refBox.x1)/rs.w,h:(refBox.y2-refBox.y1)/rs.h};
   const norm=v=>String(v||'').toLocaleLowerCase('tr-TR').replace(/[çğışöüıİ]/g,c=>({ç:'c',ğ:'g',ı:'i',İ:'i',ş:'s',ö:'o',ü:'u'}[c]||c));
   const stop=new Set(['GIDEN','GONDEREN','GONDERICI','FAST','EFT','HAVALE','TRANSFER','ISLEM','TUTAR','PARA','CINSI','ODEME','BANKA','IBAN','HESAP','FIS','REFERANS','SORGU','MUSTERI','KART','NO']);
-  const nameLike=isSemanticRecipientNameCandidate;
+  const nameLike=v=>{const t=String(v||'').trim();if(!t||/\d/.test(t))return false;const ws=t.split(/\s+/).filter(Boolean);if(ws.length<2||ws.length>6)return false;const up=ws.map(w=>norm(w).toUpperCase());if(up.some(w=>stop.has(w)))return false;return ws.every(w=>/^[A-Za-zÇĞİÖŞÜçğıöşü'’.-]{2,}$/.test(w));};
   const ibanLike=v=>/^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
   const valid=field==='recipientName'?nameLike:ibanLike;
   const scored=targetRows.filter(r=>r?.region&&valid(r.text)).map(r=>{const b=boxOf(r),n={x:(b.x1+b.x2)/(2*ts.w),y:(b.y1+b.y2)/(2*ts.h),w:(b.x2-b.x1)/ts.w,h:(b.y2-b.y1)/ts.h};const d=Math.hypot(n.x-rn.x,n.y-rn.y),sd=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,rn.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,rn.h)));return {r,d,sd,score:100-d*180-sd*18};}).sort((a,b)=>b.score-a.score);
@@ -9288,20 +9234,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     // V15.4.3 typography-only normalization. Other forensic engines continue
     // to use the original targetBuffer unchanged.
     const targetTypographyBuffer = await rfTypographyRasterNormalize(targetBuffer);
-    const attachPageNormalizedRegion = (value, size) => {
-      if (!value?.region || !size?.width || !size?.height) return value;
-      const r = value.region;
-      return {
-        ...value,
-        normalizedRegion: {
-          x1: Number((r.x1 / size.width).toFixed(6)),
-          y1: Number((r.y1 / size.height).toFixed(6)),
-          x2: Number((r.x2 / size.width).toFixed(6)),
-          y2: Number((r.y2 / size.height).toFixed(6)),
-        },
-        coordinateSpace: 'page-normalized-0-to-1',
-      };
-    };
 
     const allReferencePaths = await getReferenceFiles(normalizedBank);
     const requestedReferencePaths = Array.isArray(selectedReferencePath)
@@ -9535,23 +9467,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         }
         const globalStyleBaseline=rfMedianSigned(stylePairs.map(p=>rfStyleResidual(p.a,p.b)));
 
-        // Resolve recipient value ROIs once from typed labels. The generic
-        // nearest-value resolver below can otherwise attach a nearby text box
-        // (for example a fee/description line) to recipientName/recipientIban.
-        // For these critical fields, a missing semantic ROI must stay missing.
-        const refRecipientValueRegions = {
-          recipientName: resolveMathSemanticValueBox(refRegions, 'recipientName'),
-          recipientIban: resolveMathSemanticValueBox(refRegions, 'recipientIban'),
-        };
-        const targetRecipientValueRegions = {
-          recipientName: resolveMathSemanticValueBox(targetRegions, 'recipientName'),
-          recipientIban: resolveMathSemanticValueBox(targetRegions, 'recipientIban'),
-        };
-        for (const key of ['recipientName', 'recipientIban']) {
-          refRecipientValueRegions[key] = attachPageNormalizedRegion(refRecipientValueRegions[key], refSize);
-          targetRecipientValueRegions[key] = attachPageNormalizedRegion(targetRecipientValueRegions[key], targetSize);
-        }
-
         const fieldResults=[];
         for(const m of matches){
           const key=m.rl.rule.key;
@@ -9561,11 +9476,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           const tarStyle=tarLabelRegion?await rfStableTextMetrics(targetBuffer,tarLabelRegion,targetSize):null;
           const rawStyle=rfStyleResidual(refStyle,tarStyle);
           const styleResidual=rfStyleResidual(refStyle,tarStyle,globalStyleBaseline);
-          let refValue=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
-          if (key === 'recipientName' || key === 'recipientIban') {
-            refValue = refRecipientValueRegions[key] || null;
-            tarValue = targetRecipientValueRegions[key] || null;
-          }
+          const refValue=rfFindValueRegion(refRegions,m.rl,m.rl.rule.key),tarValue=rfFindValueRegion(targetRegions,m.tl,m.tl.rule.key);
           let valueRenderResidual=null;
           let valueGeometryResidual=null;
           if(refValue&&tarValue){
@@ -9998,14 +9909,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
           let valueRefRaw=rfResolveCriticalValueRegionV127(refRegions,m.rl,key,{source:'semantic-typed-relative-v127'});
           let valueTarRaw=rfResolveCriticalValueRegionV127(targetRegions,m.tl,key,{source:'semantic-typed-relative-v127'});
 
-          // Recipient fields must use the same label-locked ROIs as the
-          // reference engine's value/geometry measurements. Do not fall back
-          // to a nearby generic text box when either side is unresolved.
-          if (semanticKey === 'recipientName' || semanticKey === 'recipientIban') {
-            valueRefRaw = refRecipientValueRegions[semanticKey] || null;
-            valueTarRaw = targetRecipientValueRegions[semanticKey] || null;
-          }
-
           // V1.2.7 AMOUNT HARD LOCK:
           // Amount Forensics is the authoritative target ROI. Never replace it
           // with a nearby OCR number. The trusted reference anchor supplies the
@@ -10262,14 +10165,13 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         }
 
         const semanticValueRegions = {
-          recipientName: refRecipientValueRegions.recipientName,
-          recipientIban: refRecipientValueRegions.recipientIban,
+          recipientName: resolveMathSemanticValueBox(refRegions, 'recipientName'),
+          recipientIban: resolveMathSemanticValueBox(refRegions, 'recipientIban'),
         };
         console.log('MATH REFERENCE SEMANTIC VALUE RESOLVER V1.5.4:', JSON.stringify({
           reference:path.basename(referencePath),
-          coordinateSpace:'page-normalized-0-to-1',
-          recipientName:semanticValueRegions.recipientName ? {box:semanticValueRegions.recipientName.region,normalizedBox:semanticValueRegions.recipientName.normalizedRegion||null,resolver:semanticValueRegions.recipientName.resolver} : null,
-          recipientIban:semanticValueRegions.recipientIban ? {box:semanticValueRegions.recipientIban.region,normalizedBox:semanticValueRegions.recipientIban.normalizedRegion||null,resolver:semanticValueRegions.recipientIban.resolver} : null,
+          recipientName:semanticValueRegions.recipientName ? {box:semanticValueRegions.recipientName.region,resolver:semanticValueRegions.recipientName.resolver} : null,
+          recipientIban:semanticValueRegions.recipientIban ? {box:semanticValueRegions.recipientIban.region,resolver:semanticValueRegions.recipientIban.resolver} : null,
         }));
 
         const typographyStrong=typographyFindings.filter(x=>x.severity==='strong');
@@ -10437,10 +10339,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     for(const rows of spacingGroups.values()){
       const med=rfMedianSigned(rows.map(x=>Number(x.score)).filter(Number.isFinite));
       const hits=rows.filter(x=>x.score>=55).length;
-      // A single reference is not enough to claim a stable layout anomaly.
-      // Keep it in per-reference diagnostics, but require ensemble support for
-      // the consolidated finding consumed by reports and risk calculation.
-      const keep=rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45;
+      const keep=(rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45)||(rows.length===1&&med>=60);
       if(keep)spacingAnomalies.push({...rows.sort((a,b)=>b.score-a.score)[0],ensembleMedianScore:rfClamp100(med),referenceCountForPair:rows.length});
     }
 
@@ -10476,9 +10375,6 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       const referenceRowsForFallback = referenceResults.flatMap(r => Array.isArray(r?.ocrRegions) ? r.ocrRegions : []);
       const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],referenceRowsForFallback,targetSize,semanticValueReferenceSizes[field]);
       if (fallback) targetSemanticRegions[field]=fallback;
-    }
-    for (const field of ['recipientName','recipientIban']) {
-      targetSemanticRegions[field] = attachPageNormalizedRegion(targetSemanticRegions[field], targetSize) || null;
     }
 
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
@@ -11342,17 +11238,17 @@ function isAdministrativeLabelText(text) {
 }
 
 function fieldLabelStrength(field, text) {
-  const t = normalizeFieldTextForMatch(text);
+  const t = normalizeFieldTextForMatch(rfLabelPart(text));
   const labels = {
-    accountNo: /(HESAP|IBAN|GONDEREN HESAP|ALICI HESAP)/,
-    taxNo: /(TCKN|VKN|VERGI|VERGI NO|SIRA NO|SIRA NO\/ID)/,
-    date: /(TARIH|ISLEM TARIHI|TARIHI|DATE)/,
-    amount: /(TUTAR|TAHSILAT|FAST TUTARI|ISLEM TUTARI|GIDEN FAST|GONDERILEN.*TUTARI|TOPLAM.*TUTARI)/,
-    senderName: /(GONDEREN|GONDERICI|GONDEREN AD|GONDEREN UNVAN)/,
-    recipientName: /(ALICI|ALICI AD|ALICI UNVAN|ALACAKLI)/,
-    transactionNo: /(ISLEM NO|REFERANS|REF NO|ETTN|TRANSACTION|UUID|SORGU NO)/,
-    address: /(ADRES|ADDRESS)/,
-    description: /(ACIKLAMA|DESCRIPTION|NOT)/,
+    accountNo: /^(?:HESAP(?:\s*(?:NO|NUMARASI))?|MUSTERI\s*(?:NO|NUMARASI)|IBAN\/KART\s*NO)$/,
+    taxNo: /^(?:TCKN|VKN|VERGI\s*(?:NO|NUMARASI)|VERGI\s*KIMLIK\s*NO)$/,
+    date: /^(?:(?:ISLEM|DUZENLENME|BELGE)\s+)?TARIH(?:I)?(?:\s+VE\s+SAATI)?$/,
+    amount: /^(?:(?:GIDEN|GONDERILEN|ISLEM|EFT|FAST|TRANSFER)\s+)?(?:FAST\s+|EFT\s+)?TUTAR(?:I)?$|^B\/A\s+PARA\s+CINSI\s+TUTAR$/,
+    senderName: /^(?:GONDEREN|GONDERICI)(?:\s+(?:ADI|UNVANI|ISMI|AD\s+SOYADI))?$/,
+    recipientName: /^(?:ALICI|ALACAKLI|LEHDAR)(?:\s+(?:ADI|UNVANI|ISMI|AD\s+SOYADI))?$|^(?:BENEFICIARY|PAYEE|RECEIVER)(?:\s+NAME)?$/,
+    transactionNo: /^(?:ISLEM\s*(?:NO|NUMARASI)|SORGU\s*NO|REFERANS\s*(?:NO|NUMARASI)|REF\s*NO|FIS\s*NO|ETTN|UUID)$/,
+    address: /^(?:ADRES|ADDRESS|ALICI\s+ADRESI|GONDEREN\s+ADRESI)$/,
+    description: /^(?:ACIKLAMA|DESCRIPTION|ISLEM\s+ACIKLAMASI|NOT)$/,
   };
   const re = labels[field];
   return re && re.test(t) ? 100 : 0;
@@ -11361,16 +11257,20 @@ function fieldLabelStrength(field, text) {
 function nearbyFieldLabelScore(field, item, regions) {
   const ir = item?.region;
   if (!ir) return 0;
+  // Match the complete label, not a substring. In particular, "ALICI BANKA"
+  // must never authorize the bank name as recipientName, and "ŞUBE" inside
+  // an address/bank label must not authorize an arbitrary nearby value.
   const wanted = {
-    accountNo: /(HESAP|IBAN)/,
-    taxNo: /(TCKN|VKN|VERGI|SIRA NO)/,
-    date: /(TARIH|TARIHI)/,
-    amount: /(TUTAR|TAHSILAT)/,
-    senderName: /(GONDEREN|GONDERICI)/,
-    recipientName: /(ALICI|ALACAKLI)/,
-    transactionNo: /(ISLEM NO|SORGU NO|REFERANS|ETTN|UUID)/,
-    address: /(ADRES)/,
-    description: /(ACIKLAMA|DESCRIPTION|NOT)/,
+    accountNo: /^(?:HESAP(?:\s*(?:NO|NUMARASI))?|MUSTERI\s*(?:NO|NUMARASI)|IBAN\/KART\s*NO)$/,
+    taxNo: /^(?:TCKN|VKN|VERGI\s*(?:NO|NUMARASI)|VERGI\s*KIMLIK\s*NO)$/,
+    date: /^(?:(?:ISLEM|DUZENLENME|BELGE)\s+)?TARIH(?:I)?(?:\s+VE\s+SAATI)?$/,
+    amount: /^(?:(?:GIDEN|GONDERILEN|ISLEM|EFT|FAST|TRANSFER)\s+)?(?:FAST\s+|EFT\s+)?TUTAR(?:I)?$|^B\/A\s+PARA\s+CINSI\s+TUTAR$/,
+    senderName: /^(?:GONDEREN|GONDERICI)(?:\s+(?:ADI|UNVANI|ISMI|AD\s+SOYADI))?$/,
+    recipientName: /^(?:ALICI|ALACAKLI|LEHDAR)(?:\s+(?:ADI|UNVANI|ISMI|AD\s+SOYADI))?$|^(?:BENEFICIARY|PAYEE|RECEIVER)(?:\s+NAME)?$/,
+    branch: /^SUBE(?:\s+(?:ADI|KODU|KODU\/ADI))?$/,
+    transactionNo: /^(?:ISLEM\s*(?:NO|NUMARASI)|SORGU\s*NO|REFERANS\s*(?:NO|NUMARASI)|REF\s*NO|FIS\s*NO|ETTN|UUID)$/,
+    address: /^(?:ADRES|ADDRESS|ALICI\s+ADRESI|GONDEREN\s+ADRESI)$/,
+    description: /^(?:ACIKLAMA|DESCRIPTION|ISLEM\s+ACIKLAMASI|NOT)$/,
   }[field];
   if (!wanted) return 0;
 
@@ -11379,22 +11279,29 @@ function nearbyFieldLabelScore(field, item, regions) {
   let best = 0;
   for (const other of regions) {
     if (other === item || !other?.region) continue;
-    const t = normalizeFieldTextForMatch(other.text);
+    const t = normalizeFieldTextForMatch(rfLabelPart(other.text));
     if (!wanted.test(t)) continue;
     const or = other.region;
     const oy = (Number(or.y1) + Number(or.y2)) / 2;
-    const sameLine = Math.abs(oy - iy) <= Math.max(18, ih * 1.8);
+    const sameLine = Math.abs(oy - iy) <= Math.max(12, ih * 0.8);
     const gapRight = Number(ir.x1) >= Number(or.x2) ? Number(ir.x1) - Number(or.x2) : Infinity;
     const gapLeft = Number(or.x1) >= Number(ir.x2) ? Number(or.x1) - Number(ir.x2) : Infinity;
     const near = Math.min(gapRight, gapLeft);
-    if (sameLine && near <= Math.max(260, ih * 14)) best = Math.max(best, 120);
+    const horizontalOverlap = Math.min(Number(ir.x2), Number(or.x2)) - Math.max(Number(ir.x1), Number(or.x1));
+    const belowGap = Number(ir.y1) >= Number(or.y2)
+      ? Number(ir.y1) - Number(or.y2)
+      : Number(or.y1) >= Number(ir.y2) ? Number(or.y1) - Number(ir.y2) : 0;
+    const sameColumnBelow = belowGap <= Math.max(48, ih * 3) &&
+      (horizontalOverlap > 0 || Math.abs((Number(ir.x1)+Number(ir.x2)-Number(or.x1)-Number(or.x2))/2) <= Math.max(36, ih * 2.5));
+    if ((sameLine && near <= Math.max(72, ih * 8)) || sameColumnBelow) best = Math.max(best, 120);
   }
   return best;
 }
 
 function referenceValueCompatible(field, text, item = null, regions = []) {
   const t = normalizeFieldTextForMatch(text);
-  if (!t || referenceFieldRuleForText(text) || isAdministrativeLabelText(t)) return false;
+  const exactFieldLabel = rfCanonicalLabelScore(field, text) >= 100;
+  if (!t || (exactFieldLabel && item?.inlineSemanticField !== field) || isAdministrativeLabelText(t)) return false;
 
   switch (field) {
     case "accountNo": {
@@ -11421,9 +11328,16 @@ function referenceValueCompatible(field, text, item = null, regions = []) {
     case "recipientName": {
       if (isAdministrativeLabelText(t)) return false;
       if (/(BANKA|TARIH|TARH|ACIKLAMA|HESAP|SUBE|TUTAR|SORGU|ETTN|MESAJ|FAST)/.test(t)) return false;
+      // A name-shaped string is not enough: bind it to the corresponding
+      // explicit role label. This blocks bank names beside "ALICI BANKA" and
+      // names appearing under unrelated recipient/customer headings.
+      if (item?.inlineSemanticField !== field && nearbyFieldLabelScore(field, item, regions) <= 0) return false;
       const words = t.split(/\s+/).filter(Boolean);
       return words.length >= 2 && words.some(w => /[A-ZÇĞİÖŞÜ]{3,}/.test(w)) && !/\d{3,}/.test(t);
     }
+    case "branch":
+      return (item?.inlineSemanticField === field || nearbyFieldLabelScore(field, item, regions) > 0) &&
+        !/(TARIH|ADRES|KATILIMCI)/.test(t);
     case "transactionNo":
       return /[0-9a-f]{8}-[0-9a-f-]{20,}/i.test(t) ||
         (/(REFERANS|REF|ETTN|ISLEM|SORGU)/i.test(t) && /[A-Z0-9]{6,}/i.test(t));
@@ -11444,17 +11358,47 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
   const candidates = [];
   const referenceVariants = Array.isArray(ref?.variants) && ref.variants.length ? ref.variants : [ref];
 
-  for (const item of regions) {
-    const text = String(item.text || "").trim();
+  for (const sourceItem of regions) {
+    const sourceText = String(sourceItem.text || "").trim();
+    let inline = rfSplitInlineLabelValue(sourceText);
+    // Preserve explicit label:value OCR rows even for value classes (such as
+    // branch names) that the generic value-type parser does not recognize.
+    // The field label is the anchor; the value is still validated below.
+    if (!inline && /[:：]/.test(sourceText)) {
+      const colon = sourceText.search(/[:：]/);
+      const label = sourceText.slice(0, colon).trim();
+      const value = sourceText.slice(colon + 1).trim();
+      const rule = referenceFieldRuleForText(label);
+      if (rule?.key === field && value) inline = { label, value, rule };
+    }
+    let item = sourceItem;
+    let text = sourceText;
+    if (inline?.rule?.key === field && inline.value && sourceItem.region) {
+      const colon = sourceText.search(/[:：]/);
+      if (colon >= 0) {
+        const valueStart = colon + 1;
+        const x1 = Number(sourceItem.region.x1), x2 = Number(sourceItem.region.x2);
+        const y1 = Number(sourceItem.region.y1), y2 = Number(sourceItem.region.y2);
+        const scale = Math.max(1, sourceText.length);
+        item = {
+          ...sourceItem,
+          text: inline.value,
+          inlineSemanticField: field,
+          region: { x1:x1+(x2-x1)*(valueStart/scale), y1, x2, y2 },
+        };
+        text = inline.value;
+      }
+    }
     const box = normalizeRegionBox(item.region, size);
     if (!box) continue;
-    if (referenceFieldRuleForText(text)) continue;
+    if (referenceFieldRuleForText(sourceText) && item === sourceItem &&
+        !referenceValueCompatible(field, text, item, regions)) continue;
 
     const semantic = referenceValueCompatible(field, text, item, regions);
     if (!semantic) continue;
 
-    const labelStrength = fieldLabelStrength(field, text);
-    const nearbyLabel = nearbyFieldLabelScore(field, item, regions);
+    const labelStrength = item.inlineSemanticField === field ? 120 : fieldLabelStrength(field, text);
+    const nearbyLabel = item.inlineSemanticField === field ? 120 : nearbyFieldLabelScore(field, item, regions);
 
     const variantDistances = referenceVariants.map((rv) => {
       const rcx = Number(rv.xNorm || 0) + Number(rv.widthNorm || 0) / 2;
@@ -11469,7 +11413,19 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
     const nearestVariant = variantDistances[0];
     const positionDistance = nearestVariant?.distance ?? Infinity;
 
-    // Etiketsiz semantik eşleşme çok uzaktaysa reddet.
+    // Position alone is not evidence that a value belongs to a field. For
+    // typed/role-bearing fields require an explicit same-row/column label;
+    // otherwise a nearby account holder, bank name, or date can be assigned
+    // to the wrong semantic field and manufacture a layout anomaly.
+    const labelAnchoredFields = new Set([
+      "branch", "date", "amount", "senderName", "recipientName",
+      "accountNo", "taxNo", "transactionNo", "address", "description",
+      "iban", "senderIban", "recipientIban",
+    ]);
+    if (labelAnchoredFields.has(field) && labelStrength === 0 && nearbyLabel === 0) continue;
+
+    // For non-canonical bank-specific fields, retain the positional fallback
+    // only when the candidate is very close to the trusted reference anchor.
     if (labelStrength === 0 && nearbyLabel === 0 && positionDistance > 0.065) continue;
 
     let score = Math.min(60, Number(item.score || 0) * 25);
@@ -11510,6 +11466,7 @@ function sanitizeReferenceTemplateForOutput(analysis) {
   const safeFields = Array.isArray(analysis.fields) ? analysis.fields.map((f) => ({
     field: f.field,
     status: f.status,
+    reason: f.reason,
     reference: f.reference ? {
       xNorm: f.reference.xNorm,
       yNorm: f.reference.yNorm,
@@ -11534,6 +11491,8 @@ function sanitizeReferenceTemplateForOutput(analysis) {
       pageIndex: f.target.pageIndex,
       text: f.target.text,
       ocrScore: f.target.ocrScore,
+      labelAssociation: f.target.labelAssociation,
+      labelMatchScore: f.target.labelMatchScore,
     } : undefined,
     matchScore: f.matchScore,
     geometryScore: f.geometryScore,
@@ -11592,7 +11551,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
 
     const candidates = referenceFieldTargetCandidates(field, ref, regions, size);
     if (!candidates.length) {
-      matches.push({ field, status:"missing", reference:{...ref} });
+      matches.push({ field, status:"missing", reason:"NO_VALID_LABEL_ANCHORED_CANDIDATE", reference:{...ref} });
       continue;
     }
 
@@ -11658,7 +11617,16 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
       field,
       status:"matched",
       reference:{xNorm:nearestRef.xNorm,yNorm:nearestRef.yNorm,widthNorm:nearestRef.widthNorm,heightNorm:nearestRef.heightNorm,pageNumber:nearestRef.pageNumber,style:nearestRef.style,referenceFile:nearestRef.referenceFile,referenceCount:ref.referenceCount,spread:ref.spread},
-      target:{...target,pageIndex:Number(best.item.pageIndex)||0,text:targetText,ocrScore:Number(best.item.score)||0},
+      target:{
+        ...target,
+        pageIndex:Number(best.item.pageIndex)||0,
+        text:targetText,
+        ocrScore:Number(best.item.score)||0,
+        labelAssociation:best.item.inlineSemanticField===field
+          ? "inline-explicit-label"
+          : Number(best.labelScore)>0 ? "adjacent-explicit-label" : "position-only-generic",
+        labelMatchScore:Number(best.labelScore)||0,
+      },
       matchScore:Math.max(0,Math.round(best.score)),
       geometryScore,
       styleSignals,
@@ -11667,8 +11635,12 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
 
   const matched = matches.filter(x=>x.status==="matched");
   const missing = matches.filter(x=>x.status==="missing");
-  const strongGeometry = matched.filter(x=>x.geometryScore>=60);
-  const weakPlacement = matched.filter(x=>x.geometryScore>=35);
+  // geometryScore is a similarity score: 100 means the target and reference
+  // boxes are nearly aligned, while 0 means a large geometric deviation.
+  // The old >= thresholds counted good matches as anomalies, which could
+  // trigger a false layout finding/Terra pass on visually aligned documents.
+  const strongGeometry = matched.filter(x=>x.geometryScore<=40);
+  const weakPlacement = matched.filter(x=>x.geometryScore>40 && x.geometryScore<=65);
 
   const referenceTemplateResult = {
     bank:profile.bank,
@@ -13697,34 +13669,14 @@ repeatedCharacterAnalysis.available = repeatedCharacterAnalysis.strongGroups.len
 console.warn("AYNI KARAKTER ANALİZİ HATASI:", error?.message || error);
 }
 
-// Compare a glyph only with repetitions of the same digit. Comparing every
-// glyph against one global median treats commas, decimal points, and naturally
-// different digits (for example 3 versus 0) as anomalies.
-const typedGlyphs=[...cleanAmountText(candidate.text).replace(/(?:TL|TRY|EUR|USD|GBP|₺|€|\$|£)/gi,'').replace(/\s+/g,'')].filter(char=>/[0-9.,]/.test(char));
-const typedDigits=typedGlyphs.filter(char=>/[0-9]/.test(char));
-let alignedGlyphRows=[];
-if(features.length===typedGlyphs.length){
-  alignedGlyphRows=features.map((feature,index)=>({feature,char:typedGlyphs[index],position:index}));
-}else if(features.length===typedDigits.length){
-  alignedGlyphRows=features.map((feature,index)=>({feature,char:typedDigits[index],position:index}));
-}
-const repeatedDigitCounts=new Map();
-for(const row of alignedGlyphRows)if(/[0-9]/.test(row.char))repeatedDigitCounts.set(row.char,(repeatedDigitCounts.get(row.char)||0)+1);
-const comparableGlyphRows=alignedGlyphRows.filter(row=>(repeatedDigitCounts.get(row.char)||0)>=2);
-const glyphGroups=new Map();
-for(const row of comparableGlyphRows){if(!glyphGroups.has(row.char))glyphGroups.set(row.char,[]);glyphGroups.get(row.char).push(row);}
-const metricKeys=['inkRatio','inkRatio200','inkRatio160','darkness','edgeDensity','width','height'];
-const anomalyScores = comparableGlyphRows.map((row) => {
-const group=glyphGroups.get(row.char)||[];
-const center=Object.fromEntries(metricKeys.map(key=>[key,median(group.map(x=>x.feature[key]))]));
-const feature=row.feature;
-const inkDiff = relativeOutlier(feature.inkRatio, center.inkRatio);
-const ink200Diff = relativeOutlier(feature.inkRatio200, center.inkRatio200);
-const ink160Diff = relativeOutlier(feature.inkRatio160, center.inkRatio160);
-const darkDiff = relativeOutlier(feature.darkness, center.darkness);
-const edgeDiff = relativeOutlier(feature.edgeDensity, center.edgeDensity);
-const widthDiff = relativeOutlier(feature.width, center.width);
-const heightDiff = relativeOutlier(feature.height, center.height);
+const anomalyScores = features.map((feature) => {
+const inkDiff = relativeOutlier(feature.inkRatio, medInk);
+const ink200Diff = relativeOutlier(feature.inkRatio200, medInk200);
+const ink160Diff = relativeOutlier(feature.inkRatio160, medInk160);
+const darkDiff = relativeOutlier(feature.darkness, medDark);
+const edgeDiff = relativeOutlier(feature.edgeDensity, medEdge);
+const widthDiff = relativeOutlier(feature.width, medWidth);
+const heightDiff = relativeOutlier(feature.height, medHeight);
 
 let votes = 0;
 if (inkDiff >= 0.22) votes++;
@@ -13736,8 +13688,6 @@ if (widthDiff >= 0.18) votes++;
 if (heightDiff >= 0.12) votes++;
 
 return {
-char:row.char,
-position:row.position,
 votes,
 inkDiff,
 ink200Diff,
@@ -13749,25 +13699,29 @@ heightDiff,
 };
 });
 
-const maxScore = Math.max(0,...anomalyScores.map((x) => x.votes));
+const maxScore = Math.max(...anomalyScores.map((x) => x.votes));
 const maxIndex = anomalyScores.findIndex((x) => x.votes === maxScore);
 const maxAnomaly = anomalyScores[maxIndex] || null;
 
 const maxInkDifference = Math.max(
-...anomalyScores.map(x=>x.inkDiff),0
+...features.map((x) => relativeOutlier(x.inkRatio, medInk))
 );
 const maxStrokeProxyDifference = Math.max(
-...anomalyScores.map(x=>Math.max(x.ink200Diff,x.ink160Diff,x.widthDiff)),0
+...features.map((x) => Math.max(
+relativeOutlier(x.inkRatio200, medInk200),
+relativeOutlier(x.inkRatio160, medInk160),
+relativeOutlier(x.width, medWidth)
+))
 );
 const maxEdgeDifference = Math.max(
-...anomalyScores.map(x=>x.edgeDiff),0
+...features.map((x) => relativeOutlier(x.edgeDensity, medEdge))
 );
 const maxDarkDifference = Math.max(
-...anomalyScores.map(x=>x.darkDiff),0
+...features.map((x) => relativeOutlier(x.darkness, medDark))
 );
 
 const anomalousCount = anomalyScores.filter((x) => x.votes >= 3).length;
-const anomalyRatio = anomalyScores.length ? anomalousCount / anomalyScores.length : 0;
+const anomalyRatio = features.length ? anomalousCount / features.length : 0;
 
 // Özellikle tek bir karakterin diğerlerinden ayrılması değerlidir.
 // Çok sayıda karakter aynı şekilde değişmişse bunun belge/render etkisi
@@ -13789,7 +13743,7 @@ Number(group.differences.dark) || 0
 ) >= 0.12)
 );
 
-let status = comparableGlyphRows.length ? "pass" : "unknown";
+let status = "pass";
 let severity = "none";
 let score = 0;
 
@@ -13829,7 +13783,7 @@ score = 65;
 }
 
 const outlierFeature =
-maxIndex >= 0 ? {...alignedGlyphRows.find(x=>x.position===anomalyScores[maxIndex]?.position)?.feature,character:anomalyScores[maxIndex]?.char,characterPosition:anomalyScores[maxIndex]?.position} : null;
+maxIndex >= 0 ? features[maxIndex] : null;
 
 let evidence;
 if (status === "warning") {
@@ -13837,12 +13791,10 @@ const repeatedText = repeatedCharacterAnalysis.strongGroups.length
 ? ` Aynı rakam tekrarları içinde ${repeatedCharacterAnalysis.strongGroups.length} lokal farklılık da tespit edildi.`
 : "";
 evidence =
-`Tutar alanında yalnızca aynı rakam türlerinin tekrar eden bölgeleri karşılaştırıldı (${comparableGlyphRows.length} rakam; virgül/nokta karşılaştırma dışı). ${maxScore} mikro-görsel özellik aynı rakamın bir bölgesinde diğer tekrarlarından ayrıştı.${repeatedText} Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
-} else if(status === "unknown") {
-evidence = "Tutar bulundu ancak aynı türden tekrarlanan rakamlar güvenilir biçimde hizalanamadığı için lokal karakter tutarlılığı ölçülemedi; noktalama işaretleri rakam anomalisi olarak değerlendirilmedi.";
+`Tutar alanında ${features.length} karakter bölgesi karşılaştırıldı. ${maxScore} ayrı mikro-görsel özellik aynı karakter bölgesinde diğer karakterlerden ayrıştı.${repeatedText} En belirgin fark; ink/stroke yoğunluğu, kenar yapısı veya karakter geometrisinde lokalize bir tutarsızlık olarak ölçüldü. Bu bulgu tek başına sahtecilik kanıtı değildir; yeniden boyutlandırma, sıkıştırma, tarama ve render farklılıkları ayrıca dikkate alınmalıdır.`;
 } else {
 evidence =
-`Tutar alanında aynı türden tekrarlanan rakam bölgeleri karşılaştırıldı (${comparableGlyphRows.length} rakam; virgül/nokta karşılaştırma dışı); lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
+`Tutar alanında ${features.length} karakter bölgesi ${estimatedCharacterSlots ? "geometrik slotlar üzerinden yaklaşık olarak " : ""}mikro-görsel olarak karşılaştırıldı; lokal ve çoklu özelliklerle desteklenen belirgin bir karakter render anomalisi oluşmadı.`;
 }
 
 console.log(
@@ -13854,8 +13806,6 @@ templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
 templatePositionScore: candidate.templateScore || 0,
 characterCount: features.length,
-digitComparableCount: comparableGlyphRows.length,
-punctuationExcluded: typedGlyphs.filter(char=>/[.,]/.test(char)).length,
 estimatedCharacterSlots,
 maxScore,
 maxInkDifference,
@@ -16281,7 +16231,6 @@ let paintOverForensicsV2 = null;
 let openSourceForensics = null;
 let fontForensics = null;
 let mathematicalForensics = null;
-let resolvedAmountRoiEvidence = null;
 let multimodalReceiptEvidence = null;
 let semanticEvidenceFusion = null;
 let azureLayout = null;
@@ -16518,36 +16467,6 @@ if (type === "image" || type === "pdf") {
     mathematicalForensics = { available: false, status: "error", error: error?.message || String(error) };
   }
 }
-
-// Share the same typed amount box with downstream measurements. Previously
-// contrast and semantic fusion only read amountForensics, even when the typed
-// same-line resolver had already found a valid amount box.
-const mathAmountPair = mathematicalForensics?.semanticRois?.amount || null;
-resolvedAmountRoiEvidence = amountForensics?.region
-  ? {
-      ...amountForensics,
-      available: true,
-      region: amountForensics.region,
-      selectedAmountText: amountForensics.selectedAmountText || amountForensics.amountText || mathAmountPair?.targetText || null,
-      resolver: amountForensics.selectionMethod || "amount-forensics-typed-label",
-    }
-  : mathAmountPair?.target
-    ? {
-        available: true,
-        status: "typed-roi-only",
-        region: mathAmountPair.target,
-        selectedAmountText: mathAmountPair.targetText || null,
-        resolver: mathAmountPair.source || "typed-ocr-amount-same-line-right-v1",
-      }
-    : null;
-console.log("CRITICAL AMOUNT ROI HANDOFF V1:", JSON.stringify({
-  available: Boolean(resolvedAmountRoiEvidence?.region),
-  source: resolvedAmountRoiEvidence?.resolver || null,
-  text: resolvedAmountRoiEvidence?.selectedAmountText || null,
-  region: resolvedAmountRoiEvidence?.region || null,
-  referenceRegionAvailable: Boolean(mathAmountPair?.reference),
-  skipReason: resolvedAmountRoiEvidence?.region ? null : (amountForensics?.evidence || mathematicalForensics?.status || "typed-amount-roi-unavailable"),
-}));
 
 // V63 SPEED: Azure, referans şablonu ve lokal referans karşılaştırması
 // birbirinden bağımsız hazırlık işleridir; mümkün olduğunca paralel yürütülür.
@@ -18294,8 +18213,8 @@ if (multimodalReceiptEvidence) {
           ? {text:r.text,region:r.region,resolver,validated:true}
           : null;
       })(),
-      amount: resolvedAmountRoiEvidence?.region
-        ? {text:resolvedAmountRoiEvidence.selectedAmountText||null,region:resolvedAmountRoiEvidence.region,resolver:resolvedAmountRoiEvidence.resolver||'shared-typed-amount-roi-v1',validated:true}
+      amount: amountForensics?.available===true&&amountForensics?.region
+        ? {text:amountForensics.selectedAmountText||amountForensics.amountText||null,region:amountForensics.region,resolver:amountForensics.selectionMethod||'amount-forensics-typed-label',validated:true}
         : null,
     },
   });
@@ -18316,20 +18235,6 @@ if (multimodalReceiptEvidence) {
 // Deterministik yapısal geometri sinyali AI çıktısından bağımsızdır.
 if (layoutForensics?.available && result?.checks) {
   result.checks.layoutIntegrity = layoutForensics.check;
-}
-const reliableReferenceSpacingRows = (Array.isArray(referenceForensics?.spacingAnomalies) ? referenceForensics.spacingAnomalies : [])
-  .filter(x => Number(x?.score) >= 85 && Number(x?.ensembleMedianScore) >= 85 && Number(x?.referenceCountForPair) >= 3);
-if (result?.checks && referenceForensics?.available === true && reliableReferenceSpacingRows.length) {
-  const existing = result.checks.layoutIntegrity || {};
-  const strongest = Math.max(...reliableReferenceSpacingRows.map(x => Number(x.score) || 0));
-  const pairs = reliableReferenceSpacingRows.map(x => `${x.beforeLabel || x.beforeField} → ${x.afterLabel || x.afterField}`).join('; ');
-  const evidence = `Güvenilir referans eşleştirmelerinde dikey yerleşim aralığı farkı ölçüldü (en yüksek ${strongest}/100; destek ${Math.max(...reliableReferenceSpacingRows.map(x => Number(x.referenceCountForPair) || 0))} referans): ${pairs}.`;
-  result.checks.layoutIntegrity = {
-    ...existing,
-    status: 'warning',
-    score: Math.max(Number(existing.score) || 0, Math.min(85, Math.round(strongest))),
-    evidence: [String(existing.evidence || '').trim(), evidence].filter(Boolean).join(' '),
-  };
 }
 
 // Bank-specific measured indicators add warnings to their related check only;
@@ -18354,7 +18259,7 @@ if(ziraatAmountSpacing.available){
 }
 
 let garantiAmountContrast={available:false,status:'MEASUREMENT_UNAVAILABLE'};
-if(String(bank||'').toLowerCase().includes('garanti')) garantiAmountContrast=await measureGarantiAmountContrast(forensicTargetPath,resolvedAmountRoiEvidence?.region,resolvedAmountRoiEvidence?.selectedAmountText||'');
+if(String(bank||'').toLowerCase().includes('garanti')) garantiAmountContrast=await measureGarantiAmountContrast(forensicTargetPath,amountForensics?.region,amountForensics?.selectedAmountText||amountForensics?.amountText||'');
 if(String(bank||'').toLowerCase().includes('garanti')) {
   result.garantiAmountContrast=garantiAmountContrast;
   console.log('GARANTI AMOUNT CONTRAST MEASUREMENT:', JSON.stringify(garantiAmountContrast));
@@ -18786,13 +18691,8 @@ if (pixelForensics) {
 if (advancedForensics) {
   result.advancedForensics = advancedForensics;
 }
-const canonicalPaintOverForensics = paintOverForensicsV2?.available === true
-  ? paintOverForensicsV2
-  : paintOverForensics;
-if (canonicalPaintOverForensics) {
-  // Keep the compatibility alias aligned with the baseline-calibrated result.
-  // V1 remains available only under the explicitly diagnostic V1 property.
-  result.paintOverForensics = canonicalPaintOverForensics;
+if (paintOverForensics) {
+  result.paintOverForensics = paintOverForensics;
 }
 
 if (amountForensics) {
@@ -20751,18 +20651,16 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 5) Field placement is user-facing only when the ensemble has confirmed it
-  // and both matched label boxes are available. A raw per-reference score is
-  // not enough: it can be inflated by template variants or affine alignment,
-  // and without boxes the report cannot show what was actually compared.
+  // 5) Strong field placement is concrete even when no local pixel crop is
+  // available. Sorgu Numarası gibi fields can be located from their OCR label.
+  // KUVEYT TÜRK: after the bank-specific global-Y normalization, a raw
+  // positionScore alone is not enough to expose a user-facing field-position
+  // finding. Require the engine's own consensus decision for this bank only.
+  const normalizedReportBank = normalizeBank(bank);
+  const kuveytTurkPositionGate = normalizedReportBank === 'kuveytturk';
   for (const f of (Array.isArray(forensic?.fields) ? forensic.fields : [])) {
-    const positionScore = Number(f?.ensembleMedianPositionScore ?? f?.positionScore ?? 0);
-    const referenceSupport = Number(f?.referenceCountForField || 0);
-    const referenceBox = f?.referenceLabelBox || f?.referenceValueBox || null;
-    const targetBox = f?.targetLabelBox || f?.targetValueBox || null;
-    if (positionScore < 70) continue;
-    if (f?.suspicious !== true || referenceSupport < 2) continue;
-    if (!referenceBox || !targetBox) continue;
+    if (Number(f?.positionScore || 0) < 70) continue;
+    if (kuveytTurkPositionGate && f?.suspicious !== true) continue;
     const field = String(f?.field || '').replace(/:value$/i,'');
     if (!field) continue;
     const title = fieldName(field);
@@ -20775,14 +20673,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
       detail: 'Bu alanın referansa göre dikey konumu belirgin şekilde farklı.',
       kind: 'field-position',
       evidenceField: field,
-      referenceBox,
-      targetBox,
-      referenceCount: referenceSupport,
-      positionScore,
-      normalizedPosition: {
-        reference: { x: f.referenceLabelXNorm ?? null, y: f.referenceLabelYNorm ?? null },
-        target: { x: f.targetLabelXNorm ?? null, y: f.targetLabelYNorm ?? null },
-      }
+      targetBox: null
     });
   }
 
@@ -21282,29 +21173,16 @@ if (advancedForensics?.available) {
     referenceToneScore: advancedForensics.metrics?.amountReferenceTone?.reference?.score || 0
   }));
 }
-if (canonicalPaintOverForensics?.available) {
+if (paintOverForensics?.available) {
   console.log("PAINT-OVER FORENSICS SUMMARY:", JSON.stringify({
-    source: canonicalPaintOverForensics === paintOverForensicsV2
-      ? (paintOverForensicsV2.metrics?.telegramBaseline?.available === true ? 'baseline-calibrated-v2' : 'baseline-unavailable-score-zero')
-      : 'uncalibrated-v1-fallback',
-    score: canonicalPaintOverForensics.score,
-    rawScore: canonicalPaintOverForensics.rawScore ?? canonicalPaintOverForensics.score,
-    severity: canonicalPaintOverForensics.severity,
-    baseline: canonicalPaintOverForensics.metrics?.telegramBaseline || null,
-    channelResidualScore: canonicalPaintOverForensics.metrics?.featureScores?.channelResidual ?? canonicalPaintOverForensics.metrics?.channelResidualScore ?? 0,
-    lumaResidualScore: canonicalPaintOverForensics.metrics?.featureScores?.lumaResidual ?? canonicalPaintOverForensics.metrics?.lumaResidualScore ?? 0,
-    edgeScore: canonicalPaintOverForensics.metrics?.featureScores?.edge ?? canonicalPaintOverForensics.metrics?.edgeScore ?? 0,
-    textureScore: canonicalPaintOverForensics.metrics?.featureScores?.texture ?? canonicalPaintOverForensics.metrics?.textureScore ?? 0,
-    corroboratingSignals: canonicalPaintOverForensics.metrics?.supportSignals ?? 0,
-    amountSupport: canonicalPaintOverForensics.metrics?.amountSupport ?? 0
-  }));
-}
-if (paintOverForensics?.available && paintOverForensicsV2?.available === true) {
-  console.log("PAINT-OVER RAW DIAGNOSTIC V1:", JSON.stringify({
     score: paintOverForensics.score,
     severity: paintOverForensics.severity,
-    roi: paintOverForensics.roi,
-    note: 'Uncalibrated diagnostic only; not the canonical Paint-Over score.'
+    channelResidualScore: paintOverForensics.metrics?.channelResidualScore || 0,
+    lumaResidualScore: paintOverForensics.metrics?.lumaResidualScore || 0,
+    edgeScore: paintOverForensics.metrics?.edgeScore || 0,
+    textureScore: paintOverForensics.metrics?.textureScore || 0,
+    corroboratingSignals: paintOverForensics.metrics?.supportSignals || 0,
+    amountSupport: paintOverForensics.metrics?.amountSupport || 0
   }));
 }
 
@@ -21431,7 +21309,7 @@ const strongPixelReferenceSignal =
 const paintOverForV152 =
   result?.paintOverForensicsV2?.available === true
     ? result.paintOverForensicsV2
-    : null;
+    : (paintOverForensics || result?.paintOverForensics || null);
 const paintOverV152Score = Number(paintOverForV152?.score || 0);
 const paintOverV152Signals = Number(paintOverForV152?.metrics?.supportSignals || 0);
 const paintOverV152AmountSupport = Number(paintOverForV152?.metrics?.amountSupport || 0);
