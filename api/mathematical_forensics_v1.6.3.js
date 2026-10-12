@@ -673,6 +673,21 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
       result[name] = { available: false, reason: 'roi-missing-on-one-side' };
       continue;
     }
+    const targetInk = t.alignment?.contentBox;
+    const referenceInk = r.alignment?.contentBox;
+    if (targetInk?.detected === false || referenceInk?.detected === false) {
+      result[name] = {
+        available: false,
+        reason: 'roi-ink-not-detected',
+        targetInkDetected: targetInk?.detected ?? null,
+        referenceInkDetected: referenceInk?.detected ?? null,
+        targetInkPixels: targetInk?.inkPixels ?? 0,
+        referenceInkPixels: referenceInk?.inkPixels ?? 0,
+        targetSourceBox: t.sourceBox || null,
+        referenceSourceBox: r.sourceBox || null,
+      };
+      continue;
+    }
     const metric = compareMetricObjects(t.metrics, r.metrics);
     const targetTiles = Array.isArray(t.tiles16x16) ? t.tiles16x16 : [];
     const referenceTiles = Array.isArray(r.tiles16x16) ? r.tiles16x16 : [];
