@@ -293,9 +293,25 @@ async function measureMedianDigitFillRatio(imagePath, box, amountText='') {
     const meta=await sharp(imagePath).metadata(),left=Math.max(0,Math.floor(Number(box.x1))),top=Math.max(0,Math.floor(Number(box.y1))),right=Math.min(Number(meta.width)||0,Math.ceil(Number(box.x2))),bottom=Math.min(Number(meta.height)||0,Math.ceil(Number(box.y2)));
     const width=right-left,height=bottom-top;if(width<3||height<3)return{available:false,reason:'invalid-amount-box'};
     const {data}=await sharp(imagePath).extract({left,top,width,height}).grayscale().raw().toBuffer({resolveWithObject:true});
+    // OCR crops may contain light-gray antialiased ink. A fixed 160 cutoff
+    // turned valid amount ROIs into zero components on Telegram/JPEG receipts.
+    // Pick a foreground threshold from this crop's own grayscale histogram.
+    const histogram=new Uint32Array(256);let grayMin=255,grayMax=0;
+    for(const value of data){histogram[value]++;if(value<grayMin)grayMin=value;if(value>grayMax)grayMax=value;}
+    const total=data.length;let sumAll=0;for(let i=0;i<256;i++)sumAll+=i*histogram[i];
+    let sumBackground=0,weightBackground=0,bestVariance=-1,threshold=160;
+    for(let t=0;t<255;t++){
+      weightBackground+=histogram[t];if(!weightBackground)continue;
+      const weightForeground=total-weightBackground;if(!weightForeground)break;
+      sumBackground+=t*histogram[t];
+      const meanBackground=sumBackground/weightBackground,meanForeground=(sumAll-sumBackground)/weightForeground;
+      const variance=weightBackground*weightForeground*(meanBackground-meanForeground)**2;
+      if(variance>bestVariance){bestVariance=variance;threshold=t;}
+    }
+    threshold=Math.max(32,Math.min(248,threshold));
     const seen=new Uint8Array(width*height),components=[];
     for(let y=0;y<height;y++)for(let x=0;x<width;x++){
-      const start=y*width+x;if(seen[start]||data[start]>160)continue;seen[start]=1;const stack=[start];let minX=x,maxX=x,minY=y,maxY=y,area=0;
+      const start=y*width+x;if(seen[start]||data[start]>threshold)continue;seen[start]=1;const stack=[start];let minX=x,maxX=x,minY=y,maxY=y,area=0;
       while(stack.length){const i=stack.pop(),cx=i%width,cy=Math.floor(i/width);area++;minX=Math.min(minX,cx);maxX=Math.max(maxX,cx);minY=Math.min(minY,cy);maxY=Math.max(maxY,cy);
         for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){if(!dx&&!dy)continue;const nx=cx+dx,ny=cy+dy;if(nx<0||ny<0||nx>=width||ny>=height)continue;const ni=ny*width+nx;if(!seen[ni]&&data[ni]<=160){seen[ni]=1;stack.push(ni);}}
       }
@@ -306,9 +322,9 @@ async function measureMedianDigitFillRatio(imagePath, box, amountText='') {
     // A partial set of connected components is not a valid per-digit profile.
     // OCR boxes often contain touching glyphs or low-resolution scans; never
     // publish a ratio from only a subset of the requested amount digits.
-    if(selected.length<2|| (digitCount>0&&selected.length!==digitCount))return{available:false,reason:selected.length<2?'too-few-digit-components':'incomplete-digit-components',componentCount:selected.length,digitCount,threshold:160};
+    if(selected.length<2|| (digitCount>0&&selected.length!==digitCount))return{available:false,reason:selected.length<2?'too-few-digit-components':'incomplete-digit-components',componentCount:selected.length,digitCount,threshold,thresholdMethod:'crop-otsu',grayRange:{min:grayMin,max:grayMax},crop:{left,top,width,height}};
     const ratios=selected.map(c=>c.fill).sort((a,b)=>a-b),median=ratios[Math.floor(ratios.length/2)];
-    return{available:true,medianDigitFillRatio:Number(median.toFixed(6)),digitComponentCount:selected.length,requestedDigitCount:digitCount||null,threshold:160};
+    return{available:true,medianDigitFillRatio:Number(median.toFixed(6)),digitComponentCount:selected.length,requestedDigitCount:digitCount||null,threshold,thresholdMethod:'crop-otsu',grayRange:{min:grayMin,max:grayMax},crop:{left,top,width,height}};
   }catch(error){return{available:false,reason:error?.message||'digit-fill-measurement-error'};}
 }
 
@@ -605,6 +621,8 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
         const c = roiForensics?.[field] || null;
         semanticReferenceMeasurements[field] = {
           available: Boolean(t?.metrics && r?.metrics),
+          comparisonAvailable: c?.available !== false,
+          comparisonUnavailableReason: c?.reason || null,
           targetSourceBox: t?.sourceBox || null,
           referenceSourceBox: r?.sourceBox || null,
           targetMetrics: t?.metrics || null,
@@ -616,20 +634,23 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
           targetAlignment: t?.alignment || null,
           referenceAlignment: r?.alignment || null,
           comparison: c ? {
-            meanDistance: c.meanDistance,
-            maxCellDistance: c.maxCellDistance,
-            metricDistances: c.metricDistances,
-            rawMetricDistances: c.rawMetricDistances,
-            topCells: c.topCells,
-            grid: c.grid,
-            cellCount: c.cellCount,
+            available: c.available !== false,
+            reason: c.reason || null,
+            meanDistance: Number.isFinite(Number(c.meanDistance)) ? c.meanDistance : null,
+            maxCellDistance: Number.isFinite(Number(c.maxCellDistance)) ? c.maxCellDistance : null,
+            metricDistances: c.metricDistances || null,
+            rawMetricDistances: c.rawMetricDistances || null,
+            topCells: c.topCells || [],
+            grid: c.grid || '16x16',
+            cellCount: Number(c.cellCount) || 0,
           } : null,
         };
       }
 
       console.log('MATH SEMANTIC REFERENCE FINGERPRINT V1.5:', JSON.stringify(
         Object.fromEntries(Object.entries(semanticReferenceMeasurements).map(([field, v]) => [field, {
-          available: v.available,
+          available: v.comparisonAvailable,
+          reason: v.comparisonUnavailableReason,
           referenceSourceBox: v.referenceSourceBox,
           targetSourceBox: v.targetSourceBox,
           meanDistance: v.comparison?.meanDistance ?? null,
@@ -7042,6 +7063,36 @@ function referenceFieldRuleForText(text) {
   return null;
 }
 
+// A label match alone is not a field match. Keep reference-template ROI
+// candidates typed so nearby addresses, account numbers, or unrelated text
+// cannot become recipient-name/IBAN/amount anchors.
+function referenceValueMatchesField(key, text) {
+  const raw = String(text || '').trim().replace(/^[:=\-\s]+/, '');
+  if (!raw) return false;
+  if (key === 'recipientIban' || key === 'senderIban' || key === 'iban') {
+    const compact = raw.toLocaleUpperCase('tr-TR').replace(/[^A-Z0-9]/g, '');
+    if (!/^TR\d{24}$/.test(compact)) return false;
+    // Turkish IBAN MOD-97 checksum, streamed to avoid unsafe integer parsing.
+    const rearranged = compact.slice(4) + compact.slice(0, 4);
+    let remainder = 0;
+    for (const ch of rearranged) {
+      const digits = /[A-Z]/.test(ch) ? String(ch.charCodeAt(0) - 55) : ch;
+      for (const digit of digits) remainder = (remainder * 10 + Number(digit)) % 97;
+    }
+    return remainder === 1;
+  }
+  if (key === 'amount') {
+    return /[-+]?\s*(?:₺\s*)?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{2}|\.\d{2})\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i.test(raw);
+  }
+  if (key === 'recipientName' || key === 'senderName') {
+    const normalized = normalizeFieldTextForMatch(raw).replace(/[^A-Z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (normalized.length < 3 || /\d/.test(normalized)) return false;
+    if (/\b(?:IBAN|HESAP|TUTAR|SIRA|NO|SAYIN|ALACAKLI|ALICI|GONDEREN|GONDERICI|MAH|MAHALLESI|CAD|CADDESI|SOK|SOKAK|DAIRE|KAT|MERKEZ|ILCE|IL)\b/.test(normalized)) return false;
+    return /[A-Z]/.test(normalized);
+  }
+  return true;
+}
+
 function rfSplitInlineLabelValue(text) {
   const raw = String(text || '').trim();
   if (!raw) return null;
@@ -10885,6 +10936,9 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         const valueMatchesRule = (key, text) => {
           const t = String(text || '').trim();
           if (!t) return false;
+          if (['recipientName','senderName','recipientIban','senderIban','iban','amount'].includes(key)) {
+            return referenceValueMatchesField(key, t);
+          }
           if (key === 'amount') return isMoney(t);
           if (key === 'iban') return isIban(t);
           if (key === 'date' || key === 'time') return isDate(t) || /\b\d{1,2}:\d{2}(?::\d{2})?\b/.test(t);
@@ -10983,6 +11037,13 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
       }
       valueItems = valueItems.filter((item) => !referenceFieldRuleForText(item.str));
       if (!valueItems.length) continue;
+      const resolvedValueText = valueItems.map(item => String(item.str || '').trim()).filter(Boolean).join(' ');
+      if (['recipientName','senderName','recipientIban','senderIban','iban','amount'].includes(rule.key) &&
+          !referenceValueMatchesField(rule.key, resolvedValueText)) {
+        // Do not turn a nearby address/ID/fee into a critical-field template
+        // anchor just because it follows a matching label in PDF text order.
+        continue;
+      }
 
       const x1 = Math.min(...valueItems.map((x) => x.x));
       const x2 = Math.max(...valueItems.map((x) => x.x + x.width));
