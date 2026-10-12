@@ -66,6 +66,7 @@ pathToFileURL(pdfWorkerPath).href;
 const execFileAsync = promisify(execFile);
 const amountForensicsStrongCache = new Map();
 const referenceAmountAnchorCache = new Map();
+const rasterContentBoundsCache = new Map();
 // PaddleOCR pahalı bir uzak API çağrısıdır. Aynı dosya analiz hattında
 // birden fazla kez istendiğinde aynı OCR sonucunu yeniden üretme.
 const paddleOCRCache = new Map();
@@ -344,6 +345,8 @@ async function measureSemanticRoiAppearance(imagePath, box) {
       imageInput=rendered.buffer;
     }
     const meta=await sharp(imageInput).metadata(),pageWidth=Number(meta.width)||0,pageHeight=Number(meta.height)||0;
+    const contentBounds=await detectRasterContentBounds(imageInput);
+    const contentHeight=Number(contentBounds?.height)||pageHeight;
     const x1=Number(box.x1),y1=Number(box.y1),x2=Number(box.x2),y2=Number(box.y2);
     if(!pageWidth||!pageHeight||![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1)return{available:false,reason:'invalid-roi-or-image-size'};
     // Add a small local paper margin so both foreground and clean background
@@ -380,12 +383,17 @@ async function measureSemanticRoiAppearance(imagePath, box) {
       inkMedianGray,
       backgroundMedianGray,
       glyphHeightPx:maxY>=minY?maxY-minY+1:0,
+      // Keep the legacy full-canvas metric for diagnostics, but compare font
+      // size against the detected printed-content height. Page scans can have
+      // large, unrelated white margins (or a page number below the receipt).
       glyphHeightPer1000PageHeight:Number((((maxY>=minY?maxY-minY+1:0)/pageHeight)*1000).toFixed(4)),
+      glyphHeightPer1000ContentHeight:Number((((maxY>=minY?maxY-minY+1:0)/contentHeight)*1000).toFixed(4)),
       glyphWidthPx:maxX>=minX?maxX-minX+1:0,
       inkCoverage:Number((ink.length/data.length).toFixed(6)),
       roi:{x1,y1,x2,y2},
       crop:{left,top,width,height},
       page:{width:pageWidth,height:pageHeight},
+      pageContentBounds:contentBounds,
       segmentation:{method:'Otsu grayscale on validated value ROI',threshold:otsu,inkPixelCount:ink.length,backgroundPixelCount:paper.length},
     };
   }catch(error){return{available:false,reason:error?.message||'semantic-roi-appearance-error'};}
@@ -412,6 +420,7 @@ async function compareSemanticRoiAppearance(targetPath,referencePath,semanticRoi
       delta:comparable?{
         contrast:Number((target.contrast-reference.contrast).toFixed(4)),
         glyphHeightPer1000PageHeight:Number((target.glyphHeightPer1000PageHeight-reference.glyphHeightPer1000PageHeight).toFixed(4)),
+        glyphHeightPer1000ContentHeight:Number((target.glyphHeightPer1000ContentHeight-reference.glyphHeightPer1000ContentHeight).toFixed(4)),
         inkCoverage:Number((target.inkCoverage-reference.inkCoverage).toFixed(6)),
       }:null,
       interpretation:'appearance diagnostics within matching typed field ROIs; dynamic text may differ; no independent fraud verdict',
@@ -429,12 +438,18 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     ? referenceForensics.characterFindings : [];
   const targetSemanticRegions = referenceForensics?.targetSemanticRegions || {};
   const referenceSemanticRegions = referenceForensics?.referenceSemanticRegions || {};
+  const targetContentBounds = targetPath && path.extname(String(targetPath)).toLowerCase() !== '.pdf'
+    ? await detectRasterContentBounds(targetPath) : null;
+  const referenceContentBounds = referencePath && path.extname(String(referencePath)).toLowerCase() !== '.pdf'
+    ? await detectRasterContentBounds(referencePath) : null;
 
-  const normalizedBox = (b, width, height) => {
+  const normalizedBox = (b, bounds, width, height) => {
     if (!b) return null;
     const x1=Number(b.x1),y1=Number(b.y1),x2=Number(b.x2),y2=Number(b.y2);
     if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1 || !width || !height) return null;
-    return {x:(x1+x2)/(2*width), y:(y1+y2)/(2*height), w:(x2-x1)/width, h:(y2-y1)/height};
+    const left=Number(bounds?.left)||0,top=Number(bounds?.top)||0;
+    const contentWidth=Number(bounds?.width)||width,contentHeight=Number(bounds?.height)||height;
+    return {x:((x1+x2)/2-left)/contentWidth, y:((y1+y2)/2-top)/contentHeight, w:(x2-x1)/contentWidth, h:(y2-y1)/contentHeight};
   };
   const inferRasterSize = (rows) => {
     const xs=rows.flatMap(r=>[Number(r?.region?.x1),Number(r?.region?.x2)]).filter(Number.isFinite);
@@ -444,12 +459,12 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   const geometryFallback = (field, referenceCandidate, targetRows, referenceRows) => {
     if (!referenceCandidate || !Array.isArray(targetRows) || !targetRows.length) return null;
     const refSize=inferRasterSize(referenceRows), tarSize=inferRasterSize(targetRows);
-    const refNorm=normalizedBox(referenceCandidate.region,refSize.width,refSize.height);
+     const refNorm=normalizedBox(referenceCandidate.region,referenceContentBounds,refSize.width,refSize.height);
     if (!refNorm || !tarSize.width || !tarSize.height) return null;
     const valid = field==='recipientName' ? nameLike : ibanLike;
     const candidates=targetRows.filter(r=>r?.region && valid(String(r.text||'').trim()));
     const scored=candidates.map(r=>{
-      const n=normalizedBox(r.region,tarSize.width,tarSize.height);
+       const n=normalizedBox(r.region,targetContentBounds,tarSize.width,tarSize.height);
       if(!n) return null;
       const d=Math.hypot((n.x-refNorm.x), (n.y-refNorm.y));
       const sizeD=Math.abs(Math.log(Math.max(.0001,n.w)/Math.max(.0001,refNorm.w)))+Math.abs(Math.log(Math.max(.0001,n.h)/Math.max(.0001,refNorm.h)));
@@ -545,7 +560,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   }
   if (!amountReferenceBox && referencePath) {
     try {
-      referenceTypedAmountOCR = await runPaddleOCR(referencePath);
+      referenceTypedAmountOCR = await runPaddleOCROnContentCrop(referencePath);
       referenceTypedAmount = resolveTypedAmountRegionFromOcr(referenceTypedAmountOCR);
       if (referenceTypedAmount) {
         amountReferenceBox = referenceTypedAmount.region;
@@ -670,7 +685,10 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
     if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference, targetText:targetSemanticRegions.recipientIban?.text||null, referenceText:referenceSemanticRegions.recipientIban?.text||null, source:'semantic-label-neighbor', validated:true };
   }
 
-  console.log('MATH SEMANTIC ROI RESOLVER V1.5.4:', JSON.stringify({
+  console.log('MATH SEMANTIC ROI RESOLVER V1.5.5-CONTENT-NORMALIZED:', JSON.stringify({
+    coordinateNormalization: 'detected-printed-content-bounds-v1',
+    targetContentBounds,
+    referenceContentBounds,
     fields: fields.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     profiles: profiles.map(f => ({field:f?.field, hasTarget:Boolean(boxFrom(f).target), hasReference:Boolean(boxFrom(f).reference)})).slice(0,40),
     resolved: Object.fromEntries(Object.entries(rois).map(([k,v]) => {
@@ -704,7 +722,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   if(referencePath){
     try{
       semanticAppearanceMeasurements=await compareSemanticRoiAppearance(targetPath,referencePath,semanticRois);
-      console.log('MATH SEMANTIC ROI APPEARANCE V1:',JSON.stringify({bank,reference:path.basename(referencePath),fields:semanticAppearanceMeasurements}));
+      console.log('MATH SEMANTIC ROI APPEARANCE V2-CONTENT-NORMALIZED:',JSON.stringify({bank,reference:path.basename(referencePath),fields:semanticAppearanceMeasurements}));
     }catch(error){
       semanticAppearanceMeasurements={available:false,reason:error?.message||'semantic-appearance-comparison-failed'};
       console.warn('MATH SEMANTIC ROI APPEARANCE ATLANDI:',JSON.stringify({bank,reason:semanticAppearanceMeasurements.reason}));
@@ -2627,10 +2645,104 @@ try {
 }
 
 // Compatibility entry point retained for callers that explicitly expect the
-// JPEG PaddleOCR name. The existing OCR implementation and caching stay in
-// runPaddleOCR; this wrapper does not alter its behavior.
+// Find the printed-content bounds without assuming a bank-specific page size.
+// Sparse scan artifacts (such as a page number far below the receipt) are
+// excluded by trimming a small fraction of foreground pixels from each edge.
+async function detectRasterContentBounds(imageInput) {
+  try {
+    let cacheKey = null;
+    if (typeof imageInput === 'string') {
+      const stat = await fs.stat(imageInput);
+      cacheKey = `${imageInput}:${stat.size}:${stat.mtimeMs}`;
+      const cached = rasterContentBoundsCache.get(cacheKey);
+      if (cached) return cached;
+    }
+    const meta = await sharp(imageInput).metadata();
+    const sourceWidth = Number(meta?.width) || 0;
+    const sourceHeight = Number(meta?.height) || 0;
+    if (!sourceWidth || !sourceHeight) return null;
+    const sample = await sharp(imageInput)
+      .resize({ width: 1100, height: 1600, fit: 'inside', withoutEnlargement: true })
+      .grayscale().raw().toBuffer({ resolveWithObject: true });
+    const { data, info } = sample;
+    const rowInk = new Uint32Array(info.height);
+    const colInk = new Uint32Array(info.width);
+    let totalInk = 0;
+    // 242 tolerates JPEG antialiasing while excluding the white page surface.
+    for (let y = 0; y < info.height; y++) {
+      for (let x = 0; x < info.width; x++) {
+        if (data[y * info.width + x] > 242) continue;
+        rowInk[y]++; colInk[x]++; totalInk++;
+      }
+    }
+    if (totalInk < 80) return null;
+    const quantileBounds = (counts, trimShare) => {
+      const trim = Math.floor(totalInk * trimShare);
+      let sum = 0, start = 0, end = counts.length - 1;
+      for (; start < counts.length - 1; start++) { sum += counts[start]; if (sum > trim) break; }
+      sum = 0;
+      for (; end > 0; end--) { sum += counts[end]; if (sum > trim) break; }
+      return [start, end];
+    };
+    const [sx1, sx2] = quantileBounds(colInk, 0.008);
+    const [sy1, sy2] = quantileBounds(rowInk, 0.008);
+    const scaleX = sourceWidth / info.width, scaleY = sourceHeight / info.height;
+    const padX = Math.max(2, Math.round(sourceWidth * 0.004));
+    const padY = Math.max(2, Math.round(sourceHeight * 0.004));
+    const left = Math.max(0, Math.floor(sx1 * scaleX) - padX);
+    const top = Math.max(0, Math.floor(sy1 * scaleY) - padY);
+    const right = Math.min(sourceWidth, Math.ceil((sx2 + 1) * scaleX) + padX);
+    const bottom = Math.min(sourceHeight, Math.ceil((sy2 + 1) * scaleY) + padY);
+    const width = right - left, height = bottom - top;
+    if (width < sourceWidth * 0.35 || height < sourceHeight * 0.30) return null;
+    const result = { left, top, width, height, sourceWidth, sourceHeight, method: 'foreground-quantile-content-bounds-v1' };
+    if (cacheKey) {
+      rasterContentBoundsCache.set(cacheKey, result);
+      if (rasterContentBoundsCache.size > 96) rasterContentBoundsCache.delete(rasterContentBoundsCache.keys().next().value);
+    }
+    return result;
+  } catch (error) {
+    console.warn('RASTER CONTENT BOUNDS UNAVAILABLE:', error?.message || error);
+    return null;
+  }
+}
+
+// OCR is run on a crop around printed content for raster receipts. This avoids
+// scale/coordinate drift from large scan margins; returned boxes are mapped
+// back to the original image coordinate system before downstream use.
+async function runPaddleOCROnContentCrop(imagePath) {
+  if (!imagePath || path.extname(String(imagePath)).toLowerCase() === '.pdf') return runPaddleOCR(imagePath);
+  const bounds = await detectRasterContentBounds(imagePath);
+  if (!bounds || (bounds.left <= 1 && bounds.top <= 1 && bounds.width >= bounds.sourceWidth - 2 && bounds.height >= bounds.sourceHeight - 2)) {
+    return runPaddleOCR(imagePath);
+  }
+  const cropPath = path.join('/tmp', `verifydoc-content-${createHash('sha256').update(`${imagePath}:${bounds.left}:${bounds.top}:${bounds.width}:${bounds.height}`).digest('hex').slice(0, 12)}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.png`);
+  try {
+    await sharp(imagePath).extract({ left: bounds.left, top: bounds.top, width: bounds.width, height: bounds.height }).png().toFile(cropPath);
+    const result = await runPaddleOCR(cropPath);
+    if (!result?.success || !Array.isArray(result?.regions) || !result.regions.length) {
+      console.warn('PADDLEOCR CONTENT-CROP EMPTY; ORIGINAL IMAGE FALLBACK:', JSON.stringify({ file: path.basename(imagePath), bounds }));
+      return runPaddleOCR(imagePath);
+    }
+    const regions = Array.isArray(result?.regions) ? result.regions.map(item => {
+      const r = item?.region;
+      if (!r || ![r.x1, r.y1, r.x2, r.y2].every(v => Number.isFinite(Number(v)))) return item;
+      return { ...item, region: { ...r, x1: Number(r.x1) + bounds.left, y1: Number(r.y1) + bounds.top, x2: Number(r.x2) + bounds.left, y2: Number(r.y2) + bounds.top } };
+    }) : [];
+    console.log('PADDLEOCR CONTENT-CROP COORDINATE MAP:', JSON.stringify({ file: path.basename(imagePath), bounds, cropRegionCount: regions.length }));
+    return { ...result, regions, coordinateTransform: { type: 'content-crop-offset-v1', bounds } };
+  } catch (error) {
+    console.warn('PADDLEOCR CONTENT-CROP FALLBACK:', JSON.stringify({ file: path.basename(imagePath), reason: error?.message || String(error) }));
+    return runPaddleOCR(imagePath);
+  } finally {
+    try { await fs.unlink(cropPath); } catch {}
+  }
+}
+
+// JPEG image entry point. The crop helper is format agnostic and is also used
+// for PNG/WebP reference images; PDFs keep their page-aware OCR path.
 async function runPaddleOCRForJPEG(filePath) {
-  return runPaddleOCR(filePath);
+  return runPaddleOCROnContentCrop(filePath);
 }
 let ocrWorker = null;
 async function getOCRWorker() {
@@ -10935,7 +11047,7 @@ async function readReferenceVariant(referencePath) {
   try {
     const ext = path.extname(referencePath).toLowerCase();
     if (ext !== '.pdf') {
-      const ocr = await runPaddleOCR(referencePath);
+       const ocr = await runPaddleOCROnContentCrop(referencePath);
       return detectReferenceVariantFromText(ocr?.text || '');
     }
     const buffer = await fs.readFile(referencePath);
@@ -11119,7 +11231,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
         if (rendered.width && rendered.height) {
           const tempPath = path.join('/tmp', `verifydoc-ref-image-${normalizedBank}-${createHash('sha256').update(cacheKey).digest('hex').slice(0,16)}${ext}`);
           await fs.writeFile(tempPath, buffer);
-          ocr = await runPaddleOCR(tempPath);
+          ocr = await runPaddleOCROnContentCrop(tempPath);
           try { await fs.unlink(tempPath); } catch {}
         }
         referenceRasterOcrCache.set(cacheKey, { ocr: ocr || null, rendered: { width: rendered.width, height: rendered.height } });
@@ -11305,7 +11417,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
             .slice(0, 16);
           const tempPath = path.join('/tmp', `verifydoc-ref-${normalizedBank}-${stableRefId}.png`);
           await fs.writeFile(tempPath, rendered.buffer);
-          ocr = await runPaddleOCR(tempPath);
+          ocr = await runPaddleOCROnContentCrop(tempPath);
           try { await fs.unlink(tempPath); } catch {}
           // OCR + raster boyutlarını birlikte cache'le; sonraki çağrıda
           // aynı referansı tekrar render edip OCR etmeye gerek kalmasın.
@@ -20246,13 +20358,13 @@ async function buildV48WholeDocumentReferenceDifferenceReport({
         if (firstImage) {
           const refPath = `/tmp/verifydoc-v48-ref-${createHash('sha1').update(refBuffer).digest('hex').slice(0,12)}.png`;
           await fs.writeFile(refPath, firstImage);
-          referenceOCR = await runPaddleOCR(refPath);
+           referenceOCR = await runPaddleOCROnContentCrop(refPath);
         }
         if (doc?.destroy) await doc.destroy();
       } else {
         // This engine also receives image-only trusted references. Do not feed
         // JPG bytes to the PDF renderer; run PaddleOCR directly on the raster.
-        referenceOCR = await runPaddleOCR(referenceInfo.path);
+        referenceOCR = await runPaddleOCROnContentCrop(referenceInfo.path);
       }
     }
   } catch (e) {
