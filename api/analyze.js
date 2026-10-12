@@ -11291,7 +11291,10 @@ function nearbyFieldLabelScore(field, item, regions) {
     const belowGap = Number(ir.y1) >= Number(or.y2)
       ? Number(ir.y1) - Number(or.y2)
       : Number(or.y1) >= Number(ir.y2) ? Number(or.y1) - Number(ir.y2) : 0;
-    const sameColumnBelow = belowGap <= Math.max(48, ih * 3) &&
+    // A value may sit directly below its label (for example in a narrow
+    // mobile receipt table), but do not let a label authorize a value several
+    // rows away. The previous 3-line/48px window attached ŞUBE to MÜŞTERİ NO.
+    const sameColumnBelow = belowGap <= Math.max(20, ih * 1.2) &&
       (horizontalOverlap > 0 || Math.abs((Number(ir.x1)+Number(ir.x2)-Number(or.x1)-Number(or.x2))/2) <= Math.max(36, ih * 2.5));
     if ((sameLine && near <= Math.max(72, ih * 8)) || sameColumnBelow) best = Math.max(best, 120);
   }
@@ -16322,6 +16325,7 @@ if ((type === "image" || type === "pdf") && forensicTargetPath) {
       openai,
       imageBuffer: evidenceImage,
       mimeType: forensicTargetMime || "image/jpeg",
+      bank: bank || null,
     });
     console.log("MULTIMODAL RECEIPT EVIDENCE:", JSON.stringify({
       available: multimodalReceiptEvidence?.available === true,
@@ -16516,7 +16520,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
   prepTasks.push((async () => {
     try {
       const ta = await analyzeReferenceTemplateAgainstDocument(
-        forensicTargetPath, forensicTargetMime, bank, paddleImageOCR, reference.path
+        forensicTargetPath, forensicTargetMime, bank, paddleImageOCR, null
       );
       console.log("REFERENCE TEMPLATE ANALYSIS (SAFE):", JSON.stringify(ta));
       return { kind:"template", referenceTemplateAnalysis:ta };
@@ -18223,6 +18227,7 @@ if (multimodalReceiptEvidence) {
     status:semanticEvidenceFusion.status,
     fields:Object.fromEntries(Object.entries(semanticEvidenceFusion.fields||{}).map(([field,row])=>[field,{
       visionValueAvailable:Boolean(String(row?.visualEvidence?.text||'').trim()),
+      visionLabelText:row?.visualEvidence?.labelText||null,
       paddleOCRAgreement:row?.paddleOCRAgreement||'unavailable',
       paddleOCRResolver:row?.paddleOCRFieldEvidence?.resolver||null,
       paddleOCRRegion:row?.paddleOCRFieldEvidence?.region||null,
