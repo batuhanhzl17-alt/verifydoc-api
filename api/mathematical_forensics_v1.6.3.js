@@ -427,15 +427,7 @@ export async function extractMathematicalFingerprint(input, options = {}) {
   const meta = await sharp(buffer).metadata();
   const rendered = await sharp(buffer)
     .rotate()
-    // Normalize orientation first, then preserve document geometry on a fixed
-    // canvas. Stretching with `fill` changes aspect ratio and alters global
-    // texture features for the same image at different sizes.
-    .resize({
-      width: options.size || DEFAULT_SIZE,
-      height: options.size || DEFAULT_SIZE,
-      fit: 'contain',
-      background: { r: 255, g: 255, b: 255, alpha: 1 },
-    })
+    .resize({ width: options.size || DEFAULT_SIZE, height: options.size || DEFAULT_SIZE, fit: 'fill' })
     .grayscale()
     .raw()
     .toBuffer({ resolveWithObject: true });
@@ -673,21 +665,6 @@ export function compare16x16Rois(targetFingerprint, referenceFingerprint, roiNam
       result[name] = { available: false, reason: 'roi-missing-on-one-side' };
       continue;
     }
-    const targetInk = t.alignment?.contentBox;
-    const referenceInk = r.alignment?.contentBox;
-    if (targetInk?.detected === false || referenceInk?.detected === false) {
-      result[name] = {
-        available: false,
-        reason: 'roi-ink-not-detected',
-        targetInkDetected: targetInk?.detected ?? null,
-        referenceInkDetected: referenceInk?.detected ?? null,
-        targetInkPixels: targetInk?.inkPixels ?? 0,
-        referenceInkPixels: referenceInk?.inkPixels ?? 0,
-        targetSourceBox: t.sourceBox || null,
-        referenceSourceBox: r.sourceBox || null,
-      };
-      continue;
-    }
     const metric = compareMetricObjects(t.metrics, r.metrics);
     const targetTiles = Array.isArray(t.tiles16x16) ? t.tiles16x16 : [];
     const referenceTiles = Array.isArray(r.tiles16x16) ? r.tiles16x16 : [];
@@ -738,37 +715,21 @@ export function compareAgainstBaseline(fingerprint, baseline, bank, family='unkn
   if (!baseline?.profiles) return { available:false, reason:'baseline-missing' };
   const candidates = Object.values(baseline.profiles).filter(p => p.bank === bank);
   if (!candidates.length) return { available:false, reason:'bank-profile-missing', bank };
-  // Transaction families are not interchangeable. In particular, a generic
-  // UNKNOWN profile must not silently become a CREDIT_CARD/FAST/EFT baseline.
-  const pool = candidates.filter(p => p.family === family);
-  if (!pool.length) {
-    return { available:false, reason:'family-profile-missing', bank, requestedFamily:family, availableFamilies:[...new Set(candidates.map(p=>p.family))] };
-  }
+  const exact = candidates.find(p => p.family === family);
+  const pool = exact ? [exact, ...candidates.filter(p => p !== exact)] : candidates;
   const comparisons = pool.map(p => ({...compareFingerprint(fingerprint,p), family:p.family})).filter(x=>x.available);
   comparisons.sort((a,b)=>b.similarityScore-a.similarityScore);
   const best = comparisons[0] || null;
   return { available:Boolean(best), bank, requestedFamily:family, bestMatch:best, candidates:comparisons.slice(0,8), profileCount:candidates.length };
 }
 
-export function inferDocumentFamily(name='', text='', bank='') {
+export function inferDocumentFamily(name='', text='') {
   const s = `${name} ${text}`.toLocaleLowerCase('tr-TR');
   if (/hesap[-_ ]?hareket|hesap[-_ ]?ozeti/.test(s)) return 'ACCOUNT_STATEMENT';
-  // Garanti payment receipts share the same printed receipt template across
-  // FAST, EFT and account-to-account transfers. Compare those together while
-  // keeping account statements as their own family.
-  if (String(bank || '').toLocaleLowerCase('tr-TR').replace(/[^a-z]/g, '') === 'garanti') return 'DEKONT';
-  // DenizBank receipt layouts are shared across FAST/EFT/HAVALE wording; the
-  // supplied trusted raster references are stored as FAST, so normalize every
-  // DenizBank payment receipt to that family for stable baseline lookup.
-  if (String(bank || '').toLocaleLowerCase('tr-TR').replace(/[^a-z]/g, '') === 'denizbank') return 'FAST';
-  // Enpara references are generic bank receipt templates. FAST/EFT wording
-  // describes the payment rail inside the receipt, not a separate Enpara
-  // document family. Keep target and baseline family assignment consistent.
-  if (String(bank || '').toLocaleLowerCase('tr-TR').replace(/[^a-z]/g, '') === 'enpara') return 'DEKONT';
-  if (/giden\s+fast|fast\s+(mesaj|sorgu|islem|ucreti)|hesaptan\s+fast|\bfast\b/.test(s)) return 'FAST';
-  if (/eft/.test(s)) return 'EFT';
-  if (/havale|hvl/.test(s)) return 'HAVALE';
   if (/nakit avans|kk1|kredi kart/.test(s)) return 'CREDIT_CARD';
+  if (/havale|hvl/.test(s)) return 'HAVALE';
+  if (/fast/.test(s)) return 'FAST';
+  if (/eft/.test(s)) return 'EFT';
   if (/e[- ]?dekont|dekont/.test(s)) return 'DEKONT';
   return 'UNKNOWN';
 }
