@@ -131,9 +131,6 @@ function resolveMathSemanticValueBox(regions, field, bank = null) {
     if (!item) return false;
     if (field === 'recipientName') {
       if (recipientNameLabel(item?.text)) return true;
-      // In Garanti transfer receipts the right-hand addressee panel can label
-      // the beneficiary as SAYIN instead of repeating ALICI/ALACAKLI.
-      if (normalizeBank(bank) === 'garanti' && /^SAYIN(?:\s|[:：]|$)/i.test(String(item?.text||'').trim())) return true;
       // Reuse the bank/reference field grammar as a second semantic gate.
       // This catches OCR variants such as "Alıcı İsim/Unvan" without
       // reopening the old broad name-neighbor heuristic.
@@ -178,17 +175,19 @@ function resolveMathSemanticValueBox(regions, field, bank = null) {
     const lb=box(label); if(!lb) continue;
     const raw=String(label.text||'');
     const colon=raw.search(/[:：]/);
-    const sayinPrefix = field==='recipientName' && normalizeBank(bank)==='garanti' && /^SAYIN(?:\s|$)/i.test(raw);
-    const sayinMatch = sayinPrefix ? raw.match(/^SAYIN\s*/i) : null;
-    const inlineStart = colon>=0 ? colon+1 : (sayinMatch ? sayinMatch[0].length : raw.length);
+    // SAYIN is a document addressee cue, not a reliable beneficiary label.
+    // Use explicit ALICI/ALACAKLI/LEHDAR semantics for recipientName; if none
+    // exists, leave the field unresolved instead of binding the account-holder
+    // name from the top address panel.
+    const inlineStart = colon>=0 ? colon+1 : raw.length;
     const inline=raw.slice(inlineStart).trim();
     const semanticLabelKey = field==='recipientName'
-      ? (recipientNameLabel(raw) || sayinPrefix ? 'recipientName' : (()=>{ try { return referenceFieldRuleForText(raw)?.key || null; } catch { return null; } })())
+      ? (recipientNameLabel(raw) ? 'recipientName' : (()=>{ try { return referenceFieldRuleForText(raw)?.key || null; } catch { return null; } })())
       : (recipientIbanLabel(raw) ? 'recipientIban' : (()=>{ try { return referenceFieldRuleForText(raw)?.key || null; } catch { return null; } })());
     if(field==='recipientName' && semanticLabelKey==='recipientName' && nameLike(inline)) {
       const width=lb.x2-lb.x1,total=Math.max(1,raw.length),end=raw.length;
-      const valueRegion=sayinPrefix ? {...lb,x1:lb.x1+width*inlineStart/total,x2:lb.x1+width*end/total} : lb;
-      solutions.push({value:inline,region:valueRegion,score:150,resolver:sayinPrefix?'garanti-sayin-addressee-inline-v1':'semantic-inline-label-v152'});
+      const valueRegion={...lb,x1:lb.x1+width*inlineStart/total,x2:lb.x1+width*end/total};
+      solutions.push({value:inline,region:valueRegion,score:150,resolver:'semantic-inline-label-v152'});
     }
     if(field==='recipientIban' && semanticLabelKey==='recipientIban' && inline && ibanLike(inline)) solutions.push({value:inline,region:lb,score:160,resolver:'semantic-inline-iban-v152'});
     const lh=Math.max(6,lb.y2-lb.y1);
@@ -536,6 +535,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   let amountReferenceBox = amountFieldIsTyped ? boxFrom(amountField).reference : null;
   let amountReferenceResolver = amountReferenceBox ? 'typed-reference-amount-field' : null;
   let referenceTypedAmount = null;
+  let referenceTypedAmountOCR = null;
   let targetTypedAmount = resolveTypedAmountRegionFromOcr(targetOCR);
   if(!targetTypedAmount&&targetPath){
     try{
@@ -545,8 +545,8 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   }
   if (!amountReferenceBox && referencePath) {
     try {
-      const refOcr = await runPaddleOCR(referencePath);
-      referenceTypedAmount = resolveTypedAmountRegionFromOcr(refOcr);
+      referenceTypedAmountOCR = await runPaddleOCR(referencePath);
+      referenceTypedAmount = resolveTypedAmountRegionFromOcr(referenceTypedAmountOCR);
       if (referenceTypedAmount) {
         amountReferenceBox = referenceTypedAmount.region;
         amountReferenceResolver = referenceTypedAmount.resolver;
@@ -579,6 +579,37 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
         console.warn('MATH AMOUNT ANCHOR REJECTED:',JSON.stringify({bank,reason:'typed-ocr-unavailable-or-anchor-spread-too-high',spread}));
       }
     } catch (error) { console.warn('MATH AMOUNT ANCHOR FALLBACK HATASI:', error?.message || error); }
+  }
+  // A typed OCR result is not enough: prove its box contains ink in the exact
+  // source reference raster before using it in any comparison. If OCR geometry
+  // drifted, re-read a crop anchored at the typed TUTAR label; otherwise leave
+  // the reference ROI unresolved instead of pairing the target with blank page.
+  if(amountReferenceBox&&referencePath){
+    let pixelValidation=await measureSemanticRoiAppearance(referencePath,amountReferenceBox);
+    if(!pixelValidation.available&&referenceTypedAmountOCR?.success&&path.extname(referencePath).toLowerCase()!=='.pdf'){
+      try{
+        const meta=await sharp(referencePath).metadata();
+        const reread=await rereadTypedAmountCrop(referencePath,{width:Number(meta.width)||0,height:Number(meta.height)||0},referenceTypedAmountOCR);
+        if(reread?.region){
+          const rereadValidation=await measureSemanticRoiAppearance(referencePath,reread.region);
+          console.log('MATH REFERENCE AMOUNT ROI PIXEL RE-VALIDATION:',JSON.stringify({reference:path.basename(referencePath),originalBox:amountReferenceBox,originalAvailable:pixelValidation.available,rereadBox:reread.region,rereadText:reread.text,rereadAvailable:rereadValidation.available}));
+          if(rereadValidation.available){
+            amountReferenceBox=reread.region;
+            referenceTypedAmount=reread;
+            referenceAmountResolver=`${reread.resolver}+ink-validated`;
+            pixelValidation=rereadValidation;
+          }
+        }
+      }catch(error){console.warn('MATH REFERENCE AMOUNT ROI CROP REREAD ERROR:',error?.message||error);}
+    }
+    if(pixelValidation.available){
+      console.log('MATH REFERENCE AMOUNT ROI PIXEL VALIDATED:',JSON.stringify({reference:path.basename(referencePath),box:amountReferenceBox,inkPixelCount:pixelValidation.segmentation?.inkPixelCount||null,page:pixelValidation.page,resolver:amountReferenceResolver}));
+    }else{
+      console.warn('MATH REFERENCE AMOUNT ROI REJECTED:',JSON.stringify({reference:path.basename(referencePath),box:amountReferenceBox,reason:pixelValidation.reason||'no-ink-in-source-image',resolver:amountReferenceResolver}));
+      amountReferenceBox=null;
+      amountReferenceResolver=null;
+      referenceTypedAmount=null;
+    }
   }
   const amountTargetBox = amountForensics?.available===true&&amountForensics?.region ? amountForensics.region : (amountFieldIsTyped ? boxFrom(amountField).target : targetTypedAmount?.region || null);
   if (amountTargetBox && amountReferenceBox) {
@@ -615,7 +646,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       return w >= 12 && h >= 6 && w / Math.max(1,h) >= 1.2;
     };
     if (nameLabelValid && plausible(boxes.target) && plausible(boxes.reference)) {
-      rois.recipientName = { target: boxes.target, reference: boxes.reference, source: 'semantic-label-neighbor', validated: true };
+      rois.recipientName = { target: boxes.target, reference: boxes.reference, targetText:targetSemanticRegions.recipientName?.text||null, referenceText:referenceSemanticRegions.recipientName?.text||null, source: 'semantic-label-neighbor', validated: true };
     } else {
       console.warn('MATH RECIPIENT NAME ROI SKIPPED: label/value geometry not validated');
     }
@@ -636,7 +667,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
   }
   if (recipientIban) {
     const boxes = boxFrom(recipientIban);
-    if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference };
+    if (boxes.target && boxes.reference) rois.recipientIban = { target: boxes.target, reference: boxes.reference, targetText:targetSemanticRegions.recipientIban?.text||null, referenceText:referenceSemanticRegions.recipientIban?.text||null, source:'semantic-label-neighbor', validated:true };
   }
 
   console.log('MATH SEMANTIC ROI RESOLVER V1.5.4:', JSON.stringify({
@@ -654,6 +685,8 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
         referenceMatchScore:Number.isFinite(Number(referenceCandidate?.score))?Number(referenceCandidate.score):null,
         targetCandidateCount:Number.isFinite(Number(targetCandidate?.candidateCount))?Number(targetCandidate.candidateCount):null,
         referenceCandidateCount:Number.isFinite(Number(referenceCandidate?.candidateCount))?Number(referenceCandidate.candidateCount):null,
+        targetLabelText:targetCandidate?.labelText||null,referenceLabelText:referenceCandidate?.labelText||null,
+        targetValueText:targetCandidate?.text||null,referenceValueText:referenceCandidate?.text||null,
       }];
     })),
   }));
