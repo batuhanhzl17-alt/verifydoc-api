@@ -126,7 +126,7 @@ function resolveMathSemanticValueBox(regions, field, bank = null) {
     if(upper.filter(w=>actionWords.has(w)).length>=1) return false;
     return upper.filter(w=>/^[A-ZÇĞİÖŞÜ]{2,}$/.test(w)).length>=2;
   };
-  const ibanLike = (v) => /^TR\s*\d{2}(?:[\s-]*[0-9A-Z]){22,}$/i.test(String(v||'')) || /^TR\d{24}$/i.test(String(v||'').replace(/[^A-Z0-9]/gi,''));
+  const ibanLike = (v) => referenceValueMatchesField('recipientIban', String(v || ''));
   const isLabel = (item) => {
     if (!item) return false;
     if (field === 'recipientName') {
@@ -198,11 +198,14 @@ function resolveMathSemanticValueBox(regions, field, bank = null) {
       const valid=field==='recipientName'?nameLike(text):ibanLike(text);
       if(!valid) continue;
       const overlapY=Math.min(lb.y2,rb.y2)-Math.max(lb.y1,rb.y1);
-      const sameLineLimit=Math.min(Math.max(120,lh*18),pageRight*.45);
+      // A typed value must be physically adjacent to its own label. Large
+      // page-relative windows used to let another field elsewhere in a wide
+      // receipt become the label's value candidate.
+      const sameLineLimit=Math.max(48,lh*12);
       const sameLine=overlapY>=-lh*.45 && rb.x1>=lb.x1-lh*.5 && rb.x1-lb.x2<sameLineLimit;
       const belowGap=rb.y1-lb.y2;
-      const belowXLimit=Math.min(Math.max(180,lh*18),pageRight*.35);
-      const below=belowGap>=-lh*.35 && belowGap<Math.max(170,lh*6) && Math.abs(((rb.x1+rb.x2)/2)-((lb.x1+lb.x2)/2))<belowXLimit;
+      const belowXLimit=Math.max(72,lh*10);
+      const below=belowGap>=-lh*.35 && belowGap<Math.max(64,lh*4.5) && Math.abs(((rb.x1+rb.x2)/2)-((lb.x1+lb.x2)/2))<belowXLimit;
       if(!sameLine&&!below) continue;
       const cost=(sameLine?Math.max(0,rb.x1-lb.x2)/lh:4+Math.max(0,belowGap)/lh) + Math.abs(((rb.y1+rb.y2)/2)-((lb.y1+lb.y2)/2))/lh*.25;
       const score=120-cost*8+(sameLine?25:0);
@@ -220,7 +223,7 @@ function resolveMathSemanticValueBox(regions, field, bank = null) {
   const margin=runnerUp?Number(best.score)-Number(runnerUp.score):null;
   // If two different values are nearly as close to the label, leave the field
   // unresolved. A guessed recipient or IBAN box is worse than missing data.
-  if(margin!==null&&margin<8)return null;
+  if(margin!==null&&margin<12)return null;
   return {text:best.value,region:best.region,score:Number(best.score.toFixed(2)),margin:margin===null?null:Number(margin.toFixed(2)),candidateCount:solutions.length,resolver:best.resolver};
 }
 
@@ -10528,6 +10531,80 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       if (fallback) targetSemanticRegions[field]=fallback;
     }
 
+    // A semantic label match is necessary, but it is not sufficient: in a
+    // dense receipt, OCR can pair a valid-looking name/IBAN with the wrong
+    // label. Use the trusted reference ROI as a bank/variant layout template
+    // to validate the target candidate. Build the template only from a
+    // coordinate-consistent reference cluster; otherwise leave this check
+    // unavailable rather than average different receipt variants together.
+    const semanticTemplateDiagnostics = {};
+    for (const field of ['recipientName','recipientIban']) {
+      const samples = referenceResults.map(result => {
+        const candidate = result?.semanticValueRegions?.[field];
+        const dims = result?.rasterSize;
+        const region = candidate?.region;
+        const width = Number(dims?.width), height = Number(dims?.height);
+        if (!region || !width || !height) return null;
+        const x1=Number(region.x1), y1=Number(region.y1), x2=Number(region.x2), y2=Number(region.y2);
+        if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1) return null;
+        return { x:(x1+x2)/(2*width), y:(y1+y2)/(2*height), file:result.file };
+      }).filter(Boolean);
+      if (samples.length < 2) {
+        semanticTemplateDiagnostics[field] = {status:'template-insufficient-references',sampleCount:samples.length};
+        continue;
+      }
+      const median = values => {
+        const sorted=[...values].sort((a,b)=>a-b), mid=Math.floor(sorted.length/2);
+        return sorted.length%2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
+      };
+      const cx=median(samples.map(x=>x.x)), cy=median(samples.map(x=>x.y));
+      const spreadX=Math.max(...samples.map(x=>Math.abs(x.x-cx)));
+      const spreadY=Math.max(...samples.map(x=>Math.abs(x.y-cy)));
+      if (spreadX > 0.10 || spreadY > 0.10) {
+        semanticTemplateDiagnostics[field] = {status:'template-variant-spread',sampleCount:samples.length,spreadX:Number(spreadX.toFixed(4)),spreadY:Number(spreadY.toFixed(4))};
+        continue;
+      }
+
+      const rows=(targetOCR?.regions||[]).filter(row=>row?.region&&referenceValueMatchesField(field,String(row.text||'')));
+      const scored=rows.map(row=>{
+        const r=row.region, x1=Number(r.x1), y1=Number(r.y1), x2=Number(r.x2), y2=Number(r.y2);
+        if (![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1) return null;
+        const x=(x1+x2)/(2*targetSize.width), y=(y1+y2)/(2*targetSize.height);
+        return {row,distance:Math.hypot(x-cx,y-cy)};
+      }).filter(Boolean).sort((a,b)=>a.distance-b.distance);
+      const distinct=[];
+      for (const item of scored) {
+        const value=String(item.row.text||'').replace(/[^A-Z0-9]/gi,'').toLocaleUpperCase('tr-TR');
+        const prior=distinct.find(x=>String(x.row.text||'').replace(/[^A-Z0-9]/gi,'').toLocaleUpperCase('tr-TR')===value);
+        if (!prior) distinct.push(item);
+      }
+      const best=distinct[0], runner=distinct[1];
+      const current=targetSemanticRegions[field];
+      const currentValue=String(current?.text||'').replace(/[^A-Z0-9]/gi,'').toLocaleUpperCase('tr-TR');
+      const currentCandidate=distinct.find(x=>String(x.row.text||'').replace(/[^A-Z0-9]/gi,'').toLocaleUpperCase('tr-TR')===currentValue);
+      const margin=best&&runner?runner.distance-best.distance:null;
+      let status='template-no-typed-candidate';
+      if (best && best.distance <= 0.16 && (margin===null || margin >= 0.025)) {
+        if (currentCandidate && currentCandidate.distance <= 0.16) status='template-confirmed';
+        else {
+          // Template geometry may rescue a wrong label-neighbor association
+          // only when the candidate is uniquely closest to the trusted ROI.
+          targetSemanticRegions[field]={
+            text:String(best.row.text||'').trim(), region:best.row.region,
+            score:Number((100-best.distance*300).toFixed(2)),
+            margin:margin===null?null:Number(margin.toFixed(4)),
+            candidateCount:distinct.length, resolver:`reference-template-position-${field}-v1`
+          };
+          status=current?'template-reselected-candidate':'template-resolved-candidate';
+        }
+      } else if (current) {
+        targetSemanticRegions[field]=null;
+        status=best&&best.distance<=0.16?'template-ambiguous-candidates':'template-position-mismatch';
+      }
+      semanticTemplateDiagnostics[field]={status,sampleCount:samples.length,spreadX:Number(spreadX.toFixed(4)),spreadY:Number(spreadY.toFixed(4)),candidateCount:distinct.length,bestDistance:best?Number(best.distance.toFixed(4)):null,margin:margin===null?null:Number(margin.toFixed(4))};
+    }
+    console.log('SEMANTIC FIELD TEMPLATE MATCH V1:',JSON.stringify({bank:normalizedBank,diagnostics:semanticTemplateDiagnostics}));
+
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
     const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
     const maxSpacingScore=spacingAnomalies.length?Math.max(...spacingAnomalies.map(x=>Number(x.score)||0)):0;
@@ -10563,6 +10640,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       references:referenceResults.map(x=>({file:x.file,fieldCount:x.fieldCount,styleScore:x.styleScore,localAnomalyScore:x.localAnomalyScore,suspiciousFieldCount:x.suspiciousFieldCount,suspiciousFields:x.suspiciousFields,spacingAnomalyCount:x.spacingAnomalyCount,spacingAnomalies:x.spacingAnomalies,referenceQuality:x.referenceQuality})),
       referenceSemanticRegions:semanticValueRegions,
       targetSemanticRegions,
+      semanticTemplateDiagnostics,
       fields,fieldObservations,
       evidence:localized.length
         ? `Referans ensemble + semantik occurrence eşleştirme + affine hizalama sonrasında ${suspicious.length} alan ve ${spacingAnomalies.length} yerel yapısal aralık anomalisi bulundu: ${localized.join(', ')}.`
