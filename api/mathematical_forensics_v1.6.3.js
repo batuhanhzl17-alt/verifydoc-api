@@ -427,7 +427,15 @@ export async function extractMathematicalFingerprint(input, options = {}) {
   const meta = await sharp(buffer).metadata();
   const rendered = await sharp(buffer)
     .rotate()
-    .resize({ width: options.size || DEFAULT_SIZE, height: options.size || DEFAULT_SIZE, fit: 'fill' })
+    // Normalize orientation first, then preserve document geometry on a fixed
+    // canvas. Stretching with `fill` changes aspect ratio and alters global
+    // texture features for the same image at different sizes.
+    .resize({
+      width: options.size || DEFAULT_SIZE,
+      height: options.size || DEFAULT_SIZE,
+      fit: 'contain',
+      background: { r: 255, g: 255, b: 255, alpha: 1 },
+    })
     .grayscale()
     .raw()
     .toBuffer({ resolveWithObject: true });
