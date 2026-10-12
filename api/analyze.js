@@ -10339,7 +10339,9 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
     for(const rows of spacingGroups.values()){
       const med=rfMedianSigned(rows.map(x=>Number(x.score)).filter(Number.isFinite));
       const hits=rows.filter(x=>x.score>=55).length;
-      const keep=(rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45)||(rows.length===1&&med>=60);
+      // A single reference pair can be another receipt variant or an OCR
+      // outlier; require corroboration from at least two references.
+      const keep=rows.length>=2&&hits>=Math.ceil(rows.length*.5)&&med>=45;
       if(keep)spacingAnomalies.push({...rows.sort((a,b)=>b.score-a.score)[0],ensembleMedianScore:rfClamp100(med),referenceCountForPair:rows.length});
     }
 
@@ -11374,6 +11376,10 @@ function referenceFieldTargetCandidates(field, ref, regions, size) {
       const rule = referenceFieldRuleForText(label);
       if (rule?.key === field && value) inline = { label, value, rule };
     }
+    // Never let a row with a recognized, different field label be reassigned
+    // by proximity to this field's reference anchor.
+    const explicitSourceRule = inline?.rule || referenceFieldRuleForText(sourceText);
+    if (explicitSourceRule?.key && explicitSourceRule.key !== field) continue;
     let item = sourceItem;
     let text = sourceText;
     if (inline?.rule?.key === field && inline.value && sourceItem.region) {
@@ -18225,13 +18231,18 @@ if (multimodalReceiptEvidence) {
   result.semanticEvidenceFusion = semanticEvidenceFusion;
   console.log('SEMANTIC EVIDENCE FUSION V2 FIELD ROI:',JSON.stringify({
     status:semanticEvidenceFusion.status,
+    reviewStatus:semanticEvidenceFusion.reviewStatus||'NO_CONFLICT_DETECTED',
+    reviewMessage:semanticEvidenceFusion.reviewMessage||null,
     fields:Object.fromEntries(Object.entries(semanticEvidenceFusion.fields||{}).map(([field,row])=>[field,{
       visionValueAvailable:Boolean(String(row?.visualEvidence?.text||'').trim()),
       visionLabelText:row?.visualEvidence?.labelText||null,
       paddleOCRAgreement:row?.paddleOCRAgreement||'unavailable',
       paddleOCRResolver:row?.paddleOCRFieldEvidence?.resolver||null,
+      paddleOCRLabelText:row?.paddleOCRFieldEvidence?.labelText||null,
       paddleOCRRegion:row?.paddleOCRFieldEvidence?.region||null,
       associationValidated:row?.paddleOCRFieldEvidence?.associationValidated===true,
+      validation:row?.validation||null,
+      paddleValidation:row?.paddleValidation||null,
       primaryAnalysisAgreement:row?.primaryAnalysisAgreement||'unavailable',
     }]))
   }));
