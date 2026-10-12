@@ -255,6 +255,11 @@ function resolveTypedAmountRegionFromOcr(ocrResult) {
   scored.sort((a,b)=>b.score-a.score);
   const best=scored[0];
   if(!best||best.score<28)return null;
+  const valueDigits=v=>String(v||'').replace(/[^0-9]/g,'');
+  const bestDigits=valueDigits(best.candidate.text);
+  const runner=scored.find(item=>valueDigits(item.candidate.text)!==bestDigits);
+  const scoreMargin=runner?best.score-runner.score:null;
+  if(runner&&scoreMargin<8)return null;
   let region=best.candidate.row.region;
   if(best.candidate.row===best.label.row&&best.candidate.match?.index>=0){
     const text=best.candidate.text,total=Math.max(1,text.length),start=best.candidate.match.index,end=start+best.candidate.match[0].length,w=Number(region.x2)-Number(region.x1);
@@ -10744,93 +10749,25 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
       const reread=await rereadSemanticFieldCrop(targetPath,targetSize,targetOCR,field,normalizedBank);
       if(reread)targetSemanticRegions[field]=reread;
     }
-    // V1.5.2: Enpara can expose the beneficiary value without a clean OCR
-    // "ALICI" label on the target. If the trusted reference semantic ROI is
-    // known, resolve the target by normalized geometry, but ONLY among strict
-    // name/IBAN candidates. Never use an arbitrary numeric/text box.
-    for (const field of ['recipientName','recipientIban']) {
-      if (targetSemanticRegions[field]) continue;
-      const refCandidate=semanticValueRegions[field];
-      if (!refCandidate) continue;
-      const referenceRowsForFallback = referenceResults.flatMap(r => Array.isArray(r?.ocrRegions) ? r.ocrRegions : []);
-      const fallback=resolveSemanticGeometryFallbackV152(field,refCandidate,targetOCR?.regions||[],referenceRowsForFallback,targetSize,semanticValueReferenceSizes[field]);
-      if (fallback) targetSemanticRegions[field]=fallback;
-    }
-
-    // A semantic label match is necessary, but it is not sufficient: in a
-    // dense receipt, OCR can pair a valid-looking name/IBAN with the wrong
-    // label. Use the trusted reference ROI as a bank/variant layout template
-    // to validate the target candidate. Build the template only from a
-    // coordinate-consistent reference cluster; otherwise leave this check
-    // unavailable rather than average different receipt variants together.
+        // Critical recipient regions are resolved on this document from its own
+    // typed labels and neighboring OCR boxes. Reference coordinates never
+    // override or invalidate a locally detected field region.
     const semanticTemplateDiagnostics = {};
     for (const field of ['recipientName','recipientIban']) {
-      const samples = referenceResults.map(result => {
-        const candidate = result?.semanticValueRegions?.[field];
-        const dims = result?.rasterSize;
-        const region = candidate?.region;
-        const width = Number(dims?.width), height = Number(dims?.height);
-        if (!region || !width || !height) return null;
-        const x1=Number(region.x1), y1=Number(region.y1), x2=Number(region.x2), y2=Number(region.y2);
-        if (![x1,y1,x2,y2].every(Number.isFinite) || x2<=x1 || y2<=y1) return null;
-        return { x:(x1+x2)/(2*width), y:(y1+y2)/(2*height), file:result.file };
-      }).filter(Boolean);
-      if (samples.length < 2) {
-        semanticTemplateDiagnostics[field] = {status:'template-insufficient-references',sampleCount:samples.length};
-        continue;
-      }
-      const median = values => {
-        const sorted=[...values].sort((a,b)=>a-b), mid=Math.floor(sorted.length/2);
-        return sorted.length%2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
+      const detected=targetSemanticRegions[field];
+      semanticTemplateDiagnostics[field]={
+        status:detected?'per-document-label-resolved':'per-document-label-unresolved',
+        resolver:detected?.resolver||null,
+        score:Number.isFinite(Number(detected?.score))?Number(detected.score):null,
+        candidateCount:Number.isFinite(Number(detected?.candidateCount))?Number(detected.candidateCount):null,
+        referencePositionGate:'disabled',
       };
-      const cx=median(samples.map(x=>x.x)), cy=median(samples.map(x=>x.y));
-      const spreadX=Math.max(...samples.map(x=>Math.abs(x.x-cx)));
-      const spreadY=Math.max(...samples.map(x=>Math.abs(x.y-cy)));
-      if (spreadX > 0.10 || spreadY > 0.10) {
-        semanticTemplateDiagnostics[field] = {status:'template-variant-spread',sampleCount:samples.length,spreadX:Number(spreadX.toFixed(4)),spreadY:Number(spreadY.toFixed(4))};
-        continue;
-      }
-
-      const rows=(targetOCR?.regions||[]).filter(row=>row?.region&&referenceValueMatchesField(field,String(row.text||'')));
-      const scored=rows.map(row=>{
-        const r=row.region, x1=Number(r.x1), y1=Number(r.y1), x2=Number(r.x2), y2=Number(r.y2);
-        if (![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1) return null;
-        const x=(x1+x2)/(2*targetSize.width), y=(y1+y2)/(2*targetSize.height);
-        return {row,distance:Math.hypot(x-cx,y-cy)};
-      }).filter(Boolean).sort((a,b)=>a.distance-b.distance);
-      const distinct=[];
-      for (const item of scored) {
-        const value=String(item.row.text||'').replace(/[^A-Z0-9]/gi,'').toLocaleUpperCase('tr-TR');
-        const prior=distinct.find(x=>String(x.row.text||'').replace(/[^A-Z0-9]/gi,'').toLocaleUpperCase('tr-TR')===value);
-        if (!prior) distinct.push(item);
-      }
-      const best=distinct[0], runner=distinct[1];
-      const current=targetSemanticRegions[field];
-      const currentValue=String(current?.text||'').replace(/[^A-Z0-9]/gi,'').toLocaleUpperCase('tr-TR');
-      const currentCandidate=distinct.find(x=>String(x.row.text||'').replace(/[^A-Z0-9]/gi,'').toLocaleUpperCase('tr-TR')===currentValue);
-      const margin=best&&runner?runner.distance-best.distance:null;
-      let status='template-no-typed-candidate';
-      if (best && best.distance <= 0.16 && (margin===null || margin >= 0.025)) {
-        if (currentCandidate && currentCandidate.distance <= 0.16) status='template-confirmed';
-        else {
-          // Template geometry may rescue a wrong label-neighbor association
-          // only when the candidate is uniquely closest to the trusted ROI.
-          targetSemanticRegions[field]={
-            text:String(best.row.text||'').trim(), region:best.row.region,
-            score:Number((100-best.distance*300).toFixed(2)),
-            margin:margin===null?null:Number(margin.toFixed(4)),
-            candidateCount:distinct.length, resolver:`reference-template-position-${field}-v1`
-          };
-          status=current?'template-reselected-candidate':'template-resolved-candidate';
-        }
-      } else if (current) {
-        targetSemanticRegions[field]=null;
-        status=best&&best.distance<=0.16?'template-ambiguous-candidates':'template-position-mismatch';
-      }
-      semanticTemplateDiagnostics[field]={status,sampleCount:samples.length,spreadX:Number(spreadX.toFixed(4)),spreadY:Number(spreadY.toFixed(4)),candidateCount:distinct.length,bestDistance:best?Number(best.distance.toFixed(4)):null,margin:margin===null?null:Number(margin.toFixed(4))};
     }
-    console.log('SEMANTIC FIELD TEMPLATE MATCH V1:',JSON.stringify({bank:normalizedBank,diagnostics:semanticTemplateDiagnostics}));
-
+    console.log('SEMANTIC FIELD REGION DETECTION V2 LABEL-LOCAL:',JSON.stringify({
+      bank:normalizedBank,
+      fields:Object.fromEntries(Object.entries(targetSemanticRegions).map(([field,item])=>[field,item?{available:true,box:item.region||null,resolver:item.resolver||null,score:item.score??null}:{available:false}])),
+      diagnostics:semanticTemplateDiagnostics,
+    }));
     const styleMedian=rfMedianSigned(fields.map(x=>Number(x.ensembleMedianStyleScore)).filter(Number.isFinite));
     const strongSpacing=spacingAnomalies.filter(x=>x.score>=60);
     const maxSpacingScore=spacingAnomalies.length?Math.max(...spacingAnomalies.map(x=>Number(x.score)||0)):0;
@@ -13613,7 +13550,31 @@ const gatedRankedCandidatesV152 = rankedCandidates.filter(c => {
   if (explicit && !/(?:IBAN|REFERANS|FIS|SIRA|HESAP|MÜŞTERİ|MUSTERI|SORGU)/i.test(text)) return true;
   return !idLike && explicit;
 });
-const candidate = gatedRankedCandidatesV152[0] || null;
+const typedLocalAmountRegion = resolveTypedAmountRegionFromOcr(ocrResult);
+let candidate = null;
+if (typedLocalAmountRegion?.region && Number(typedLocalAmountRegion.score) >= 28) {
+  candidate = {
+    text: typedLocalAmountRegion.text,
+    region: typedLocalAmountRegion.region,
+    signal: 0,
+    score: Number(typedLocalAmountRegion.score),
+    amountCandidateScore: Number(typedLocalAmountRegion.score),
+    inlineAmountLabel: typedLocalAmountRegion.label,
+    directLabelEvidence: { hard: true, label: typedLocalAmountRegion.label, score: 150 },
+    localRegionDetection: typedLocalAmountRegion.resolver,
+  };
+  selectionMethod = typedLocalAmountRegion.resolver;
+} else {
+  candidate = gatedRankedCandidatesV152[0] || null;
+}
+console.log('TARGET AMOUNT FIELD REGION DETECTION V1:',JSON.stringify({
+  available:Boolean(typedLocalAmountRegion?.region),
+  resolver:typedLocalAmountRegion?.resolver||null,
+  score:typedLocalAmountRegion?.score??null,
+  box:typedLocalAmountRegion?.region||null,
+  label:typedLocalAmountRegion?.label||null,
+  selectionMethod,
+}));
 
 if (!candidate) {
   console.warn(
