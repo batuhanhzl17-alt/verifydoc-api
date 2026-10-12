@@ -17,13 +17,12 @@ const EVIDENCE_SCHEMA = {
     recipientName: FIELD_SCHEMA,
     recipientIBAN: FIELD_SCHEMA,
     amount: FIELD_SCHEMA,
-    transactionDate: FIELD_SCHEMA,
     fieldLocations: {
       type: 'array',
       items: {
         type: 'object',
         properties: {
-          field: { type: 'string', enum: ['recipientName', 'recipientIBAN', 'amount', 'transactionDate'] },
+          field: { type: 'string', enum: ['recipientName', 'recipientIBAN', 'amount'] },
           labelText: { type: ['string', 'null'] },
           relationship: { type: 'string' },
           confidence: { type: 'number', minimum: 0, maximum: 1 },
@@ -46,7 +45,7 @@ const EVIDENCE_SCHEMA = {
       },
     },
   },
-  required: ['recipientName', 'recipientIBAN', 'amount', 'transactionDate', 'fieldLocations', 'visualObservations'],
+  required: ['recipientName', 'recipientIBAN', 'amount', 'fieldLocations', 'visualObservations'],
   additionalProperties: false,
 };
 
@@ -107,7 +106,6 @@ function labelMatchesField(field, label) {
   if (field === 'recipientName') return /^(ALICI|ALACAKLI|LEHDAR|BENEFICIARY|PAYEE|RECEIVER)( ADI| ISMI| UNVANI| AD SOYADI| NAME)?$/.test(text);
   if (field === 'recipientIBAN') return /^(ALICI|ALACAKLI|LEHDAR|BENEFICIARY|PAYEE|RECEIVER) (HESAP )?(IBAN|HESAP|HESAP NO|HESAP NUMARASI)$/.test(text);
   if (field === 'amount') return /^(ISLEM |EFT |FAST |GIDEN FAST |TRANSFER )?(ISLEM )?TUTAR(I)?$/.test(text) || /^B A PARA CINSI TUTAR$/.test(text) || /^PARA CINSI TUTAR$/.test(text) || /^TUTAR$/.test(text);
-  if (field === 'transactionDate') return /^(ISLEM )?TARIH(I)?( VE SAATI)?$/.test(text) || /^DATE$/.test(text);
   return false;
 }
 
@@ -212,7 +210,6 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
         '- amount: dekontun işlem özeti/tablosundaki ana işlem tutarı; yalnız TUTAR, İŞLEM TUTARI veya bankaya özgü açık işlem tutarı etiketine bağlı sayı. Bakiye, kullanılabilir bakiye, masraf, komisyon, BSMV veya ücret değil.',
         '- recipientName: yalnız ALICI, ALACAKLI, LEHDAR veya açık eşdeğer etiketin yanındaki alıcı adı/unvanı. Gönderen, banka adı, şube ve adres değil.',
         '- recipientIBAN: yalnız ALICI/ALACAKLI/LEHDAR IBAN veya alıcı hesap etiketiyle ilişkilendirilmiş IBAN. Gönderen IBAN’ı, komisyon hesabı IBAN’ı veya sayfanın başka yerindeki IBAN değil.',
-        '- transactionDate: yalnız İŞLEM TARİHİ veya eşdeğer açık işlem tarihi etiketi. Düzenlenme tarihi, valör tarihi, yükleme tarihi veya saat tek başına değil.',
         'Her alan için labelText içine görüntüde okuduğun etiketi aynen yaz. Etiket açık değilse, değer etiketin hemen yanında/aynı satırında değilse veya birden fazla aday varsa text ve labelText için null döndür; tahmin etme.',
         example,
         'Sadece görünür içeriği kullan; referans veya başka alanlardan değer tamamlama. JSON şemasına harfiyen uy.',
@@ -223,7 +220,7 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
     text: { format: { type: 'json_schema', name: 'receipt_visual_evidence', strict: true, schema: EVIDENCE_SCHEMA } },
   });
   const evidence = JSON.parse(response.output_text || '{}');
-  for (const field of ['recipientName', 'recipientIBAN', 'amount', 'transactionDate']) {
+  for (const field of ['recipientName', 'recipientIBAN', 'amount']) {
     const row = evidence?.[field];
     if (row?.text != null && !labelMatchesField(field, row?.labelText)) {
       row.text = null; row.confidence = 0; row.semanticRelationship = 'label-not-validated-for-field';
@@ -239,28 +236,25 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
     recipientName: { primary: primary.recipientName },
     recipientIBAN: { primary: primary.recipientIban },
     amount: { primary: primary.amount },
-    transactionDate: { primary: primary.transactionDate || primary.date },
   };
   const fields = {};
   const controlReasons = [];
   for (const field of Object.keys(mappings)) {
     const visual = evidence[field] || {}, value = String(visual.text || '').trim();
     const key = normalizeForField(value, field);
-    const fieldRegion = field === 'transactionDate' ? resolvePaddleTransactionDate(paddleOCR) : semanticFieldRegions[field] || null;
+    const fieldRegion = semanticFieldRegions[field] || null;
     const ocrValue = String(fieldRegion?.text || '').trim();
     const primaryText = String(mappings[field].primary || '').trim();
-    const ocrComparable = field === 'transactionDate' ? Boolean(fieldRegion?.normalized) : fieldRegion?.validated === true && Boolean(ocrValue);
-    const ocrKey = field === 'transactionDate' ? fieldRegion?.normalized : normalizeForField(ocrValue, field);
+    const ocrComparable = fieldRegion?.validated === true && Boolean(ocrValue);
+    const ocrKey = normalizeForField(ocrValue, field);
     const ocrAgreement = Boolean(ocrComparable && key != null && ocrKey != null && ocrKey === key);
     const primaryKey = normalizeForField(primaryText, field);
     const primaryAgreement = Boolean(key != null && primaryKey != null && primaryKey === key);
     let valueValidation = { status: value ? 'not-applicable' : 'no-vision-value' };
     if (field === 'recipientIBAN') valueValidation = value ? validateIBAN(value) : valueValidation;
-    if (field === 'transactionDate') valueValidation = value ? { valid: normalizeDate(value) !== null, reason: normalizeDate(value) ? 'date-format-valid' : 'date-format-invalid' } : valueValidation;
     if (field === 'amount') valueValidation = value ? { valid: normalizeAmount(value) !== null, reason: normalizeAmount(value) !== null ? 'amount-format-valid' : 'amount-format-invalid' } : valueValidation;
     let paddleValidation = { status: ocrComparable ? 'not-applicable' : 'unavailable' };
     if (ocrComparable && field === 'recipientIBAN') paddleValidation = validateIBAN(ocrValue);
-    if (ocrComparable && field === 'transactionDate') paddleValidation = { valid: Boolean(ocrKey), reason: ocrKey ? 'date-format-valid' : 'date-format-invalid' };
     if (ocrComparable && field === 'amount') paddleValidation = { valid: ocrKey !== null, reason: ocrKey !== null ? 'amount-format-valid' : 'amount-format-invalid' };
     const paddleStatus = !value || !ocrComparable ? 'unavailable' : ocrAgreement ? 'agreement' : 'disagreement';
     const primaryStatus = primaryAgreement ? 'agreement' : value && primaryText ? 'disagreement' : 'unavailable';
