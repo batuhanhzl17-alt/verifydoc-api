@@ -6616,6 +6616,8 @@ async function getReferenceAmountAnchor(bank, allowedReferencePaths = null) {
   const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
   const primaryLabelRe = /(?:giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|giden\s*tutar|\btutar\b)/i;
   const negativeLabelRe = /(?:sorgu|sorgulama|işlem\s*no|islem\s*no|fiş|fis|referans|iban|hesap\s*no|müşteri|musteri|masraf|komisyon|ücret|ucret)/i;
+  const secondaryAmountLabelRe = /(?:toplam|tahsilat|komisyon|masraf|ücret|ucret|bsmv|vergi|bakiye|kalan|borç|alacak|hesap\s*özeti|hesap\s*ozeti)/i;
+  const isPrimaryAmountLabel = (value) => primaryLabelRe.test(String(value || '')) && !secondaryAmountLabelRe.test(String(value || ''));
 
   const median = (values) => {
     const v = values.filter(Number.isFinite).sort((a,b)=>a-b);
@@ -6733,6 +6735,7 @@ async function getReferenceAmountAnchor(bank, allowedReferencePaths = null) {
         // De-duplicate identical boxes/text so scoring remains deterministic.
         const seenAmountLabels = new Set();
         const uniqueAmountLabels = amountLabels.filter(label => {
+          if (!isPrimaryAmountLabel(label.text)) return false;
           const r = label.region;
           const key = `${label.text.toLowerCase()}|${Math.round(r.x1)}|${Math.round(r.y1)}|${Math.round(r.x2)}|${Math.round(r.y2)}`;
           if (seenAmountLabels.has(key)) return false;
@@ -6757,8 +6760,8 @@ async function getReferenceAmountAnchor(bank, allowedReferencePaths = null) {
             const near = verticalGap <= Math.max(oh * 1.8, 45) && horizontal >= -oh * 1.0 && horizontal <= Math.max(280, oh * 14);
             const belowOrAbove = Math.abs(cr.y1 - or.y2) <= Math.max(oh * 2.0, 70) && Math.abs(ccx - ((or.x1 + or.x2) / 2)) <= Math.max(320, oh * 14);
             if (near || belowOrAbove) {
-              if (primaryLabelRe.test(t)) { score += 120; primaryHits++; }
-              if (negativeLabelRe.test(t)) { score -= 45; negativeHits++; }
+              if (isPrimaryAmountLabel(t)) { score += 120; primaryHits++; }
+              if (negativeLabelRe.test(t) || secondaryAmountLabelRe.test(t)) { score -= 90; negativeHits++; }
             }
           }
           // The main transaction amount is normally in the upper transaction
@@ -6771,7 +6774,7 @@ async function getReferenceAmountAnchor(bank, allowedReferencePaths = null) {
           // Explicit-label proximity is a stronger signal than the generic
           // `primaryLabelRe` match. It also permits OCR-split/plain-integer
           // amounts, but only inside the amount row/field neighborhood.
-          for (const label of amountLabels) {
+          for (const label of uniqueAmountLabels) {
             const lr = label.region;
             const lh = Math.max(8, lr.y2 - lr.y1);
             const lcY = (lr.y1 + lr.y2) / 2;
@@ -6802,7 +6805,7 @@ async function getReferenceAmountAnchor(bank, allowedReferencePaths = null) {
         // is safely contained. PaddleOCR is already available here, so when
         // its word segmentation misses the numeric value we use a raster
         // projection fallback on the SAME reference image instead.
-        if (!best && amountLabels.length) {
+        if (!best && uniqueAmountLabels.length) {
           try {
             const buffer = await fs.readFile(referencePath);
             const raw = await sharp(buffer).greyscale().raw().toBuffer({ resolveWithObject: true });
@@ -6899,7 +6902,7 @@ async function getReferenceAmountAnchor(bank, allowedReferencePaths = null) {
               }
             };
 
-            for (const label of amountLabels) {
+            for (const label of uniqueAmountLabels) {
               const lr = label.region;
               const lh = Math.max(8, lr.y2 - lr.y1);
               const lw = Math.max(lh * 3, lr.x2 - lr.x1);
@@ -6965,6 +6968,24 @@ async function getReferenceAmountAnchor(bank, allowedReferencePaths = null) {
     if (!entries.length) {
       referenceAmountAnchorCache.set(cacheKey, null);
       console.warn('REFERENCE AMOUNT ANCHOR V16.1: UYGUN TUTAR ALANI BULUNAMADI');
+      return null;
+    }
+
+    // Only aggregate anchors that describe one stable primary-amount field.
+    // A broad median can otherwise land between unrelated rows when a bad
+    // OCR fallback selected footer/fee text in one or more references.
+    const anchorSpreadX = Math.max(...entries.map(x => x.xNorm)) - Math.min(...entries.map(x => x.xNorm));
+    const anchorSpreadY = Math.max(...entries.map(x => x.yNorm)) - Math.min(...entries.map(x => x.yNorm));
+    if (entries.length > 1 && (anchorSpreadX > 0.12 || anchorSpreadY > 0.12)) {
+      referenceAmountAnchorCache.set(cacheKey, null);
+      console.warn('REFERENCE AMOUNT TEMPLATE REJECTED: UNSTABLE ANCHOR SPREAD', JSON.stringify({
+        bank: normalizedBank,
+        referenceCount: entries.length,
+        files: entries.map(x => x.referenceFile),
+        spread: { x: anchorSpreadX, y: anchorSpreadY },
+        maxAllowed: { x: 0.12, y: 0.12 },
+        fallback: 'label-local amount resolution only'
+      }));
       return null;
     }
 
@@ -11248,6 +11269,7 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
     }
 
     const fields = {};
+    const rejectedFields = [];
     for (const [field, entries] of Object.entries(fieldBuckets)) {
       const pageOne = entries.filter(x => Number(x.pageNumber) === 1);
       let usableEntries = pageOne.length ? pageOne : entries;
@@ -11269,7 +11291,18 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
         }
       }
       if (!usableEntries.length) continue;
-      fields[field] = aggregateReferenceField(usableEntries);
+      const aggregate = aggregateReferenceField(usableEntries);
+      // A useful image-derived template needs consensus in normalized page
+      // coordinates. Do not average distinct receipt layouts into a synthetic
+      // location that belongs to none of the source documents.
+      const critical = ['amount','recipientName','senderName','recipientIban','senderIban','iban'].includes(field);
+      const maxSpread = critical ? { x: 0.15, y: 0.12 } : { x: 0.25, y: 0.20 };
+      if (usableEntries.length > 1 &&
+          (Number(aggregate?.spread?.x) > maxSpread.x || Number(aggregate?.spread?.y) > maxSpread.y)) {
+        rejectedFields.push({ field, referenceCount: usableEntries.length, spread: aggregate.spread, maxAllowed: maxSpread });
+        continue;
+      }
+      fields[field] = aggregate;
     }
 
     // SECURITY BOUNDARY: extracted reference PDF text is used only while
@@ -11290,6 +11323,21 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
       }
     }
 
+    const hasImageOcr = extracted.some(x => x.styleSource === 'reference-image-ocr');
+    const hasPdfRasterOcr = extracted.some(x => x.styleSource === 'reference-raster-ocr');
+    const hasPdfTextMetadata = extracted.some(x => x.styleSource === 'pdf-text-metadata');
+    const profileStyleSource = hasImageOcr && (hasPdfRasterOcr || hasPdfTextMetadata)
+      ? 'mixed-reference-image-and-pdf-template-ocr'
+      : hasImageOcr
+        ? 'reference-image-ocr'
+        : hasPdfRasterOcr && hasPdfTextMetadata
+          ? 'mixed-pdf-text-and-reference-raster-ocr'
+          : hasPdfRasterOcr
+            ? 'reference-raster-ocr'
+            : hasPdfTextMetadata
+              ? 'pdf-text-metadata'
+              : 'none';
+
     const profile = {
       bank: normalizedBank,
       referenceFiles: referencePaths.map(x=>path.basename(x)),
@@ -11298,9 +11346,7 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
       fields,
       fieldCount: Object.keys(fields).length,
       referenceMode: 'trusted-ensemble',
-      styleSource: extracted.some(x => x.styleSource === 'reference-raster-ocr')
-        ? 'mixed-pdf-text-and-reference-raster-ocr'
-        : 'pdf-text-metadata',
+      styleSource: profileStyleSource,
     };
 
     referenceTemplateProfileCache.set(cacheKey, profile);
@@ -11310,7 +11356,8 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
       usablePdfReferenceCount: profile.usablePdfReferenceCount,
       files: profile.referenceFiles,
       styleSource: profile.styleSource,
-      fields: Object.fromEntries(Object.entries(fields).map(([k,v])=>[k,{referenceCount:v.referenceCount,spread:v.spread,source:v.style?.source || null}]))
+      fields: Object.fromEntries(Object.entries(fields).map(([k,v])=>[k,{referenceCount:v.referenceCount,spread:v.spread,source:v.style?.source || null}])),
+      rejectedFields
     }));
     return profile;
   } catch (error) {
