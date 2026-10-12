@@ -17750,6 +17750,20 @@ if (multimodalReceiptEvidence) {
     primaryDocumentData: result?.documentData,
   });
   result.semanticEvidenceFusion = semanticEvidenceFusion;
+  result.manualReviewRequired = semanticEvidenceFusion.reviewStatus === 'CONTROL_REQUIRED';
+  console.log('SEMANTIC FIELD ASSOCIATION V1:', JSON.stringify({
+    reviewStatus: semanticEvidenceFusion.reviewStatus || null,
+    fields: Object.fromEntries(Object.entries(semanticEvidenceFusion.fields || {}).map(([field, row]) => [field, {
+      visionValueAvailable: Boolean(row?.visualEvidence?.text),
+      paddleOCRStatus: row?.paddleOCRStatus || 'unavailable',
+      paddleOCRAgreement: row?.paddleOCRAgreement || 'unavailable',
+      paddleOCRResolver: row?.paddleOCRResolver || null,
+      labelText: row?.paddleOCRLabelText || null,
+      region: row?.paddleOCRRegion || null,
+      associationValidated: Boolean(row?.associationValidated),
+      primaryAnalysisAgreement: row?.primaryAnalysisAgreement || 'unavailable',
+    }]))
+  }));
 }
 
 // Deterministik yapısal geometri sinyali AI çıktısından bağımsızdır.
@@ -20495,11 +20509,6 @@ async function buildAnnotatedReferenceDifferenceImage({
 // =====================================================
 // DETERMINISTIK RİSK MOTORU
 // =====================================================
-const calculatedRisk =
-calculateOverallRisk(
-result
-);
-
 // Güçlü karakter-düzeyi tutar anomalisi varsa risk motoruna
 // deterministik bir üst sınır uygula. Orta seviye sinyal
 // tek başına skoru değiştirmez.
@@ -20576,29 +20585,10 @@ if (referenceForensics?.available && referenceForensics.severity !== "low") {
   // clean reference comparison report generated above.
 }
 
-// FINAL RISK IS NOW INDEPENDENT FROM AI-GENERATED CHECK SCORES.
-// GPT may still provide explanations/documentData, but it cannot change the
-// numerical risk result.
-result.deterministicRisk = calculateDeterministicForensicRisk(result, {
-  visualForensics,
-  layoutForensics,
-  amountForensics,
-  paddleImageOCR,
-  referenceTemplateAnalysis,
-  referenceForensics,
-  pixelForensics,
-  advancedForensics,
-  paintOverForensics,
-  openSourceForensics,
-  azureLayout,
-  azureReferenceGeometry,
-  targetMime: forensicTargetMime,
-});
-if (openSourceForensics?.strongCorroboration) {
-  result.deterministicRisk = {
-    ...(result.deterministicRisk || {}),
-    corroboratedEditingSignal: true
-  };
+// Collect corroboration as evidence only. Do not create a provisional score
+// before every forensic stage has completed.
+const corroboratedEditingSignal = Boolean(openSourceForensics?.strongCorroboration);
+if (corroboratedEditingSignal) {
   console.log("OPEN SOURCE FORENSICS CORROBORATED EDITING SIGNAL: TRUE");
 }
 
@@ -20607,7 +20597,12 @@ if (__controlledAmountPromotion.eligible) {
   console.log("AMOUNT FORENSICS CONTROLLED PROMOTION:", JSON.stringify(__controlledAmountPromotion));
 }
 
-console.log("DETERMINISTIC FORENSIC RISK:", JSON.stringify(result.deterministicRisk));
+console.log("FORENSIC SIGNALS READY FOR FINAL DECISION:", JSON.stringify({
+  visualAvailable: Boolean(visualForensics?.available),
+  layoutAvailable: Boolean(layoutForensics?.available),
+  amountAvailable: Boolean(amountForensics?.available),
+  corroboratedEditingSignal,
+}));
 if (advancedForensics?.available) {
   console.log("V68 RGB/CFA/JPEG-GRID/AMOUNT-TONE ACTIVE:", JSON.stringify({
     score: advancedForensics.score,
@@ -20630,39 +20625,6 @@ if (paintOverForensics?.available) {
     amountSupport: paintOverForensics.metrics?.amountSupport || 0
   }));
 }
-
-// Risk motorunu amount forensics değişikliğinden sonra tekrar hesapla.
-const deterministicRiskAfterForensics =
-calculateOverallRisk(
-result
-);
-
-// IMPORTANT: İlk calculateOverallRisk çağrısının skorunu koruma.
-// O çağrı, amount/layout forensics sonradan check'leri güncellemeden önce
-// yapılır ve AI'ın eski bir check skorunu nihai skora taşıyabilir.
-// Nihai skor yalnızca güncellenmiş deterministik check setinden hesaplanmalı.
-calculatedRisk.overallRisk =
-Number(deterministicRiskAfterForensics.overallRisk) || 0;
-
-calculatedRisk.categories =
-deterministicRiskAfterForensics.categories;
-
-// A very strong, semantically matched local geometry anomaly is a deterministic
-// forensic finding. Keep the user-facing suspicious threshold aligned with that
-// evidence instead of allowing a quiet visual/text category mix to dilute it.
-if (
-  referenceForensics?.available === true &&
-  referenceForensics?.severity === 'strong' &&
-  Number(referenceForensics?.maxSpacingScore) >= 85
-) {
-  calculatedRisk.overallRisk = Math.max(46, Number(calculatedRisk.overallRisk) || 0);
-  calculatedRisk.riskLabel = getRiskLabel(calculatedRisk.overallRisk);
-}
-
-console.log("FINAL RISK RECOMPUTED FROM UPDATED CHECKS:", JSON.stringify({
-  overallRisk: calculatedRisk.overallRisk,
-  categories: calculatedRisk.categories
-}));
 
 // ==========================================
 // KRİTİK TUTAR TUTARSIZLIĞI
@@ -20691,19 +20653,6 @@ const hasSevereAmountMismatch =
 Number.isFinite(amountDifference) &&
 Math.abs(amountDifference) >= 1000;
 
-// Mevcut JavaScript risk motorunun sonucunu temel al
-let finalRiskScore =
-Number(calculatedRisk.overallRisk) || 0;
-
-if (visualForensics?.available && visualForensics?.severity === "strong") {
-  const structuralSupport =
-    Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
-    Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
-  if (structuralSupport) finalRiskScore = Math.max(finalRiskScore, 70);
-}
-if (layoutForensics?.available && layoutForensics.severity === "strong") {
-  finalRiskScore = Math.max(finalRiskScore, 70);
-}
 // KRİTİK: amountAnalysis tek başına nihai risk tabanı oluşturmaz.
 // Bu alan AI tarafından çıkarılmış toplam/hesaplanan tutar verisidir;
 // tek başına 60/85 puan zorlamak, kullanıcı arayüzünde "tutar tutarsızlığı"
@@ -20718,11 +20667,48 @@ if (hasMajorAmountMismatch || hasSevereAmountMismatch) {
   }));
 }
 
-// FINAL SKORU SADECE GÜNCEL CHECK'LERDEN TÜRET.
-// Eski/AI skorunun veya amountAnalysis'in gizli katkısı olamaz.
-const finalDeterministicRisk = calculateOverallRisk(result);
-finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
+// Tek kanonik temel skor: bütün OCR, ROI ve forensic kontrolleri tamamlandıktan
+// sonra güncel check setinden bir kez hesaplanır. Aşağıdaki kurallar sadece
+// doğrulanmış bağımsız kanıtların risk tabanlarını ekler; ara skor etiketi yoktur.
+const finalDeterministicRisk = calculateDeterministicForensicRisk(result, {
+  visualForensics,
+  layoutForensics,
+  amountForensics,
+  paddleImageOCR,
+  referenceTemplateAnalysis,
+  referenceForensics,
+  pixelForensics,
+  advancedForensics,
+  paintOverForensics,
+  paintOverForensicsV2,
+  openSourceForensics,
+  azureLayout,
+  azureReferenceGeometry,
+  targetMime: forensicTargetMime,
+});
+let finalRiskScore = Number(finalDeterministicRisk.overallRisk) || 0;
 result.categories = finalDeterministicRisk.categories;
+
+if (visualForensics?.available && visualForensics?.severity === "strong") {
+  const structuralSupport =
+    Number(referenceTemplateAnalysis?.strongGeometryCount || 0) > 0 ||
+    Number(referenceTemplateAnalysis?.missingFieldCount || 0) > 0;
+  if (structuralSupport) finalRiskScore = Math.max(finalRiskScore, 70);
+}
+if (layoutForensics?.available && layoutForensics.severity === "strong") {
+  finalRiskScore = Math.max(finalRiskScore, 70);
+}
+if (
+  referenceForensics?.available === true &&
+  referenceForensics?.severity === 'strong' &&
+  Number(referenceForensics?.maxSpacingScore) >= 85
+) {
+  finalRiskScore = Math.max(finalRiskScore, 46);
+  result.categories = {
+    ...(result.categories || {}),
+    editingRisk: Math.max(Number(result.categories?.editingRisk || 0), 55),
+  };
+}
 
 // =====================================================
 // V67: KANIT KORELASYON KÖPRÜSÜ
@@ -20847,26 +20833,11 @@ if (strongUnifiedReferenceCount >= 2 && independentForensicSupportCount >= 1) {
     appliedFloor: 70
   }));
 }
-console.log("FINAL RISK CONSISTENCY:", JSON.stringify({
+console.log("RISK EVIDENCE AGGREGATION (PRE-FINAL):", JSON.stringify({
   overallRisk: finalRiskScore,
   categories: result.categories,
   source: "updated deterministic checks only"
 }));
-
-// 0-100 arasında tut
-finalRiskScore = Math.round(
-Math.max(
-0,
-Math.min(100, finalRiskScore)
-)
-);
-const finalRiskLabel = getRiskLabel(finalRiskScore);
-result.overallRisk = finalRiskScore;
-result.riskLabel = finalRiskLabel;
-
-if (!controlledAmountCorroborated) {
-  result.categories = finalDeterministicRisk.categories;
-}
 
 // Mathematical fingerprint is intentionally a corroborating signal, not an
 // automatic authenticity verdict. Require a reasonably sized baseline and
@@ -20909,6 +20880,28 @@ if (mathReferenceOutlier && mathNegativeAffinity) {
   };
 }
 
+// Tek ve son karar noktası: tüm kanıtlar ve kontrollü risk tabanları toplandıktan
+// sonra skor kırpılır; etiket aynı skordan türetilir. Bu bloğun ardından risk
+// skoru veya etiketi yeniden yazılmamalıdır.
+finalRiskScore = Math.round(Math.max(0, Math.min(100, finalRiskScore)));
+const finalRiskLabel = getRiskLabel(finalRiskScore);
+result.overallRisk = finalRiskScore;
+result.riskLabel = finalRiskLabel;
+result.deterministicRisk = {
+  ...finalDeterministicRisk,
+  overallRisk: finalRiskScore,
+  riskLabel: finalRiskLabel,
+  categories: result.categories || {},
+  corroboratedEditingSignal,
+  source: 'single-final-deterministic-decision',
+};
+console.log("FINAL RISK DECISION:", JSON.stringify({
+  overallRisk: finalRiskScore,
+  riskLabel: finalRiskLabel,
+  categories: result.categories,
+  source: "single-final-deterministic-decision",
+}));
+
 // AI'ın overallRisk değerini kullanma.
 // Nihai skor JavaScript risk motorundan gelir.
 
@@ -20933,10 +20926,7 @@ informationCheck;
 // ANA SKOR
 // =====================================================
 
-const finalScore =
-Number(
-result.overallRisk
-) || 0;
+const finalScore = finalRiskScore;
 
 const finalSuspicious =
 finalScore >= 46;
@@ -20970,6 +20960,9 @@ const referenceDifferences = primaryForensicFindings;
 result.primaryForensicFindings = primaryForensicFindings;
 result.telegramForensicSummary = telegramForensicSummary;
 result.referenceDifferences = referenceDifferences;
+result.fieldReviewStatus = semanticEvidenceFusion?.reviewStatus ||
+  ((type === 'image' || type === 'pdf') ? 'CONTROL_REQUIRED' : null);
+result.manualReviewRequired = result.fieldReviewStatus === 'CONTROL_REQUIRED';
 
 const finalEvidence = canonicalReferenceText;
 
@@ -20986,6 +20979,10 @@ console.log(
 "FINAL SUSPICIOUS:",
 finalSuspicious
 );
+console.log("FINAL FIELD REVIEW STATUS:", JSON.stringify({
+  status: result.fieldReviewStatus,
+  manualReviewRequired: result.manualReviewRequired,
+}));
 
 await applyHistoricalSuspicion(result, {
   type,
@@ -21080,6 +21077,9 @@ reference:
 reference?.fileName ||
 null,
 ...result,
+
+manualReviewRequired: Boolean(result?.manualReviewRequired),
+fieldReviewStatus: result?.semanticEvidenceFusion?.reviewStatus || null,
 
 score:
 finalScore,
