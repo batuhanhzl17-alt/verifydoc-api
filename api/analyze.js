@@ -331,6 +331,96 @@ async function measureMedianDigitFillRatio(imagePath, box, amountText='') {
   }catch(error){return{available:false,reason:error?.message||'digit-fill-measurement-error'};}
 }
 
+// Compare the appearance of a value only inside its validated semantic ROI.
+// Coordinates remain in each source image's native pixels; glyph height is
+// normalized by that image's page height so scans at different resolutions
+// can be compared. This reports measurements, not a stand-alone fraud verdict.
+async function measureSemanticRoiAppearance(imagePath, box) {
+  if(!imagePath||!box)return{available:false,reason:'missing-image-or-validated-roi'};
+  try{
+    let imageInput=imagePath;
+    if(path.extname(String(imagePath)).toLowerCase()==='.pdf'){
+      const rendered=await renderPdfPagePng(imagePath,1,1.8);
+      if(!rendered?.buffer)return{available:false,reason:'reference-pdf-rasterization-unavailable'};
+      imageInput=rendered.buffer;
+    }
+    const meta=await sharp(imageInput).metadata(),pageWidth=Number(meta.width)||0,pageHeight=Number(meta.height)||0;
+    const x1=Number(box.x1),y1=Number(box.y1),x2=Number(box.x2),y2=Number(box.y2);
+    if(!pageWidth||!pageHeight||![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1)return{available:false,reason:'invalid-roi-or-image-size'};
+    // Add a small local paper margin so both foreground and clean background
+    // are sampled, while avoiding distant labels, box borders, or other fields.
+    const marginX=Math.max(2,Math.round((x2-x1)*.12)),marginY=Math.max(2,Math.round((y2-y1)*.22));
+    const left=Math.max(0,Math.floor(x1-marginX)),top=Math.max(0,Math.floor(y1-marginY)),right=Math.min(pageWidth,Math.ceil(x2+marginX)),bottom=Math.min(pageHeight,Math.ceil(y2+marginY));
+    const width=right-left,height=bottom-top;
+    if(width<3||height<3)return{available:false,reason:'roi-outside-image-or-too-small',roi:{x1,y1,x2,y2},pageWidth,pageHeight};
+    const {data}=await sharp(imageInput).extract({left,top,width,height}).grayscale().raw().toBuffer({resolveWithObject:true});
+    const histogram=new Uint32Array(256);for(const gray of data)histogram[gray]++;
+    let sum=0;for(let i=0;i<256;i++)sum+=i*histogram[i];
+    let sumBackground=0,backgroundCount=0,bestVariance=-1,otsu=0;
+    for(let t=0;t<255;t++){
+      backgroundCount+=histogram[t];if(!backgroundCount)continue;
+      const foregroundCount=data.length-backgroundCount;if(!foregroundCount)break;
+      sumBackground+=t*histogram[t];
+      const meanBackground=sumBackground/backgroundCount,meanForeground=(sum-sumBackground)/foregroundCount;
+      const variance=backgroundCount*foregroundCount*(meanBackground-meanForeground)**2;
+      if(variance>bestVariance){bestVariance=variance;otsu=t;}
+    }
+    const ink=[],paper=[],rowHasInk=new Uint8Array(height);let minX=width,maxX=-1;
+    for(let y=0;y<height;y++)for(let x=0;x<width;x++){
+      const gray=data[y*width+x];
+      if(gray<=otsu){ink.push(gray);rowHasInk[y]=1;minX=Math.min(minX,x);maxX=Math.max(maxX,x);}
+      else paper.push(gray);
+    }
+    if(ink.length<6||paper.length<Math.max(12,Math.floor(data.length*.03)))return{available:false,reason:'insufficient-ink-or-background-pixels',roi:{x1,y1,x2,y2},pageWidth,pageHeight,otsu,inkPixelCount:ink.length,backgroundPixelCount:paper.length};
+    const median=values=>{values.sort((a,b)=>a-b);return values[Math.floor(values.length/2)];};
+    let minY=height,maxY=-1,glyphRows=0;for(let y=0;y<height;y++)if(rowHasInk[y]){minY=Math.min(minY,y);maxY=Math.max(maxY,y);glyphRows++;}
+    const inkMedianGray=median(ink),backgroundMedianGray=median(paper);
+    return{
+      available:true,
+      contrast:backgroundMedianGray-inkMedianGray,
+      inkMedianGray,
+      backgroundMedianGray,
+      glyphHeightPx:maxY>=minY?maxY-minY+1:0,
+      glyphHeightPer1000PageHeight:Number((((maxY>=minY?maxY-minY+1:0)/pageHeight)*1000).toFixed(4)),
+      glyphWidthPx:maxX>=minX?maxX-minX+1:0,
+      inkCoverage:Number((ink.length/data.length).toFixed(6)),
+      roi:{x1,y1,x2,y2},
+      crop:{left,top,width,height},
+      page:{width:pageWidth,height:pageHeight},
+      segmentation:{method:'Otsu grayscale on validated value ROI',threshold:otsu,inkPixelCount:ink.length,backgroundPixelCount:paper.length},
+    };
+  }catch(error){return{available:false,reason:error?.message||'semantic-roi-appearance-error'};}
+}
+
+async function compareSemanticRoiAppearance(targetPath,referencePath,semanticRois){
+  const out={};
+  for(const field of ['amount','recipientName','recipientIban']){
+    const pair=semanticRois?.[field];
+    if(!pair?.target||!pair?.reference){out[field]={available:false,reason:'validated-target-or-reference-roi-unavailable',targetRoi:pair?.target||null,referenceRoi:pair?.reference||null};continue;}
+    const [target,reference]=await Promise.all([
+      measureSemanticRoiAppearance(targetPath,pair.target),
+      measureSemanticRoiAppearance(referencePath,pair.reference),
+    ]);
+    const comparable=target.available&&reference.available;
+    out[field]={
+      available:comparable,
+      status:comparable?'MEASURED':'MEASUREMENT_UNAVAILABLE',
+      resolver:pair.source||pair.resolver||'validated-semantic-value-roi',
+      targetText:pair.targetText||null,
+      referenceText:pair.referenceText||null,
+      target,
+      reference,
+      delta:comparable?{
+        contrast:Number((target.contrast-reference.contrast).toFixed(4)),
+        glyphHeightPer1000PageHeight:Number((target.glyphHeightPer1000PageHeight-reference.glyphHeightPer1000PageHeight).toFixed(4)),
+        inkCoverage:Number((target.inkCoverage-reference.inkCoverage).toFixed(6)),
+      }:null,
+      interpretation:'appearance diagnostics within matching typed field ROIs; dynamic text may differ; no independent fraud verdict',
+    };
+  }
+  return out;
+}
+
 async function getMathSemanticRois({ amountForensics = null, referenceForensics = null, targetOCR = null, targetPath = null, bank = null, fileName = '', referencePath = null } = {}) {
   const rois = {};
   const fields = Array.isArray(referenceForensics?.fields) ? referenceForensics.fields : [];
@@ -576,9 +666,20 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     return { available: false, status: "missing-target-or-bank" };
   }
   const baseline = await loadMathematicalBaseline();
-  if (!baseline) return { available: false, status: "baseline-unavailable" };
-
   const semanticRois = await getMathSemanticRois({ amountForensics, referenceForensics, targetOCR, targetPath, bank, referencePath });
+  let semanticAppearanceMeasurements = null;
+  if(referencePath){
+    try{
+      semanticAppearanceMeasurements=await compareSemanticRoiAppearance(targetPath,referencePath,semanticRois);
+      console.log('MATH SEMANTIC ROI APPEARANCE V1:',JSON.stringify({bank,reference:path.basename(referencePath),fields:semanticAppearanceMeasurements}));
+    }catch(error){
+      semanticAppearanceMeasurements={available:false,reason:error?.message||'semantic-appearance-comparison-failed'};
+      console.warn('MATH SEMANTIC ROI APPEARANCE ATLANDI:',JSON.stringify({bank,reason:semanticAppearanceMeasurements.reason}));
+    }
+  }
+  // Semantic field appearance remains measurable even if a bank has not yet
+  // got a mathematical baseline. Do not let missing baselines suppress it.
+  if(!baseline)return{available:false,status:'baseline-unavailable',bank,semanticAppearanceMeasurements};
   const ibanProfile = (Array.isArray(referenceForensics?.typographyFieldProfiles) ? referenceForensics.typographyFieldProfiles : [])
     .find(profile => {
       const field = String(profile?.field || '').replace(/:value$/i, '');
@@ -832,6 +933,7 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
     // reference-side recipientName / recipientIban / amount ROIs were
     // measured mathematically when their boxes were available.
     semanticReferenceMeasurements,
+    semanticAppearanceMeasurements,
     amountInkProfiles,
     typedAmountPair: semanticRois.amount ? {
       targetText: semanticRois.amount.targetText || null,
@@ -1724,31 +1826,10 @@ function measureZiraatAmountSpacing(layout, bank, imageWidth) {
 async function measureGarantiAmountContrast(imagePath, region, amountText = '') {
   if(!imagePath||!region)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
   try{
-    const meta=await sharp(imagePath).metadata(),pw=Number(meta.width)||0,ph=Number(meta.height)||0;
-    const x1=Number(region.x1),y1=Number(region.y1),x2=Number(region.x2),y2=Number(region.y2);
-    if(!pw||!ph||![x1,y1,x2,y2].every(Number.isFinite)||x2<=x1||y2<=y1)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
-    const mx=Math.max(2,Math.round((x2-x1)*.12)),my=Math.max(2,Math.round((y2-y1)*.22));
-    const left=Math.max(0,Math.floor(x1-mx)),top=Math.max(0,Math.floor(y1-my));
-    const width=Math.min(pw-left,Math.ceil(x2-x1+2*mx)),height=Math.min(ph-top,Math.ceil(y2-y1+2*my));
-    if(width<3||height<3)return{available:false,status:'MEASUREMENT_UNAVAILABLE'};
-    const {data}=await sharp(imagePath).extract({left,top,width,height}).grayscale().raw().toBuffer({resolveWithObject:true});
-    // Use a local Otsu threshold over the amount crop. Connected-component
-    // filtering was too brittle for scanned/small text and often returned no
-    // character components even when the typed OCR ROI was valid.
-    const hist=new Uint32Array(256);let minGray=255,maxGray=0;for(const gray of data){hist[gray]++;if(gray<minGray)minGray=gray;if(gray>maxGray)maxGray=gray;}
-    const total=data.length;let sum=0;for(let i=0;i<256;i++)sum+=i*hist[i];
-    let sumB=0,wB=0,bestVariance=-1,threshold=0;
-    for(let i=0;i<255;i++){
-      wB+=hist[i];if(!wB)continue;const wF=total-wB;if(!wF)break;
-      sumB+=i*hist[i];const mB=sumB/wB,mF=(sum-sumB)/wF;
-      const variance=wB*wF*(mB-mF)*(mB-mF);if(variance>bestVariance){bestVariance=variance;threshold=i;}
-    }
-    const ink=[],background=[];
-    for(const gray of data){if(gray<=threshold)ink.push(gray);else background.push(gray);}
-    if(ink.length<8||background.length<Math.max(20,Math.floor(total*.05)))return{available:false,status:'MEASUREMENT_UNAVAILABLE',reason:'insufficient-foreground-or-background-pixels',threshold:115,segmentationThreshold:threshold,inkPixelCount:ink.length,backgroundPixelCount:background.length,grayRange:{min:minGray,max:maxGray},roi:{x1,y1,x2,y2},crop:{left,top,width,height}};
-    const median=values=>{values.sort((a,b)=>a-b);return values[Math.floor(values.length/2)];};
-    const inkMedianGray=median(ink),backgroundMedianGray=median(background),contrast=backgroundMedianGray-inkMedianGray;
-    return{available:true,inkMedianGray,backgroundMedianGray,contrast,threshold:115,warning:contrast>115,status:contrast>115?'GARANTI_AMOUNT_CONTRAST_HIGH':'NORMAL',method:'local Otsu foreground/background split; median foreground grayscale subtracted from median background grayscale in the typed amount ROI and immediate margin; grayscale 0-255',sampleCounts:{foreground:ink.length,background:background.length},segmentationThreshold:threshold,grayRange:{min:minGray,max:maxGray},roi:{x1,y1,x2,y2},crop:{left,top,width,height},amountText:String(amountText||'')};
+    const measured=await measureSemanticRoiAppearance(imagePath,region);
+    if(!measured.available)return{...measured,threshold:115,warning:false,status:'MEASUREMENT_UNAVAILABLE',amountText:String(amountText||'')};
+    const warning=measured.contrast>115;
+    return{available:true,inkMedianGray:measured.inkMedianGray,backgroundMedianGray:measured.backgroundMedianGray,contrast:measured.contrast,threshold:115,warning,status:warning?'GARANTI_AMOUNT_CONTRAST_HIGH':'NORMAL',method:'Otsu foreground/background split inside the validated typed amount ROI and a narrow local paper margin; median background grayscale minus median digit grayscale; 0-255',sampleCounts:{foreground:measured.segmentation.inkPixelCount,background:measured.segmentation.backgroundPixelCount},segmentationThreshold:measured.segmentation.threshold,glyphHeightPx:measured.glyphHeightPx,glyphHeightPer1000PageHeight:measured.glyphHeightPer1000PageHeight,roi:measured.roi,crop:measured.crop,page:measured.page,amountText:String(amountText||'')};
   }catch(error){console.warn('GARANTI TUTAR KONTRAST ÖLÇÜMÜ ATLANDI:',error?.message||error);return{available:false,status:'MEASUREMENT_UNAVAILABLE'};}
 }
 
