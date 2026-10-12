@@ -20751,16 +20751,18 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 5) Strong field placement is concrete even when no local pixel crop is
-  // available. Sorgu Numarası gibi fields can be located from their OCR label.
-  // KUVEYT TÜRK: after the bank-specific global-Y normalization, a raw
-  // positionScore alone is not enough to expose a user-facing field-position
-  // finding. Require the engine's own consensus decision for this bank only.
-  const normalizedReportBank = normalizeBank(bank);
-  const kuveytTurkPositionGate = normalizedReportBank === 'kuveytturk';
+  // 5) Field placement is user-facing only when the ensemble has confirmed it
+  // and both matched label boxes are available. A raw per-reference score is
+  // not enough: it can be inflated by template variants or affine alignment,
+  // and without boxes the report cannot show what was actually compared.
   for (const f of (Array.isArray(forensic?.fields) ? forensic.fields : [])) {
-    if (Number(f?.positionScore || 0) < 70) continue;
-    if (kuveytTurkPositionGate && f?.suspicious !== true) continue;
+    const positionScore = Number(f?.ensembleMedianPositionScore ?? f?.positionScore ?? 0);
+    const referenceSupport = Number(f?.referenceCountForField || 0);
+    const referenceBox = f?.referenceLabelBox || f?.referenceValueBox || null;
+    const targetBox = f?.targetLabelBox || f?.targetValueBox || null;
+    if (positionScore < 70) continue;
+    if (f?.suspicious !== true || referenceSupport < 2) continue;
+    if (!referenceBox || !targetBox) continue;
     const field = String(f?.field || '').replace(/:value$/i,'');
     if (!field) continue;
     const title = fieldName(field);
@@ -20773,7 +20775,14 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
       detail: 'Bu alanın referansa göre dikey konumu belirgin şekilde farklı.',
       kind: 'field-position',
       evidenceField: field,
-      targetBox: null
+      referenceBox,
+      targetBox,
+      referenceCount: referenceSupport,
+      positionScore,
+      normalizedPosition: {
+        reference: { x: f.referenceLabelXNorm ?? null, y: f.referenceLabelYNorm ?? null },
+        target: { x: f.targetLabelXNorm ?? null, y: f.targetLabelYNorm ?? null },
+      }
     });
   }
 
