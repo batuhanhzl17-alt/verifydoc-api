@@ -2,11 +2,12 @@ const FIELD_SCHEMA = {
   type: 'object',
   properties: {
     text: { type: ['string', 'null'] },
+    labelText: { type: ['string', 'null'] },
     confidence: { type: 'number', minimum: 0, maximum: 1 },
     location: { type: 'string' },
     semanticRelationship: { type: 'string' },
   },
-  required: ['text', 'confidence', 'location', 'semanticRelationship'],
+  required: ['text', 'labelText', 'confidence', 'location', 'semanticRelationship'],
   additionalProperties: false,
 };
 
@@ -60,7 +61,18 @@ function containsDateOrTime(value) {
   return /\b(?:date|time|tarih|saat)\b|\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b|\b\d{1,2}:\d{2}\b/i.test(text);
 }
 
-export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeType = 'image/jpeg', model = 'gpt-5.6-terra' }) {
+function labelMatchesField(field, label) {
+  const text = String(label || '').normalize('NFKC').toLocaleUpperCase('tr-TR')
+    .replace(/[ÇĞİÖŞÜ]/g, c => ({Ç:'C',Ğ:'G',İ:'I',Ö:'O',Ş:'S',Ü:'U'}[c]))
+    .replace(/[^A-Z0-9]+/g, ' ').trim();
+  if (!text) return false;
+  if (field === 'recipientName') return /^(ALICI|ALACAKLI|LEHDAR|BENEFICIARY|PAYEE|RECEIVER)( ADI| ISMI| UNVANI| AD SOYADI| NAME)?$/.test(text);
+  if (field === 'recipientIBAN') return /^(ALICI|ALACAKLI|LEHDAR|BENEFICIARY|PAYEE|RECEIVER) (HESAP )?IBAN$/.test(text) || /^IBAN$/.test(text);
+  if (field === 'amount') return /^(ISLEM |EFT |FAST |GIDEN FAST |TRANSFER )?(ISLEM )?TUTAR(I)?$/.test(text) || /^B A PARA CINSI TUTAR$/.test(text) || /^TUTAR$/.test(text);
+  return false;
+}
+
+export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeType = 'image/jpeg', bank = null, model = 'gpt-5.6-terra' }) {
   if (!openai || !Buffer.isBuffer(imageBuffer) || !imageBuffer.length) {
     return { available: false, status: 'missing-client-or-image' };
   }
@@ -74,7 +86,14 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
         {
           type: 'input_text',
           text: [
-            'Inspect this uploaded receipt image as an independent evidence reader alongside OCR.',
+            `Inspect this uploaded ${bank || 'unknown-bank'} receipt image as an independent evidence reader alongside OCR.`,
+            `Bank identity supplied by the application: ${bank || 'unknown'}. Use the visible layout and labels in this image; do not assume a field location from another bank or template.`,
+            'Field definitions:',
+            '- amount: only the transaction amount attached to a visible amount label (such as TUTAR or İŞLEM TUTARI); never a balance, fee, commission, or unrelated amount.',
+            '- recipientName: only the beneficiary/payee name attached to ALICI, ALACAKLI, LEHDAR, or an equivalent visible label; never the sender, bank, branch, or address.',
+            '- recipientIBAN: only the beneficiary IBAN attached to an ALICI/ALACAKLI IBAN label; never the sender IBAN or an IBAN found elsewhere on the page.',
+            'For every field, return the exact visible label in labelText. If the value is not clearly tied to the correct label, return text:null and labelText:null; do not guess.',
+            'Example: a visible row "ALICI: Ayşe Yılmaz" supports recipientName="Ayşe Yılmaz" with labelText="ALICI"; it does not support amount or recipientIBAN.',
             'Return only the structured fields in the schema: recipientName, recipientIBAN, amount, fieldLocations/semantic relationships, and visualObservations.',
             'Do not inspect, extract, mention, or return any date or time.',
             'Read only what is visibly present. Use null for unreadable values and describe uncertainty in confidence.',
@@ -91,6 +110,11 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
   // Defensive output filter: even though date/time is excluded by the prompt
   // and schema, do not let date-like content escape in a value or observation.
   for (const field of ['recipientName', 'recipientIBAN', 'amount']) {
+    if (evidence?.[field]?.text != null && !labelMatchesField(field, evidence?.[field]?.labelText)) {
+      evidence[field].text = null;
+      evidence[field].confidence = 0;
+      evidence[field].semanticRelationship = 'label-not-validated-for-field';
+    }
     if (containsDateOrTime(evidence?.[field]?.text)) evidence[field].text = null;
     if (containsDateOrTime(evidence?.[field]?.location)) evidence[field].location = '';
     if (containsDateOrTime(evidence?.[field]?.semanticRelationship)) evidence[field].semanticRelationship = '';
