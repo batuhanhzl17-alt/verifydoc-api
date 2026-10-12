@@ -911,6 +911,8 @@ async function forensicWatchlistRequest(method, query = "", body = null) {
 // 750 TL gibi pass/low sonuçlar bu kapıdan geçemez.
 function getControlledAmountPromotion(result = {}) {
   const amount = result?.amountForensics || {};
+  const amountFieldAssociation = result?.semanticEvidenceFusion?.fields?.amount;
+  const amountAssociationValidated = amountFieldAssociation?.associationValidated === true;
   const score = Number(amount.score || 0);
   const severity = String(amount.severity || "").toLowerCase();
   const anomalyRatio = Number(amount.localAnomalyRatio ?? amount.anomalyRatio ?? 0);
@@ -927,6 +929,7 @@ function getControlledAmountPromotion(result = {}) {
 
   const eligible =
     amount.available === true &&
+    amountAssociationValidated &&
     strongSeverity &&
     scoreStrong &&
     (
@@ -942,9 +945,12 @@ function getControlledAmountPromotion(result = {}) {
     anomalyRatio,
     featureVotes,
     strongFeatureEvidence,
+    amountAssociationValidated,
     reason: eligible
       ? "controlled-amount-promotion"
-      : "insufficient-independent-amount-evidence"
+      : (!amountAssociationValidated
+        ? "amount-field-association-unverified"
+        : "insufficient-independent-amount-evidence")
   };
 }
 
@@ -3443,7 +3449,11 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
 
   // Validate any visible IBAN deterministically. This does not prove that an
   // IBAN belongs to the named recipient; it only detects checksum/format errors.
-  const ibanCandidates = [doc.recipientIban, doc.iban].filter(Boolean);
+  const recipientIbanAssociationValidated =
+    result?.semanticEvidenceFusion?.fields?.recipientIBAN?.associationValidated === true;
+  const ibanCandidates = recipientIbanAssociationValidated
+    ? [doc.recipientIban].filter(Boolean)
+    : [];
   for (const candidate of ibanCandidates) {
     try {
       const check = validateIBANMod97(candidate);
@@ -6226,12 +6236,18 @@ count,
 async function getReferenceAmountAnchor(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
-  const cacheKey = `amount-anchor:v17:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}`;
+  const targetVariant = activeReferenceVariant || detectReferenceVariantFromText(paddleImageOCR?.text || '');
+  const cacheKey = `amount-anchor:v18:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}:${targetVariant || 'unknown'}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
   const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
-  const primaryLabelRe = /(?:giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|giden\s*tutar|\btutar\b)/i;
   const negativeLabelRe = /(?:sorgu|sorgulama|işlem\s*no|islem\s*no|fiş|fis|referans|iban|hesap\s*no|müşteri|musteri|masraf|komisyon|ücret|ucret)/i;
+  const isPrimaryAmountLabel = (text) => {
+    const labelPart = String(text || '').split(/[:：]/, 1)[0];
+    const normalized = normalizeFieldTextForMatch(labelPart)
+      .replace(/[().]/g, ' ').replace(/\s+/g, ' ').trim();
+    return /^(?:TUTAR|TUTARI|ISLEM TUTAR|ISLEM TUTARI|ISLEM TUTAR TL|ISLEM TUTARI TL|ISLEM TUTAR TRY|ISLEM TUTARI TRY|ANA TUTAR|ANA TUTARI|GIDEN TUTAR|GIDEN TUTARI|GIDEN FAST TUTAR|GIDEN FAST TUTARI|GIDEN FAST EFT TUTAR|GIDEN FAST EFT TUTARI|GONDERILEN TUTAR|GONDERILEN TUTARI|GONDERILEN FAST TUTAR|GONDERILEN FAST TUTARI|TRANSFER TUTAR|TRANSFER TUTARI|ODEME TUTAR|ODEME TUTARI|PARA CINSI TUTAR|B A PARA CINSI TUTAR)$/.test(normalized);
+  };
 
   const median = (values) => {
     const v = values.filter(Number.isFinite).sort((a,b)=>a-b);
@@ -6241,12 +6257,52 @@ async function getReferenceAmountAnchor(bank) {
   };
 
   try {
-    const referencePaths = (await getReferenceFiles(normalizedBank))
+    let referencePaths = (await getReferenceFiles(normalizedBank))
       .filter(p => /\.(?:jpe?g|png|webp)$/i.test(String(p || '')));
     if (!referencePaths.length) {
       referenceAmountAnchorCache.set(cacheKey, null);
       return null;
     }
+
+    // Amount anchors must come from the same transaction family as the
+    // target. The old bank-wide median mixed FAST/EFT and HAVALE positions,
+    // producing a plausible but meaningless coordinate for both families.
+    const pathVariants = await Promise.all(referencePaths.map(async referencePath => ({
+      path: referencePath,
+      variant: await readReferenceVariant(referencePath),
+    })));
+    const knownVariants = [...new Set(pathVariants.map(x => x.variant).filter(Boolean))];
+    if (targetVariant && targetVariant !== 'mixed') {
+      referencePaths = pathVariants
+        .filter(x => x.variant === targetVariant)
+        .map(x => x.path);
+      if (!referencePaths.length) {
+        console.warn('REFERENCE AMOUNT ANCHOR FAMILY UNAVAILABLE:', JSON.stringify({
+          bank: normalizedBank,
+          targetVariant,
+          availableReferenceVariants: knownVariants,
+        }));
+        referenceAmountAnchorCache.set(cacheKey, null);
+        return null;
+      }
+    } else if (knownVariants.length > 1) {
+      console.warn('REFERENCE AMOUNT ANCHOR FAMILY AMBIGUOUS:', JSON.stringify({
+        bank: normalizedBank,
+        targetVariant: targetVariant || null,
+        availableReferenceVariants: knownVariants,
+        skippedReferenceCount: referencePaths.length,
+      }));
+      referenceAmountAnchorCache.set(cacheKey, null);
+      return null;
+    } else if (knownVariants.length === 1) {
+      referencePaths = pathVariants.filter(x => x.variant === knownVariants[0]).map(x => x.path);
+    }
+    console.log('REFERENCE AMOUNT ANCHOR FAMILY FILTER:', JSON.stringify({
+      bank: normalizedBank,
+      targetVariant: targetVariant || null,
+      referenceVariants: knownVariants,
+      selectedReferenceCount: referencePaths.length,
+    }));
 
     const entries = [];
     for (const referencePath of referencePaths) {
@@ -6309,7 +6365,7 @@ async function getReferenceAmountAnchor(bank) {
           amountLabels.push({ text: String(text).trim(), region, source });
         };
         for (const r of regions) {
-          if (explicitAmountLabelRe.test(String(r.text || '')) || /\btutar(?:ı|i)?\b/i.test(String(r.text || ''))) {
+          if (isPrimaryAmountLabel(r.text)) {
             pushAmountLabel(r.text, r.region, 'ocr-token');
           }
         }
@@ -6333,7 +6389,7 @@ async function getReferenceAmountAnchor(bank) {
           if (line.length) {
             const group = [base, ...line].sort((a,b) => a.region.x1 - b.region.x1);
             const joined = group.map(x => String(x.text || '').trim()).filter(Boolean).join(' ');
-            if (explicitAmountLabelRe.test(joined) || /(?:para|cinsi|tutar|islem|işlem)/i.test(joined)) {
+            if (isPrimaryAmountLabel(joined)) {
               const x1 = Math.min(...group.map(x => x.region.x1));
               const y1 = Math.min(...group.map(x => x.region.y1));
               const x2 = Math.max(...group.map(x => x.region.x2));
@@ -6369,7 +6425,7 @@ async function getReferenceAmountAnchor(bank) {
             const near = verticalGap <= Math.max(oh * 1.8, 45) && horizontal >= -oh * 1.0 && horizontal <= Math.max(280, oh * 14);
             const belowOrAbove = Math.abs(cr.y1 - or.y2) <= Math.max(oh * 2.0, 70) && Math.abs(ccx - ((or.x1 + or.x2) / 2)) <= Math.max(320, oh * 14);
             if (near || belowOrAbove) {
-              if (primaryLabelRe.test(t)) { score += 120; primaryHits++; }
+              if (isPrimaryAmountLabel(t)) { score += 120; primaryHits++; }
               if (negativeLabelRe.test(t)) { score -= 45; negativeHits++; }
             }
           }
@@ -17799,6 +17855,7 @@ preserveAmount(result.documentData.amount);
 // tutarın büyüklüğünü korur.
 if (
   ["reference-roi-and-direct-label", "direct-amount-label-roi", "reference-roi", "reference-position-and-label", "reference-position", "reference-nearest", "amount-label", "reconstructed-amount-label", "inline-primary-amount-label", "inline-primary-amount-label-no-anchor", "same-region-strong-amount-label", "same-region-strong-amount-label-no-anchor", "direct-amount-label-no-anchor", "reconstructed-amount-label-no-anchor", "amount-label-no-anchor"].includes(amountForensics?.selectionMethod) &&
+  semanticEvidenceFusion?.fields?.amount?.associationValidated === true &&
   amountForensics?.selectedAmountText
 ) {
   const selected = normalizeOCRAmountLiteral(String(amountForensics.selectedAmountText))
@@ -20597,6 +20654,23 @@ if (__controlledAmountPromotion.eligible) {
   console.log("AMOUNT FORENSICS CONTROLLED PROMOTION:", JSON.stringify(__controlledAmountPromotion));
 }
 
+const amountAssociationValidated =
+  semanticEvidenceFusion?.fields?.amount?.associationValidated === true;
+const riskEligibleAmountForensics = amountAssociationValidated
+  ? amountForensics
+  : null;
+if (amountForensics?.available === true && !amountAssociationValidated) {
+  console.log('AMOUNT FORENSICS RISK GATE:', JSON.stringify({
+    applied: true,
+    reason: 'amount-field-association-unverified',
+    amountStatus: amountForensics.status || null,
+    selectionMethod: amountForensics.selectionMethod || null,
+    fieldAssociationStatus: semanticEvidenceFusion?.fields?.amount?.paddleOCRStatus || 'unavailable',
+    labelText: semanticEvidenceFusion?.fields?.amount?.paddleOCRLabelText || null,
+    region: semanticEvidenceFusion?.fields?.amount?.paddleOCRRegion || null,
+  }));
+}
+
 console.log("FORENSIC SIGNALS READY FOR FINAL DECISION:", JSON.stringify({
   visualAvailable: Boolean(visualForensics?.available),
   layoutAvailable: Boolean(layoutForensics?.available),
@@ -20673,7 +20747,7 @@ if (hasMajorAmountMismatch || hasSevereAmountMismatch) {
 const finalDeterministicRisk = calculateDeterministicForensicRisk(result, {
   visualForensics,
   layoutForensics,
-  amountForensics,
+  amountForensics: riskEligibleAmountForensics,
   paddleImageOCR,
   referenceTemplateAnalysis,
   referenceForensics,
@@ -20725,6 +20799,7 @@ const strongUnifiedReferenceCount = unifiedReferenceFindings.filter((x) =>
   Number(x?.confidence) >= 90 || Number(x?.priority) === 1
 ).length;
 const strongAmountSignal =
+  amountAssociationValidated &&
   amountForensics?.available === true &&
   amountForensics?.severity === 'strong' &&
   Number(amountForensics?.score || 0) >= 80 &&
