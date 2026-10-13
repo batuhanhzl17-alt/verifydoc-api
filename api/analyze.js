@@ -6236,7 +6236,9 @@ count,
 async function getReferenceAmountAnchor(bank) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
-  const targetVariant = activeReferenceVariant || detectReferenceVariantFromText(paddleImageOCR?.text || '');
+  // This helper runs outside the request handler's lexical scope, so it must
+  // use the request-level variant state rather than the local Paddle result.
+  const targetVariant = activeReferenceVariant || null;
   const cacheKey = `amount-anchor:v18:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}:${targetVariant || 'unknown'}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
@@ -15896,6 +15898,10 @@ if (!paddleImageOCR?.success) {
 if (
 paddleImageOCR.success
 ) {
+
+// Make the OCR-derived transaction family available to the module-level
+// reference-anchor resolver before amount forensics requests an anchor.
+activeReferenceVariant = activeReferenceVariant || detectReferenceVariantFromText(paddleImageOCR.text || '');
 
 console.log(
 "PADDLEOCR IMAGE OCR BAŞARILI"
