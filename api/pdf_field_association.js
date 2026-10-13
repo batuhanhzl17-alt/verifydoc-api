@@ -139,7 +139,9 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       const nextLabelIndex = row.items.findIndex((_, index) => index > label.end && startsKnownLabel(row.items, index));
       const nextLabel = nextLabelIndex >= 0 ? row.items[nextLabelIndex] : null;
       const nextLabelX = nextLabel?.x ?? Infinity;
-      const sameRow = row.items.slice(label.end + 1).filter(item => item.x >= labelRight - 1 && item.x < nextLabelX);
+      const sameRow = row.items.slice(label.end + 1).filter(item =>
+        item.x >= labelRight - 1 && item.x < nextLabelX && !/^[:：=]+$/.test(String(item.text || '').trim())
+      );
       let valueItems = sameRow;
       let valueText = sameRow.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
 
@@ -166,21 +168,61 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       valueText = cleanAssociatedValue(field, valueText);
       if (!validValue(field, valueText)) continue;
 
-      const labelBox = boxForItems(label.items, pageWidth, pageHeight);
+      let labelBoxItems = label.items;
+      if (label.inlineValue) {
+        const colonIndex = label.items.findIndex(item => /[:：]/.test(String(item.text || '')));
+        if (colonIndex >= 0) {
+          labelBoxItems = label.items.slice(0, colonIndex + 1);
+          const colonItem = labelBoxItems[labelBoxItems.length - 1];
+          const colonText = String(colonItem.text || '');
+          const colonPosition = colonText.search(/[:：]/);
+          if (colonPosition >= 0 && colonPosition < colonText.length - 1) {
+            const prefixLength = colonPosition + 1;
+            labelBoxItems[labelBoxItems.length - 1] = {
+              ...colonItem,
+              text: colonText.slice(0, prefixLength),
+              width: colonItem.width * prefixLength / Math.max(1, colonText.length),
+            };
+          }
+        }
+      }
+      const labelBox = boxForItems(labelBoxItems, pageWidth, pageHeight);
       let inlineValueItems = null;
-      if (label.inlineValue && label.items.length === 1 && validValue(field, cleanAssociatedValue(field, label.inlineValue))) {
-        const item = label.items[0];
-        const fullText = String(item.text || '');
-        const valueStart = fullText.indexOf(label.inlineValue);
-        if (valueStart >= 0 && fullText.length > 0) {
-          const startRatio = valueStart / fullText.length;
-          const widthRatio = label.inlineValue.length / fullText.length;
-          inlineValueItems = [{
-            ...item,
-            text: label.inlineValue,
-            x: item.x + item.width * startRatio,
-            width: item.width * widthRatio,
-          }];
+      if (label.inlineValue && validValue(field, cleanAssociatedValue(field, label.inlineValue))) {
+        const colonIndex = label.items.findIndex(item => /[:：]/.test(String(item.text || '')));
+        if (colonIndex >= 0) {
+          const colonItem = label.items[colonIndex];
+          const colonText = String(colonItem.text || '');
+          const separatorIndex = colonText.search(/[:：]/);
+          const suffix = separatorIndex >= 0 ? colonText.slice(separatorIndex + 1).trim() : '';
+          const suffixItems = label.items.slice(colonIndex + 1);
+          const suffixValueItems = [];
+          if (suffix) {
+            const valueStart = colonText.indexOf(suffix);
+            const startRatio = valueStart / Math.max(1, colonText.length);
+            const widthRatio = suffix.length / Math.max(1, colonText.length);
+            suffixValueItems.push({
+              ...colonItem,
+              text: suffix,
+              x: colonItem.x + colonItem.width * startRatio,
+              width: colonItem.width * widthRatio,
+            });
+          }
+          inlineValueItems = [...suffixValueItems, ...suffixItems];
+        } else if (label.items.length === 1) {
+          const item = label.items[0];
+          const fullText = String(item.text || '');
+          const valueStart = fullText.indexOf(label.inlineValue);
+          if (valueStart >= 0 && fullText.length > 0) {
+            const startRatio = valueStart / fullText.length;
+            const widthRatio = label.inlineValue.length / fullText.length;
+            inlineValueItems = [{
+              ...item,
+              text: label.inlineValue,
+              x: item.x + item.width * startRatio,
+              width: item.width * widthRatio,
+            }];
+          }
         }
       }
       const valueBox = inlineValueItems?.length
@@ -238,27 +280,36 @@ export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = 
       const d = Number(transform[3]) || 1;
       const e = Number(transform[4]) || 0;
       const f = Number(transform[5]) || 0;
-      const matrix = [
-        view[0] * a + view[2] * b,
-        view[1] * a + view[3] * b,
-        view[0] * c + view[2] * d,
-        view[1] * c + view[3] * d,
+      // PDF.js text item width/height are already expressed in page units;
+      // the text matrix supplies orientation only. Applying its font scale to
+      // width/height again inflated boxes (and row tolerances) beyond the page.
+      const width = Math.max(0, Number(item.width) || 0);
+      const height = Math.max(1, Number(item.height) || Math.hypot(c, d) || 8);
+      const xAxisLength = Math.hypot(a, b) || 1;
+      const yAxisLength = Math.hypot(c, d) || 1;
+      const xAxis = [a / xAxisLength, b / xAxisLength];
+      const yAxis = [c / yAxisLength, d / yAxisLength];
+      const origin = [
         view[0] * e + view[2] * f + view[4],
         view[1] * e + view[3] * f + view[5],
       ];
-      const width = Math.max(0, Number(item.width) || 0);
-      const height = Math.max(1, Number(item.height) || Math.hypot(c, d) || 8);
+      const widthVector = [
+        view[0] * xAxis[0] * width + view[2] * xAxis[1] * width,
+        view[1] * xAxis[0] * width + view[3] * xAxis[1] * width,
+      ];
+      const heightVector = [
+        view[0] * yAxis[0] * height + view[2] * yAxis[1] * height,
+        view[1] * yAxis[0] * height + view[3] * yAxis[1] * height,
+      ];
       const corners = [
-        [0, 0], [width, 0], [0, height], [width, height],
-      ].map(([u, v]) => [
-        matrix[0] * u + matrix[2] * v + matrix[4],
-        matrix[1] * u + matrix[3] * v + matrix[5],
-      ]);
+        [0, 0], widthVector, heightVector,
+        [widthVector[0] + heightVector[0], widthVector[1] + heightVector[1]],
+      ].map(([dx, dy]) => [origin[0] + dx, origin[1] + dy]);
       const x = Math.min(...corners.map(point => point[0]));
       const right = Math.max(...corners.map(point => point[0]));
       const top = Math.min(...corners.map(point => point[1]));
       const bottom = Math.max(...corners.map(point => point[1]));
-      const baseline = matrix[5];
+      const baseline = origin[1];
       return {
         text: String(item.str || '').trim(), x, baseline,
         top: Math.max(0, top), height: Math.max(1, bottom - top),
