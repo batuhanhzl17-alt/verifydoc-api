@@ -6290,11 +6290,20 @@ async function getReferenceAmountAnchor(bank) {
       variant: await readReferenceVariant(referencePath),
     })));
     const knownVariants = [...new Set(pathVariants.map(x => x.variant).filter(Boolean))];
+    let familySelection = 'unfiltered';
     if (targetVariant && targetVariant !== 'mixed') {
-      referencePaths = pathVariants
-        .filter(x => x.variant === targetVariant)
-        .map(x => x.path);
-      if (!referencePaths.length) {
+      const exactFamily = pathVariants.filter(x => x.variant === targetVariant);
+      const untagged = pathVariants.filter(x => !x.variant);
+      if (exactFamily.length) {
+        referencePaths = exactFamily.map(x => x.path);
+        familySelection = 'exact-variant';
+      } else if (untagged.length) {
+        // Older reference PDFs often have no stored variant metadata. Keep
+        // their typed-label-derived anchors as a cautious fallback instead
+        // of discarding a valid anchor (Vakıfbank log showed this failure).
+        referencePaths = untagged.map(x => x.path);
+        familySelection = 'unknown-variant-typed-label-fallback';
+      } else {
         console.warn('REFERENCE AMOUNT ANCHOR FAMILY UNAVAILABLE:', JSON.stringify({
           bank: normalizedBank,
           targetVariant,
@@ -6320,6 +6329,7 @@ async function getReferenceAmountAnchor(bank) {
       targetVariant: targetVariant || null,
       referenceVariants: knownVariants,
       selectedReferenceCount: referencePaths.length,
+      familySelection,
     }));
 
     const entries = [];
@@ -6684,6 +6694,28 @@ async function getReferenceAmountAnchor(bank) {
       referenceAmountAnchorCache.set(cacheKey, null);
       console.warn('REFERENCE AMOUNT ANCHOR V16.1: UYGUN TUTAR ALANI BULUNAMADI');
       return null;
+    }
+
+    if (familySelection === 'unknown-variant-typed-label-fallback' && entries.length > 1) {
+      const fallbackSpread = {
+        x: Math.max(...entries.map(x => x.xNorm)) - Math.min(...entries.map(x => x.xNorm)),
+        y: Math.max(...entries.map(x => x.yNorm)) - Math.min(...entries.map(x => x.yNorm)),
+      };
+      // Untagged references may mix FAST/EFT with HAVALE. Do not invent a
+      // median anchor when their typed amount boxes visibly belong to different
+      // layouts; keep the measurement unavailable and explain why.
+      if (fallbackSpread.x > 0.04 || fallbackSpread.y > 0.025) {
+        console.warn('REFERENCE AMOUNT ANCHOR UNTAGGED LAYOUTS AMBIGUOUS:', JSON.stringify({
+          bank: normalizedBank,
+          targetVariant,
+          referenceCount: entries.length,
+          spread: fallbackSpread,
+          files: entries.map(x => x.referenceFile),
+          reason: 'untagged-reference-amount-boxes-do-not-share-one-layout',
+        }));
+        referenceAmountAnchorCache.set(cacheKey, null);
+        return null;
+      }
     }
 
     const anchor = {
