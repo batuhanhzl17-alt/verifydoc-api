@@ -12,6 +12,7 @@ import { analyzeFontForensics } from "./font_forensics.js";
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
+import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -60,6 +61,18 @@ const pdfWorkerPath = require.resolve(
 
 pdfjsLib.GlobalWorkerOptions.workerSrc =
 pathToFileURL(pdfWorkerPath).href;
+
+// PDF.js needs its standard font assets for reliable text-layer extraction
+// and page rendering. Missing assets can silently omit Helvetica glyphs and
+// make the OCR raster unusable even when the PDF text layer is intact.
+const pdfjsBuildDirectory = path.dirname(require.resolve("pdfjs-dist/build/pdf.mjs"));
+const pdfjsStandardFontDirectory = path.resolve(pdfjsBuildDirectory, "../standard_fonts") + path.sep;
+function getPdfDocument(options) {
+  return pdfjsLib.getDocument({
+    ...options,
+    standardFontDataUrl: options?.standardFontDataUrl || pdfjsStandardFontDirectory,
+  });
+}
 
 
 
@@ -325,7 +338,7 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
         let meta;
         if (path.extname(referencePath).toLowerCase() === '.pdf') {
           const raw = await fs.readFile(referencePath);
-          const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+          const pdf = await getPdfDocument({ data: new Uint8Array(raw) }).promise;
           const rendered = await renderPdfPagePng(pdf, 1, 1.8);
           meta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
         } else {
@@ -2335,7 +2348,7 @@ pages.length,
 async function pdfToImg(buffer, options = {}) {
 const scale = options.scale || 2;
 
-const pdf = await pdfjsLib.getDocument({
+const pdf = await getPdfDocument({
 data: new Uint8Array(buffer),
 }).promise;
 
@@ -4381,7 +4394,7 @@ async function pfLoadVisualBuffer(filePath) {
   // "unsupported image format" hatası oluşmaz.
   const looksLikePdf = ext === '.pdf' || input.subarray(0, 5).toString() === '%PDF-';
   if (looksLikePdf) {
-    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(input) }).promise;
+    const pdf = await getPdfDocument({ data: new Uint8Array(input) }).promise;
     const rendered = await renderPdfPagePng(pdf, 1, 1.6);
     if (!rendered?.buffer) throw new Error('Pixel Forensics: PDF ilk sayfası rasterize edilemedi.');
     return { buffer: rendered.buffer, sourceType: 'pdf' };
@@ -4538,7 +4551,7 @@ async function runPixelForensics(targetPath, referencePaths = []) {
         try {
           let refBuffer = await fs.readFile(refPath);
           if (path.extname(refPath).toLowerCase() === '.pdf') {
-            const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(refBuffer) }).promise;
+            const pdf = await getPdfDocument({ data: new Uint8Array(refBuffer) }).promise;
             const rendered = await renderPdfPagePng(pdf, 1, 1.0); if (!rendered?.buffer) continue; refBuffer = rendered.buffer;
           }
           const rp = await projection(refBuffer);
@@ -6259,8 +6272,11 @@ async function getReferenceAmountAnchor(bank) {
   };
 
   try {
+    const pdfReferenceMode = normalizeReferenceFormat(activeReferenceFormat) === 'pdf';
     let referencePaths = (await getReferenceFiles(normalizedBank))
-      .filter(p => /\.(?:jpe?g|png|webp)$/i.test(String(p || '')));
+      .filter(p => pdfReferenceMode
+        ? /\.pdf$/i.test(String(p || ''))
+        : /\.(?:jpe?g|png|webp)$/i.test(String(p || '')));
     if (!referencePaths.length) {
       referenceAmountAnchorCache.set(cacheKey, null);
       return null;
@@ -6307,8 +6323,40 @@ async function getReferenceAmountAnchor(bank) {
     }));
 
     const entries = [];
+    let nativePdfReferenceCount = 0;
     for (const referencePath of referencePaths) {
       try {
+        if (/\.pdf$/i.test(String(referencePath || ''))) {
+          const pdfBuffer = await fs.readFile(referencePath);
+          const pdf = await getPdfDocument({ data: new Uint8Array(pdfBuffer) }).promise;
+          const native = await extractPdfNativeFieldAssociations(pdf);
+          const amount = native?.fields?.amount;
+          const box = amount?.valueBox;
+          if (amount?.status === 'matched' && amount?.associationValidated && box) {
+            entries.push({
+              xNorm: box.x,
+              yNorm: box.y,
+              widthNorm: Math.max(0.001, box.width),
+              heightNorm: Math.max(0.001, box.height),
+              referenceFile: path.basename(referencePath),
+              pageNumber: amount.pageNumber || 1,
+            });
+            nativePdfReferenceCount++;
+            console.log('PDF NATIVE REFERENCE AMOUNT BOX:', JSON.stringify({
+              referenceFile: path.basename(referencePath),
+              pageNumber: amount.pageNumber || 1,
+              labelText: amount.labelText || null,
+              valueBoxNorm: box,
+            }));
+          } else {
+            console.warn('PDF NATIVE REFERENCE AMOUNT BOX UNAVAILABLE:', JSON.stringify({
+              referenceFile: path.basename(referencePath),
+              status: amount?.status || 'unavailable',
+              reason: amount?.reason || 'typed-amount-label-not-found',
+            }));
+          }
+          continue;
+        }
         const stat = await fs.stat(referencePath);
         const ocrKey = `ref-image-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
         let cached = referenceRasterOcrCache.get(ocrKey);
@@ -6640,7 +6688,7 @@ async function getReferenceAmountAnchor(bank) {
 
     const anchor = {
       bank: normalizedBank,
-      pageNumber: 1,
+      pageNumber: median(entries.map(x => Number(x.pageNumber) || 1)),
       xNorm: median(entries.map(x => x.xNorm)),
       yNorm: median(entries.map(x => x.yNorm)),
       widthNorm: median(entries.map(x => x.widthNorm)),
@@ -6652,7 +6700,9 @@ async function getReferenceAmountAnchor(bank) {
         width: Math.max(...entries.map(x => x.widthNorm)) - Math.min(...entries.map(x => x.widthNorm)),
         height: Math.max(...entries.map(x => x.heightNorm)) - Math.min(...entries.map(x => x.heightNorm)),
       },
-      source: 'trusted-telegram-raster-ensemble-v16.1-explicit-amount-label-fallback',
+      source: nativePdfReferenceCount
+        ? 'trusted-pdf-native-typed-amount-label-coordinate-ensemble-v1'
+        : 'trusted-telegram-raster-ensemble-v16.1-explicit-amount-label-fallback',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
     console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE V16.1:', JSON.stringify({
@@ -6802,7 +6852,7 @@ async function renderPdfPagePng(pdfOrPath, pageNumber, scale = 1) {
       const data = typeof pdfOrPath === 'string'
         ? await fs.readFile(pdfOrPath)
         : pdfOrPath;
-      pdf = await pdfjsLib.getDocument({ data: new Uint8Array(data) }).promise;
+      pdf = await getPdfDocument({ data: new Uint8Array(data) }).promise;
       ownedPdf = true;
     }
   } catch (e) {
@@ -7075,7 +7125,7 @@ async function runReferenceLayoutForensics(targetPath, bank, selectedReferencePa
           const ext = path.extname(referencePath).toLowerCase();
           let refBuffer = await fs.readFile(referencePath);
           if (ext === '.pdf') {
-            const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(refBuffer) }).promise;
+            const pdf = await getPdfDocument({ data: new Uint8Array(refBuffer) }).promise;
             const rendered = await renderPdfPagePng(pdf, 1, 1.6);
             if (!rendered?.buffer) continue;
             refBuffer = rendered.buffer;
@@ -9083,7 +9133,7 @@ async function runReferenceForensicEngine(targetPath, bank, targetOCR, selectedR
         const raw=await fs.readFile(referencePath);
         let refBuffer=null;
         if(ext==='.pdf'){
-          const pdf=await pdfjsLib.getDocument({data:new Uint8Array(raw)}).promise;
+          const pdf=await getPdfDocument({data:new Uint8Array(raw)}).promise;
           const rendered=await renderPdfPagePng(pdf,1,1.8);
           if(!rendered?.buffer)continue;
           refBuffer=rendered.buffer;
@@ -10287,7 +10337,7 @@ async function readReferenceVariant(referencePath) {
     if (ext !== '.pdf') return null;
     const buffer = await fs.readFile(referencePath);
     if (!buffer?.length) return null;
-    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    const pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
     let text = '';
     for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 2); pageNumber++) {
       const page = await pdf.getPage(pageNumber);
@@ -10561,7 +10611,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
 
   const buffer = await fs.readFile(referencePath);
   if (!buffer?.length) return null;
-  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+  const pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
 
   for (let pageNumber = 1; pageNumber <= Math.min(pdf.numPages, 5); pageNumber++) {
     const page = await pdf.getPage(pageNumber);
@@ -11163,7 +11213,7 @@ async function analyzeReferenceTemplateAgainstDocument(filePath, mime, bank, ocr
     imageBuffer = await fs.readFile(filePath);
   } else if (mime === "application/pdf" || String(filePath).toLowerCase().endsWith(".pdf")) {
     const pdfBuffer = await fs.readFile(filePath);
-    const pdf = await pdfjsLib.getDocument({data:new Uint8Array(pdfBuffer)}).promise;
+    const pdf = await getPdfDocument({data:new Uint8Array(pdfBuffer)}).promise;
     for (const pageIndex of new Set(regions.map(x => Number(x.pageIndex)||0))) {
       const page = await pdf.getPage(pageIndex+1);
       const viewport = page.getViewport({scale:1});
@@ -15505,7 +15555,7 @@ first(
 fields?.statementMode
 ) === "true"
 
-const type =
+let type =
 statementMode
 ? "statement"
 : rawType;
@@ -15650,6 +15700,24 @@ await fs.readFile(
 filePath
 );
 
+// PDF-only analysis mode: reject raster uploads before OCR or forensic work.
+// Identify the actual container from its signature rather than trusting the
+// Telegram filename or client-supplied MIME type.
+const pdfHeader = buffer.subarray(0, Math.min(buffer.length, 1024)).toString('latin1');
+const isPdfUpload = /%PDF-\d\.\d/.test(pdfHeader);
+if (!isPdfUpload) {
+  console.warn('NON-PDF UPLOAD REJECTED:', JSON.stringify({ fileName, mime: uploadedFile.mimetype || null }));
+  return res.status(415).json({
+    success: false,
+    error: 'PDF_ONLY: Lütfen dekontu veya hesap özetini PDF olarak yükleyin.',
+    code: 'PDF_ONLY',
+  });
+}
+if (!statementMode) type = 'pdf';
+mime = 'application/pdf';
+activeReferenceFormat = 'pdf';
+console.log('PDF-ONLY INPUT ACCEPTED:', JSON.stringify({ fileName, type, signatureValidated: true }));
+
 const fileFingerprint =
 createHash("sha256")
 .update(buffer)
@@ -15671,6 +15739,7 @@ throw new Error(
 // =================================================
 
 let extractedPdfText = ""
+let pdfNativeFieldAssociation = null
 let paddleOcrText = ""
 let paddleOcrConfidence = 0;
 let paddleOcrAttempted = false;
@@ -15680,9 +15749,12 @@ mime === "application/pdf" ||
 path.extname(filePath).toLowerCase() === ".pdf"
 ) {
 try {
-const pdf = await pdfjsLib.getDocument({
+const pdf = await getPdfDocument({
 data: new Uint8Array(buffer),
 }).promise;
+
+pdfNativeFieldAssociation = await extractPdfNativeFieldAssociations(pdf);
+console.log("PDF NATIVE FIELD ASSOCIATION:", JSON.stringify(pdfNativeFieldAssociation));
 
 const pages = [];
 for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
@@ -15830,6 +15902,7 @@ buffer.toString(
 // =====================================================
 
 let paddleImageOCR = null;
+let paddleDocumentOCR = null;
 let paddleCriticalFailure = false;
 let amountForensics = null;
 let referenceTemplateAnalysis = null;
@@ -15859,7 +15932,7 @@ let forensicTargetIsTemporary = false;
 
 if (type === "pdf") {
   try {
-    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    const pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
     const rendered = await renderPdfPagePng(pdf, 1, 1.6);
     if (rendered?.buffer) {
       forensicTargetPath = `/tmp/verifydoc-forensic-${fileFingerprint}.png`;
@@ -15920,6 +15993,68 @@ fileFingerprint,
 bank
 );
 
+// Digital PDFs expose text runs and their page coordinates even when the
+// rendered OCR misses a line. If Paddle did not resolve a primary amount box,
+// use only the value box adjacent to the PDF's typed transaction-amount label
+// as the ROI input for the existing local pixel inspection.
+const pdfAmountField = pdfNativeFieldAssociation?.fields?.amount;
+if (
+  type === "pdf" && pdfAmountField?.status === "matched" &&
+  pdfAmountField?.associationValidated === true && pdfAmountField?.pageNumber === 1 &&
+  pdfAmountField?.valueBox && pdfAmountField?.labelBox
+) {
+  try {
+    const rasterMeta = await sharp(forensicTargetPath).metadata();
+    const rasterWidth = Number(rasterMeta.width) || 0;
+    const rasterHeight = Number(rasterMeta.height) || 0;
+    const toRasterRegion = box => ({
+      x1: Math.max(0, Math.floor(box.x * rasterWidth)),
+      y1: Math.max(0, Math.floor(box.y * rasterHeight)),
+      x2: Math.min(rasterWidth, Math.ceil((box.x + box.width) * rasterWidth)),
+      y2: Math.min(rasterHeight, Math.ceil((box.y + box.height) * rasterHeight)),
+    });
+    const pdfNativeAmountOcr = {
+      success: rasterWidth > 0 && rasterHeight > 0,
+      confidence: 100,
+      text: `${pdfAmountField.labelText}: ${pdfAmountField.value}`,
+      regions: [
+        { text: pdfAmountField.labelText, score: 100, region: toRasterRegion(pdfAmountField.labelBox) },
+        { text: pdfAmountField.value, score: 100, region: toRasterRegion(pdfAmountField.valueBox) },
+      ],
+    };
+    const nativeAmountForensics = await analyzeAmountForensics(
+      forensicTargetPath,
+      pdfNativeAmountOcr,
+      `${fileFingerprint}:pdf-native-typed-amount`,
+      bank
+    );
+    if (nativeAmountForensics?.region) {
+      amountForensics = {
+        ...nativeAmountForensics,
+        source: "pdf-text-layer-label-value-coordinates-plus-rendered-pixel-roi",
+        pdfNativeLabelText: pdfAmountField.labelText,
+        pdfNativeValueBoxNorm: pdfAmountField.valueBox,
+      };
+      console.log("PDF NATIVE AMOUNT ROI FORENSICS:", JSON.stringify({
+        available: true,
+        status: amountForensics.status || null,
+        selectionMethod: amountForensics.selectionMethod || null,
+        valueBoxNorm: pdfAmountField.valueBox,
+        rasterRegion: amountForensics.region,
+        referenceAnchorAvailable: Boolean(amountForensics.referenceAnchorAvailable),
+        referenceAnchorSource: amountForensics.referenceAnchorSource || null,
+      }));
+    } else {
+      console.warn("PDF NATIVE AMOUNT ROI FORENSICS UNAVAILABLE:", JSON.stringify({
+        reason: nativeAmountForensics?.reason || nativeAmountForensics?.status || "pixel-roi-not-resolved",
+        valueBoxNorm: pdfAmountField.valueBox,
+      }));
+    }
+  } catch (error) {
+    console.warn("PDF NATIVE AMOUNT ROI FORENSICS ERROR:", error?.message || error);
+  }
+}
+
 console.log(
 "AMOUNT FORENSICS:",
 JSON.stringify(amountForensics)
@@ -15960,9 +16095,47 @@ if ((type === "image" || type === "pdf") && forensicTargetPath) {
 // ReferenceError: Cannot access 'reference' before initialization
 // hatası oluşur.
 let reference = null;
+let pdfReferenceFieldAssociation = null;
 
 if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR, activeReferenceFormat);
+}
+
+if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCase() === ".pdf") {
+  try {
+    const referenceBuffer = await fs.readFile(reference.path);
+    const referencePdf = await getPdfDocument({ data: new Uint8Array(referenceBuffer) }).promise;
+    pdfReferenceFieldAssociation = await extractPdfNativeFieldAssociations(referencePdf);
+    const fieldComparison = {};
+    for (const field of ["recipientName", "recipientIBAN", "amount"]) {
+      const targetField = pdfNativeFieldAssociation?.fields?.[field];
+      const referenceField = pdfReferenceFieldAssociation?.fields?.[field];
+      const targetBox = targetField?.valueBox;
+      const referenceBox = referenceField?.valueBox;
+      fieldComparison[field] = {
+        targetStatus: targetField?.status || "unavailable",
+        referenceStatus: referenceField?.status || "unavailable",
+        targetLabel: targetField?.labelText || null,
+        referenceLabel: referenceField?.labelText || null,
+        targetValueBoxNorm: targetBox || null,
+        referenceValueBoxNorm: referenceBox || null,
+        centerDeltaNorm: targetBox && referenceBox ? {
+          dx: Number(((targetBox.x + targetBox.width / 2) - (referenceBox.x + referenceBox.width / 2)).toFixed(6)),
+          dy: Number(((targetBox.y + targetBox.height / 2) - (referenceBox.y + referenceBox.height / 2)).toFixed(6)),
+        } : null,
+        comparable: Boolean(targetField?.associationValidated && referenceField?.associationValidated && targetBox && referenceBox),
+      };
+    }
+    console.log("PDF NATIVE TARGET-REFERENCE FIELD COMPARISON:", JSON.stringify({
+      referenceFile: path.basename(reference.path),
+      targetPageCount: pdfNativeFieldAssociation?.pageCount || 0,
+      referencePageCount: pdfReferenceFieldAssociation?.pageCount || 0,
+      fields: fieldComparison,
+    }));
+  } catch (error) {
+    console.warn("PDF NATIVE REFERENCE FIELD ASSOCIATION ERROR:", error?.message || error);
+    pdfReferenceFieldAssociation = { available: false, status: "error", fields: {}, error: error?.message || String(error) };
+  }
 }
 
 // =====================================================
@@ -17497,6 +17670,7 @@ process.env.PADDLEOCR_ACCESS_TOKEN &&
 
 const paddleResult =
 await runPaddleOCR(filePath);
+paddleDocumentOCR = paddleResult;
 paddleOcrAttempted = true;
 
 if (!amountForensics) {
@@ -17808,8 +17982,9 @@ response.output_text
 if (multimodalReceiptEvidence) {
   semanticEvidenceFusion = fuseReceiptSemanticEvidence({
     evidenceResult: multimodalReceiptEvidence,
-    paddleOCR: paddleImageOCR,
+    paddleOCR: paddleDocumentOCR?.success ? paddleDocumentOCR : paddleImageOCR,
     primaryDocumentData: result?.documentData,
+    pdfNativeFields: pdfNativeFieldAssociation,
   });
   result.semanticEvidenceFusion = semanticEvidenceFusion;
   result.manualReviewRequired = semanticEvidenceFusion.reviewStatus === 'CONTROL_REQUIRED';
@@ -17823,9 +17998,17 @@ if (multimodalReceiptEvidence) {
       labelText: row?.paddleOCRLabelText || null,
       region: row?.paddleOCRRegion || null,
       associationValidated: Boolean(row?.associationValidated),
+      pdfNativeStatus: row?.pdfNativeAssociation?.status || 'unavailable',
+      pdfNativeLabelText: row?.pdfNativeAssociation?.labelText || null,
+      pdfNativeValue: row?.pdfNativeAssociation?.value || null,
+      pdfNativeAgreement: row?.pdfNativeAgreement || 'unavailable',
       primaryAnalysisAgreement: row?.primaryAnalysisAgreement || 'unavailable',
     }]))
   }));
+}
+if (result && pdfNativeFieldAssociation?.available) {
+  result.pdfNativeFieldAssociation = pdfNativeFieldAssociation;
+  result.pdfReferenceFieldAssociation = pdfReferenceFieldAssociation;
 }
 
 // Deterministik yapısal geometri sinyali AI çıktısından bağımsızdır.
@@ -18296,7 +18479,7 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
 
     if (refExt === '.pdf') {
       const rb = await fs.readFile(referencePath);
-      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(rb) }).promise;
+      const pdf = await getPdfDocument({ data: new Uint8Array(rb) }).promise;
       const rendered = await renderPdfPagePng(pdf, 1, 1.8);
       if (!rendered?.buffer || !rendered.width || !rendered.height) return null;
       refBuffer = rendered.buffer;
@@ -18733,7 +18916,7 @@ async function runTargetedReferenceVisualZones({ targetPath, referenceInfo, bank
       const ext = path.extname(String(filePath)).toLowerCase();
       if (ext === '.pdf') {
         const raw = await fs.readFile(filePath);
-        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+        const pdf = await getPdfDocument({ data: new Uint8Array(raw) }).promise;
         const rendered = await renderPdfPagePng(pdf, 1, 1.8);
         if (!rendered?.buffer) return null;
         return rendered.buffer;
@@ -18859,7 +19042,7 @@ async function runEvidenceLinkedVisualAdjudicator({
     const ext = path.extname(String(filePath)).toLowerCase();
     if (ext === '.pdf') {
       const raw = await fs.readFile(filePath);
-      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(raw) }).promise;
+      const pdf = await getPdfDocument({ data: new Uint8Array(raw) }).promise;
       const rendered = await renderPdfPagePng(pdf, 1, 1.8);
       return rendered?.buffer || null;
     }
