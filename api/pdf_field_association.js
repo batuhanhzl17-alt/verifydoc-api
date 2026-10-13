@@ -5,9 +5,15 @@ const FIELD_LABELS = {
   recipientIBAN: [
     /^(?:ALICI|ALACAKLI)\s+(?:HESAP\s+NO\s*\/\s*)?IBAN$/,
     /^(?:ALICI|ALACAKLI)\s+HESAP\s+NUMARASI$/,
+    // Some banks label the beneficiary account simply "ALICI HESAP".
+    // This is safe because the value must still pass the Turkish IBAN checksum.
+    /^(?:ALICI|ALACAKLI)\s+HESAP(?:\s+(?:NO|NUMARASI))?$/,
   ],
   amount: [
     /^(?:ISLEM|TRANSFER|GONDERILEN|ODEME|ANA|GIDEN(?:\s+FAST(?:\s+EFT)?)?)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
+    // Vakifbank PDFs may omit the first glyph of the embedded-font label
+    // during text extraction ("İŞLEM TUTARI" becomes "LEM TUTARI").
+    /^LEM\s+TUTAR(?:I)?$/,
     /^TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
     /^PARA\s+CINSI\s+TUTAR$/,
   ],
@@ -57,6 +63,15 @@ function validValue(field, value) {
   return clean.length >= 3 && clean.split(' ').filter(Boolean).length >= 2;
 }
 
+function cleanAssociatedValue(field, value) {
+  let text = String(value || '').replace(/\s+/g, ' ').trim();
+  // Separators are often exposed as standalone PDF text items between the
+  // label and value. Do not leak them into the extracted field value.
+  // Keep an amount's leading minus sign; it is part of the transaction value.
+  text = text.replace(/^[\s:：=]+/, '').trim();
+  return text;
+}
+
 function boxForItems(items, pageWidth, pageHeight) {
   const x1 = Math.min(...items.map(item => item.x));
   const x2 = Math.max(...items.map(item => item.x + item.width));
@@ -97,6 +112,12 @@ function labelSpans(row, field) {
       if (previousItem && lastItem.x - (previousItem.x + previousItem.width) > Math.max(12, lastItem.height * 2.2)) break;
       const text = group.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
       if (matchesLabel(field, text)) spans.push({ text, items: group, start, end });
+      // A PDF can store "LABEL: value" in a single text item. Match only the
+      // exact typed label prefix, then associate the suffix as its value.
+      const inline = text.match(/^(.{2,80}?)[：:]\s*(\S[\s\S]*)$/);
+      if (inline && matchesLabel(field, inline[1])) {
+        spans.push({ text: inline[1].trim(), inlineValue: inline[2].trim(), items: group, start, end });
+      }
     }
   }
   return spans.sort((a, b) => (a.end - a.start) - (b.end - b.start));
@@ -139,12 +160,32 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       }
 
       // If the label and value share one PDF text item, parse only its suffix.
+      if (label.inlineValue && !validValue(field, valueText)) valueText = label.inlineValue;
       const inline = label.text.match(/[:：]\s*(.+)$/);
       if (inline?.[1] && !validValue(field, valueText)) valueText = inline[1].trim();
+      valueText = cleanAssociatedValue(field, valueText);
       if (!validValue(field, valueText)) continue;
 
       const labelBox = boxForItems(label.items, pageWidth, pageHeight);
-      const valueBox = valueItems.length ? boxForItems(valueItems, pageWidth, pageHeight) : null;
+      let inlineValueItems = null;
+      if (label.inlineValue && label.items.length === 1 && validValue(field, cleanAssociatedValue(field, label.inlineValue))) {
+        const item = label.items[0];
+        const fullText = String(item.text || '');
+        const valueStart = fullText.indexOf(label.inlineValue);
+        if (valueStart >= 0 && fullText.length > 0) {
+          const startRatio = valueStart / fullText.length;
+          const widthRatio = label.inlineValue.length / fullText.length;
+          inlineValueItems = [{
+            ...item,
+            text: label.inlineValue,
+            x: item.x + item.width * startRatio,
+            width: item.width * widthRatio,
+          }];
+        }
+      }
+      const valueBox = inlineValueItems?.length
+        ? boxForItems(inlineValueItems, pageWidth, pageHeight)
+        : valueItems.length ? boxForItems(valueItems, pageWidth, pageHeight) : null;
       candidates.push({
         value: valueText,
         labelText: label.text,
@@ -182,16 +223,46 @@ export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = 
     const pageWidth = Number(viewport.width) || 0;
     const pageHeight = Number(viewport.height) || 0;
     if (!(pageWidth > 0 && pageHeight > 0)) continue;
+    const view = Array.isArray(viewport.transform) && viewport.transform.length === 6
+      ? viewport.transform.map(Number)
+      : [1, 0, 0, 1, 0, 0];
     const content = await page.getTextContent();
     const items = (content.items || []).filter(item => String(item.str || '').trim()).map(item => {
       const transform = item.transform || [];
-      const x = Number(transform[4]) || 0;
-      const baseline = Number(transform[5]) || 0;
-      const height = Math.max(1, Number(item.height) || Number(transform[3]) || 8);
+      // Text item matrices are in PDF user space. Apply the page viewport
+      // transform (rotation + crop-box translation + scale) before comparing
+      // target and reference coordinates in normalized page space.
+      const a = Number(transform[0]) || 1;
+      const b = Number(transform[1]) || 0;
+      const c = Number(transform[2]) || 0;
+      const d = Number(transform[3]) || 1;
+      const e = Number(transform[4]) || 0;
+      const f = Number(transform[5]) || 0;
+      const matrix = [
+        view[0] * a + view[2] * b,
+        view[1] * a + view[3] * b,
+        view[0] * c + view[2] * d,
+        view[1] * c + view[3] * d,
+        view[0] * e + view[2] * f + view[4],
+        view[1] * e + view[3] * f + view[5],
+      ];
+      const width = Math.max(0, Number(item.width) || 0);
+      const height = Math.max(1, Number(item.height) || Math.hypot(c, d) || 8);
+      const corners = [
+        [0, 0], [width, 0], [0, height], [width, height],
+      ].map(([u, v]) => [
+        matrix[0] * u + matrix[2] * v + matrix[4],
+        matrix[1] * u + matrix[3] * v + matrix[5],
+      ]);
+      const x = Math.min(...corners.map(point => point[0]));
+      const right = Math.max(...corners.map(point => point[0]));
+      const top = Math.min(...corners.map(point => point[1]));
+      const bottom = Math.max(...corners.map(point => point[1]));
+      const baseline = matrix[5];
       return {
-        text: String(item.str || '').trim(), x, baseline, height,
-        top: Math.max(0, pageHeight - baseline - height),
-        width: Math.max(0, Number(item.width) || 0), pageNumber,
+        text: String(item.str || '').trim(), x, baseline,
+        top: Math.max(0, top), height: Math.max(1, bottom - top),
+        width: Math.max(0, right - x), pageNumber,
       };
     });
     const rows = makeRows(items);
