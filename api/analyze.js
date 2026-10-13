@@ -5320,7 +5320,146 @@ function osfSafeString(v) {
   return String(v ?? '').replace(/\s+/g, ' ').trim();
 }
 
-async function runPdfStructuralForensics(filePath, rawBuffer = null) {
+function pdfAuditNormalizeText(value) {
+  return String(value || '').normalize('NFKC').toLocaleUpperCase('tr-TR')
+    .replace(/İ|I|ı/g, 'I').replace(/Ğ/g, 'G').replace(/Ü/g, 'U')
+    .replace(/Ş/g, 'S').replace(/Ö/g, 'O').replace(/Ç/g, 'C')
+    .replace(/\s+/g, ' ').trim();
+}
+
+function pdfAuditNumberText(value) {
+  return String(value || '').replace(/[^0-9,.-]/g, '');
+}
+
+async function auditPdfContentLayer(buffer, fieldAssociation = null) {
+  let pdf = null;
+  try {
+    pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
+    const metadataResult = await pdf.getMetadata().catch(() => null);
+    const fields = fieldAssociation?.fields || {};
+    const amount = fields.amount?.status === 'matched' && fields.amount?.associationValidated
+      ? fields.amount : null;
+    const pages = [];
+    let operatorTotals = { hiddenTextModeOps: 0, imagePaintOps: 0, formPaintOps: 0, annotationCount: 0 };
+    const amountCandidates = [];
+    const amountOverlaps = [];
+
+    for (let pageNumber = 1; pageNumber <= Math.min(Number(pdf.numPages) || 0, 3); pageNumber++) {
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1 });
+      const [content, operators, annotations] = await Promise.all([
+        page.getTextContent(),
+        page.getOperatorList(),
+        page.getAnnotations({ intent: 'display' }).catch(() => []),
+      ]);
+      const fnArray = operators?.fnArray || [];
+      const argsArray = operators?.argsArray || [];
+      let hiddenTextModeOps = 0, imagePaintOps = 0, formPaintOps = 0;
+      for (let i = 0; i < fnArray.length; i++) {
+        const fn = fnArray[i];
+        if (fn === pdfjsLib.OPS.setTextRenderingMode && Number(argsArray[i]?.[0]) === 3) hiddenTextModeOps++;
+        if ([pdfjsLib.OPS.paintImageXObject, pdfjsLib.OPS.paintInlineImageXObject,
+          pdfjsLib.OPS.paintImageMaskXObject, pdfjsLib.OPS.paintImageMaskXObjectGroup].includes(fn)) imagePaintOps++;
+        if ([pdfjsLib.OPS.paintFormXObjectBegin, pdfjsLib.OPS.paintFormXObjectEnd].includes(fn)) formPaintOps++;
+      }
+      operatorTotals.hiddenTextModeOps += hiddenTextModeOps;
+      operatorTotals.imagePaintOps += imagePaintOps;
+      operatorTotals.formPaintOps += formPaintOps;
+      operatorTotals.annotationCount += annotations.length;
+      pages.push({ pageNumber, width: viewport.width, height: viewport.height,
+        textItemCount: (content.items || []).filter(item => String(item.str || '').trim()).length,
+        operatorCount: fnArray.length, hiddenTextModeOps, imagePaintOps, formPaintOps,
+        annotationCount: annotations.length });
+
+      if (!amount || Number(amount.pageNumber) !== pageNumber || !amount.valueBox) continue;
+      const expected = amount.valueBox;
+      const expectedText = pdfAuditNumberText(amount.value);
+      const transformViewport = viewport.transform;
+      const rows = (content.items || []).filter(item => String(item.str || '').trim()).map(item => {
+        const t = item.transform || [];
+        const a = Number(t[0]) || 1, b = Number(t[1]) || 0;
+        const c = Number(t[2]) || 0, d = Number(t[3]) || 1;
+        const e = Number(t[4]) || 0, f = Number(t[5]) || 0;
+        const w = Math.max(0, Number(item.width) || 0), h = Math.max(1, Number(item.height) || 8);
+        // PDF.js item width/height already include the text scale. Keep the
+        // text matrix for orientation and transform the origin separately.
+        const xAxisLength = Math.hypot(a, b) || 1, yAxisLength = Math.hypot(c, d) || 1;
+        const xAxis = [a / xAxisLength, b / xAxisLength];
+        const yAxis = [c / yAxisLength, d / yAxisLength];
+        const origin = [
+          transformViewport[0] * e + transformViewport[2] * f + transformViewport[4],
+          transformViewport[1] * e + transformViewport[3] * f + transformViewport[5],
+        ];
+        const widthVector = [
+          transformViewport[0] * xAxis[0] * w + transformViewport[2] * xAxis[1] * w,
+          transformViewport[1] * xAxis[0] * w + transformViewport[3] * xAxis[1] * w,
+        ];
+        const heightVector = [
+          transformViewport[0] * yAxis[0] * h + transformViewport[2] * yAxis[1] * h,
+          transformViewport[1] * yAxis[0] * h + transformViewport[3] * yAxis[1] * h,
+        ];
+        const corners = [[0,0],widthVector,heightVector,[widthVector[0]+heightVector[0],widthVector[1]+heightVector[1]]]
+          .map(([dx,dy]) => [origin[0]+dx,origin[1]+dy]);
+        const x1 = Math.min(...corners.map(p=>p[0])) / viewport.width;
+        const x2 = Math.max(...corners.map(p=>p[0])) / viewport.width;
+        const y1 = Math.min(...corners.map(p=>p[1])) / viewport.height;
+        const y2 = Math.max(...corners.map(p=>p[1])) / viewport.height;
+        return { text: String(item.str || '').trim(), fontResource: item.fontName || null,
+          box: { x: x1, y: y1, width: x2-x1, height: y2-y1 },
+          numberText: pdfAuditNumberText(item.str),
+          fontSize: Number(Math.hypot(Number(t[2]) || 0, Number(t[3]) || 0).toFixed(3)) };
+      });
+      for (const row of rows) {
+        const cx = row.box.x + row.box.width / 2, cy = row.box.y + row.box.height / 2;
+        const ex = expected.x + expected.width / 2, ey = expected.y + expected.height / 2;
+        const distance = Math.hypot(cx-ex, cy-ey);
+        if (expectedText && row.numberText === expectedText) {
+          amountCandidates.push({ pageNumber, text: row.text, fontResource: row.fontResource, fontSize: row.fontSize,
+            box: row.box, centerDistanceNorm: Number(distance.toFixed(6)) });
+        }
+        const ix = Math.max(0, Math.min(row.box.x+row.box.width, expected.x+expected.width)-Math.max(row.box.x,expected.x));
+        const iy = Math.max(0, Math.min(row.box.y+row.box.height, expected.y+expected.height)-Math.max(row.box.y,expected.y));
+        const intersection = ix * iy;
+        const union = row.box.width*row.box.height + expected.width*expected.height - intersection;
+        if (intersection > 0 && union > 0 && intersection/union >= 0.3 && row.numberText !== expectedText) {
+          amountOverlaps.push({ pageNumber, text: row.text, fontResource: row.fontResource,
+            overlapRatio: Number((intersection/union).toFixed(3)), box: row.box });
+        }
+      }
+    }
+    const matchingAmount = amountCandidates.sort((a,b)=>a.centerDistanceNorm-b.centerDistanceNorm);
+    return {
+      available: true,
+      engine: 'pdfjs-content-layer-audit-v1',
+      pageCount: Number(pdf.numPages) || pages.length,
+      metadata: {
+        producer: metadataResult?.info?.Producer || null,
+        creator: metadataResult?.info?.Creator || null,
+        creationDate: metadataResult?.info?.CreationDate || null,
+        modificationDate: metadataResult?.info?.ModDate || null,
+        hasXmpMetadata: Boolean(metadataResult?.metadata),
+      },
+      operators: operatorTotals,
+      pages,
+      amountField: amount ? {
+        status: matchingAmount.length ? 'native-text-located' : 'native-text-not-located-in-associated-box',
+        label: amount.labelText,
+        value: amount.value,
+        expectedBoxNorm: amount.valueBox,
+        candidateCount: matchingAmount.length,
+        candidates: matchingAmount.slice(0, 5),
+        overlappingDifferentText: amountOverlaps.slice(0, 8),
+      } : { status: 'unavailable', reason: 'validated-typed-amount-field-not-found' },
+      interpretation: 'Bu katman nesne/metin yapısını ve alan çakışmalarını raporlar; tek başına Photoshop kullanımı veya sahtecilik kararı vermez.',
+    };
+  } catch (error) {
+    return { available:false, engine:'pdfjs-content-layer-audit-v1', status:'unknown', error:error?.message || String(error) };
+  } finally {
+    try { await pdf?.destroy?.(); } catch {}
+  }
+}
+
+async function runPdfStructuralForensics(filePath, rawBuffer = null, fieldAssociation = null) {
   try {
     const buffer = rawBuffer || await fs.readFile(filePath);
     const head = buffer.subarray(0, 8).toString('latin1');
@@ -5343,9 +5482,25 @@ async function runPdfStructuralForensics(filePath, rawBuffer = null) {
     const creator = osfSafeString(creatorMatch?.[1] || '');
 
     const suspiciousEditors = /(photoshop|illustrator|gimp|canva|nitro|foxit|updf|pdf[- ]?xchange|nitro pro)/i.test(`${producer} ${creator}`);
+    const eofPositions = [...text.matchAll(/%%EOF/g)].map(match => match.index);
+    const xrefPositions = [...text.matchAll(/startxref/g)].map(match => match.index);
+    const lastEof = eofPositions.length ? eofPositions[eofPositions.length - 1] + 5 : -1;
+    const trailingNonWhitespaceBytes = lastEof >= 0
+      ? Buffer.from(text.slice(lastEof), 'latin1').toString('latin1').replace(/[\x00\x09\x0a\x0c\x0d\x20]/g, '').length
+      : null;
+    const prevLinks = (text.match(/\/Prev\s+\d+/g) || []).length;
+    const signatureCount = (text.match(/\/ByteRange\s*\[/g) || []).length;
+    const redactCount = (text.match(/\/Subtype\s*\/Redact\b/g) || []).length;
+    const optionalContentCount = (text.match(/\/OCProperties\b|\/Type\s*\/OCG\b/g) || []).length;
+    const contentLayer = await auditPdfContentLayer(buffer, fieldAssociation);
     const findings = [];
     if (eofCount > 1 || startXrefCount > 1) findings.push({ type:'revision-history', severity:'medium', detail:'PDF içinde birden fazla kaydetme/revizyon izi bulundu.' });
-    if (hiddenTextCount > 0) findings.push({ type:'hidden-text', severity:'medium', detail:'Görünmez metin katmanı izi bulundu.' });
+    // Invisible text is common in searchable/scanned PDFs (OCR text layers).
+    // Keep it diagnostic and low severity unless field-local evidence supports it.
+    if (hiddenTextCount > 0) findings.push({ type:'hidden-text-layer', severity:'low', detail:'Görünmez metin çizim modu bulundu; taranmış PDF OCR katmanlarında normal olabilir.' });
+    if ((contentLayer?.operators?.hiddenTextModeOps || 0) > 0 && hiddenTextCount === 0) {
+      findings.push({ type:'hidden-text-layer', severity:'low', detail:'PDF operatör akışında görünmez metin çizim modu bulundu; OCR katmanı olasılığı ayrıca değerlendirilmelidir.' });
+    }
     if (jsCount > 0 || actionCount > 0) findings.push({ type:'actions', severity:'medium', detail:'PDF içinde script/otomatik action nesnesi bulundu.' });
     if (attachmentCount > 0) findings.push({ type:'embedded-content', severity:'low', detail:'PDF içinde gömülü dosya/ek nesnesi bulundu.' });
     if (suspiciousEditors) findings.push({ type:'producer-signature', severity:'low', detail:'PDF üretici/yazar bilgisinde düzenleme yazılımıyla uyumlu bir imza bulundu.' });
@@ -5359,8 +5514,11 @@ async function runPdfStructuralForensics(filePath, rawBuffer = null) {
       engine:'pdf-structural-forensics-v1',
       status,
       severity: strongRevision ? 'strong' : mediumSignals ? 'medium' : 'low',
-      metrics:{ eofCount, startXrefCount, objectCount:objCount, streamCount, hiddenTextCount, javascriptCount:jsCount, actionCount, attachmentCount },
+      metrics:{ eofCount, startXrefCount, startXrefOffsets:xrefPositions, eofOffsets:eofPositions,
+        trailingNonWhitespaceBytes, prevLinks, objectCount:objCount, streamCount, hiddenTextCount,
+        javascriptCount:jsCount, actionCount, attachmentCount, signatureCount, redactCount, optionalContentCount },
       metadata:{ producer:producer || null, creator:creator || null },
+      contentLayer,
       findings,
       evidence: findings.length
         ? 'PDF yapısında adli inceleme açısından dikkat gerektiren teknik izler bulundu. Bu izler tek başına belge sahteciliği kanıtı değildir.'
@@ -5481,8 +5639,8 @@ async function runLocalizedCopyMoveForensics(targetPath) {
   }
 }
 
-async function runOpenSourceForensics({ targetPath, targetBuffer=null, type='image' }) {
-  const pdfStructural = type === 'pdf' ? await runPdfStructuralForensics(targetPath,targetBuffer) : null;
+async function runOpenSourceForensics({ targetPath, targetBuffer=null, type='image', fieldAssociation=null }) {
+  const pdfStructural = type === 'pdf' ? await runPdfStructuralForensics(targetPath,targetBuffer,fieldAssociation) : null;
   const copyMove = (type === 'image' || type === 'pdf') ? await runLocalizedCopyMoveForensics(targetPath) : null;
   const findings=[];
   if(pdfStructural?.findings?.length) findings.push(...pdfStructural.findings.map(x=>({source:'pdf',...x})));
@@ -16307,7 +16465,8 @@ if (type === "image" || type === "pdf") {
       const osf = await runOpenSourceForensics({
         targetPath: forensicTargetPath,
         targetBuffer: type === "pdf" ? buffer : null,
-        type
+        type,
+        fieldAssociation: type === "pdf" ? pdfNativeFieldAssociation : null
       });
       console.log("OPEN SOURCE FORENSICS V66:", JSON.stringify(osf));
       return { kind:"open-source-forensics", openSourceForensics:osf };
