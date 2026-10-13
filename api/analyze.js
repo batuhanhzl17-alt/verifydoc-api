@@ -15930,6 +15930,7 @@ throw new Error(
 
 let extractedPdfText = ""
 let pdfNativeFieldAssociation = null
+let paddleDocumentOCR = null
 let paddleOcrText = ""
 let paddleOcrConfidence = 0;
 let paddleOcrAttempted = false;
@@ -16095,7 +16096,6 @@ buffer.toString(
 // =====================================================
 
 let paddleImageOCR = null;
-let paddleDocumentOCR = null;
 let paddleCriticalFailure = false;
 let amountForensics = null;
 let referenceTemplateAnalysis = null;
