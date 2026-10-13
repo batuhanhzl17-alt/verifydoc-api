@@ -242,7 +242,7 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
   return { available: true, status: 'ok', model: response.model || model, evidence };
 }
 
-export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primaryDocumentData }) {
+export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primaryDocumentData, pdfNativeFields = null }) {
   if (evidenceResult?.available !== true || !evidenceResult.evidence) {
     return { available: false, status: evidenceResult?.status || 'multimodal-unavailable', fields: {} };
   }
@@ -260,8 +260,16 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
     const key = normalize(value, field);
     const ocr = resolveOcrField(field, paddleOCR);
     const primaryText = String(mappings[field].primary || '').trim();
-    const ocrAgreement = Boolean(key && ocr.status === 'matched' && normalize(ocr.text, field) === key);
-    const primaryAgreement = Boolean(key && primaryText && normalize(primaryText, field) === key);
+    const pdfNative = pdfNativeFields?.fields?.[field] || null;
+    const nativeMatched = pdfNative?.status === 'matched' && pdfNative?.associationValidated === true;
+    const comparisonValue = value || (nativeMatched ? String(pdfNative.value || '').trim() : '');
+    const comparisonKey = normalize(comparisonValue, field);
+    const ocrAgreement = Boolean(comparisonKey && ocr.status === 'matched' && normalize(ocr.text, field) === comparisonKey);
+    const primaryAgreement = Boolean(comparisonKey && primaryText && normalize(primaryText, field) === comparisonKey);
+    const pdfNativeAgreement = Boolean(
+      pdfNative?.status === 'matched' && pdfNative?.associationValidated === true &&
+      primaryText && normalize(primaryText, field) === normalize(pdfNative.value, field)
+    );
     fields[field] = {
       visualEvidence: visual,
       paddleOCRAgreement: ocrAgreement ? 'agreement' : ocr.status === 'matched' && value ? 'disagreement' : 'unavailable',
@@ -270,15 +278,23 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
       paddleOCRRegion: ocr.region || null,
       paddleOCRStatus: ocr.status,
       paddleOCRReason: ocr.reason || null,
-      associationValidated: ocr.status === 'matched',
-      primaryAnalysisAgreement: primaryAgreement ? 'agreement' : value && primaryText ? 'disagreement' : 'unavailable',
+      associationValidated: ocr.status === 'matched' || nativeMatched,
+      // Native PDF text is kept as an independent, coordinate-backed
+      // association. It does not silently turn a failed OCR/vision check into
+      // a fully corroborated field; the final review remains conservative.
+      pdfNativeAssociation: pdfNative,
+      pdfNativeAgreement: pdfNativeAgreement ? 'agreement' : pdfNative?.status === 'matched' && primaryText ? 'disagreement' : 'unavailable',
+      primaryAnalysisAgreement: primaryAgreement ? 'agreement' : comparisonValue && primaryText ? 'disagreement' : 'unavailable',
       evidenceOnly: true,
     };
   }
   const requiresControl = Object.values(fields).some(row =>
-    row.paddleOCRStatus !== 'matched' ||
-    row.paddleOCRAgreement !== 'agreement' ||
-    row.primaryAnalysisAgreement !== 'agreement'
+    !row.associationValidated ||
+    row.primaryAnalysisAgreement !== 'agreement' ||
+    (row.paddleOCRStatus === 'matched' && row.paddleOCRAgreement !== 'agreement') ||
+    (row.visualEvidence?.text && row.pdfNativeAssociation?.status === 'matched' &&
+      normalize(row.visualEvidence.text, Object.keys(fields).find(key => fields[key] === row)) !==
+      normalize(row.pdfNativeAssociation.value, Object.keys(fields).find(key => fields[key] === row)))
   );
   return {
     available: true,
