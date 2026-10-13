@@ -15781,6 +15781,7 @@ if (extractedPdfText.trim().length < 100) {
 console.log("PDF metni yetersiz, PaddleOCR başlatılıyor...");
 const paddleResult =
 await runPaddleOCR(filePath);
+paddleDocumentOCR = paddleResult;
 
 paddleOcrAttempted = true;
 if (paddleResult.text?.trim()) {
@@ -15857,6 +15858,8 @@ const paddleResult =
 await runPaddleOCR(
 filePath
 );
+paddleDocumentOCR = paddleResult;
+paddleOcrAttempted = true;
 
 if (
 paddleResult.success &&
