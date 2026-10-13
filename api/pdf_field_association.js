@@ -92,7 +92,9 @@ function labelSpans(row, field) {
   for (let start = 0; start < items.length; start++) {
     for (let end = start; end < Math.min(items.length, start + 7); end++) {
       const group = items.slice(start, end + 1);
-      if (end > start && group[end].x - (group[end - 1].x + group[end - 1].width) > Math.max(12, group[end].height * 2.2)) break;
+      const lastItem = group[group.length - 1];
+      const previousItem = group[group.length - 2];
+      if (previousItem && lastItem.x - (previousItem.x + previousItem.width) > Math.max(12, lastItem.height * 2.2)) break;
       const text = group.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
       if (matchesLabel(field, text)) spans.push({ text, items: group, start, end });
     }
