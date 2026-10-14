@@ -17225,7 +17225,10 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       forensicTargetPath,
       bank,
       paddleImageOCR,
-      getVisualReferencePath(reference)
+      getVisualReferencePath(reference),
+      type === "pdf" ? pdfNativeFieldAssociation : null,
+      type === "pdf" ? pdfReferenceFieldAssociation : null,
+      type === "pdf" ? reference?.path : null
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
     const amountReferenceComparison = referenceLocalCrop?.amountComparison || null;
@@ -17239,7 +17242,10 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         referenceText: amountReferenceComparison.referenceText,
         styleDistance: amountReferenceComparison.styleDistance,
         characterDistance: amountReferenceComparison.characterDistance,
-        method: 'reference-local-crop-comparator-v3-same-selected-reference',
+        fieldAssociationSource: amountReferenceComparison.fieldAssociationSource || null,
+        method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
+          ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
+          : 'reference-local-crop-comparator-v3-same-selected-reference',
         literalAmountEqualityRequired: false,
       };
       console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify(amountForensics.referenceComparison));
@@ -18873,7 +18879,15 @@ if (amountForensics) {
 // Aynı semantic alanın referans ve hedef crop'larını normalize edip,
 // yerel render/karakter ölçümlerini karşılaştırır.
 // Bu bir sahtecilik kararı değil, lokal görsel karşılaştırma kanıtıdır.
-async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, selectedReferencePath = null) {
+async function runReferenceLocalCropComparator(
+  targetPath,
+  bank,
+  targetOCR,
+  selectedReferencePath = null,
+  pdfNativeTargetFields = null,
+  pdfNativeReferenceFields = null,
+  pdfNativeReferencePath = null
+) {
   if (!targetPath || !bank || !targetOCR?.success) return null;
 
   try {
@@ -18889,7 +18903,7 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
       referencePaths.find(p => /\.(png|jpe?g|webp)$/i.test(String(p)));
     if (!referencePath) return null;
     const profile = await buildReferenceTemplateProfile(bank, referencePath);
-    if (!profile?.fields || !Object.keys(profile.fields).length) return null;
+    if (!profile?.fields) return null;
     console.log('REFERENCE LOCAL CROP SOURCE:', JSON.stringify({
       referenceFile: path.basename(referencePath),
       profileReferenceFiles: profile.referenceFiles || [],
@@ -18921,8 +18935,6 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
     const regions = Array.isArray(targetOCR.regions)
       ? targetOCR.regions.filter(x => x?.region && String(x.text || '').trim())
       : [];
-    if (!regions.length) return null;
-
     const observations = [];
 
     // Placeholder-only fields such as '-' are not valid typography evidence.
@@ -18936,16 +18948,94 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
       return !t || /^[-_/]+$/.test(t);
     };
 
-    for (const [field, ref] of Object.entries(profile.fields)) {
+    const fieldEntries = Object.entries(profile.fields);
+    // Digital PDFs already have a stronger, label-validated field resolver.
+    // The geometry/profile ensemble intentionally omits value text and may
+    // omit generic labels such as "TUTAR". Reuse the typed PDF associations
+    // here instead of trying to rediscover the amount through OCR/profile.
+    const nativeTargetAmount = pdfNativeTargetFields?.fields?.amount;
+    const nativeReferenceAmount = pdfNativeReferenceFields?.fields?.amount;
+    const nativePdfAmountPairAvailable = Boolean(
+      path.extname(referencePath).toLowerCase() === '.pdf' &&
+      pdfNativeReferencePath && path.resolve(referencePath) === path.resolve(pdfNativeReferencePath) &&
+      nativeTargetAmount?.status === 'matched' && nativeTargetAmount?.associationValidated === true &&
+      nativeReferenceAmount?.status === 'matched' && nativeReferenceAmount?.associationValidated === true &&
+      Number(nativeTargetAmount?.pageNumber) === 1 && Number(nativeReferenceAmount?.pageNumber) === 1 &&
+      nativeTargetAmount?.valueBox && nativeReferenceAmount?.valueBox &&
+      nativeTargetAmount?.value && nativeReferenceAmount?.value
+    );
+    if (nativePdfAmountPairAvailable) {
+      // The native pair is authoritative for amount. Avoid also processing a
+      // weaker OCR-derived/profile amount if a bank template happens to expose one.
+      for (let i = fieldEntries.length - 1; i >= 0; i--) {
+        if (fieldEntries[i]?.[0] === 'amount') fieldEntries.splice(i, 1);
+      }
+      fieldEntries.push(['amount', {
+        valueText: String(nativeReferenceAmount.value),
+        nativePdfFieldPair: true,
+        targetNativeField: nativeTargetAmount,
+        referenceNativeField: nativeReferenceAmount,
+      }]);
+      console.log('REFERENCE LOCAL CROP NATIVE PDF AMOUNT HANDOFF:', JSON.stringify({
+        available: true,
+        targetLabel: nativeTargetAmount.labelText,
+        referenceLabel: nativeReferenceAmount.labelText,
+        targetValue: nativeTargetAmount.value,
+        referenceValue: nativeReferenceAmount.value,
+        targetPage: nativeTargetAmount.pageNumber,
+        referencePage: nativeReferenceAmount.pageNumber,
+        source: 'validated-pdf-text-layer-label-value-boxes',
+      }));
+    } else if (pdfNativeTargetFields || pdfNativeReferenceFields) {
+      console.log('REFERENCE LOCAL CROP NATIVE PDF AMOUNT HANDOFF:', JSON.stringify({
+        available: false,
+        targetStatus: nativeTargetAmount?.status || null,
+        targetValidated: nativeTargetAmount?.associationValidated === true,
+        referenceStatus: nativeReferenceAmount?.status || null,
+        referenceValidated: nativeReferenceAmount?.associationValidated === true,
+        targetPage: nativeTargetAmount?.pageNumber || null,
+        referencePage: nativeReferenceAmount?.pageNumber || null,
+        reason: 'both-target-and-selected-reference-need-validated-native-amount-boxes',
+      }));
+    }
+
+    for (const [field, ref] of fieldEntries) {
       const variants = Array.isArray(ref?.variants) && ref.variants.length ? ref.variants : [ref];
       const refVariant = variants[0];
       if (!refVariant) continue;
 
-      const candidates = referenceFieldTargetCandidates(field, ref, regions, targetSize);
-      if (!candidates.length) continue;
-
-      const best = candidates[0];
-      const targetBox = best.box;
+      let best = null;
+      let targetBox = null;
+      let refText = String(ref?.valueText || '');
+      let targetText = '';
+      let refRegion = null;
+      if (field === 'amount' && ref?.nativePdfFieldPair) {
+        const toPixelBox = (box, size) => {
+          if (!box || !size?.width || !size?.height) return null;
+          const x1 = Math.max(0, Math.floor(Number(box.x) * size.width));
+          const y1 = Math.max(0, Math.floor(Number(box.y) * size.height));
+          const x2 = Math.min(size.width, Math.ceil((Number(box.x) + Number(box.width)) * size.width));
+          const y2 = Math.min(size.height, Math.ceil((Number(box.y) + Number(box.height)) * size.height));
+          return x2 > x1 && y2 > y1 ? { x1, y1, x2, y2 } : null;
+        };
+        targetBox = toPixelBox(ref.targetNativeField.valueBox, targetSize);
+        refRegion = toPixelBox(ref.referenceNativeField.valueBox, refSize);
+        targetText = String(ref.targetNativeField.value || '').trim();
+        refText = String(ref.referenceNativeField.value || '').trim();
+        if (!targetBox || !refRegion || !targetText || !refText) continue;
+        best = { item: { text: targetText, score: 1 }, box: targetBox };
+      } else {
+        const candidates = referenceFieldTargetCandidates(field, ref, regions, targetSize);
+        if (!candidates.length) continue;
+        best = candidates[0];
+        targetBox = best.box;
+        targetText = String(best.item.text || '').trim();
+        const rx = Math.max(0, Math.floor(refVariant.xNorm * refSize.width));
+        const ry = Math.max(0, Math.floor(refVariant.yNorm * refSize.height));
+        const rw = Math.max(4, Math.min(refSize.width - rx, Math.ceil(refVariant.widthNorm * refSize.width)));
+        const rh = Math.max(4, Math.min(refSize.height - ry, Math.ceil(refVariant.heightNorm * refSize.height)));
+        refRegion = { x1: rx, y1: ry, x2: rx + rw, y2: ry + rh };
+      }
 
       // Do not compare placeholder-only values as typography/raster evidence.
       // Example: target '-' vs reference '-' must never create a taxNo finding.
@@ -18953,12 +19043,6 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
         continue;
       }
 
-      const rx = Math.max(0, Math.floor(refVariant.xNorm * refSize.width));
-      const ry = Math.max(0, Math.floor(refVariant.yNorm * refSize.height));
-      const rw = Math.max(4, Math.min(refSize.width - rx, Math.ceil(refVariant.widthNorm * refSize.width)));
-      const rh = Math.max(4, Math.min(refSize.height - ry, Math.ceil(refVariant.heightNorm * refSize.height)));
-
-      const refRegion = { x1: rx, y1: ry, x2: rx + rw, y2: ry + rh };
       const tarRegion = {
         x1: Number(targetBox.x1), y1: Number(targetBox.y1),
         x2: Number(targetBox.x2), y2: Number(targetBox.y2)
@@ -18973,7 +19057,7 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
       const charDistance = refChar && tarChar ? rfCharacterDistance(refChar, tarChar) : null;
 
       const normText = (v) => String(v ?? '').trim().toLocaleLowerCase('tr-TR').replace(/\s+/g, '');
-      const sameText = normText(best.item.text) && normText(ref?.valueText) && normText(best.item.text) === normText(ref?.valueText);
+      const sameText = normText(targetText) && normText(refText) && normText(targetText) === normText(refText);
       const fieldIsFreeText = ['description','senderName','recipientName','senderAddress','recipientAddress','address'].includes(field);
       if (field === 'taxNo' && (isPlaceholderOnly(best.item.text) || isPlaceholderOnly(ref?.valueText))) continue;
       // A different legitimate name/description naturally has different glyph
@@ -18986,12 +19070,13 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
 
       observations.push({
         field,
-        targetText: String(best.item.text || '').trim(),
-        referenceText: String(ref?.valueText || '').trim(),
+        targetText,
+        referenceText: refText,
         referenceFile: path.basename(referencePath),
         styleDistance: Number.isFinite(styleDistance) ? Number(styleDistance.toFixed(4)) : null,
         characterDistance: Number.isFinite(charDistance) ? Number(charDistance.toFixed(4)) : null,
         targetOCRConfidence: Number(best.item.score || 0),
+        fieldAssociationSource: ref?.nativePdfFieldPair ? 'validated-pdf-text-layer-label-value-boxes' : 'reference-profile-plus-target-ocr',
         referenceBox: refRegion,
         targetBox: tarRegion,
       });
@@ -19039,7 +19124,9 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
 
     return {
       available: true,
-      engine: 'reference-local-crop-comparator-v3-all-points',
+      engine: nativePdfAmountPairAvailable
+        ? 'reference-local-crop-comparator-v4-pdf-native-amount-handoff'
+        : 'reference-local-crop-comparator-v3-all-points',
       bank: normalizeBank(bank),
       referenceFile: path.basename(referencePath),
       comparedFieldCount: observations.length,
@@ -19057,6 +19144,7 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
           referenceBox: amount.referenceBox,
           styleDistance: amount.styleDistance,
           characterDistance: amount.characterDistance,
+          fieldAssociationSource: amount.fieldAssociationSource || null,
         } : null;
       })(),
       findings
