@@ -1,6 +1,11 @@
 import fs from "fs/promises";
 import path from "path";
 import { inflateSync } from "zlib";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const pdfjsBuildDirectory = path.dirname(require.resolve("pdfjs-dist/build/pdf.mjs"));
+const pdfjsStandardFontDirectory = path.resolve(pdfjsBuildDirectory, "../standard_fonts") + path.sep;
 
 // =====================================================
 // VERIFYDOC FONT FORENSICS v3
@@ -813,7 +818,12 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
 
   const buffer = await fs.readFile(pdfPath);
   if (!buffer?.length) return null;
-  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buffer), useWorkerFetch: false, isEvalSupported: true }).promise;
+  const pdf = await pdfjsLib.getDocument({
+    data: new Uint8Array(buffer),
+    useWorkerFetch: false,
+    isEvalSupported: true,
+    standardFontDataUrl: pdfjsStandardFontDirectory,
+  }).promise;
   const maxPages = Math.min(Number(options.maxPages) || 5, pdf.numPages || 1);
   const fonts = new Map();
   const items = [];
