@@ -262,7 +262,9 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
     const primaryText = String(mappings[field].primary || '').trim();
     const pdfNative = pdfNativeFields?.fields?.[field] || null;
     const nativeMatched = pdfNative?.status === 'matched' && pdfNative?.associationValidated === true;
-    const comparisonValue = value || (nativeMatched ? String(pdfNative.value || '').trim() : '');
+    const comparisonValue = value ||
+      (nativeMatched ? String(pdfNative.value || '').trim() : '') ||
+      (ocr.status === 'matched' ? String(ocr.text || '').trim() : '');
     const comparisonKey = normalize(comparisonValue, field);
     const ocrAgreement = Boolean(comparisonKey && ocr.status === 'matched' && normalize(ocr.text, field) === comparisonKey);
     const primaryAgreement = Boolean(comparisonKey && primaryText && normalize(primaryText, field) === comparisonKey);
@@ -270,9 +272,18 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
       pdfNative?.status === 'matched' && pdfNative?.associationValidated === true &&
       primaryText && normalize(primaryText, field) === normalize(pdfNative.value, field)
     );
+    const availableReadings = [
+      value,
+      ocr.status === 'matched' ? ocr.text : '',
+      nativeMatched ? pdfNative.value : '',
+      primaryText,
+    ].map(item => normalize(item, field)).filter(Boolean);
+    const sourceDisagreement = new Set(availableReadings).size > 1;
     fields[field] = {
       visualEvidence: visual,
-      paddleOCRAgreement: ocrAgreement ? 'agreement' : ocr.status === 'matched' && value ? 'disagreement' : 'unavailable',
+      paddleOCRAgreement: ocr.status === 'matched'
+        ? (ocrAgreement ? 'agreement' : comparisonKey ? 'disagreement' : 'unavailable')
+        : 'unavailable',
       paddleOCRResolver: ocr.status === 'matched' ? ocr.resolver : null,
       paddleOCRLabelText: ocr.labelText || null,
       paddleOCRRegion: ocr.region || null,
@@ -285,16 +296,22 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
       pdfNativeAssociation: pdfNative,
       pdfNativeAgreement: pdfNativeAgreement ? 'agreement' : pdfNative?.status === 'matched' && primaryText ? 'disagreement' : 'unavailable',
       primaryAnalysisAgreement: primaryAgreement ? 'agreement' : comparisonValue && primaryText ? 'disagreement' : 'unavailable',
+      sourceDisagreement,
       evidenceOnly: true,
     };
   }
-  const requiresControl = Object.values(fields).some(row =>
-    !row.associationValidated ||
+  // The user's fraud checks focus on the beneficiary IBAN and transaction
+  // amount. A name-resolution failure is retained as evidence, but it must
+  // not block these two critical fields or dominate the review status.
+  const criticalFields = ['recipientIBAN', 'amount'].map(field => fields[field]);
+  const requiresControl = criticalFields.some(row =>
+    !row?.associationValidated ||
     row.primaryAnalysisAgreement !== 'agreement' ||
+    row.sourceDisagreement ||
     (row.paddleOCRStatus === 'matched' && row.paddleOCRAgreement !== 'agreement') ||
     (row.visualEvidence?.text && row.pdfNativeAssociation?.status === 'matched' &&
-      normalize(row.visualEvidence.text, Object.keys(fields).find(key => fields[key] === row)) !==
-      normalize(row.pdfNativeAssociation.value, Object.keys(fields).find(key => fields[key] === row)))
+      normalize(row.visualEvidence.text, row === fields.recipientIBAN ? 'recipientIBAN' : 'amount') !==
+      normalize(row.pdfNativeAssociation.value, row === fields.recipientIBAN ? 'recipientIBAN' : 'amount'))
   );
   return {
     available: true,
