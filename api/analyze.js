@@ -1680,9 +1680,11 @@ async function getAzureReferenceLayouts(bank, selectedReferencePath = null) {
   }
 
   const allReferencePaths = await getReferenceFiles(normalizedBank);
-  const referencePaths = selectedReferencePath && allReferencePaths.includes(selectedReferencePath)
-    ? [selectedReferencePath]
-    : allReferencePaths;
+  const requestedPaths = Array.isArray(selectedReferencePath)
+    ? selectedReferencePath.filter(Boolean)
+    : selectedReferencePath ? [selectedReferencePath] : [];
+  const selectedPaths = requestedPaths.filter(requested => allReferencePaths.includes(requested));
+  const referencePaths = selectedPaths.length ? selectedPaths : allReferencePaths;
   const layouts = [];
 
   for (const referencePath of referencePaths) {
@@ -7138,13 +7140,27 @@ const REFERENCE_FIELD_RULES = [
 ];
 
 function classifyReferenceTemplateRole(field, text) {
-  const t = String(text || "").toLocaleLowerCase("tr-TR");
+  const t = String(text || "").toLocaleLowerCase("tr-TR").replace(/[İIı]/g, "i").replace(/\s+/g, " ").trim();
   if (field === "amount") {
-    if (/giden\s*fast\s*tutar[ıi]?/.test(t) || /gönderilen\s*(?:fast\s*)?tutar/.test(t) || /transfer\s*tutar/.test(t) || /işlem\s*tutar/.test(t) || /ana\s*tutar/.test(t) || /giden\s*tutar/.test(t) || /b\s*\/\s*a\s*para\s*cinsi\s*tutar/.test(t)) return "primaryAmount";
-    if (/vergi|komisyon|ücret|masraf|toplam\s*(?:işlem|tahsilat)|tahsilat\s*tutar/.test(t)) return "secondaryAmount";
+    if (isPrimaryAmountReferenceLabel(t)) return "primaryAmount";
+    if (/vergi|komisyon|ücret|masraf|toplam|tahsilat|bakiye/.test(t)) return "secondaryAmount";
     return "amountOther";
   }
   return "fieldValue";
+}
+
+function isPrimaryAmountReferenceLabel(text) {
+  const t = String(text || "").toLocaleLowerCase("tr-TR")
+    .replace(/[İIı]/g, "i").replace(/ğ/g, "g").replace(/ü/g, "u")
+    .replace(/ş/g, "s").replace(/ö/g, "o").replace(/ç/g, "c")
+    .replace(/[():]/g, " ").replace(/\s+/g, " ").trim();
+  // Exact generic labels are common on receipt footers. Keep them primary,
+  // while explicitly excluding totals, fees, balances, taxes and commissions.
+  if (/\b(?:toplam|tahsilat|bakiye|masraf|komisyon|bsmv|vergi|ucret)\b/.test(t)) return false;
+  return /^(?:(?:islem|transfer|gonderilen|gonderim|odeme|ana|giden(?: fast(?: eft)?)?|fast|eft|havale) )?tutari?(?: (?:tl|try))?$/.test(t) ||
+    /^(?:para cinsi )?tutari?(?: tl| try)?$/.test(t) ||
+    /^b ?\/ ?a para cinsi tutari?$/.test(t) ||
+    /^(?:giden fast|gonderilen fast) eft tutari?$/.test(t);
 }
 
 function referenceFieldRuleForText(text) {
@@ -11249,8 +11265,7 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
         // işlem tutarı etiketi. Vergi, komisyon, toplam tahsilat ve
         // açıklama satırları amount alanına kesinlikle giremez.
         const primary = usableEntries.filter(x =>
-          x?.templateRole === "primaryAmount" ||
-          /giden\s*fast\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|işlem\s*tutar|ana\s*tutar|gönderim\s*tutar|giden\s*tutar/i.test(String(x?.label || ""))
+          x?.templateRole === "primaryAmount" || isPrimaryAmountReferenceLabel(x?.label)
         );
         if (primary.length) {
           usableEntries = primary;
@@ -16599,7 +16614,7 @@ if (type === "pdf" && reference?.path) {
   }
 }
 
-if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?.success) {
+if ((type === "image" || type === "pdf") && bank && reference) {
   try {
     // V1.2.2: `referenceAmountField` inside analyzeAmountForensics is function-scoped.
     // Never read that local from this outer pipeline block. Resolve the trusted
@@ -17268,10 +17283,11 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
     const amountReferenceComparison = referenceLocalCrop?.amountComparison || null;
-    if (amountForensics && amountReferenceComparison?.referenceText) {
-      amountForensics.referenceAmountText = amountReferenceComparison.referenceText;
-      amountForensics.templateAmountText = amountReferenceComparison.referenceText;
-      amountForensics.referenceComparison = {
+    if (amountReferenceComparison?.referenceText) {
+      if (amountForensics) {
+        amountForensics.referenceAmountText = amountReferenceComparison.referenceText;
+        amountForensics.templateAmountText = amountReferenceComparison.referenceText;
+        amountForensics.referenceComparison = {
         available: true,
         referenceFile: amountReferenceComparison.referenceFile,
         targetText: amountReferenceComparison.targetText,
@@ -17286,12 +17302,30 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
           ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
           : 'reference-local-crop-comparator-v3-same-selected-reference',
         literalAmountEqualityRequired: false,
-      };
-      console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify(amountForensics.referenceComparison));
+        };
+      }
+      console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
+        available: true,
+        referenceFile: amountReferenceComparison.referenceFile,
+        targetText: amountReferenceComparison.targetText,
+        referenceText: amountReferenceComparison.referenceText,
+        styleDistance: amountReferenceComparison.styleDistance,
+        characterDistance: amountReferenceComparison.characterDistance,
+        fieldAssociationSource: amountReferenceComparison.fieldAssociationSource || null,
+        relativeBaselineAvailable: amountReferenceComparison.relativeBaselineAvailable === true,
+        comparisonMode: amountReferenceComparison.comparisonMode || null,
+        classification: amountReferenceComparison.classification || 'measurement-only',
+        method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
+          ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
+          : 'reference-local-crop-comparator-v3-same-selected-reference',
+        literalAmountEqualityRequired: false,
+      }));
     } else {
       console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
         available: false,
-        reason: referenceLocalCrop ? 'typed-reference-amount-or-target-amount-box-unavailable' : 'reference-local-crop-unavailable',
+        reason: referenceLocalCrop?.available === false
+          ? referenceLocalCrop.reason || 'reference-local-crop-unavailable'
+          : referenceLocalCrop ? 'typed-reference-amount-or-target-amount-box-unavailable' : 'reference-local-crop-unavailable',
         selectedReference: reference?.fileName || null,
         targetAmountText: amountForensics?.amountText || null,
       }));
@@ -18927,7 +18961,7 @@ async function runReferenceLocalCropComparator(
   pdfNativeReferenceFields = null,
   pdfNativeReferencePath = null
 ) {
-  if (!targetPath || !bank || !targetOCR?.success) return null;
+  if (!targetPath || !bank) return { available: false, reason: 'target-path-or-bank-unavailable' };
 
   try {
     // Resolve the selected reference through the canonical resolver, then use
@@ -18937,12 +18971,34 @@ async function runReferenceLocalCropComparator(
       ? selectedReferencePath.filter(Boolean)
       : selectedReferencePath ? [selectedReferencePath] : [];
     const selectedTrustedPath = requestedPaths.find(p => referencePaths.includes(p)) || null;
+    if (requestedPaths.length && !selectedTrustedPath) {
+      return { available: false, reason: 'selected-reference-not-in-bank-reference-set' };
+    }
     const referencePath = selectedTrustedPath ||
       referencePaths.find(p => /\.(pdf)$/i.test(String(p))) ||
       referencePaths.find(p => /\.(png|jpe?g|webp)$/i.test(String(p)));
-    if (!referencePath) return null;
+    if (!referencePath) return { available: false, reason: 'no-compatible-reference-file' };
     const profile = await buildReferenceTemplateProfile(bank, referencePath);
-    if (!profile?.fields) return null;
+    const nativeTargetAmount = pdfNativeTargetFields?.fields?.amount;
+    const nativeReferenceAmount = pdfNativeReferenceFields?.fields?.amount;
+    const nativePdfAmountPairCandidate = Boolean(
+      path.extname(referencePath).toLowerCase() === '.pdf' &&
+      pdfNativeReferencePath && path.resolve(referencePath) === path.resolve(pdfNativeReferencePath) &&
+      nativeTargetAmount?.status === 'matched' && nativeTargetAmount?.associationValidated === true &&
+      nativeReferenceAmount?.status === 'matched' && nativeReferenceAmount?.associationValidated === true &&
+      Number(nativeTargetAmount?.pageNumber) === 1 && Number(nativeReferenceAmount?.pageNumber) === 1 &&
+      nativeTargetAmount?.valueBox && nativeReferenceAmount?.valueBox &&
+      nativeTargetAmount?.value && nativeReferenceAmount?.value
+    );
+    if (!profile?.fields && !nativePdfAmountPairCandidate) {
+      return {
+        available: false,
+        reason: 'selected-reference-field-profile-unavailable',
+        referenceFile: path.basename(referencePath),
+        nativeTargetAmountStatus: nativeTargetAmount?.status || null,
+        nativeReferenceAmountStatus: nativeReferenceAmount?.status || null,
+      };
+    }
     console.log('REFERENCE LOCAL CROP SOURCE:', JSON.stringify({
       referenceFile: path.basename(referencePath),
       profileReferenceFiles: profile.referenceFiles || [],
@@ -18971,7 +19027,7 @@ async function runReferenceLocalCropComparator(
     const targetSize = { width: Number(tmeta.width) || 0, height: Number(tmeta.height) || 0 };
     if (!refSize.width || !refSize.height || !targetSize.width || !targetSize.height) return null;
 
-    const regions = Array.isArray(targetOCR.regions)
+    const regions = Array.isArray(targetOCR?.regions)
       ? targetOCR.regions.filter(x => x?.region && String(x.text || '').trim())
       : [];
     const observations = [];
@@ -18987,22 +19043,12 @@ async function runReferenceLocalCropComparator(
       return !t || /^[-_/]+$/.test(t);
     };
 
-    const fieldEntries = Object.entries(profile.fields);
+    const fieldEntries = Object.entries(profile?.fields || {});
     // Digital PDFs already have a stronger, label-validated field resolver.
     // The geometry/profile ensemble intentionally omits value text and may
     // omit generic labels such as "TUTAR". Reuse the typed PDF associations
     // here instead of trying to rediscover the amount through OCR/profile.
-    const nativeTargetAmount = pdfNativeTargetFields?.fields?.amount;
-    const nativeReferenceAmount = pdfNativeReferenceFields?.fields?.amount;
-    const nativePdfAmountPairAvailable = Boolean(
-      path.extname(referencePath).toLowerCase() === '.pdf' &&
-      pdfNativeReferencePath && path.resolve(referencePath) === path.resolve(pdfNativeReferencePath) &&
-      nativeTargetAmount?.status === 'matched' && nativeTargetAmount?.associationValidated === true &&
-      nativeReferenceAmount?.status === 'matched' && nativeReferenceAmount?.associationValidated === true &&
-      Number(nativeTargetAmount?.pageNumber) === 1 && Number(nativeReferenceAmount?.pageNumber) === 1 &&
-      nativeTargetAmount?.valueBox && nativeReferenceAmount?.valueBox &&
-      nativeTargetAmount?.value && nativeReferenceAmount?.value
-    );
+    const nativePdfAmountPairAvailable = nativePdfAmountPairCandidate;
     if (nativePdfAmountPairAvailable) {
       // The native pair is authoritative for amount. Avoid also processing a
       // weaker OCR-derived/profile amount if a bank template happens to expose one.
@@ -19121,7 +19167,17 @@ async function runReferenceLocalCropComparator(
       });
     }
 
-    if (!observations.length) return null;
+    if (!observations.length) {
+      return {
+        available: false,
+        reason: 'no-shared-critical-field-crops',
+        referenceFile: path.basename(referencePath),
+        referenceAmountProfileAvailable: Boolean(profile.fields.amount),
+        targetOcrRegionsAvailable: regions.length > 0,
+        nativeTargetAmountStatus: pdfNativeTargetFields?.fields?.amount?.status || null,
+        nativeReferenceAmountStatus: pdfNativeReferenceFields?.fields?.amount?.status || null,
+      };
+    }
 
     // Global render conversion (PDF -> JPG, camera blur, contrast) affects most
     // fields. Use the median as a baseline and report only local outliers.
@@ -21811,9 +21867,61 @@ const referenceDifferences = primaryForensicFindings;
 result.primaryForensicFindings = primaryForensicFindings;
 result.telegramForensicSummary = telegramForensicSummary;
 result.referenceDifferences = referenceDifferences;
-result.fieldReviewStatus = semanticEvidenceFusion?.reviewStatus ||
-  ((type === 'image' || type === 'pdf') ? 'CONTROL_REQUIRED' : null);
+const criticalIbanEvidence = semanticEvidenceFusion?.fields?.recipientIBAN || null;
+const criticalAmountEvidence = semanticEvidenceFusion?.fields?.amount || null;
+const finalAmountReferenceComparison = referenceLocalCrop?.amountComparison ||
+  amountForensics?.referenceComparison || null;
+const amountRenderDifferenceStrong = Boolean(
+  finalAmountReferenceComparison?.available === true && (
+    finalAmountReferenceComparison.classification === 'strong-reference-render-difference' ||
+    (Number(finalAmountReferenceComparison.styleDistance) >= 0.30 &&
+      Number(finalAmountReferenceComparison.characterDistance) >= 0.36)
+  )
+);
+const criticalReviewReasons = [];
+if (!criticalIbanEvidence?.associationValidated) criticalReviewReasons.push('recipient-iban-label-association-unverified');
+if (criticalIbanEvidence?.primaryAnalysisAgreement !== 'agreement' || criticalIbanEvidence?.sourceDisagreement) {
+  criticalReviewReasons.push('recipient-iban-source-disagreement');
+}
+if (!criticalAmountEvidence?.associationValidated) criticalReviewReasons.push('amount-label-association-unverified');
+if (criticalAmountEvidence?.primaryAnalysisAgreement !== 'agreement' || criticalAmountEvidence?.sourceDisagreement) {
+  criticalReviewReasons.push('amount-source-disagreement');
+}
+if (finalAmountReferenceComparison?.available !== true) criticalReviewReasons.push('amount-reference-comparison-unavailable');
+if (amountRenderDifferenceStrong) criticalReviewReasons.push('strong-amount-reference-render-difference');
+const criticalFieldsRequireControl = criticalReviewReasons.length > 0;
+if (semanticEvidenceFusion?.available) {
+  semanticEvidenceFusion.reviewStatus = criticalFieldsRequireControl ? 'CONTROL_REQUIRED' : 'FIELDS_CORROBORATED';
+  semanticEvidenceFusion.reviewMessage = criticalFieldsRequireControl
+    ? 'Kontrol gerekli: alıcı IBANı veya tutar alanı doğrulanamadı, kaynaklar uyuşmadı ya da tutar referans karşılaştırması eksik/güçlü fark gösteriyor.'
+    : 'Alıcı IBANı ve tutar alanı doğrulandı; tutar referans karşılaştırması güçlü fark göstermedi.';
+  semanticEvidenceFusion.criticalFieldReview = {
+    focusFields: ['recipientIBAN', 'amount'],
+    recipientNameUsedAsReviewGate: false,
+    amountReferenceComparison: finalAmountReferenceComparison ? {
+      available: finalAmountReferenceComparison.available === true,
+      referenceFile: finalAmountReferenceComparison.referenceFile || null,
+      classification: finalAmountReferenceComparison.classification || null,
+      styleDistance: finalAmountReferenceComparison.styleDistance != null && Number.isFinite(Number(finalAmountReferenceComparison.styleDistance)) ? Number(finalAmountReferenceComparison.styleDistance) : null,
+      characterDistance: finalAmountReferenceComparison.characterDistance != null && Number.isFinite(Number(finalAmountReferenceComparison.characterDistance)) ? Number(finalAmountReferenceComparison.characterDistance) : null,
+    } : { available: false, referenceFile: null, classification: null, styleDistance: null, characterDistance: null },
+    reasons: criticalReviewReasons,
+  };
+}
+result.fieldReviewStatus = (type === 'image' || type === 'pdf')
+  ? (criticalFieldsRequireControl ? 'CONTROL_REQUIRED' : 'FIELDS_CORROBORATED')
+  : (semanticEvidenceFusion?.reviewStatus || null);
 result.manualReviewRequired = result.fieldReviewStatus === 'CONTROL_REQUIRED';
+console.log('FINAL CRITICAL FIELD REVIEW:', JSON.stringify({
+  focusFields: ['recipientIBAN', 'amount'],
+  recipientNameUsedAsReviewGate: false,
+  amountReferenceComparisonAvailable: finalAmountReferenceComparison?.available === true,
+  amountReferenceComparisonClassification: finalAmountReferenceComparison?.classification || null,
+  amountRenderDifferenceStrong,
+  reasons: criticalReviewReasons,
+  status: result.fieldReviewStatus,
+  manualReviewRequired: result.manualReviewRequired,
+}));
 
 const finalEvidence = canonicalReferenceText;
 
