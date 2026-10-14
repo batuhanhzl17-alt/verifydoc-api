@@ -28,7 +28,9 @@ export function recipientNameLabel(value) {
 /** Only labels that explicitly identify the beneficiary/payee may own its IBAN ROI. */
 export function recipientIbanLabel(value) {
   const compact = normalizeSemanticLabel(String(value ?? '').split(/[:：]/, 1)[0]).replace(/\s+/g, '');
-  return /^(?:ALICI|ALACAKLI|LEHDAR)(?:(?:HESAP|BANKA)(?:IBAN|NO|NUMARASI)?|IBAN(?:NO|NUMARASI)?|HESAPNO|HESAPNUMARASI|HESABI)$/.test(compact) ||
+  // "ALICI BANKA" names the receiving bank; it does not identify an IBAN.
+  // Only accept BANKA when the label explicitly continues with IBAN.
+  return /^(?:ALICI|ALACAKLI|LEHDAR)(?:(?:HESAP(?:NO|NUMARASI)?)(?:IBAN)?|BANKAIBAN|IBAN(?:NO|NUMARASI)?|HESABI)$/.test(compact) ||
     /^(?:BENEFICIARY|PAYEE|RECEIVER)(?:(?:ACCOUNT|BANK))?(?:IBAN|IBANNO|ACCOUNT|ACCOUNTNUMBER)$/.test(compact);
 }
 
