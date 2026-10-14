@@ -140,8 +140,10 @@ function startsKnownLabel(items, index) {
 
 function resolveField(field, rows, pageWidth, pageHeight) {
   const candidates = [];
+  const trace = { typedLabelCandidates: 0, multilineJoinAttempts: 0, checksumValidValues: 0 };
   for (const row of rows) {
     for (const label of labelSpans(row, field)) {
+      trace.typedLabelCandidates++;
       const labelRight = Math.max(...label.items.map(item => item.x + item.width));
       const labelLeft = Math.min(...label.items.map(item => item.x));
       const nextLabelIndex = row.items.findIndex((_, index) => index > label.end && startsKnownLabel(row.items, index));
@@ -157,6 +159,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       // TR-prefixed fragments in the narrow horizontal band to the right of
       // the typed recipient-IBAN label.
       if (field === 'recipientIBAN' && !validValue(field, valueText)) {
+        trace.multilineJoinAttempts++;
         const nearRows = rows.filter(candidate => candidate !== row && Math.abs(candidate.baseline - row.baseline) <= 1.8 * Math.max(8, ...label.items.map(item => item.height)));
         const fragments = nearRows.flatMap(candidate => candidate.items).filter(item =>
           item.x >= labelRight - 1 && item.x < Math.min(nextLabelX, labelRight + 240) &&
@@ -164,7 +167,13 @@ function resolveField(field, rows, pageWidth, pageHeight) {
           !Object.keys(FIELD_LABELS).some(key => matchesLabel(key, item.text))
         );
         if (fragments.length) {
-          valueItems = [...sameRow, ...fragments].sort((a, b) => b.baseline - a.baseline || a.x - b.x);
+          // `baseline` is measured after the PDF.js viewport transform, where
+          // Y grows down the page. Reading order is therefore top-to-bottom
+          // (ascending baseline). Sorting descending silently reversed
+          // multi-line IBANs such as `TR31 ... 0268` + `6128 ... 01`, causing
+          // an otherwise valid IBAN to fail shape/checksum validation.
+          valueItems = [...new Set([...sameRow, ...fragments])]
+            .sort((a, b) => a.baseline - b.baseline || a.x - b.x);
           valueText = valueItems.map(item => item.text).join(' ');
         }
       }
@@ -175,6 +184,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       if (inline?.[1] && !validValue(field, valueText)) valueText = inline[1].trim();
       valueText = cleanAssociatedValue(field, valueText);
       if (!validValue(field, valueText)) continue;
+      if (field === 'recipientIBAN') trace.checksumValidValues++;
 
       let labelBoxItems = label.items;
       if (label.inlineValue) {
@@ -242,9 +252,12 @@ function resolveField(field, rows, pageWidth, pageHeight) {
         pageNumber: row.items[0]?.pageNumber || 1,
         labelBox,
         valueBox,
-        resolver: 'pdf-text-layer-typed-label-coordinate-v1',
+        resolver: field === 'recipientIBAN'
+          ? 'pdf-text-layer-typed-label-coordinate-v2-top-down-iban-join'
+          : 'pdf-text-layer-typed-label-coordinate-v1',
         validation: field === 'recipientIBAN' ? 'TR-IBAN-checksum' : field === 'amount' ? 'typed-amount-format' : 'typed-name-shape',
         associationValidated: true,
+        ...(field === 'recipientIBAN' ? { associationTrace: trace } : {}),
       });
     }
   }
@@ -259,13 +272,16 @@ function resolveField(field, rows, pageWidth, pageHeight) {
   }
   const resolved = [...distinct.values()];
   if (resolved.length === 1) return { status: 'matched', ...resolved[0], candidateCount: 1 };
-  if (resolved.length > 1) return { status: 'ambiguous', value: null, associationValidated: false, candidateCount: resolved.length, candidates: resolved };
-  return { status: 'unavailable', value: null, associationValidated: false, candidateCount: 0, reason: 'typed-label-or-valid-neighbor-not-found' };
+  if (resolved.length > 1) return { status: 'ambiguous', value: null, associationValidated: false, candidateCount: resolved.length, candidates: resolved,
+    ...(field === 'recipientIBAN' ? { associationTrace: trace } : {}) };
+  return { status: 'unavailable', value: null, associationValidated: false, candidateCount: 0, reason: 'typed-label-or-valid-neighbor-not-found',
+    ...(field === 'recipientIBAN' ? { associationTrace: trace } : {}) };
 }
 
 export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = {}) {
   if (!pdf || typeof pdf.getPage !== 'function') return { available: false, status: 'pdf-unavailable', fields: {} };
   const collected = { recipientName: [], recipientIBAN: [], amount: [] };
+  const ibanPageTrace = [];
   let pageCount = 0;
   for (let pageNumber = 1; pageNumber <= Math.min(Number(pdf.numPages) || 0, maxPages); pageNumber++) {
     const page = await pdf.getPage(pageNumber);
@@ -327,6 +343,11 @@ export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = 
     const rows = makeRows(items);
     for (const field of Object.keys(collected)) {
       const resolved = resolveField(field, rows, pageWidth, pageHeight);
+      if (field === 'recipientIBAN') ibanPageTrace.push({
+        pageNumber,
+        status: resolved.status,
+        ...(resolved.associationTrace || {}),
+      });
       if (resolved.status === 'matched') collected[field].push(resolved);
       else if (resolved.status === 'ambiguous') collected[field].push(resolved);
     }
@@ -342,6 +363,12 @@ export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = 
     else if (keys.size > 1 || collected[field].some(item => item.status === 'ambiguous')) {
       fields[field] = { status: 'ambiguous', value: null, associationValidated: false, candidateCount: keys.size || collected[field].length, reason: 'multiple-pdf-pages-or-labeled-values' };
     } else fields[field] = { status: 'unavailable', value: null, associationValidated: false, candidateCount: 0, reason: 'typed-label-or-valid-neighbor-not-found' };
+    if (field === 'recipientIBAN') fields[field].associationTrace = {
+      pages: ibanPageTrace,
+      totalTypedLabelCandidates: ibanPageTrace.reduce((sum, item) => sum + (item.typedLabelCandidates || 0), 0),
+      totalMultilineJoinAttempts: ibanPageTrace.reduce((sum, item) => sum + (item.multilineJoinAttempts || 0), 0),
+      totalChecksumValidValues: ibanPageTrace.reduce((sum, item) => sum + (item.checksumValidValues || 0), 0),
+    };
   }
   const matchedFieldCount = Object.values(fields).filter(field => field.status === 'matched').length;
   return {
