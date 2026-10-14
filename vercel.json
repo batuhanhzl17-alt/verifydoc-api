@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/analyze.js": {
+      "includeFiles": "node_modules/pdfjs-dist/standard_fonts/**"
+    }
+  }
+}
