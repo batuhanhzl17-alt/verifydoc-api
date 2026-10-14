@@ -2133,10 +2133,14 @@ async function sendAnalysisResult(
  ) || 0;
 
 
+ const hasConfidence = result?.confidence !== null &&
+   result?.confidence !== undefined &&
+   String(result.confidence).trim() !== '' &&
+   Number.isFinite(Number(result.confidence));
  const confidence =
- Number(
- result?.confidence
- ) || 0;
+ hasConfidence
+   ? Math.max(0, Math.min(100, Math.round(Number(result.confidence))))
+   : null;
 
 
  const riskLabel =
@@ -2147,6 +2151,21 @@ async function sendAnalysisResult(
  const summary =
  result?.summary ||
  "Analiz tamamlandı.";
+
+ const manualReviewRequired = result?.manualReviewRequired === true ||
+   result?.fieldReviewStatus === 'CONTROL_REQUIRED' ||
+   result?.semanticEvidenceFusion?.reviewStatus === 'CONTROL_REQUIRED';
+ const suspiciousFinding = result?.suspicious === true;
+ const reviewHeadline = manualReviewRequired
+   ? '🟠 KONTROL GEREKLİ'
+   : suspiciousFinding
+     ? '🔴 ŞÜPHELİ BULGU VAR'
+     : score >= 21
+       ? '🟡 BULGULARI İNCELEYİN'
+       : '🟢 BELİRGİN ŞÜPHELİ BULGU YOK';
+ const confidenceLine = confidence === null
+   ? 'Güven: Belirlenemedi'
+   : `Güven: ${confidence}/100`;
 
 
  // ===================================================
@@ -2272,15 +2291,17 @@ async function sendAnalysisResult(
  );
 
  const lines = [
-   `${emoji} VERIFYDOC ANALİZ SONUCU`,
+   `${emoji} VERIFYDOC ÖN İNCELEMESİ`,
+   '',
+   reviewHeadline,
    '',
    `${result?.bank ? `Banka: ${getBankDisplayName(result.bank)}\n` : ''}Risk Skoru: ${score}/100`,
    '',
    'Risk Seviyesi:',
    riskLabel,
    '',
-   'Güven:',
-   `${confidence}/100`,
+   confidenceLine,
+   ...(manualReviewRequired ? ['', 'Risk seviyesi ile kontrol durumu farklı ölçümlerdir. Kritik alanlarda belirsizlik veya karşılaştırma gerektiren bulgu olduğu için manuel kontrol gerekiyor.'] : []),
    '',
    '━━━━━━━━━━━━━━'
  ];
@@ -2301,7 +2322,7 @@ async function sendAnalysisResult(
  }
 
  lines.push(formatHistoricalWarning(result?.historicalMatch));
- lines.push('', '━━━━━━━━━━━━━━', '', 'Bu sonuç yalnızca otomatik ön inceleme sonucudur.', 'Kesin gerçeklik veya sahtecilik kararı değildir.');
+ lines.push('', '━━━━━━━━━━━━━━', '', 'Bu sonuç yalnızca otomatik ön inceleme sonucudur.', 'Güven puanı, bulguların güvenilirliğine dair model tahminidir; belgenin gerçeklik olasılığı değildir.', 'Kesin gerçeklik veya sahtecilik kararı değildir.');
 
  const text = lines.join('\n');
 
@@ -2330,24 +2351,53 @@ async function sendAnalysisResult(
  result?.bank ||
  null;
 
+ const summaryGeneral = String(summary || '')
+   .replace(/🔎\s*REFERANS KARŞILAŞTIRMASI[\s\S]*$/i, '')
+   .trim();
+ const rawReferenceFindings = Array.isArray(result?.primaryForensicFindings)
+   ? result.primaryForensicFindings
+   : (Array.isArray(result?.referenceForensicReport?.findings)
+       ? result.referenceForensicReport.findings
+       : []);
+ const criticalReferenceFindings = rawReferenceFindings
+   .filter(item => /tutar|amount|iban/i.test(`${item?.title || ''} ${item?.detail || ''}`))
+   .slice(0, 4)
+   .map(item => ({
+     title: /iban/i.test(`${item?.title || ''} ${item?.detail || ''}`)
+       ? 'Alıcı IBAN’ı'
+       : 'Tutar',
+     detail: String(item?.detail || '').trim(),
+   }))
+   .filter(item => item.detail);
+ const fallbackCriticalReferenceLines = criticalReferenceFindings.length
+   ? []
+   : (String(summary || '').match(/🔎\s*REFERANS KARŞILAŞTIRMASI[\s\S]*$/i)?.[0] || '')
+       .split(/\n+/)
+       .map(line => line.trim())
+       .filter(line => /^•/.test(line) && /tutar|amount|iban/i.test(line))
+       .slice(0, 4);
+
 
  const text =
 
-`${emoji} VERIFYDOC ANALİZ SONUCU
+`${emoji} VERIFYDOC ÖN İNCELEMESİ
+
+${reviewHeadline}
 
 Risk Seviyesi:
 ${riskLabel}
 
-Güven:
-${confidence}/100
+${confidenceLine}
+${manualReviewRequired ? '\nRisk seviyesi ile kontrol durumu farklı ölçümlerdir. Kritik alanlarda belirsizlik veya karşılaştırma gerektiren bulgu olduğu için manuel kontrol gerekiyor.\n' : ''}
 
 ━━━━━━━━━━━━━━
 
-${summary}${comparisonWarning}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
+${summaryGeneral}${criticalReferenceFindings.length || fallbackCriticalReferenceLines.length ? `\n\n🔎 KRİTİK ALAN REFERANS KONTROLÜ\n${criticalReferenceFindings.length ? criticalReferenceFindings.map(item => `• ${item.title}: ${item.detail}`).join('\n') : fallbackCriticalReferenceLines.join('\n')}` : ''}${comparisonWarning}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
 
 ━━━━━━━━━━━━━━
 
 Bu sonuç yalnızca otomatik ön inceleme sonucudur.
+Güven puanı, bulguların güvenilirliğine dair model tahminidir; belgenin gerçeklik olasılığı değildir.
 Kesin gerçeklik veya sahtecilik kararı değildir.`;
 
 
