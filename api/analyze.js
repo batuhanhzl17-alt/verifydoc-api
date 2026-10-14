@@ -5531,7 +5531,7 @@ function pdfAuditWhiteFill(args, operator) {
 function pdfAuditOperatorText(value) {
   if (typeof value === 'string') return value;
   if (Array.isArray(value) || ArrayBuffer.isView(value)) return Array.from(value).map(pdfAuditOperatorText).join('');
-  if (value && typeof value === 'object') return String(value.unicode ?? '');
+  if (value && typeof value === 'object') return String(value.unicode ?? value.str ?? '');
   return '';
 }
 
@@ -5557,13 +5557,29 @@ function pdfAuditWhiteCoverCandidates(operatorList, viewport, targetBox, fieldKe
   const fieldTextIndices=[];
   for(let start=0;start<textEvents.length;start++){
     let joined='';
-    for(let end=start;end<Math.min(textEvents.length,start+8);end++){
+    // A native field may be emitted as several showText operators (one per
+    // run/fragment). Scan a wider bounded window and retain the complete
+    // operator range so a later intersecting image can be ordered against it.
+    for(let end=start;end<Math.min(textEvents.length,start+24);end++){
       joined += textEvents[end].text;
-      if(expectedCanonical && pdfAuditCanonicalField(fieldKey,joined)===expectedCanonical){
-        fieldTextIndices.push(textEvents[end].index);
+      const canonicalJoined=pdfAuditCanonicalField(fieldKey,joined);
+      if(expectedCanonical && (canonicalJoined===expectedCanonical || canonicalJoined.includes(expectedCanonical))){
+        fieldTextIndices.push({startIndex:textEvents[start].index,endIndex:textEvents[end].index});
+        break;
       }
     }
   }
+  // Prefer the shortest operator span for a field value. The `includes`
+  // fallback can otherwise create many nested matches starting in preceding
+  // label text, making a single value appear to have several draw positions.
+  const uniqueTextRanges=[...new Map(fieldTextIndices.map(range=>[
+    `${range.startIndex}:${range.endIndex}`,range
+  ])).values()];
+  const minimalTextRanges=uniqueTextRanges.filter(range=>!uniqueTextRanges.some(other=>
+    other!==range && other.startIndex>=range.startIndex && other.endIndex<=range.endIndex &&
+    (other.endIndex-other.startIndex)<(range.endIndex-range.startIndex)
+  ));
+  fieldTextIndices.splice(0,fieldTextIndices.length,...minimalTextRanges);
   const matrixIdentity=[1,0,0,1,0,0];
   let ctm=matrixIdentity.slice(), fillIsWhite=false, fillAlpha=1, pendingPath=null;
   const stack=[];
@@ -5606,12 +5622,21 @@ function pdfAuditWhiteCoverCandidates(operatorList, viewport, targetBox, fieldKe
         // Exclude page backgrounds and large white panels. This heuristic keeps
         // small cover-like shapes for review, never as a standalone verdict.
         if(targetCoverage>=0.08&&shapeArea>0&&shapeArea<=Math.max(targetArea*12,0.00002)){
-          const priorTextIndex=fieldTextIndices.filter(index=>index<pendingPath.operatorIndex).pop() ?? null;
-          const laterTextIndex=fieldTextIndices.find(index=>index>i) ?? null;
+          const priorTextRanges=fieldTextIndices.filter(range=>range.endIndex<i);
+          const laterTextRanges=fieldTextIndices.filter(range=>range.startIndex>i);
+          const crossingTextRanges=fieldTextIndices.filter(range=>range.startIndex<=i&&range.endIndex>=i);
+          const order=priorTextRanges.length&&!laterTextRanges.length&&!crossingTextRanges.length?'image-after-field-text'
+            :laterTextRanges.length&&!priorTextRanges.length&&!crossingTextRanges.length?'image-before-field-text'
+            :priorTextRanges.length||laterTextRanges.length||crossingTextRanges.length?'ambiguous-multiple-or-interleaved-text-operators':'unknown-text-operator-not-mapped';
+          const priorTextRange=priorTextRanges[priorTextRanges.length-1]||null;
           candidates.push({objectType:'white-vector-fill',operatorIndex:i,box,targetCoverage:Number(targetCoverage.toFixed(3)),
-            fieldTextOperatorIndex:priorTextIndex,fieldTextComesBeforeShape:priorTextIndex!==null,
-            laterMatchingFieldTextOperatorIndex:laterTextIndex,
-            evidence:priorTextIndex!==null?'white-fill intersects validated field after matching native field text':'white-fill intersects validated field; relative order not confirmed'});
+            fieldTextOperatorIndex:priorTextRange?.endIndex??null,
+            fieldTextComesBeforeShape:priorTextRanges.length>0,
+            matchingFieldTextOperatorRanges:fieldTextIndices,
+            imagePaintOrderRelativeToFieldText:order,
+            evidence:order==='image-after-field-text'?'white-fill is painted after matching field text; verify actual opacity/visibility':
+              order==='image-before-field-text'?'matching field text is painted after the white-fill; the text may remain visible':
+              'white-fill intersects the validated field, but operator-to-field order could not be resolved unambiguously'});
         }
       }
       pendingPath=null;
@@ -5630,10 +5655,21 @@ function pdfAuditWhiteCoverCandidates(operatorList, viewport, targetBox, fieldKe
       const overlapArea=ix*iy,targetArea=targetBox.width*targetBox.height,shapeArea=box.width*box.height;
       const targetCoverage=targetArea>0?overlapArea/targetArea:0;
       if(targetCoverage>=0.08&&shapeArea>0&&shapeArea<=Math.max(targetArea*12,0.00002)){
-        const priorTextIndex=fieldTextIndices.filter(index=>index<i).pop()??null;
+        const priorTextRanges=fieldTextIndices.filter(range=>range.endIndex<i);
+        const laterTextRanges=fieldTextIndices.filter(range=>range.startIndex>i);
+        const crossingTextRanges=fieldTextIndices.filter(range=>range.startIndex<=i&&range.endIndex>=i);
+        const order=priorTextRanges.length&&!laterTextRanges.length&&!crossingTextRanges.length?'image-after-field-text'
+          :laterTextRanges.length&&!priorTextRanges.length&&!crossingTextRanges.length?'image-before-field-text'
+          :priorTextRanges.length||laterTextRanges.length||crossingTextRanges.length?'ambiguous-multiple-or-interleaved-text-operators':'unknown-text-operator-not-mapped';
+        const priorTextRange=priorTextRanges[priorTextRanges.length-1]||null;
         candidates.push({objectType:'image-object',operatorIndex:i,box,targetCoverage:Number(targetCoverage.toFixed(3)),
-          fieldTextOperatorIndex:priorTextIndex,fieldTextComesBeforeShape:priorTextIndex!==null,
-          evidence:priorTextIndex!==null?'localized image object intersects validated field after matching native field text':'localized image object intersects validated field; relative order not confirmed'});
+          fieldTextOperatorIndex:priorTextRange?.endIndex??null,
+          fieldTextComesBeforeShape:priorTextRanges.length>0,
+          matchingFieldTextOperatorRanges:fieldTextIndices,
+          imagePaintOrderRelativeToFieldText:order,
+          evidence:order==='image-after-field-text'?'localized image is painted after matching field text; verify actual opacity/visibility':
+            order==='image-before-field-text'?'matching field text is painted after the localized image; text may remain visible':
+            'localized image intersects the validated field, but operator-to-field order could not be resolved unambiguously'});
       }
       continue;
     }
@@ -5769,7 +5805,7 @@ async function auditPdfContentLayer(buffer, fieldAssociation = null) {
     }));
     return {
       available: true,
-      engine: 'pdfjs-critical-field-object-audit-v3',
+      engine: 'pdfjs-critical-field-object-audit-v4-order-aware',
       pageCount: Number(pdf.numPages) || pages.length,
       metadata: {
         producer: metadataResult?.info?.Producer || null,
@@ -5784,10 +5820,10 @@ async function auditPdfContentLayer(buffer, fieldAssociation = null) {
         amount: { status: 'unavailable', reason: 'validated-typed-amount-field-not-found' },
         recipientIBAN: { status: 'unavailable', reason: 'validated-typed-recipient-iban-field-not-found' },
       },
-      interpretation: 'Alan incelemesi yalnızca önceden doğrulanmış tutar ve alıcı IBAN kutularında yapılır. Küçük, opak beyaz vektör dolguların alanla kesişmesi ve çizim sırası raporlanır; tek başına Photoshop veya sahtecilik kanıtı değildir. Rasterleştirilmiş sayfalarda PDF çizim/metin nesneleri bulunmayabilir.',
+      interpretation: 'Alan incelemesi yalnızca önceden doğrulanmış tutar ve alıcı IBAN kutularında yapılır. Küçük, opak beyaz vektör dolguların/görüntü nesnelerinin alanla kesişmesi ve eşleşen metin operatörlerine göre çizim sırası raporlanır; sıra tek başına Photoshop veya sahtecilik kanıtı değildir. Rasterleştirilmiş sayfalarda PDF çizim/metin nesneleri bulunmayabilir.',
     };
   } catch (error) {
-    return { available:false, engine:'pdfjs-critical-field-object-audit-v3', status:'unknown', error:error?.message || String(error) };
+    return { available:false, engine:'pdfjs-critical-field-object-audit-v4-order-aware', status:'unknown', error:error?.message || String(error) };
   } finally {
     try { await pdf?.destroy?.(); } catch {}
   }
@@ -16899,7 +16935,7 @@ if (type === "image" || type === "pdf") {
       console.log("OPEN SOURCE FORENSICS V66:", JSON.stringify(osf));
       const pdfFieldAudit = osf?.pdfStructural?.contentLayer?.criticalFields;
       if (type === "pdf" && pdfFieldAudit) {
-        console.log("PDF CRITICAL FIELD ROI OBJECT AUDIT V3:", JSON.stringify({
+        console.log("PDF CRITICAL FIELD ROI OBJECT AUDIT V4:", JSON.stringify({
           engine: osf.pdfStructural.contentLayer.engine,
           fields: Object.fromEntries(Object.entries(pdfFieldAudit).map(([key, field]) => [key, {
             status: field?.status,
@@ -21691,9 +21727,16 @@ if (amountForensics?.available === true && !riskEligibleAmountForensics) {
         : 'reference-amount-difference-below-threshold',
     amountStatus: amountForensics.status || null,
     selectionMethod: amountForensics.selectionMethod || null,
-    fieldAssociationStatus: semanticEvidenceFusion?.fields?.amount?.paddleOCRStatus || 'unavailable',
-    labelText: semanticEvidenceFusion?.fields?.amount?.paddleOCRLabelText || null,
-    region: semanticEvidenceFusion?.fields?.amount?.paddleOCRRegion || null,
+    fieldAssociationStatus: semanticEvidenceFusion?.fields?.amount?.associationValidated
+      ? 'validated'
+      : semanticEvidenceFusion?.fields?.amount?.paddleOCRStatus || 'unavailable',
+    fieldAssociationResolver: semanticEvidenceFusion?.fields?.amount?.pdfNativeStatus === 'matched'
+      ? 'pdf-text-layer-typed-label-coordinate'
+      : semanticEvidenceFusion?.fields?.amount?.paddleOCRResolver || null,
+    labelText: semanticEvidenceFusion?.fields?.amount?.paddleOCRLabelText ||
+      semanticEvidenceFusion?.fields?.amount?.pdfNativeLabelText || null,
+    region: semanticEvidenceFusion?.fields?.amount?.paddleOCRRegion ||
+      semanticEvidenceFusion?.fields?.amount?.pdfNativeValueBoxNorm || null,
   }));
 }
 
@@ -22065,8 +22108,20 @@ result.telegramForensicSummary = telegramForensicSummary;
 result.referenceDifferences = referenceDifferences;
 const criticalIbanEvidence = semanticEvidenceFusion?.fields?.recipientIBAN || null;
 const criticalAmountEvidence = semanticEvidenceFusion?.fields?.amount || null;
-const finalAmountReferenceComparison = referenceLocalCrop?.amountComparison ||
+const rawFinalAmountReferenceComparison = referenceLocalCrop?.amountComparison ||
   amountForensics?.referenceComparison || null;
+// The local crop comparator stores availability on its parent result, while
+// `amountForensics.referenceComparison` stores it on the child. Normalize the
+// contract before the final review gate so a measured comparison is not
+// incorrectly reported as unavailable.
+const finalAmountReferenceComparison = rawFinalAmountReferenceComparison ? {
+  ...rawFinalAmountReferenceComparison,
+  available: rawFinalAmountReferenceComparison.available === true || Boolean(
+    referenceLocalCrop?.available === true &&
+    rawFinalAmountReferenceComparison.targetText &&
+    rawFinalAmountReferenceComparison.referenceText
+  ),
+} : null;
 const amountRenderDifferenceStrong = Boolean(
   finalAmountReferenceComparison?.available === true && (
     finalAmountReferenceComparison.classification === 'strong-reference-render-difference' ||
