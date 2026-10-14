@@ -60,14 +60,8 @@ async function renderPdfFirstPage(buf) {
     const output = path.join(tempDir, 'page');
     await fs.writeFile(input, buf);
     try {
-      // Fixed-resolution Poppler rendering avoids local pdfjs/canvas version
-      // differences and stays close to the runtime's approximately 1.6x raster.
-      await execFileAsync('pdftoppm', ['-f', '1', '-l', '1', '-r', '120', '-png', '-singlefile', input, output], { timeout:30000, maxBuffer:8 * 1024 * 1024 });
-      return await fs.readFile(`${output}.png`);
-    } catch (popplerError) {
-      if (popplerError?.code !== 'ENOENT') throw popplerError;
-      // Preserve the original dependency-based route on machines without
-      // Poppler; this uses the same canvas/PDF.js packages as the API.
+      // Use the same PDF.js/canvas rendering stack as the API. This avoids
+      // host-specific Poppler/fontconfig failures during baseline generation.
       const pdfjsLib = await loadPdfJs();
       const pdf = await pdfjsLib.getDocument({ data:new Uint8Array(buf) }).promise;
       const page = await pdf.getPage(1);
@@ -75,6 +69,13 @@ async function renderPdfFirstPage(buf) {
       const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
       await page.render({ canvasContext:canvas.getContext('2d'), viewport }).promise;
       return canvas.toBuffer('image/png');
+    } catch (pdfjsError) {
+      try {
+        await execFileAsync('pdftoppm', ['-f', '1', '-l', '1', '-r', '120', '-png', '-singlefile', input, output], { timeout:30000, maxBuffer:8 * 1024 * 1024 });
+        return await fs.readFile(`${output}.png`);
+      } catch {
+        throw new Error(`PDF render failed: ${String(pdfjsError?.message || pdfjsError).slice(0, 240)}`);
+      }
     }
   } finally {
     await fs.rm(tempDir, { recursive:true, force:true });
@@ -114,7 +115,12 @@ async function addFiles(files, label) {
   }
 }
 
-const refFiles = await walk(REFS);
+// This retired VakıfBank layout and its raster exports are deliberately not
+// part of the reference population. Keep the exclusion in the builder too so
+// a future baseline rebuild cannot silently reintroduce them.
+const refFiles = (await walk(REFS)).filter(file =>
+  !/^vakifbank-2\.(?:pdf|jpe?g|png)$/i.test(path.basename(file))
+);
 const negFiles = await walk(NEG);
 await addFiles(refFiles, 'reference');
 await addFiles(negFiles, 'negative');
