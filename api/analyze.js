@@ -969,15 +969,26 @@ async function forensicWatchlistRequest(method, query = "", body = null) {
 }
 
 
-// V14: Amount Forensics kontrollü promotion.
-// Reference anchor yokluğu tek başına güçlü lokal amount bulgusunu silmez.
-// 750 TL gibi pass/low sonuçlar bu kapıdan geçemez.
+// Amount risk eligibility requires an actual visual comparison to a matched
+// reference amount field. A position anchor alone only locates the target ROI.
+function hasStrongAmountReferenceDifference(amount = {}) {
+  const comparison = amount?.referenceComparison || {};
+  const styleDistance = Number(comparison.styleDistance);
+  const characterDistance = Number(comparison.characterDistance);
+  return comparison.available === true &&
+    Number.isFinite(styleDistance) && styleDistance >= 0.30 &&
+    Number.isFinite(characterDistance) && characterDistance >= 0.36;
+}
+
+// V14: controlled amount promotion. In-target glyph irregularity is only
+// diagnostic; promote only when the same labeled field also differs strongly
+// from the selected reference amount crop.
 function getControlledAmountPromotion(result = {}) {
   const amount = result?.amountForensics || {};
   const amountFieldAssociation = result?.semanticEvidenceFusion?.fields?.amount;
   const amountAssociationValidated = amountFieldAssociation?.associationValidated === true;
-  const score = Number(amount.score || 0);
-  const severity = String(amount.severity || "").toLowerCase();
+  const score = Number(amount.rawDiagnosticScore ?? amount.score ?? 0);
+  const severity = String(amount.targetInternalDiagnostic?.severity || amount.severity || "").toLowerCase();
   const anomalyRatio = Number(amount.localAnomalyRatio ?? amount.anomalyRatio ?? 0);
   const featureVotes = Number(amount.maxFeatureVotes ?? amount.featureVotes ?? 0);
 
@@ -993,6 +1004,7 @@ function getControlledAmountPromotion(result = {}) {
   const eligible =
     amount.available === true &&
     amountAssociationValidated &&
+    hasStrongAmountReferenceDifference(amount) &&
     strongSeverity &&
     scoreStrong &&
     (
@@ -1013,7 +1025,11 @@ function getControlledAmountPromotion(result = {}) {
       ? "controlled-amount-promotion"
       : (!amountAssociationValidated
         ? "amount-field-association-unverified"
-        : "insufficient-independent-amount-evidence")
+        : !amount.referenceComparison?.available
+          ? "reference-amount-comparison-unavailable"
+          : !hasStrongAmountReferenceDifference(amount)
+            ? "reference-amount-difference-below-threshold"
+            : "insufficient-independent-amount-evidence")
   };
 }
 
@@ -3506,10 +3522,13 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   let financialDataRisk = 0;
   const amountText = String(amount?.amountText || doc.amount || '').trim();
   if (!amountText) financialDataRisk = Math.max(financialDataRisk, 45);
-  if (amount?.status === 'warning') {
+  if (
+    amount?.targetInternalDiagnostic?.severity === 'strong' &&
+    hasStrongAmountReferenceDifference(amount)
+  ) {
     financialDataRisk = Math.max(
       financialDataRisk,
-      amount?.severity === 'strong' ? 85 : 35
+      85
     );
   }
 
@@ -13858,9 +13877,25 @@ outlierFeature,
 
 const finalForensics = {
 available: true,
-status,
-severity,
-score,
+// The character-median/repeated-glyph score below is computed only inside
+// this target amount. Keep it as an explicitly named diagnostic; a reference
+// anchor used to locate the ROI does not make this a reference comparison.
+status: status === "warning" ? "diagnostic-only" : status,
+severity: status === "warning" ? "diagnostic-only" : severity,
+score: null,
+rawDiagnosticScore: score,
+targetInternalDiagnostic: {
+  available: true,
+  source: "within-target-amount-character-consistency",
+  status,
+  severity,
+  score,
+  riskEligible: false,
+  evidence: status === "warning"
+    ? "Bu sinyal yalnızca hedef tutar içindeki karakterleri birbiriyle karşılaştırır; referans dekontla karşılaştırma değildir."
+    : evidence,
+},
+referenceComparison: null,
 fileFingerprint: fileFingerprint || null,
 amountText: candidate.text,
 region: {
@@ -13916,12 +13951,13 @@ darkness: Number(feature.darkness.toFixed(2)),
 edgeDensity: Number(feature.edgeDensity.toFixed(2)),
 votes: anomalyScores[index]?.votes || 0,
 })),
-evidence,
+evidence: status === "warning"
+  ? "Hedef tutar içinde referans dekonttan bağımsız bir karakter tutarlılığı sinyali var; referans karşılaştırması yapılmadan bu sinyal risk/fark kararı olarak kullanılmaz."
+  : evidence,
 };
 
 if (
-finalForensics.status === "warning" &&
-finalForensics.severity === "strong" &&
+finalForensics.rawDiagnosticScore >= 65 &&
 fileFingerprint
 ) {
 amountForensicsStrongCache.set(fileFingerprint, finalForensics);
@@ -17243,6 +17279,9 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         styleDistance: amountReferenceComparison.styleDistance,
         characterDistance: amountReferenceComparison.characterDistance,
         fieldAssociationSource: amountReferenceComparison.fieldAssociationSource || null,
+        relativeBaselineAvailable: amountReferenceComparison.relativeBaselineAvailable === true,
+        comparisonMode: amountReferenceComparison.comparisonMode || null,
+        classification: amountReferenceComparison.classification || 'measurement-only',
         method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
           ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
           : 'reference-local-crop-comparator-v3-same-selected-reference',
@@ -19088,16 +19127,21 @@ async function runReferenceLocalCropComparator(
     // fields. Use the median as a baseline and report only local outliers.
     const styleVals = observations.map(x => x.styleDistance).filter(Number.isFinite);
     const charVals = observations.map(x => x.characterDistance).filter(Number.isFinite);
+    const relativeBaselineAvailable = observations.length >= 2;
     const styleBaseline = rfMedianSigned(styleVals);
     const charBaseline = rfMedianSigned(charVals);
 
     const findings = [];
     for (const o of observations) {
       const styleExcess = Number.isFinite(o.styleDistance)
-        ? Math.max(0, o.styleDistance - styleBaseline)
+        ? relativeBaselineAvailable
+          ? Math.max(0, o.styleDistance - styleBaseline)
+          : Number(o.styleDistance)
         : 0;
       const charExcess = Number.isFinite(o.characterDistance)
-        ? Math.max(0, o.characterDistance - charBaseline)
+        ? relativeBaselineAvailable
+          ? Math.max(0, o.characterDistance - charBaseline)
+          : Number(o.characterDistance)
         : 0;
 
       // Conservative gates: a field must be a local outlier, not merely different
@@ -19130,6 +19174,10 @@ async function runReferenceLocalCropComparator(
       bank: normalizeBank(bank),
       referenceFile: path.basename(referencePath),
       comparedFieldCount: observations.length,
+      relativeBaselineAvailable,
+      comparisonMode: relativeBaselineAvailable
+        ? 'same-document-multi-field-local-outlier'
+        : 'single-field-reference-distance-only',
       findingCount: findings.length,
       styleBaseline: Number(styleBaseline.toFixed(4)),
       characterBaseline: Number(charBaseline.toFixed(4)),
@@ -19145,6 +19193,13 @@ async function runReferenceLocalCropComparator(
           styleDistance: amount.styleDistance,
           characterDistance: amount.characterDistance,
           fieldAssociationSource: amount.fieldAssociationSource || null,
+          relativeBaselineAvailable,
+          comparisonMode: relativeBaselineAvailable
+            ? 'same-document-multi-field-local-outlier'
+            : 'single-field-reference-distance-only',
+          classification: Number(amount.styleDistance) >= 0.30 && Number(amount.characterDistance) >= 0.36
+            ? 'strong-reference-render-difference'
+            : 'measured-below-strong-difference-threshold',
         } : null;
       })(),
       findings
@@ -21301,35 +21356,37 @@ if (result && watchlistOriginalAmountConsistency) {
   result.__watchlistOriginalAmountConsistency = watchlistOriginalAmountConsistency;
 }
 
-const amountReferenceGuided = Boolean(
-  amountForensics?.referenceGuided === true ||
-  /reference-(?:roi|position)|reference-guided|reference-anchor/i.test(String(amountForensics?.selectionMethod || ""))
-);
+const amountReferenceGuided = hasStrongAmountReferenceDifference(amountForensics || {});
 
 if (
-  amountForensics?.status === "warning" &&
-  amountForensics?.severity === "strong" &&
+  amountForensics?.targetInternalDiagnostic?.status === "warning" &&
+  amountForensics?.targetInternalDiagnostic?.severity === "strong" &&
+  amountReferenceGuided &&
   result?.checks?.amountConsistency
 ) {
-  if (amountReferenceGuided) {
-    result.checks.amountConsistency.status = "fail";
-    result.checks.amountConsistency.score = Math.max(
-      Number(result.checks.amountConsistency.score) || 0,
-      85
-    );
-    result.checks.amountConsistency.evidence = [
-      result.checks.amountConsistency.evidence,
-      amountForensics.evidence,
-    ].filter(Boolean).join(" ");
-    console.log("AMOUNT FORENSICS PROMOTED TO RISK: REFERENCE-GUIDED");
-  } else {
-    console.log("AMOUNT FORENSICS NOT PROMOTED TO RISK: NO REFERENCE ANCHOR", JSON.stringify({
-      selectionMethod: amountForensics.selectionMethod || null,
-      referenceGuided: amountForensics.referenceGuided ?? false,
-      score: amountForensics.score || 0,
-      severity: amountForensics.severity || null
-    }));
-  }
+  result.checks.amountConsistency.status = "fail";
+  result.checks.amountConsistency.score = Math.max(
+    Number(result.checks.amountConsistency.score) || 0,
+    85
+  );
+  result.checks.amountConsistency.evidence = [
+    result.checks.amountConsistency.evidence,
+    amountForensics.referenceComparison?.evidence || amountForensics.evidence,
+  ].filter(Boolean).join(" ");
+  console.log("AMOUNT FORENSICS PROMOTED TO RISK: STRONG SAME-FIELD REFERENCE DIFFERENCE", JSON.stringify({
+    referenceComparison: amountForensics.referenceComparison,
+    rawDiagnosticScore: amountForensics.rawDiagnosticScore || 0,
+  }));
+} else if (amountForensics?.targetInternalDiagnostic?.status === "warning") {
+  console.log("AMOUNT INTERNAL DIAGNOSTIC NOT PROMOTED TO RISK", JSON.stringify({
+    reason: !amountForensics.referenceComparison?.available
+      ? 'reference-amount-comparison-unavailable'
+      : !amountReferenceGuided
+        ? 'reference-amount-difference-below-threshold'
+        : 'target-field-association-unverified',
+    rawDiagnosticScore: amountForensics.rawDiagnosticScore || 0,
+    referenceComparison: amountForensics.referenceComparison || null,
+  }));
 }
 
 // Görsel forensics güçlü bir sapma bulduğunda, tek başına değil,
@@ -21369,13 +21426,17 @@ if (__controlledAmountPromotion.eligible) {
 
 const amountAssociationValidated =
   semanticEvidenceFusion?.fields?.amount?.associationValidated === true;
-const riskEligibleAmountForensics = amountAssociationValidated
+const riskEligibleAmountForensics = amountAssociationValidated && hasStrongAmountReferenceDifference(amountForensics || {})
   ? amountForensics
   : null;
-if (amountForensics?.available === true && !amountAssociationValidated) {
+if (amountForensics?.available === true && !riskEligibleAmountForensics) {
   console.log('AMOUNT FORENSICS RISK GATE:', JSON.stringify({
     applied: true,
-    reason: 'amount-field-association-unverified',
+    reason: !amountAssociationValidated
+      ? 'amount-field-association-unverified'
+      : !amountForensics?.referenceComparison?.available
+        ? 'reference-amount-comparison-unavailable'
+        : 'reference-amount-difference-below-threshold',
     amountStatus: amountForensics.status || null,
     selectionMethod: amountForensics.selectionMethod || null,
     fieldAssociationStatus: semanticEvidenceFusion?.fields?.amount?.paddleOCRStatus || 'unavailable',
@@ -21516,9 +21577,9 @@ const strongUnifiedReferenceCount = unifiedReferenceFindings.filter((x) =>
 const strongAmountSignal =
   amountAssociationValidated &&
   amountForensics?.available === true &&
-  amountForensics?.severity === 'strong' &&
-  Number(amountForensics?.score || 0) >= 80 &&
-  (amountReferenceGuided || amountForensics?.referenceGuided === true);
+  amountForensics?.targetInternalDiagnostic?.severity === 'strong' &&
+  Number(amountForensics?.rawDiagnosticScore || 0) >= 80 &&
+  amountReferenceGuided;
 const strongAzureSignal =
   Array.isArray(azureReferenceGeometry?.strongAnomalies) &&
   azureReferenceGeometry.strongAnomalies.some((x) => Number(x?.score) >= 90);
