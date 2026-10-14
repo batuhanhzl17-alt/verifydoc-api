@@ -32,6 +32,14 @@ function normalizeLabel(value) {
 function matchesLabel(field, value) {
   const normalized = normalizeLabel(value);
   if (!normalized || /MASRAF|KOMISYON|BSMV|VERGI|BAKIYE|TOPLAM TAHSILAT/.test(normalized)) return false;
+  if (field === 'recipientIBAN') {
+    // PDF text extraction may lose spaces/slashes from the Vakıfbank-style
+    // "ALICI HESAP NO / IBAN" label. Match its canonical form, while
+    // deliberately excluding the unrelated label "ALICI BANKA".
+    const compact = normalized.replace(/[^A-Z0-9]/g, '');
+    if (/^(?:ALICI|ALACAKLI)(?:IBAN|IBANNO|IBANNUMARASI|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN|HESAPNOIBAN|HESAPNUMARASIIBAN)$/.test(compact)) return true;
+    if (/^(?:LEHDAR)(?:IBAN|IBANNO|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN|HESAPNOIBAN)$/.test(compact)) return true;
+  }
   return (FIELD_LABELS[field] || []).some(pattern => pattern.test(normalized));
 }
 
