@@ -2262,6 +2262,11 @@ async function sendAnalysisResult(
  }
 
  const transactionAnalysis = result?.transactionAnalysis || {};
+ const rowByRowAudit = transactionAnalysis.rowByRowAudit || {};
+ const statementPdfAudit = result?.statementPdfForensics || {};
+ const statementCheckLine = rowByRowAudit.available
+   ? `Satır kontrolü: ${rowByRowAudit.extractedRowCount} işlem satırı, ${rowByRowAudit.balanceChecks} bakiye geçişi; ${rowByRowAudit.balanceMismatchCount ? `${rowByRowAudit.balanceMismatchCount} fark` : 'bakiye farkı yok'}. PDF sayfaları: ${statementPdfAudit.pagesAnalyzed || 0}/${statementPdfAudit.pageCount || 0}.`
+   : `Satır kontrolü: işlem satırları güvenilir biçimde çıkarılamadı. PDF sayfaları: ${statementPdfAudit.pagesAnalyzed || 0}/${statementPdfAudit.pageCount || 0}.`;
  for (const item of (Array.isArray(transactionAnalysis.suspiciousTransactions) ? transactionAnalysis.suspiciousTransactions : [])) {
    addFinding('Şüpheli işlem', item);
  }
@@ -2301,6 +2306,8 @@ async function sendAnalysisResult(
    riskLabel,
    '',
    confidenceLine,
+   '',
+   statementCheckLine,
    ...(manualReviewRequired ? ['', 'Risk seviyesi ile kontrol durumu farklı ölçümlerdir. Kritik alanlarda belirsizlik veya karşılaştırma gerektiren bulgu olduğu için manuel kontrol gerekiyor.'] : []),
    '',
    '━━━━━━━━━━━━━━'
