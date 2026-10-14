@@ -349,15 +349,31 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
       const anchor = await getReferenceAmountAnchor(bank);
       // Trusted anchor is allowed only as a last resort, after the typed
       // anchor builder has already rejected non-money numeric fields.
-      if (anchor && referencePath && String(anchor.source || '').includes('amount')) {
+      // getReferenceAmountAnchor emits a box only after resolving a trusted
+      // primary amount label. Its PDF-native source id does not contain the
+      // word "amount", so source-string matching incorrectly rejected valid
+      // anchors. Validate its normalized bounds instead.
+      const anchorGeometryValid = anchor &&
+        [anchor.xNorm, anchor.yNorm, anchor.widthNorm, anchor.heightNorm].every(v => Number.isFinite(Number(v))) &&
+        Number(anchor.xNorm) >= 0 && Number(anchor.yNorm) >= 0 &&
+        Number(anchor.widthNorm) > 0 && Number(anchor.heightNorm) > 0 &&
+        Number(anchor.xNorm) + Number(anchor.widthNorm) <= 1.02 &&
+        Number(anchor.yNorm) + Number(anchor.heightNorm) <= 1.02;
+      if (anchorGeometryValid && referencePath) {
         let meta;
-        if (path.extname(referencePath).toLowerCase() === '.pdf') {
-          const raw = await fs.readFile(referencePath);
+        let anchorReferencePath = referencePath;
+        if (anchor.selectedReferenceFile) {
+          const trustedReferences = await getReferenceFiles(bank);
+          anchorReferencePath = trustedReferences.find(p => path.basename(p) === anchor.selectedReferenceFile) || referencePath;
+        }
+        if (path.extname(anchorReferencePath).toLowerCase() === '.pdf') {
+          const raw = await fs.readFile(anchorReferencePath);
           const pdf = await getPdfDocument({ data: new Uint8Array(raw) }).promise;
-          const rendered = await renderPdfPagePng(pdf, 1, 1.8);
+          const anchorPage = Math.max(1, Math.round(Number(anchor.pageNumber) || 1));
+          const rendered = await renderPdfPagePng(pdf, anchorPage, 1.8);
           meta = rendered?.buffer ? await sharp(rendered.buffer).metadata() : null;
         } else {
-          meta = await sharp(referencePath).metadata();
+          meta = await sharp(anchorReferencePath).metadata();
         }
         if (meta?.width && meta?.height) {
           amountReferenceBox = {
@@ -366,6 +382,8 @@ async function getMathSemanticRois({ amountForensics = null, referenceForensics 
             x2: (Number(anchor.xNorm) + Number(anchor.widthNorm)) * Number(meta.width),
             y2: (Number(anchor.yNorm) + Number(anchor.heightNorm)) * Number(meta.height),
           };
+          rois.amountReferencePath = anchorReferencePath;
+          rois.amountReferencePageNumber = Math.max(1, Math.round(Number(anchor.pageNumber) || 1));
         }
       }
     } catch (error) {
@@ -474,7 +492,24 @@ async function runMathematicalForensics({ targetPath, targetText = "", targetOCR
   let global16x16 = { available: false, reason: 'reference-unavailable' };
   if (referencePath && Object.keys(referenceRegions).length) {
     try {
-      const referenceFingerprint = await extractMathematicalFingerprint(referencePath, { regions: referenceRegions });
+      const selectedAmountReferencePath = semanticRois.amountReferencePath || referencePath;
+      let referenceFingerprintInput = selectedAmountReferencePath;
+      if (path.extname(String(selectedAmountReferencePath)).toLowerCase() === '.pdf') {
+        // sharp cannot decode PDF input in the deployed runtime. Render the
+        // selected trusted PDF page through the same PDF.js raster path first.
+        const referencePdfBytes = await fs.readFile(selectedAmountReferencePath);
+        const referencePdf = await getPdfDocument({ data: new Uint8Array(referencePdfBytes) }).promise;
+        const referencePageNumber = Math.max(1, Math.round(Number(semanticRois.amountReferencePageNumber) || 1));
+        const renderedReference = await renderPdfPagePng(referencePdf, referencePageNumber, 1.8);
+        if (!renderedReference?.buffer) throw new Error('reference-pdf-raster-unavailable');
+        referenceFingerprintInput = renderedReference.buffer;
+        console.log('MATH REFERENCE PDF RASTERIZED:', JSON.stringify({
+          file: path.basename(selectedAmountReferencePath), pageNumber: referencePageNumber,
+          width: renderedReference.width || null, height: renderedReference.height || null,
+          scale: 1.8,
+        }));
+      }
+      const referenceFingerprint = await extractMathematicalFingerprint(referenceFingerprintInput, { regions: referenceRegions });
       roiForensics = compare16x16Rois(fingerprint, referenceFingerprint, ['amount','recipientName','recipientIban']);
 
       // V1.5: expose the actual mathematical measurements extracted from the
@@ -3050,14 +3085,17 @@ if (detectedVariant && detectedVariant !== 'mixed' && variantMatchedCandidatePat
   candidatePaths.splice(0, candidatePaths.length, ...variantMatchedCandidatePaths);
 }
 
-// V8 FORMAT-MATCHED VISUAL REFERENCES:
-// Image hedeflerinde yalnızca aynı format ailesindeki raster referanslar
-// kullanılır. PDF hedeflerinde visualReferencePath boş kalır; PDF rasterizasyonu
-// mevcut V7 davranışıyla devam eder.
-const visualReferencePaths = candidatePaths.filter(p => {
+// V8 FORMAT-MATCHED VISUAL INPUTS:
+// Raster referanslar doğrudan, PDF referanslar ise aşağı akıştaki PDF.js
+// render işlevlerine kaynak olarak aktarılır. Böylece PDF seçildi diye görsel
+// karşılaştırma referansı sessizce yok sayılmaz.
+let visualReferencePaths = candidatePaths.filter(p => {
   const ext = path.extname(p).toLowerCase();
   return ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
 });
+if (!visualReferencePaths.length && path.extname(selectedPath).toLowerCase() === '.pdf') {
+  visualReferencePaths = [selectedPath];
+}
 const visualReferencePath = visualReferencePaths[0] || null;
 
 console.log("REFERENCE VARIANT SELECTION:", JSON.stringify({
@@ -3079,8 +3117,8 @@ try {
   console.log("REFERENCE LOADED:", selectedPath);
   console.log("REFERENCE FORMAT:", activeReferenceFormat || "AUTO");
   console.log("REFERENCE STRUCTURAL PDF:", path.extname(selectedPath).toLowerCase() === '.pdf' ? path.basename(selectedPath) : "YOK");
-  console.log("REFERENCE VISUAL IMAGE:", visualReferencePath ? path.basename(visualReferencePath) : "YOK");
-  console.log("REFERENCE VISUAL IMAGES:", JSON.stringify(visualReferencePaths.map(p => path.basename(p))));
+  console.log("REFERENCE VISUAL INPUT:", visualReferencePath ? path.basename(visualReferencePath) : "YOK");
+  console.log("REFERENCE VISUAL INPUTS:", JSON.stringify(visualReferencePaths.map(p => path.basename(p))));
   return {
     bank: normalizedBank,
     fileName: path.basename(selectedPath),
@@ -16564,8 +16602,8 @@ console.log("REFERENCE CANDIDATES:", JSON.stringify(reference?.referenceCandidat
 console.log("REFERENCE VARIANT:", reference?.variant || "YOK");
 console.log("REFERENCE FORMAT:", reference?.referenceFormat || activeReferenceFormat || "AUTO");
 console.log("REFERENCE STRUCTURAL PDF:", reference?.path && path.extname(reference.path).toLowerCase() === '.pdf' ? path.basename(reference.path) : "YOK");
-console.log("REFERENCE VISUAL IMAGE:", reference?.visualReferencePath ? path.basename(reference.visualReferencePath) : "YOK");
-console.log("REFERENCE VISUAL IMAGES:", JSON.stringify((reference?.visualReferencePaths || []).map(p => path.basename(p))));
+console.log("REFERENCE VISUAL INPUT:", reference?.visualReferencePath ? path.basename(reference.visualReferencePath) : "YOK");
+console.log("REFERENCE VISUAL INPUTS:", JSON.stringify((reference?.visualReferencePaths || []).map(p => path.basename(p))));
 
 // Known-negative sample comparison is advisory. It never replaces the
 // trusted reference engine and does not by itself declare a document fake.
@@ -17190,6 +17228,29 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
       getVisualReferencePath(reference)
     );
     console.log("REFERENCE LOCAL CROP:", JSON.stringify(referenceLocalCrop));
+    const amountReferenceComparison = referenceLocalCrop?.amountComparison || null;
+    if (amountForensics && amountReferenceComparison?.referenceText) {
+      amountForensics.referenceAmountText = amountReferenceComparison.referenceText;
+      amountForensics.templateAmountText = amountReferenceComparison.referenceText;
+      amountForensics.referenceComparison = {
+        available: true,
+        referenceFile: amountReferenceComparison.referenceFile,
+        targetText: amountReferenceComparison.targetText,
+        referenceText: amountReferenceComparison.referenceText,
+        styleDistance: amountReferenceComparison.styleDistance,
+        characterDistance: amountReferenceComparison.characterDistance,
+        method: 'reference-local-crop-comparator-v3-same-selected-reference',
+        literalAmountEqualityRequired: false,
+      };
+      console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify(amountForensics.referenceComparison));
+    } else {
+      console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
+        available: false,
+        reason: referenceLocalCrop ? 'typed-reference-amount-or-target-amount-box-unavailable' : 'reference-local-crop-unavailable',
+        selectedReference: reference?.fileName || null,
+        targetAmountText: amountForensics?.amountText || null,
+      }));
+    }
   } catch (error) {
     console.warn("REFERENCE LOCAL CROP HATASI:", error?.message || error);
   }
@@ -18816,16 +18877,24 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
   if (!targetPath || !bank || !targetOCR?.success) return null;
 
   try {
-    const profile = await buildReferenceTemplateProfile(bank, selectedReferencePath);
-    if (!profile?.fields || !Object.keys(profile.fields).length) return null;
-
-    // profile.referenceFiles intentionally stores only basenames (security boundary).
-    // Resolve the real absolute reference path again through the canonical resolver.
+    // Resolve the selected reference through the canonical resolver, then use
+    // that same file for both its OCR-derived field profile and pixel crop.
     const referencePaths = await getReferenceFiles(bank);
-    const referencePath =
+    const requestedPaths = Array.isArray(selectedReferencePath)
+      ? selectedReferencePath.filter(Boolean)
+      : selectedReferencePath ? [selectedReferencePath] : [];
+    const selectedTrustedPath = requestedPaths.find(p => referencePaths.includes(p)) || null;
+    const referencePath = selectedTrustedPath ||
       referencePaths.find(p => /\.(pdf)$/i.test(String(p))) ||
       referencePaths.find(p => /\.(png|jpe?g|webp)$/i.test(String(p)));
     if (!referencePath) return null;
+    const profile = await buildReferenceTemplateProfile(bank, referencePath);
+    if (!profile?.fields || !Object.keys(profile.fields).length) return null;
+    console.log('REFERENCE LOCAL CROP SOURCE:', JSON.stringify({
+      referenceFile: path.basename(referencePath),
+      profileReferenceFiles: profile.referenceFiles || [],
+      selectedReferenceHonored: Boolean(selectedTrustedPath),
+    }));
 
     const refExt = path.extname(referencePath).toLowerCase();
     let refBuffer = null;
@@ -18918,6 +18987,7 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
       observations.push({
         field,
         targetText: String(best.item.text || '').trim(),
+        referenceText: String(ref?.valueText || '').trim(),
         referenceFile: path.basename(referencePath),
         styleDistance: Number.isFinite(styleDistance) ? Number(styleDistance.toFixed(4)) : null,
         characterDistance: Number.isFinite(charDistance) ? Number(charDistance.toFixed(4)) : null,
@@ -18977,6 +19047,18 @@ async function runReferenceLocalCropComparator(targetPath, bank, targetOCR, sele
       styleBaseline: Number(styleBaseline.toFixed(4)),
       characterBaseline: Number(charBaseline.toFixed(4)),
       observations,
+      amountComparison: (() => {
+        const amount = observations.find(x => x.field === 'amount');
+        return amount ? {
+          targetText: amount.targetText,
+          referenceText: amount.referenceText,
+          referenceFile: amount.referenceFile,
+          targetBox: amount.targetBox,
+          referenceBox: amount.referenceBox,
+          styleDistance: amount.styleDistance,
+          characterDistance: amount.characterDistance,
+        } : null;
+      })(),
       findings
     };
   } catch (error) {
