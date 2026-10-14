@@ -5486,18 +5486,178 @@ function pdfAuditNumberText(value) {
   return String(value || '').replace(/[^0-9,.-]/g, '');
 }
 
+function pdfAuditMulMatrix(left, right) {
+  return [
+    left[0]*right[0] + left[2]*right[1], left[1]*right[0] + left[3]*right[1],
+    left[0]*right[2] + left[2]*right[3], left[1]*right[2] + left[3]*right[3],
+    left[0]*right[4] + left[2]*right[5] + left[4], left[1]*right[4] + left[3]*right[5] + left[5],
+  ];
+}
+
+function pdfAuditPoint(matrix, x, y) {
+  return [matrix[0]*x + matrix[2]*y + matrix[4], matrix[1]*x + matrix[3]*y + matrix[5]];
+}
+
+function pdfAuditPathBounds(pathArgs) {
+  const ops = Array.from(pathArgs?.[0] || []);
+  const coords = Array.from(pathArgs?.[1] || []);
+  let cursor = 0;
+  const xs = [], ys = [];
+  const add = (x, y) => { if (Number.isFinite(Number(x)) && Number.isFinite(Number(y))) { xs.push(Number(x)); ys.push(Number(y)); } };
+  for (const op of ops) {
+    if (op === pdfjsLib.OPS.moveTo || op === pdfjsLib.OPS.lineTo) {
+      add(coords[cursor], coords[cursor+1]); cursor += 2;
+    } else if (op === pdfjsLib.OPS.curveTo) {
+      for (let j=0;j<6;j+=2) add(coords[cursor+j], coords[cursor+j+1]); cursor += 6;
+    } else if (op === pdfjsLib.OPS.curveTo2 || op === pdfjsLib.OPS.curveTo3) {
+      for (let j=0;j<4;j+=2) add(coords[cursor+j], coords[cursor+j+1]); cursor += 4;
+    } else if (op === pdfjsLib.OPS.rectangle) {
+      const x=Number(coords[cursor]), y=Number(coords[cursor+1]), w=Number(coords[cursor+2]), h=Number(coords[cursor+3]);
+      add(x,y); add(x+w,y+h); cursor += 4;
+    }
+  }
+  if (!xs.length) return null;
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+function pdfAuditWhiteFill(args, operator) {
+  if (!Array.isArray(args)) return false;
+  if (operator === pdfjsLib.OPS.setFillRGBColor) return args.slice(0,3).length === 3 && args.slice(0,3).every(v => Number(v) >= 250);
+  if (operator === pdfjsLib.OPS.setFillGray) return Number(args[0]) >= 0.98;
+  if (operator === pdfjsLib.OPS.setFillCMYKColor) return args.slice(0,4).length === 4 && args.slice(0,4).every(v => Number(v) <= 0.02);
+  return false;
+}
+
+function pdfAuditOperatorText(value) {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) || ArrayBuffer.isView(value)) return Array.from(value).map(pdfAuditOperatorText).join('');
+  if (value && typeof value === 'object') return String(value.unicode ?? '');
+  return '';
+}
+
+function pdfAuditCanonicalField(fieldKey, value) {
+  return fieldKey === 'recipientIBAN'
+    ? String(value || '').replace(/[^a-z0-9]/gi, '').toUpperCase()
+    : pdfAuditNumberText(String(value || '').replace(/[−–—]/g, '-'));
+}
+
+function pdfAuditWhiteCoverCandidates(operatorList, viewport, targetBox, fieldKey, expectedValue) {
+  const ops = operatorList?.fnArray || [], args = operatorList?.argsArray || [];
+  const textEvents = [];
+  for (let i=0;i<ops.length;i++) {
+    if ([pdfjsLib.OPS.showText, pdfjsLib.OPS.showSpacedText, pdfjsLib.OPS.nextLineShowText,
+      pdfjsLib.OPS.nextLineSetSpacingShowText].includes(ops[i])) {
+      const a=args[i] || [];
+      const payload = ops[i] === pdfjsLib.OPS.showSpacedText ? a[0] : (ops[i] === pdfjsLib.OPS.nextLineSetSpacingShowText ? a[2] : a[0]);
+      const text=pdfAuditOperatorText(payload);
+      if (text) textEvents.push({ index:i, text });
+    }
+  }
+  const expectedCanonical=pdfAuditCanonicalField(fieldKey,expectedValue);
+  const fieldTextIndices=[];
+  for(let start=0;start<textEvents.length;start++){
+    let joined='';
+    for(let end=start;end<Math.min(textEvents.length,start+8);end++){
+      joined += textEvents[end].text;
+      if(expectedCanonical && pdfAuditCanonicalField(fieldKey,joined)===expectedCanonical){
+        fieldTextIndices.push(textEvents[end].index);
+      }
+    }
+  }
+  const matrixIdentity=[1,0,0,1,0,0];
+  let ctm=matrixIdentity.slice(), fillIsWhite=false, fillAlpha=1, pendingPath=null;
+  const stack=[];
+  const candidates=[];
+  const paintOps=[pdfjsLib.OPS.fill,pdfjsLib.OPS.eoFill,pdfjsLib.OPS.fillStroke,
+    pdfjsLib.OPS.eoFillStroke,pdfjsLib.OPS.closeFillStroke,pdfjsLib.OPS.closeEOFillStroke];
+  const viewportMatrix=viewport.transform || matrixIdentity;
+  for(let i=0;i<ops.length;i++){
+    const op=ops[i], a=args[i] || [];
+    if(op===pdfjsLib.OPS.save){stack.push({ctm:ctm.slice(),fillIsWhite,fillAlpha}); continue;}
+    if(op===pdfjsLib.OPS.restore){const prior=stack.pop(); if(prior){ctm=prior.ctm;fillIsWhite=prior.fillIsWhite;fillAlpha=prior.fillAlpha;} continue;}
+    if(op===pdfjsLib.OPS.transform && a.length>=6){ctm=pdfAuditMulMatrix(ctm,a.slice(0,6).map(Number)); continue;}
+    if(op===pdfjsLib.OPS.paintFormXObjectBegin){
+      stack.push({ctm:ctm.slice(),fillIsWhite,fillAlpha});
+      if(Array.isArray(a[0])&&a[0].length>=6) ctm=pdfAuditMulMatrix(ctm,a[0].slice(0,6).map(Number));
+      continue;
+    }
+    if(op===pdfjsLib.OPS.paintFormXObjectEnd){const prior=stack.pop();if(prior){ctm=prior.ctm;fillIsWhite=prior.fillIsWhite;fillAlpha=prior.fillAlpha;}continue;}
+    if(op===pdfjsLib.OPS.setFillRGBColor||op===pdfjsLib.OPS.setFillGray||op===pdfjsLib.OPS.setFillCMYKColor||op===pdfjsLib.OPS.setFillColor||op===pdfjsLib.OPS.setFillColorN){fillIsWhite=pdfAuditWhiteFill(a,op);continue;}
+    if(op===pdfjsLib.OPS.setFillTransparent){fillIsWhite=false;continue;}
+    if(op===pdfjsLib.OPS.setGState&&Array.isArray(a[0])){
+      const ca=a[0].find(pair=>Array.isArray(pair)&&pair[0]==='ca'); if(ca) fillAlpha=Number(ca[1]); continue;
+    }
+    if(op===pdfjsLib.OPS.constructPath){
+      const bounds=pdfAuditPathBounds(a);
+      pendingPath=bounds?{bounds,operatorIndex:i}:null;
+      continue;
+    }
+    if(paintOps.includes(op)&&pendingPath){
+      if(fillIsWhite&&fillAlpha>=0.95){
+        const [x1,y1,x2,y2]=pendingPath.bounds;
+        const corners=[[x1,y1],[x1,y2],[x2,y1],[x2,y2]].map(([x,y])=>pdfAuditPoint(viewportMatrix,...pdfAuditPoint(ctm,x,y)));
+        const box={x:Math.min(...corners.map(p=>p[0]))/viewport.width,y:Math.min(...corners.map(p=>p[1]))/viewport.height,
+          width:(Math.max(...corners.map(p=>p[0]))-Math.min(...corners.map(p=>p[0])))/viewport.width,
+          height:(Math.max(...corners.map(p=>p[1]))-Math.min(...corners.map(p=>p[1])))/viewport.height};
+        const ix=Math.max(0,Math.min(box.x+box.width,targetBox.x+targetBox.width)-Math.max(box.x,targetBox.x));
+        const iy=Math.max(0,Math.min(box.y+box.height,targetBox.y+targetBox.height)-Math.max(box.y,targetBox.y));
+        const overlapArea=ix*iy, targetArea=targetBox.width*targetBox.height, shapeArea=box.width*box.height;
+        const targetCoverage=targetArea>0?overlapArea/targetArea:0;
+        // Exclude page backgrounds and large white panels. This heuristic keeps
+        // small cover-like shapes for review, never as a standalone verdict.
+        if(targetCoverage>=0.08&&shapeArea>0&&shapeArea<=Math.max(targetArea*12,0.00002)){
+          const priorTextIndex=fieldTextIndices.filter(index=>index<pendingPath.operatorIndex).pop() ?? null;
+          const laterTextIndex=fieldTextIndices.find(index=>index>i) ?? null;
+          candidates.push({objectType:'white-vector-fill',operatorIndex:i,box,targetCoverage:Number(targetCoverage.toFixed(3)),
+            fieldTextOperatorIndex:priorTextIndex,fieldTextComesBeforeShape:priorTextIndex!==null,
+            laterMatchingFieldTextOperatorIndex:laterTextIndex,
+            evidence:priorTextIndex!==null?'white-fill intersects validated field after matching native field text':'white-fill intersects validated field; relative order not confirmed'});
+        }
+      }
+      pendingPath=null;
+      continue;
+    }
+    if ([pdfjsLib.OPS.paintImageXObject,pdfjsLib.OPS.paintInlineImageXObject,pdfjsLib.OPS.paintImageMaskXObject].includes(op)) {
+      // PDF.js paints image XObjects in a unit square transformed by the
+      // current CTM. Keep small, field-local objects for review; whole-page
+      // raster backgrounds are filtered by the same area bound below.
+      const corners=[[0,0],[0,1],[1,0],[1,1]].map(([x,y])=>pdfAuditPoint(viewportMatrix,...pdfAuditPoint(ctm,x,y)));
+      const box={x:Math.min(...corners.map(p=>p[0]))/viewport.width,y:Math.min(...corners.map(p=>p[1]))/viewport.height,
+        width:(Math.max(...corners.map(p=>p[0]))-Math.min(...corners.map(p=>p[0])))/viewport.width,
+        height:(Math.max(...corners.map(p=>p[1]))-Math.min(...corners.map(p=>p[1])))/viewport.height};
+      const ix=Math.max(0,Math.min(box.x+box.width,targetBox.x+targetBox.width)-Math.max(box.x,targetBox.x));
+      const iy=Math.max(0,Math.min(box.y+box.height,targetBox.y+targetBox.height)-Math.max(box.y,targetBox.y));
+      const overlapArea=ix*iy,targetArea=targetBox.width*targetBox.height,shapeArea=box.width*box.height;
+      const targetCoverage=targetArea>0?overlapArea/targetArea:0;
+      if(targetCoverage>=0.08&&shapeArea>0&&shapeArea<=Math.max(targetArea*12,0.00002)){
+        const priorTextIndex=fieldTextIndices.filter(index=>index<i).pop()??null;
+        candidates.push({objectType:'image-object',operatorIndex:i,box,targetCoverage:Number(targetCoverage.toFixed(3)),
+          fieldTextOperatorIndex:priorTextIndex,fieldTextComesBeforeShape:priorTextIndex!==null,
+          evidence:priorTextIndex!==null?'localized image object intersects validated field after matching native field text':'localized image object intersects validated field; relative order not confirmed'});
+      }
+      continue;
+    }
+    if(op===pdfjsLib.OPS.endPath||op===pdfjsLib.OPS.stroke||op===pdfjsLib.OPS.closeStroke) pendingPath=null;
+  }
+  return candidates.slice(0,12);
+}
+
 async function auditPdfContentLayer(buffer, fieldAssociation = null) {
   let pdf = null;
   try {
     pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
     const metadataResult = await pdf.getMetadata().catch(() => null);
     const fields = fieldAssociation?.fields || {};
-    const amount = fields.amount?.status === 'matched' && fields.amount?.associationValidated
-      ? fields.amount : null;
+    // Restrict structural inspection to the two user-critical, typed fields.
+    // Do not infer a field from arbitrary numeric/text content elsewhere on
+    // the page: the association resolver must already have validated it.
+    const monitoredFields = [
+      ['amount', fields.amount],
+      ['recipientIBAN', fields.recipientIBAN],
+    ].filter(([, field]) => field?.status === 'matched' && field?.associationValidated && field?.valueBox);
     const pages = [];
     let operatorTotals = { hiddenTextModeOps: 0, imagePaintOps: 0, formPaintOps: 0, annotationCount: 0 };
-    const amountCandidates = [];
-    const amountOverlaps = [];
+    const fieldAudits = Object.fromEntries(monitoredFields.map(([key]) => [key, { candidates: [], overlappingDifferentText: [], coverObjects: [] }]));
 
     for (let pageNumber = 1; pageNumber <= Math.min(Number(pdf.numPages) || 0, 3); pageNumber++) {
       const page = await pdf.getPage(pageNumber);
@@ -5526,9 +5686,8 @@ async function auditPdfContentLayer(buffer, fieldAssociation = null) {
         operatorCount: fnArray.length, hiddenTextModeOps, imagePaintOps, formPaintOps,
         annotationCount: annotations.length });
 
-      if (!amount || Number(amount.pageNumber) !== pageNumber || !amount.valueBox) continue;
-      const expected = amount.valueBox;
-      const expectedText = pdfAuditNumberText(amount.value);
+      const pageFields = monitoredFields.filter(([, field]) => Number(field.pageNumber) === pageNumber);
+      if (!pageFields.length) continue;
       const transformViewport = viewport.transform;
       const rows = (content.items || []).filter(item => String(item.str || '').trim()).map(item => {
         const t = item.transform || [];
@@ -5559,33 +5718,58 @@ async function auditPdfContentLayer(buffer, fieldAssociation = null) {
         const x2 = Math.max(...corners.map(p=>p[0])) / viewport.width;
         const y1 = Math.min(...corners.map(p=>p[1])) / viewport.height;
         const y2 = Math.max(...corners.map(p=>p[1])) / viewport.height;
-        return { text: String(item.str || '').trim(), fontResource: item.fontName || null,
+        const text = String(item.str || '').trim();
+        return { text, fontResource: item.fontName || null,
           box: { x: x1, y: y1, width: x2-x1, height: y2-y1 },
-          numberText: pdfAuditNumberText(item.str),
+          numberText: pdfAuditNumberText(text),
+          compactText: text.replace(/[^a-z0-9]/gi, '').toUpperCase(),
           fontSize: Number(Math.hypot(Number(t[2]) || 0, Number(t[3]) || 0).toFixed(3)) };
       });
-      for (const row of rows) {
-        const cx = row.box.x + row.box.width / 2, cy = row.box.y + row.box.height / 2;
-        const ex = expected.x + expected.width / 2, ey = expected.y + expected.height / 2;
-        const distance = Math.hypot(cx-ex, cy-ey);
-        if (expectedText && row.numberText === expectedText) {
-          amountCandidates.push({ pageNumber, text: row.text, fontResource: row.fontResource, fontSize: row.fontSize,
-            box: row.box, centerDistanceNorm: Number(distance.toFixed(6)) });
-        }
-        const ix = Math.max(0, Math.min(row.box.x+row.box.width, expected.x+expected.width)-Math.max(row.box.x,expected.x));
-        const iy = Math.max(0, Math.min(row.box.y+row.box.height, expected.y+expected.height)-Math.max(row.box.y,expected.y));
-        const intersection = ix * iy;
-        const union = row.box.width*row.box.height + expected.width*expected.height - intersection;
-        if (intersection > 0 && union > 0 && intersection/union >= 0.3 && row.numberText !== expectedText) {
-          amountOverlaps.push({ pageNumber, text: row.text, fontResource: row.fontResource,
-            overlapRatio: Number((intersection/union).toFixed(3)), box: row.box });
+      for (const [fieldKey, field] of pageFields) {
+        const expected = field.valueBox;
+        const expectedText = fieldKey === 'recipientIBAN'
+          ? String(field.value || '').replace(/[^a-z0-9]/gi, '').toUpperCase()
+          : pdfAuditNumberText(field.value);
+        const audit = fieldAudits[fieldKey];
+        audit.coverObjects = pdfAuditWhiteCoverCandidates(operators, viewport, expected, fieldKey, field.value);
+        for (const row of rows) {
+          const cx = row.box.x + row.box.width / 2, cy = row.box.y + row.box.height / 2;
+          const ex = expected.x + expected.width / 2, ey = expected.y + expected.height / 2;
+          const distance = Math.hypot(cx-ex, cy-ey);
+          const rowValue = fieldKey === 'recipientIBAN' ? row.compactText : row.numberText;
+          if (expectedText && rowValue === expectedText) {
+            audit.candidates.push({ pageNumber, text: row.text, fontResource: row.fontResource, fontSize: row.fontSize,
+              box: row.box, centerDistanceNorm: Number(distance.toFixed(6)) });
+          }
+          const ix = Math.max(0, Math.min(row.box.x+row.box.width, expected.x+expected.width)-Math.max(row.box.x,expected.x));
+          const iy = Math.max(0, Math.min(row.box.y+row.box.height, expected.y+expected.height)-Math.max(row.box.y,expected.y));
+          const intersection = ix * iy;
+          const union = row.box.width*row.box.height + expected.width*expected.height - intersection;
+          if (intersection > 0 && union > 0 && intersection/union >= 0.3 && rowValue !== expectedText) {
+            audit.overlappingDifferentText.push({ pageNumber, text: row.text, fontResource: row.fontResource,
+              overlapRatio: Number((intersection/union).toFixed(3)), box: row.box });
+          }
         }
       }
     }
-    const matchingAmount = amountCandidates.sort((a,b)=>a.centerDistanceNorm-b.centerDistanceNorm);
+    const fieldResults = Object.fromEntries(monitoredFields.map(([fieldKey, field]) => {
+      const audit = fieldAudits[fieldKey];
+      const candidates = audit.candidates.sort((a,b)=>a.centerDistanceNorm-b.centerDistanceNorm);
+      return [fieldKey, {
+        status: candidates.length ? 'native-text-located' : 'native-text-not-located-in-associated-box',
+        label: field.labelText,
+        value: field.value,
+        expectedBoxNorm: field.valueBox,
+        candidateCount: candidates.length,
+        candidates: candidates.slice(0, 5),
+        overlappingDifferentText: audit.overlappingDifferentText.slice(0, 8),
+        coverObjectCandidateCount: audit.coverObjects.length,
+        coverObjectCandidates: audit.coverObjects,
+      }];
+    }));
     return {
       available: true,
-      engine: 'pdfjs-content-layer-audit-v1',
+      engine: 'pdfjs-critical-field-object-audit-v3',
       pageCount: Number(pdf.numPages) || pages.length,
       metadata: {
         producer: metadataResult?.info?.Producer || null,
@@ -5596,19 +5780,14 @@ async function auditPdfContentLayer(buffer, fieldAssociation = null) {
       },
       operators: operatorTotals,
       pages,
-      amountField: amount ? {
-        status: matchingAmount.length ? 'native-text-located' : 'native-text-not-located-in-associated-box',
-        label: amount.labelText,
-        value: amount.value,
-        expectedBoxNorm: amount.valueBox,
-        candidateCount: matchingAmount.length,
-        candidates: matchingAmount.slice(0, 5),
-        overlappingDifferentText: amountOverlaps.slice(0, 8),
-      } : { status: 'unavailable', reason: 'validated-typed-amount-field-not-found' },
-      interpretation: 'Bu katman nesne/metin yapısını ve alan çakışmalarını raporlar; tek başına Photoshop kullanımı veya sahtecilik kararı vermez.',
+      criticalFields: Object.keys(fieldResults).length ? fieldResults : {
+        amount: { status: 'unavailable', reason: 'validated-typed-amount-field-not-found' },
+        recipientIBAN: { status: 'unavailable', reason: 'validated-typed-recipient-iban-field-not-found' },
+      },
+      interpretation: 'Alan incelemesi yalnızca önceden doğrulanmış tutar ve alıcı IBAN kutularında yapılır. Küçük, opak beyaz vektör dolguların alanla kesişmesi ve çizim sırası raporlanır; tek başına Photoshop veya sahtecilik kanıtı değildir. Rasterleştirilmiş sayfalarda PDF çizim/metin nesneleri bulunmayabilir.',
     };
   } catch (error) {
-    return { available:false, engine:'pdfjs-content-layer-audit-v1', status:'unknown', error:error?.message || String(error) };
+    return { available:false, engine:'pdfjs-critical-field-object-audit-v3', status:'unknown', error:error?.message || String(error) };
   } finally {
     try { await pdf?.destroy?.(); } catch {}
   }
@@ -16718,6 +16897,23 @@ if (type === "image" || type === "pdf") {
         fieldAssociation: type === "pdf" ? pdfNativeFieldAssociation : null
       });
       console.log("OPEN SOURCE FORENSICS V66:", JSON.stringify(osf));
+      const pdfFieldAudit = osf?.pdfStructural?.contentLayer?.criticalFields;
+      if (type === "pdf" && pdfFieldAudit) {
+        console.log("PDF CRITICAL FIELD ROI OBJECT AUDIT V3:", JSON.stringify({
+          engine: osf.pdfStructural.contentLayer.engine,
+          fields: Object.fromEntries(Object.entries(pdfFieldAudit).map(([key, field]) => [key, {
+            status: field?.status,
+            label: field?.label,
+            value: field?.value,
+            expectedBoxNorm: field?.expectedBoxNorm,
+            candidateCount: field?.candidateCount,
+            candidates: field?.candidates,
+            overlappingDifferentText: field?.overlappingDifferentText,
+            coverObjectCandidateCount: field?.coverObjectCandidateCount,
+            coverObjectCandidates: field?.coverObjectCandidates,
+          }]))
+        }));
+      }
       return { kind:"open-source-forensics", openSourceForensics:osf };
     } catch (error) {
       console.warn("OPEN SOURCE FORENSICS HATASI:", error?.message || error);
