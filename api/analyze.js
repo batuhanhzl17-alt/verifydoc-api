@@ -19,6 +19,7 @@ import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
 import { createRequire } from "module"
 import { fileURLToPath, pathToFileURL } from "url"
 const require = createRequire(import.meta.url);
+const fsSync = require("fs");
 
 // Vercel/ESM ortamında @napi-rs/canvas named export her zaman düzgün gelmeyebilir.
 // createRequire ile CommonJS yükleyerek createCanvas erişimini sabitliyoruz.
@@ -67,7 +68,21 @@ pathToFileURL(pdfWorkerPath).href;
 // make the OCR raster unusable even when the PDF text layer is intact.
 const pdfjsBuildDirectory = path.dirname(require.resolve("pdfjs-dist/build/pdf.mjs"));
 const pdfjsStandardFontDirectory = path.resolve(pdfjsBuildDirectory, "../standard_fonts") + path.sep;
+let pdfjsStandardFontAuditLogged = false;
 function getPdfDocument(options) {
+  if (!pdfjsStandardFontAuditLogged) {
+    pdfjsStandardFontAuditLogged = true;
+    const requiredFonts = ["LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf"];
+    const missingFonts = requiredFonts.filter((font) =>
+      !fsSync.existsSync(path.join(pdfjsStandardFontDirectory, font))
+    );
+    console.log("PDFJS STANDARD FONT ASSETS:", JSON.stringify({
+      available: missingFonts.length === 0,
+      directory: pdfjsStandardFontDirectory,
+      requiredFonts,
+      missingFonts,
+    }));
+  }
   return pdfjsLib.getDocument({
     ...options,
     standardFontDataUrl: options?.standardFontDataUrl || pdfjsStandardFontDirectory,
@@ -4628,6 +4643,40 @@ function v68RegionTo512(region, sourceW, sourceH, W=512, H=512) {
   return {x1,y1,x2,y2};
 }
 
+// A missing PDF.js standard font can leave native-text areas blank in the
+// rendered forensic raster while the text layer still extracts correctly.
+// Never score paint-over evidence unless the selected amount ROI contains ink.
+function countVisibleInkPixels(rgb, width, height, region, threshold = 245) {
+  if (!Buffer.isBuffer(rgb) || !width || !height || !region) {
+    return { available: false, inkPixels: 0, pixelCount: 0, inkRatio: 0 };
+  }
+  const x1 = Math.max(0, Math.min(width, Math.floor(region.x1)));
+  const y1 = Math.max(0, Math.min(height, Math.floor(region.y1)));
+  const x2 = Math.max(x1, Math.min(width, Math.ceil(region.x2)));
+  const y2 = Math.max(y1, Math.min(height, Math.ceil(region.y2)));
+  let inkPixels = 0;
+  const pixelCount = (x2 - x1) * (y2 - y1);
+  for (let y = y1; y < y2; y++) {
+    for (let x = x1; x < x2; x++) {
+      const i = (y * width + x) * 3;
+      const luma = 0.299 * rgb[i] + 0.587 * rgb[i + 1] + 0.114 * rgb[i + 2];
+      if (luma < threshold) inkPixels++;
+    }
+  }
+  return {
+    available: true,
+    inkPixels,
+    pixelCount,
+    inkRatio: pixelCount ? Number((inkPixels / pixelCount).toFixed(4)) : 0,
+  };
+}
+
+function hasVisibleAmountInk(rgb, width, height, region) {
+  const stats = countVisibleInkPixels(rgb, width, height, region);
+  const minimumInkPixels = Math.max(2, Math.ceil(stats.pixelCount * 0.005));
+  return { ...stats, minimumInkPixels, passed: stats.available && stats.inkPixels >= minimumInkPixels };
+}
+
 function v68CollectRGB(raw, W, H, region, excludeInk=false) {
   const out={r:[],g:[],b:[],luma:[],rg:[],gb:[],rb:[]};
   if (!region) return out;
@@ -4772,6 +4821,18 @@ async function runPaintOverForensics(targetPath, amountForensics=null) {
     };
     const rw=roi.x2-roi.x1, rh=roi.y2-roi.y1;
     if (rw<6 || rh<4) return {available:false, engine, score:0, severity:'insufficient-data', reason:'roi-too-small', roi};
+    const amountRoiInk = hasVisibleAmountInk(base, W, H, roi);
+    if (!amountRoiInk.passed) {
+      return {
+        available: false,
+        engine,
+        score: 0,
+        severity: 'insufficient-data',
+        reason: 'amount-roi-blank-or-pdf-font-render-failed',
+        roi,
+        amountRoiInk,
+      };
+    }
 
     const luma = new Float32Array(W*H);
     const chans=[new Float32Array(W*H),new Float32Array(W*H),new Float32Array(W*H)];
@@ -4852,7 +4913,7 @@ async function runPaintOverForensics(targetPath, amountForensics=null) {
     const rawScore=Math.round(channelResidualScore*.25+lumaResidualScore*.25+edgeScore*.20+textureScore*.20+channelDivergenceScore*.10);
     const score=Math.min(100, Math.round(rawScore + (multiSignal ? amountSupport : 0)));
     const severity=score>=75&&multiSignal?'strong':score>=50&&supportSignals>=2?'moderate':score>=25?'low':'none';
-    const out={available:true,engine,version:'V1',roi,metrics:{channelResidualScore,lumaResidualScore,edgeScore,textureScore,channelDivergenceScore,rawScore,supportSignals,amountSupport,multiSignal,channelResidual:channelResidual.map(x=>({roi:x.roi.mean,ring:x.ring.mean,control:x.control}))},comparators:{roiLuma:roiL,ringLuma:ringL,controlLuma:cLuma,roiResidual:roiRes,ringResidual:ringRes,roiEdge:ringEdge,controlEdge:cLuma.edge},score,severity,evidence:multiSignal?'Aynı tutar ROI içinde birden fazla bağımsız lokal residual/edge/texture sinyali birlikte görüldü; bu Paint-Over/Erase-Rewrite için corroborating bir adli sinyaldir, tek başına kesin sahtecilik hükmü değildir.':'Lokal Paint-Over için gereken çoklu bağımsız sinyal eşiği oluşmadı; global JPEG/CFA benzeri anomaliler bu katmanda tek başına kullanılmadı.'};
+    const out={available:true,engine,version:'V1',roi,amountRoiInk,metrics:{channelResidualScore,lumaResidualScore,edgeScore,textureScore,channelDivergenceScore,rawScore,supportSignals,amountSupport,multiSignal,channelResidual:channelResidual.map(x=>({roi:x.roi.mean,ring:x.ring.mean,control:x.control}))},comparators:{roiLuma:roiL,ringLuma:ringL,controlLuma:cLuma,roiResidual:roiRes,ringResidual:ringRes,roiEdge:ringEdge,controlEdge:cLuma.edge},score,severity,evidence:multiSignal?'Aynı tutar ROI içinde birden fazla bağımsız lokal residual/edge/texture sinyali birlikte görüldü; bu Paint-Over/Erase-Rewrite için corroborating bir adli sinyaldir, tek başına kesin sahtecilik hükmü değildir.':'Lokal Paint-Over için gereken çoklu bağımsız sinyal eşiği oluşmadı; global JPEG/CFA benzeri anomaliler bu katmanda tek başına kullanılmadı.'};
     advancedForensicsCache.set(cacheKey,{paintOver:out});
     return JSON.parse(JSON.stringify(out));
   } catch(error){
@@ -4951,6 +5012,8 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
     };
     const rw = roi.x2 - roi.x1, rh = roi.y2 - roi.y1;
     if (rw < 6 || rh < 4) return null;
+    const amountRoiInk = hasVisibleAmountInk(base, W, H, roi);
+    if (!amountRoiInk.passed) return null;
 
     const luma = new Float32Array(W * H);
     const chans = [new Float32Array(W * H), new Float32Array(W * H), new Float32Array(W * H)];
@@ -5068,6 +5131,7 @@ async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank
       spatialSignature,
       spatialSignatureVersion:'roi-grid-v1',
       roi,
+      amountRoiInk,
     };
   } catch(error) {
     console.warn('PAINT-OVER V2 VECTOR HATASI:',error?.message||error);
@@ -5108,7 +5172,14 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
     if(cached) return JSON.parse(JSON.stringify(cached));
 
     const target=await extractPaintOverV2Vector(targetPath,amountForensics,bank);
-    if(!target) return {available:false,engine,score:0,severity:'insufficient-data',reason:'target-vector-unavailable'};
+    if(!target) return {
+      available:false,
+      engine,
+      score:0,
+      severity:'insufficient-data',
+      reason:amountForensics?.region ? 'amount-roi-blank-or-pdf-font-render-failed' : 'target-vector-unavailable',
+      roi:amountForensics?.region || null,
+    };
 
     const genuinePaths=await listPaintOverV2Samples(bank,'genuine');
     const genuineVectors=[];
@@ -5219,6 +5290,7 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
         rawScore:target.rawScore,
         supportSignals:target.supportSignals,
         featureScores:{channelResidual:target.features[0],lumaResidual:target.features[1],edge:target.features[2],texture:target.features[3],channelDivergence:target.features[4]},
+        amountRoiInk:target.amountRoiInk,
         telegramBaseline:{available:baselineAvailable,sampleCount:genuineVectors.length,samples:genuineVectors.map(x=>path.basename(x.path)),calibrationQuality:baselineCalibrationQuality,median:Math.round(baselineMedian),mad:Math.round(baselineMad),p90:Math.round(baselineP90),percentile:Number(baselinePercentile.toFixed(3)),adjustedScore:telegramAdjusted==null?null:Math.round(telegramAdjusted)},
         knownFakePattern:{available:negativeVectors.length>0,sampleCount:negativeVectors.length,bestSimilarity:Number(bestNegativeSimilarity.toFixed(4)),score:fakePatternScore==null?null:Math.round(fakePatternScore),matches:negativeSimilarities.slice(0,5)},
         amountForensics:{score:Math.round(amountScore),strong:amountStrong,usedAsFixedSupport:false}
