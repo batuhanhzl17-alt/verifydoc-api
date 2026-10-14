@@ -1,6 +1,11 @@
 import fs from 'fs/promises';
 import path from 'path';
 import sharp from 'sharp';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const pdfjsBuildDirectory = path.dirname(require.resolve('pdfjs-dist/build/pdf.mjs'));
+const pdfjsStandardFontDirectory = path.resolve(pdfjsBuildDirectory, '../standard_fonts') + path.sep;
 
 // =====================================================
 // VERIFYDOC VISUAL FORENSICS HELPER v1
@@ -94,7 +99,9 @@ async function renderReferencePdfToPng(pdfPath, workDir) {
     // 4.7.x'te option adi canvasFactory'dir.
     const pdf = await pdfjs.getDocument({
       data: new Uint8Array(buffer),
-      canvasFactory
+      canvasFactory,
+      standardFontDataUrl: pdfjsStandardFontDirectory,
+      useWorkerFetch: false
     }).promise;
 
     const page = await pdf.getPage(1);
