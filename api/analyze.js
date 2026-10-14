@@ -6482,7 +6482,11 @@ async function getReferenceAmountAnchor(bank) {
   // This helper runs outside the request handler's lexical scope, so it must
   // use the request-level variant state rather than the local Paddle result.
   const targetVariant = activeReferenceVariant || null;
-  const cacheKey = `amount-anchor:v18:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}:${targetVariant || 'unknown'}`;
+  const targetBox = activeTargetPdfAmountBox;
+  const targetBoxKey = targetBox
+    ? `${Number(targetBox.x).toFixed(4)},${Number(targetBox.y).toFixed(4)},${Number(targetBox.width).toFixed(4)},${Number(targetBox.height).toFixed(4)}`
+    : 'no-target-box';
+  const cacheKey = `amount-anchor:v19:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}:${targetVariant || 'unknown'}:${targetBoxKey}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
   const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
@@ -6542,7 +6546,7 @@ async function getReferenceAmountAnchor(bank) {
         referenceAmountAnchorCache.set(cacheKey, null);
         return null;
       }
-    } else if (knownVariants.length > 1) {
+    } else if (knownVariants.length > 1 && !targetBox) {
       console.warn('REFERENCE AMOUNT ANCHOR FAMILY AMBIGUOUS:', JSON.stringify({
         bank: normalizedBank,
         targetVariant: targetVariant || null,
@@ -6926,7 +6930,7 @@ async function getReferenceAmountAnchor(bank) {
       return null;
     }
 
-    if (familySelection === 'unknown-variant-typed-label-fallback' && entries.length > 1) {
+    if (familySelection === 'unknown-variant-typed-label-fallback' && entries.length > 1 && !targetBox) {
       const fallbackSpread = {
         x: Math.max(...entries.map(x => x.xNorm)) - Math.min(...entries.map(x => x.xNorm)),
         y: Math.max(...entries.map(x => x.yNorm)) - Math.min(...entries.map(x => x.yNorm)),
@@ -6948,30 +6952,71 @@ async function getReferenceAmountAnchor(bank) {
       }
     }
 
+    let selectedEntries = entries;
+    let targetLayoutSelection = null;
+    if (targetBox && nativePdfReferenceCount && entries.length > 1) {
+      const targetCx = Number(targetBox.x) + Number(targetBox.width) / 2;
+      const targetCy = Number(targetBox.y) + Number(targetBox.height) / 2;
+      const ranked = entries.map(entry => {
+        const entryCx = entry.xNorm + entry.widthNorm / 2;
+        const entryCy = entry.yNorm + entry.heightNorm / 2;
+        return { entry, distance: Math.hypot(entryCx - targetCx, entryCy - targetCy) };
+      }).sort((a, b) => a.distance - b.distance);
+      const best = ranked[0];
+      const next = ranked[1];
+      const clearlyNearest = !next || next.distance - best.distance >= 0.004;
+      if (best && best.distance <= 0.035 && clearlyNearest) {
+        selectedEntries = [best.entry];
+        targetLayoutSelection = {
+          referenceFile: best.entry.referenceFile,
+          distanceNorm: Number(best.distance.toFixed(6)),
+          nextCandidateDistanceNorm: next ? Number(next.distance.toFixed(6)) : null,
+          rule: 'nearest-native-amount-box-to-target-native-amount-box',
+        };
+        console.log('REFERENCE AMOUNT LAYOUT MATCH:', JSON.stringify(targetLayoutSelection));
+      } else {
+        console.warn('REFERENCE AMOUNT LAYOUT MATCH AMBIGUOUS:', JSON.stringify({
+          targetBox,
+          bestDistanceNorm: best ? Number(best.distance.toFixed(6)) : null,
+          nextCandidateDistanceNorm: next ? Number(next.distance.toFixed(6)) : null,
+          reason: 'no-unique-nearby-native-amount-anchor',
+        }));
+        referenceAmountAnchorCache.set(cacheKey, null);
+        return null;
+      }
+    }
+
     const anchor = {
       bank: normalizedBank,
-      pageNumber: median(entries.map(x => Number(x.pageNumber) || 1)),
-      xNorm: median(entries.map(x => x.xNorm)),
-      yNorm: median(entries.map(x => x.yNorm)),
-      widthNorm: median(entries.map(x => x.widthNorm)),
-      heightNorm: median(entries.map(x => x.heightNorm)),
-      referenceCount: entries.length,
+      pageNumber: median(selectedEntries.map(x => Number(x.pageNumber) || 1)),
+      xNorm: median(selectedEntries.map(x => x.xNorm)),
+      yNorm: median(selectedEntries.map(x => x.yNorm)),
+      widthNorm: median(selectedEntries.map(x => x.widthNorm)),
+      heightNorm: median(selectedEntries.map(x => x.heightNorm)),
+      referenceCount: selectedEntries.length,
+      selectedReferenceFile: targetLayoutSelection?.referenceFile || null,
+      targetLayoutSelection,
       spread: {
-        x: Math.max(...entries.map(x => x.xNorm)) - Math.min(...entries.map(x => x.xNorm)),
-        y: Math.max(...entries.map(x => x.yNorm)) - Math.min(...entries.map(x => x.yNorm)),
-        width: Math.max(...entries.map(x => x.widthNorm)) - Math.min(...entries.map(x => x.widthNorm)),
-        height: Math.max(...entries.map(x => x.heightNorm)) - Math.min(...entries.map(x => x.heightNorm)),
+        x: Math.max(...selectedEntries.map(x => x.xNorm)) - Math.min(...selectedEntries.map(x => x.xNorm)),
+        y: Math.max(...selectedEntries.map(x => x.yNorm)) - Math.min(...selectedEntries.map(x => x.yNorm)),
+        width: Math.max(...selectedEntries.map(x => x.widthNorm)) - Math.min(...selectedEntries.map(x => x.widthNorm)),
+        height: Math.max(...selectedEntries.map(x => x.heightNorm)) - Math.min(...selectedEntries.map(x => x.heightNorm)),
       },
-      source: nativePdfReferenceCount
+      source: targetLayoutSelection
+        ? 'trusted-pdf-native-target-nearest-reference-v1'
+        : nativePdfReferenceCount
         ? 'trusted-pdf-native-typed-amount-label-coordinate-ensemble-v1'
         : 'trusted-telegram-raster-ensemble-v16.1-explicit-amount-label-fallback',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
-    console.log('REFERENCE AMOUNT ANCHOR ENSEMBLE V16.1:', JSON.stringify({
+    console.log('REFERENCE AMOUNT ANCHOR V19:', JSON.stringify({
       bank: anchor.bank, pageNumber: anchor.pageNumber,
       xNorm: anchor.xNorm, yNorm: anchor.yNorm,
       widthNorm: anchor.widthNorm, heightNorm: anchor.heightNorm,
-      referenceCount: anchor.referenceCount, spread: anchor.spread, source: anchor.source
+      referenceCount: anchor.referenceCount,
+      selectedReferenceFile: anchor.selectedReferenceFile,
+      targetLayoutSelection: anchor.targetLayoutSelection,
+      spread: anchor.spread, source: anchor.source
     }));
     return anchor;
   } catch (error) {
@@ -10529,6 +10574,9 @@ function synchronizeReferenceForensicDecision(forensic) {
 // Aynı banka farklı dekont ailelerine sahipse, hedef belgenin işlem ailesine
 // uygun referansı seçeriz. Tutar/isim/IBAN gibi dinamik değerler seçimde kullanılmaz.
 let activeReferenceVariant = null;
+// Target PDF's validated amount box is used to select the closest native
+// reference layout; it prevents averaging unrelated PDF variants together.
+let activeTargetPdfAmountBox = null;
 
 // V8 FORMAT-MATCHED REFERENCES:
 // Hedef dosyanın formatı ile aynı format ailesindeki referansları kullan.
@@ -10566,7 +10614,7 @@ function detectReferenceVariantFromText(text) {
   const t = normalizeFieldTextForMatch(text || '');
   if (!t) return null;
   const hasHvl = /DEKONT\s*\/\s*HVL|\bHVL\b|HAVALE UCRETI|PARA AKTARMA/.test(t);
-  const hasEftFast = /DEKONT\s*\/\s*EFT|\bEFT\b|GIDEN FAST|FAST UCRETI|GIDEN FAST ISLEMI|HESAPTAN FAST|FAST MESAJ KODU|FAST SORGU NO|FAST ISLEMI/.test(t);
+  const hasEftFast = /DEKONT\s*\/\s*EFT|\bEFT\b|GIDEN FAST|FAST GIDEN|FAST UCRETI|GIDEN FAST ISLEMI|FAST GIDEN ANLIK ODEME|HESAPTAN FAST|FAST MESAJ KODU|FAST SORGU NO|FAST ISLEMI/.test(t);
   if (hasHvl && !hasEftFast) return 'hvl';
   if (hasEftFast && !hasHvl) return 'eft';
   if (hasHvl && hasEftFast) return 'mixed';
@@ -15947,6 +15995,7 @@ uploadedFile.mimetype || ""
 // V8: target/reference format pairing is determined once per request.
 // PDF -> PDF, JPG/JPEG -> JPG, PNG -> PNG.
 activeReferenceFormat = detectTargetReferenceFormat({ mime, filePath, type });
+activeTargetPdfAmountBox = null;
 console.log("TARGET REFERENCE FORMAT:", activeReferenceFormat || "AUTO");
 if (
 !filePath
@@ -16017,6 +16066,19 @@ data: new Uint8Array(buffer),
 }).promise;
 
 pdfNativeFieldAssociation = await extractPdfNativeFieldAssociations(pdf);
+const targetNativeAmount = pdfNativeFieldAssociation?.fields?.amount;
+if (targetNativeAmount?.status === 'matched' && targetNativeAmount?.associationValidated && targetNativeAmount?.valueBox) {
+  const box = targetNativeAmount.valueBox;
+  activeTargetPdfAmountBox = {
+    x: Number(box.x),
+    y: Number(box.y),
+    width: Number(box.width),
+    height: Number(box.height),
+    pageNumber: Number(targetNativeAmount.pageNumber) || 1,
+    labelText: targetNativeAmount.labelText || null,
+  };
+  console.log('PDF TARGET AMOUNT BOX FOR REFERENCE MATCH:', JSON.stringify(activeTargetPdfAmountBox));
+}
 console.log("PDF NATIVE FIELD ASSOCIATION:", JSON.stringify(pdfNativeFieldAssociation));
 
 const pages = [];
