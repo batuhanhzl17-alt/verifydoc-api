@@ -10688,6 +10688,13 @@ async function getReferenceFiles(bank) {
         const ext = path.extname(entry.name).toLowerCase();
         if (!['.pdf', '.jpg', '.jpeg', '.png', '.webp'].includes(ext)) continue;
         if (isStatementReferencePath(entry.name)) continue;
+        // This VakıfBank PDF was a different layout variant and repeatedly
+        // won by directory order despite its amount/name boxes not matching
+        // the target. Retire it from every active VakıfBank reference pool.
+        if (normalizedBank === 'vakifbank' && /^vakifbank-2\.pdf$/i.test(entry.name)) {
+          console.log('REFERENCE EXCLUDED BY POLICY:', JSON.stringify({ bank: normalizedBank, file: entry.name, reason: 'retired-vakifbank-pdf-layout-variant' }));
+          continue;
+        }
         if (requestedFormat && !referenceFormatMatches(entry.name, requestedFormat)) continue;
 
         if (requireBankName) {
@@ -13564,6 +13571,7 @@ let repeatedCharacterAnalysis = {
 available: false,
 strongGroups: [],
 maxDifference: 0,
+  skippedReason: null,
 };
 
 try {
@@ -13576,7 +13584,9 @@ const components = extractConnectedCharacterComponents(data, w, h);
 
 // İlk karakterler soldan sağa tutar karakterlerine karşılık gelir.
 // Currency metni varsa sayısal karakterlerden sonra gelir ve dışarıda bırakılır.
-if (expectedCharacters.length >= 4 && components.length >= expectedCharacters.length) {
+if (estimatedCharacterSlots) {
+repeatedCharacterAnalysis.skippedReason = 'estimated-slots-do-not-provide-reliable-character-indexing';
+} else if (expectedCharacters.length >= 4 && components.length >= expectedCharacters.length) {
 const charPairs = expectedCharacters.map((char, index) => ({
 char,
 component: components[index],
@@ -13821,6 +13831,7 @@ localAnomalyRatio: Number(anomalyRatio.toFixed(3)),
 repeatedCharacterAvailable: repeatedCharacterAnalysis.available,
 repeatedCharacterMaxDifference: Number((repeatedCharacterAnalysis.maxDifference || 0).toFixed(3)),
 repeatedCharacterGroups: repeatedCharacterAnalysis.strongGroups.slice(0, 8),
+repeatedCharacterSkipReason: repeatedCharacterAnalysis.skippedReason,
 maxFeatureVotes: maxScore,
 templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
