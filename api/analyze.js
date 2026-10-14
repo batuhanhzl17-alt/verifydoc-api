@@ -3530,13 +3530,13 @@ function calculateDeterministicForensicRisk(result, forensic = {}) {
   // Paint-Over V1: promote only multi-signal LOCAL evidence. A single residual,
   // grayscale channel match, or Telegram/JPEG artifact is never enough.
   const paintOverV2 = forensic?.paintOverForensicsV2;
-  const paintOverV1 = forensic?.paintOverForensics || forensic?.paintOverForensicsV1;
-  const paintOverScore = Number(paintOverV2?.score ?? paintOverV1?.score);
-  const paintOverSignals = Number(paintOverV2?.metrics?.supportSignals ?? paintOverV1?.metrics?.supportSignals) || 0;
-  const paintOverMultiSignal = paintOverV2?.available === true
-    ? (String(paintOverV2?.severity || '').toLowerCase() === 'strong' || String(paintOverV2?.severity || '').toLowerCase() === 'moderate')
-    : paintOverV1?.metrics?.multiSignal === true;
-  if (Number.isFinite(paintOverScore) && forensic?.paintOverForensics?.available === true && paintOverMultiSignal) {
+  const paintOverScore = Number(paintOverV2?.score);
+  const paintOverSignals = Number(paintOverV2?.metrics?.supportSignals) || 0;
+  const paintOverMultiSignal = paintOverV2?.available === true && paintOverV2?.calibrated === true &&
+    (String(paintOverV2?.severity || '').toLowerCase() === 'strong' || String(paintOverV2?.severity || '').toLowerCase() === 'moderate');
+  // Raw V1/V2 residual scores cannot raise risk. The comparison must first
+  // pass a multi-sample genuine baseline calibration.
+  if (paintOverV2?.calibrated === true && Number.isFinite(paintOverScore) && paintOverMultiSignal) {
     const promoted = paintOverSignals >= 3 && paintOverScore >= 75 ? 75
       : paintOverSignals >= 3 && paintOverScore >= 60 ? 65
       : paintOverSignals >= 2 && paintOverScore >= 50 ? 55
@@ -4950,11 +4950,27 @@ async function listPaintOverV2Samples(bank, kind = "genuine") {
   // Ayrı genuine_telegram klasörü kullanılmaz.
   if (kind === "genuine") {
     try {
-      const refs = await getReferenceFiles(normalizedBank);
-      return (Array.isArray(refs) ? refs : [])
-        .filter(Boolean)
-        .map(String)
-        .filter((file) => /\.(?:jpe?g|png|webp)$/i.test(file));
+      // The active document-matching format is commonly PDF, which means
+      // getReferenceFiles() can return PDFs only and leave this raster
+      // calibration pool empty. Paint-Over calibration intentionally reads
+      // genuine raster references from their dedicated format folders.
+      // These are calibration-only samples; they do not select the document
+      // variant or provide the amount field anchor.
+      const refs = [];
+      for (const format of ['jpg', 'png', 'webp']) {
+        const dir = path.join(REFERENCE_DIR, format);
+        let entries = [];
+        try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { continue; }
+        for (const entry of entries) {
+          if (!entry.isFile() || !/\.(?:jpe?g|png|webp)$/i.test(entry.name)) continue;
+          const compact = normalizeTurkishText(path.basename(entry.name, path.extname(entry.name))).replace(/[^a-z0-9]/g, '');
+          if (!compact.includes(normalizedBank)) continue;
+          if (isStatementReferencePath(entry.name)) continue;
+          if (normalizedBank === 'vakifbank' && /^vakifbank-2\./i.test(entry.name)) continue;
+          refs.push(path.join(dir, entry.name));
+        }
+      }
+      return [...new Set(refs)].slice(0, 30);
     } catch (error) {
       console.warn("PAINTOVER V2 GENUINE REFERENCE LOAD HATASI:", error?.message || error);
       return [];
@@ -5194,8 +5210,12 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       samples: genuineVectors.map(x => ({ file: path.basename(x.path), path: x.path, rawScore: x.vector.rawScore }))
     }));
     const baselineScores=genuineVectors.map(x=>x.vector.rawScore);
-    const baselineAvailable=baselineScores.length>=1;
-    const baselineCalibrationQuality = genuineVectors.length >= 3 ? 'multi-sample' : genuineVectors.length === 2 ? 'two-sample' : genuineVectors.length === 1 ? 'single-sample' : 'unavailable';
+    // A single clean reference is not a usable calibration set: its dynamic
+    // amount and PDF/raster renderer can themselves be local outliers. Require
+    // at least three independent genuine raster samples before turning this
+    // raw local residual detector into a calibrated score.
+    const baselineAvailable=baselineScores.length>=3;
+    const baselineCalibrationQuality = genuineVectors.length >= 3 ? 'multi-sample' : genuineVectors.length === 2 ? 'insufficient-two-sample' : genuineVectors.length === 1 ? 'insufficient-single-sample' : 'unavailable';
     const baselineMedian=robustMedian(baselineScores);
     const baselineMad=robustMad(baselineScores,baselineMedian);
     const baselineP90=baselineScores.length?baselineScores.slice().sort((a,b)=>a-b)[Math.min(baselineScores.length-1,Math.ceil(baselineScores.length*.90)-1)]:0;
@@ -5261,29 +5281,31 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
     // 1) raw local signal is first calibrated against genuine Telegram data;
     // 2) known-fake similarity can corroborate it;
     // 3) Amount Forensics is corroboration only, never +10/+25 to PaintOver.
-    let calibrated=baselineAvailable?telegramAdjusted:clamp100(target.rawScore);
-    if(fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
-    else if(fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
+    let calibrated=baselineAvailable?telegramAdjusted:null;
+    if(calibrated!=null && fakePatternScore!=null && bestNegativeSimilarity>=0.90) calibrated=clamp100(calibrated*.55+fakePatternScore*.45);
+    else if(calibrated!=null && fakePatternScore!=null && bestNegativeSimilarity>=0.85) calibrated=clamp100(calibrated*.70+fakePatternScore*.30);
 
     // Amount Forensics can lift a borderline calibrated result only when the
     // image-local signal already survives Telegram calibration. It is not added
     // as a fixed support score.
-    if(amountStrong && calibrated>=45) calibrated=clamp100(calibrated+Math.min(18,amountScore*.18));
+    if(calibrated!=null && amountStrong && calibrated>=45) calibrated=clamp100(calibrated+Math.min(18,amountScore*.18));
 
-    const strong=calibrated>=75 && (
+    const strong=calibrated!=null && calibrated>=75 && (
       target.supportSignals>=3 ||
       bestNegativeSimilarity>=0.90 ||
       (amountStrong && target.supportSignals>=2)
     );
-    const moderate=calibrated>=50 && (target.supportSignals>=2 || bestNegativeSimilarity>=0.85);
-    const severity=strong?'strong':moderate?'moderate':calibrated>=25?'low':'none';
+    const moderate=calibrated!=null && calibrated>=50 && (target.supportSignals>=2 || bestNegativeSimilarity>=0.85);
+    const severity=calibrated==null?'insufficient-data':strong?'strong':moderate?'moderate':calibrated>=25?'low':'none';
 
     const out={
       available:true,
       engine,
       version:'V2',
-      score:Math.round(calibrated),
+      score:calibrated==null?null:Math.round(calibrated),
       rawScore:target.rawScore,
+      calibrated:baselineAvailable,
+      status:baselineAvailable?'calibrated':'calibration-unavailable',
       severity,
       roi:target.roi,
       metrics:{
@@ -5295,7 +5317,9 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
         knownFakePattern:{available:negativeVectors.length>0,sampleCount:negativeVectors.length,bestSimilarity:Number(bestNegativeSimilarity.toFixed(4)),score:fakePatternScore==null?null:Math.round(fakePatternScore),matches:negativeSimilarities.slice(0,5)},
         amountForensics:{score:Math.round(amountScore),strong:amountStrong,usedAsFixedSupport:false}
       },
-      evidence: strong
+      evidence: !baselineAvailable
+        ? 'Paint-Over ham sinyali hesaplandı ancak en az üç gerçek referans görüntüsüyle kalibre edilemedi; adli skor ve risk katkısı üretilmedi.'
+        : strong
         ? 'Telegram baseline kalibrasyonundan sonra lokal Paint-Over sinyali yüksek kaldı ve bağımsız desteklerle güçlendi.'
         : moderate
           ? 'Telegram etkisi kalibrasyona dahil edildi; kalan lokal sinyal orta düzeyde ve ek corroborating bulgu gerektiriyor.'
@@ -7039,7 +7063,9 @@ const REFERENCE_FIELD_RULES = [
   { key: "senderName", patterns: [/gönderen\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı)/i, /gönderici\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı)/i, /gonderen\s*(?:adi|ad[ıi]\s*soyad[ıi]?|unvani)/i] },
   { key: "recipientName", patterns: [/^alıcı(?:\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı|ismi|adi soyadi))?$/i, /^alacaklı(?:\s*(?:adı|adi|ad[ıi]\s*soyad[ıi]?|ünvanı|unvanı|ismi))?$/i, /^beneficiary(?:\s*name)?$/i, /^payee(?:\s*name)?$/i, /^receiver(?:\s*name)?$/i, /^lehdar(?:\s*(?:adı|unvanı))?$/i] },
   { key: "senderIban", patterns: [/^gönderen\s*(?:hesap\s*)?iban$/i, /^gönderici\s*(?:hesap\s*)?iban$/i, /^gonderen\s*(?:hesap\s*)?iban$/i, /^sender\s*(?:account\s*)?iban$/i, /^originator\s*(?:account\s*)?iban$/i] },
-  { key: "recipientIban", patterns: [/^alıcı\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^alacaklı\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^lehdar\s+(?:(?:hesap|banka)(?:\s*(?:no|numarası|numarasi|iban))?|iban)$/i, /^beneficiary\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i, /^payee\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i, /^receiver\s+(?:(?:account|bank)(?:\s*(?:number|iban))?|iban)$/i] },
+  // A bank-name label such as "ALICI BANKA" is not an IBAN label. BANKA
+  // qualifies only when IBAN is explicit; account labels remain accepted.
+  { key: "recipientIban", patterns: [/^alıcı\s+(?:hesap(?:\s*(?:no|numarası|numarasi))?(?:\s*iban)?|banka\s*iban|iban)$/i, /^alacaklı\s+(?:hesap(?:\s*(?:no|numarası|numarasi))?(?:\s*iban)?|banka\s*iban|iban)$/i, /^lehdar\s+(?:hesap(?:\s*(?:no|numarası|numarasi))?(?:\s*iban)?|banka\s*iban|iban)$/i, /^beneficiary\s+(?:account(?:\s*(?:number|iban))?|bank\s*iban|iban)$/i, /^payee\s+(?:account(?:\s*(?:number|iban))?|bank\s*iban|iban)$/i, /^receiver\s+(?:account(?:\s*(?:number|iban))?|bank\s*iban|iban)$/i] },
   { key: "senderAddress", patterns: [/gönderen\s*adres/i, /gönderici\s*adres/i, /gonderen\s*adres/i, /gonderici\s*adres/i] },
   { key: "recipientAddress", patterns: [/alıcı\s*adres/i, /alici\s*adres/i, /alacaklı\s*adres/i, /alacakli\s*adres/i] },
   { key: "address", patterns: [/\badres\b/i] },
@@ -10688,13 +10714,6 @@ async function getReferenceFiles(bank) {
         const ext = path.extname(entry.name).toLowerCase();
         if (!['.pdf', '.jpg', '.jpeg', '.png', '.webp'].includes(ext)) continue;
         if (isStatementReferencePath(entry.name)) continue;
-        // This VakıfBank PDF was a different layout variant and repeatedly
-        // won by directory order despite its amount/name boxes not matching
-        // the target. Retire it from every active VakıfBank reference pool.
-        if (normalizedBank === 'vakifbank' && /^vakifbank-2\.pdf$/i.test(entry.name)) {
-          console.log('REFERENCE EXCLUDED BY POLICY:', JSON.stringify({ bank: normalizedBank, file: entry.name, reason: 'retired-vakifbank-pdf-layout-variant' }));
-          continue;
-        }
         if (requestedFormat && !referenceFormatMatches(entry.name, requestedFormat)) continue;
 
         if (requireBankName) {
@@ -13571,7 +13590,6 @@ let repeatedCharacterAnalysis = {
 available: false,
 strongGroups: [],
 maxDifference: 0,
-  skippedReason: null,
 };
 
 try {
@@ -13584,9 +13602,7 @@ const components = extractConnectedCharacterComponents(data, w, h);
 
 // İlk karakterler soldan sağa tutar karakterlerine karşılık gelir.
 // Currency metni varsa sayısal karakterlerden sonra gelir ve dışarıda bırakılır.
-if (estimatedCharacterSlots) {
-repeatedCharacterAnalysis.skippedReason = 'estimated-slots-do-not-provide-reliable-character-indexing';
-} else if (expectedCharacters.length >= 4 && components.length >= expectedCharacters.length) {
+if (expectedCharacters.length >= 4 && components.length >= expectedCharacters.length) {
 const charPairs = expectedCharacters.map((char, index) => ({
 char,
 component: components[index],
@@ -13831,7 +13847,6 @@ localAnomalyRatio: Number(anomalyRatio.toFixed(3)),
 repeatedCharacterAvailable: repeatedCharacterAnalysis.available,
 repeatedCharacterMaxDifference: Number((repeatedCharacterAnalysis.maxDifference || 0).toFixed(3)),
 repeatedCharacterGroups: repeatedCharacterAnalysis.strongGroups.slice(0, 8),
-repeatedCharacterSkipReason: repeatedCharacterAnalysis.skippedReason,
 maxFeatureVotes: maxScore,
 templateBank: referenceAnchor?.bank || null,
 templateAmountText: null,
@@ -21217,8 +21232,10 @@ if (advancedForensics?.available) {
 }
 if (paintOverForensics?.available) {
   console.log("PAINT-OVER FORENSICS SUMMARY:", JSON.stringify({
-    score: paintOverForensics.score,
-    severity: paintOverForensics.severity,
+    status: "raw-diagnostic-only",
+    score: null,
+    rawDiagnosticScore: paintOverForensics.score,
+    severity: "not-calibrated-for-risk",
     channelResidualScore: paintOverForensics.metrics?.channelResidualScore || 0,
     lumaResidualScore: paintOverForensics.metrics?.lumaResidualScore || 0,
     edgeScore: paintOverForensics.metrics?.edgeScore || 0,
