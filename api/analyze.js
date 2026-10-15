@@ -15651,6 +15651,10 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   const orderedRows = rows.map((row, index) => ({ ...row, _index: index }))
     .sort((a, b) => (Number(a.pageNumber) - Number(b.pageNumber)) || (Number(a.rowNumber) - Number(b.rowNumber)) || a._index - b._index);
 
+  // A description token such as an ATM code is not a unique transaction ID.
+  // Treat rows as duplicate candidates only when the full ledger fingerprint,
+  // including the resulting balance, is identical. Repeated fees/ATM labels
+  // with different balances are separate transactions, not duplicates.
   const duplicateGroups = new Map();
   for (const row of orderedRows) {
     const date = statementNormalizeText(row.date);
@@ -15658,11 +15662,9 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     const counterparty = statementNormalizeText(row.counterparty);
     const debit = statementCents(row.debitAmount);
     const credit = statementCents(row.creditAmount);
-    const txId = statementNormalizeText(row.transactionId);
-    if (!date || (!description && !txId) || (debit === null && credit === null)) continue;
-    const key = txId
-      ? `id:${txId}`
-      : `${date}|${debit ?? 0}|${credit ?? 0}|${description}|${counterparty}`;
+    const balanceAfter = statementCents(row.balanceAfter);
+    if (!date || !description || (debit === null && credit === null) || balanceAfter === null) continue;
+    const key = `${date}|${debit ?? 0}|${credit ?? 0}|${description}|${counterparty}|${balanceAfter}`;
     if (!duplicateGroups.has(key)) duplicateGroups.set(key, []);
     duplicateGroups.get(key).push(row);
   }
@@ -15711,7 +15713,8 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     (statementCents(row.debitAmount) !== null || statementCents(row.creditAmount) !== null)
   );
   const declaredCount = Number(transactionAnalysis.transactionCount) || 0;
-  const rowsIncomplete = usableRows.length === 0 || (declaredCount > 0 && usableRows.length < declaredCount);
+  const rowCountMismatch = declaredCount > 0 && usableRows.length !== declaredCount;
+  const rowsIncomplete = usableRows.length === 0 || rowCountMismatch;
   const pageNumbersSeen = new Set(usableRows.map(row => Number(row.pageNumber)));
   const pagesWithRows = pageNumbersSeen.size;
   const pageCoverageComplete = Number(pdfPageCount) > 0 &&
@@ -15732,14 +15735,10 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   const calculatedClosingCents = completeAmounts && openingCents !== null
     ? openingCents + totalIncomingCents - totalOutgoingCents
     : null;
-  const aggregateMismatch = Boolean(
-    completeAmounts && (
-      (statementCents(balanceAnalysis.totalIncoming) !== null && Math.abs(statementCents(balanceAnalysis.totalIncoming) - totalIncomingCents) > 1) ||
-      (statementCents(balanceAnalysis.totalOutgoing) !== null && Math.abs(statementCents(balanceAnalysis.totalOutgoing) - totalOutgoingCents) > 1) ||
-      (calculatedClosingCents !== null && documentClosingCents !== null && Math.abs(calculatedClosingCents - documentClosingCents) > 1)
-    )
-  );
-  deterministicMismatch = deterministicMismatch || aggregateMismatch;
+  // Model-provided aggregate totals are not guaranteed to be transcribed from
+  // explicit totals printed on the statement. Do not turn those values into a
+  // mathematical mismatch. The deterministic row-to-row balance chain is the
+  // authoritative check here; totals remain informational when available.
   if (completeAmounts) {
     balanceAnalysis.totalIncoming = Number((totalIncomingCents / 100).toFixed(2));
     balanceAnalysis.totalOutgoing = Number((totalOutgoingCents / 100).toFixed(2));
@@ -15751,13 +15750,27 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     if (bestOrder.mismatches > 0) {
       notes.push(`Satır bakiyesi kontrolünde ${bestOrder.mismatches}/${bestOrder.checks} ardışık karşılaştırmada fark görüldü (${bestOrder.direction === 'ascending' ? 'belgede yukarıdan aşağıya' : 'belgede aşağıdan yukarıya'} sıralama). Örnek farklar: ${bestOrder.examples.map(item => `s.${item.pageNumber}/satır ${item.rowNumber}: beklenen ${item.expectedBalance}, belgede ${item.documentBalance} (${item.difference})`).join('; ')}.`);
     }
-    if (aggregateMismatch) notes.push('Satır tutarlarından hesaplanan giriş/çıkış toplamı veya kapanış bakiyesi, belgedeki toplamla uyuşmuyor.');
     balanceAnalysis.evidence = [balanceAnalysis.evidence, ...notes, 'OCR/alan çıkarım hatası olasılığı nedeniyle banka kaydı üzerinden kontrol edilmeli.'].filter(Boolean).join(' ');
-  } else if (bestOrder.checks >= 2 && !rowsIncomplete && !aggregateMismatch) {
+  } else if (rowsIncomplete) {
+    // Missing/extra rows make the full statement result indeterminate; do not
+    // preserve a model-generated false value as if a mismatch was verified.
+    balanceAnalysis.calculationConsistent = null;
+    balanceAnalysis.evidence = [balanceAnalysis.evidence, 'Satır sayısı doğrulanamadığı için hesap özeti genelinde bakiye tutarlılığı kesinleştirilemedi.'].filter(Boolean).join(' ');
+  } else if (bestOrder.checks >= 2) {
     balanceAnalysis.calculationConsistent = true;
     balanceAnalysis.evidence = [balanceAnalysis.evidence, `Satır bakiyesi devamlılığı ${bestOrder.checks} ardışık karşılaştırmada tutarlı (${bestOrder.direction === 'ascending' ? 'yukarıdan aşağıya' : 'aşağıdan yukarıya'} sıra).`].filter(Boolean).join(' ');
   }
 
+  // Discard narrative count claims and replace them with the structured row
+  // count comparison below. The model's prose can disagree with its row array.
+  const staleCountClaim = /(bildirilen|beyan edilen|toplam).{0,40}(kayıt|işlem|satır).{0,80}(fark|eksik|arasında)|(?:\d+).{0,30}(işlem|satır).{0,40}(arasında|fark)/i;
+  transactionAnalysis.suspiciousTransactions = (Array.isArray(transactionAnalysis.suspiciousTransactions)
+    ? transactionAnalysis.suspiciousTransactions : []).filter(item => !staleCountClaim.test(String(item || '')));
+  if (rowCountMismatch) {
+    transactionAnalysis.suspiciousTransactions.push(
+      `Belgede bildirilen ${declaredCount} işlem satırı ile yapılandırılmış olarak çıkarılan ${usableRows.length} satır uyuşmuyor; satır sayımı manuel kontrol edilmeli.`
+    );
+  }
   const existingDuplicates = Array.isArray(transactionAnalysis.duplicateTransactions) ? transactionAnalysis.duplicateTransactions : [];
   transactionAnalysis.duplicateTransactions = [...new Set([...existingDuplicates, ...derivedDuplicates])];
   transactionAnalysis.rows = orderedRows.map(({ _index, ...row }) => row);
@@ -15788,7 +15801,8 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   const findings = [];
   if (deterministicMismatch) findings.push('Satır bazlı bakiye hesabında fark bulundu; örnek satırlar ve beklenen bakiyeler rapora eklendi.');
   if (derivedDuplicates.length) findings.push(`${derivedDuplicates.length} olası yinelenen işlem grubu bulundu; tekrarlar ayrı listelendi.`);
-  if (rowsIncomplete) findings.push(`Model ${usableRows.length}/${declaredCount || '?'} işlem satırını yapılandırılmış çıkarabildi; tamamlanmayan satırlar nedeniyle tüm bakiye zinciri doğrulanamadı.`);
+  if (usableRows.length === 0) findings.push('Yapılandırılmış işlem satırı çıkarılamadığı için bakiye zinciri doğrulanamadı.');
+  else if (rowCountMismatch) findings.push(`Belgede bildirilen ${declaredCount} işlem satırı ile yapılandırılmış olarak çıkarılan ${usableRows.length} satır uyuşmuyor; tüm bakiye zinciri doğrulanmış sayılmamalı.`);
   if (!pageCoverageComplete) findings.push(`PDF'nin ${pdfForensics?.pagesAnalyzed || 0}/${pdfPageCount || '?'} sayfasındaki yerel PDF denetimi tamamlanamadı.`);
   if (pdfForensics?.findings?.length) findings.push(...pdfForensics.findings.map(item => item.detail));
   result.manualReviewRequired = Boolean(deterministicMismatch || derivedDuplicates.length || rowsIncomplete || !pageCoverageComplete || pdfForensics?.reviewRequired);
@@ -15801,6 +15815,15 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : []), ...findings])];
   if (rowsIncomplete || !pageCoverageComplete) {
     result.limitations = [...new Set([...(Array.isArray(result.limitations) ? result.limitations : []), 'PDF sayfalarının veya işlem satırlarının bir kısmı yapılandırılmış olarak doğrulanamadı; eksik bölümler manuel incelenmeli.'])];
+  }
+  if (result.summary) {
+    result.summary = String(result.summary)
+      .split(/(?<=[.!?])\s+|\n+/)
+      .filter(sentence => !staleCountClaim.test(sentence))
+      .join(' ');
+  }
+  if (Array.isArray(result.evidence)) {
+    result.evidence = result.evidence.filter(item => !staleCountClaim.test(String(item || '')));
   }
   return result;
 }
