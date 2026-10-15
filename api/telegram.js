@@ -1465,6 +1465,7 @@ function extractFileFromMessage(
 async function analyzeFile({
 
  buffer,
+fileId,
  fileName,
  mimeType,
  type,
@@ -1706,65 +1707,36 @@ expectedDetails,
  // DOSYA
  // ===================================================
 
- const blob =
- new Blob(
- [buffer],
- {
- type:
- mimeType ||
- "application/octet-stream",
+ let response;
+ if (type === "video" && fileId) {
+  const internalSecret = process.env.VERIFYDOC_TELEGRAM_ANALYSIS_SECRET;
+  if (!internalSecret) throw new Error("VERIFYDOC_TELEGRAM_ANALYSIS_SECRET Vercel ortam değişkeninde tanımlı değil.");
+  console.log("VIDEO TRANSFER MODE: Telegram file_id; file bytes are fetched by the analysis API");
+  response = await fetch(ANALYZE_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-verifydoc-telegram-secret": internalSecret,
+    },
+    body: JSON.stringify({
+      source: "telegram-video",
+      fileId,
+      fileName,
+      mimeType,
+      type,
+      bank: bank || null,
+      statementMode: Boolean(statementMode),
+      providedInfo: expectedDetails || null,
+    }),
+  });
+ } else {
+  const blob = new Blob([buffer], { type: mimeType || "application/octet-stream" });
+  let fieldName = "file";
+  if (type === "image") fieldName = "image";
+  if (type === "video") fieldName = "video";
+  form.append(fieldName, blob, fileName);
+  response = await fetch(ANALYZE_URL, { method: "POST", body: form });
  }
- );
-
-
- let fieldName =
- "file";
-
-
- if (
- type ===
- "image"
- ) {
-
- fieldName =
- "image";
-
- }
-
-
- if (
- type ===
- "video"
- ) {
-
- fieldName =
- "video";
-
- }
-
-
- form.append(
- fieldName,
- blob,
- fileName
- );
-
-
- // ===================================================
- // API
- // ===================================================
-
- const response =
- await fetch(
- ANALYZE_URL,
- {
- method:
- "POST",
-
- body:
- form,
- }
- );
 
 
  const responseText =
@@ -2804,10 +2776,9 @@ Analiz ediliyor...`;
  // TELEGRAM'DAN DOSYAYI İNDİR
  // =================================================
 
- const downloaded =
- await downloadTelegramFile(
- fileInfo.fileId
- );
+ const downloaded = fileInfo.type === "video" && !statementMode
+  ? null
+  : await downloadTelegramFile(fileInfo.fileId);
 
 
  // =================================================
@@ -2818,7 +2789,10 @@ Analiz ediliyor...`;
  await analyzeFile({
 
  buffer:
- downloaded.buffer,
+ downloaded?.buffer || null,
+
+ fileId:
+ fileInfo.fileId,
 
  fileName:
  fileInfo.fileName,
