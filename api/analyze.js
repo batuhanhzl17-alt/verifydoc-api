@@ -3506,16 +3506,23 @@ String(check.status || "")
 .trim()
 .toLowerCase();
 
-// Kontrolün kendi sayısal skorunu kullan. Böylece tek bir fail,
-// bütün kategoriyi otomatik 100'e kilitlemez.
-if (status !== "pass" && status !== "fail") {
+// The status defines whether the check found a problem. High scores on
+// passing checks describe confidence/consistency, not risk, so they add zero.
+// For a failing check, score is the reported anomaly strength.
+if (status === "pass") {
+  weightedTotal += 0;
+  totalWeight += weight;
+  continue;
+}
+
+if (status !== "fail") {
 continue;
 }
 
 const rawCheckScore = Number(check.score);
 const safeScore = Number.isFinite(rawCheckScore)
 ? Math.max(0, Math.min(100, rawCheckScore))
-: (status === "fail" ? 60 : 0);
+: 60;
 
 
 weightedTotal +=
@@ -6823,12 +6830,14 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
     const args = [
       "-hide_banner", "-loglevel", "error", "-i", videoPath,
       "-t", String(scanSeconds),
-      "-vf", `scdet=threshold=15,metadata=print:file=${metadataPath}`,
+      "-vf", `scdet=threshold=15,metadata=mode=print:file=${metadataPath}`,
       "-an", "-f", "null", "-"
     ];
     await execFileAsync(ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 90000 });
     const metadata = await fs.readFile(metadataPath, "utf8").catch(() => "");
     const records = [];
+    let parsedScoreCount = 0;
+    let maxSceneScore = 0;
     let currentTime = null;
     for (const line of metadata.split(/\r?\n/)) {
       const frameMatch = line.match(/pts_time:([0-9]+(?:\.[0-9]+)?)/);
@@ -6836,8 +6845,22 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       const scoreMatch = line.match(/lavfi\.scd\.score=([0-9]+(?:\.[0-9]+)?)/);
       if (scoreMatch && Number.isFinite(currentTime)) {
         const score = Number(scoreMatch[1]);
+        parsedScoreCount += 1;
+        maxSceneScore = Math.max(maxSceneScore, score);
         if (score >= 15) records.push({ timestampSeconds: currentTime, score: Number(score.toFixed(2)) });
       }
+    }
+    if (parsedScoreCount === 0) {
+      return {
+        available: false,
+        engine: "ffmpeg-scdet-temporal-audit-v1",
+        durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
+        scannedSeconds: Number(scanSeconds.toFixed(3)),
+        fullDurationScanned: Number.isFinite(durationSeconds) && durationSeconds <= maxScanSeconds,
+        candidateCount: null,
+        sceneChangeCandidates: [],
+        reason: "FFmpeg kare puanlarını metadata dosyasına yazmadı; sıfır aday sonucu güvenilir değil."
+      };
     }
     const candidates = [];
     for (const item of records) {
@@ -6858,6 +6881,8 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
       scannedSeconds: Number(scanSeconds.toFixed(3)),
       fullDurationScanned: Number.isFinite(durationSeconds) && durationSeconds <= maxScanSeconds,
+      analyzedFrameCount: parsedScoreCount,
+      maxSceneChangeScore: Number(maxSceneScore.toFixed(2)),
       candidateCount: candidates.length,
       sceneChangeCandidates: candidates.slice(0, 30),
       interpretation: "Adaylar ani görüntü geçişlerini gösterir; tek başına kesme veya manipülasyon kanıtı değildir.",
@@ -7296,12 +7321,12 @@ throw new Error(
 }
 
 console.log(
-"VIDEO OVERALL RISK:",
+"VIDEO MODEL SUGGESTED RISK:",
 result.overallRisk
 );
 
 console.log(
-"VIDEO RISK LABEL:",
+"VIDEO MODEL SUGGESTED LABEL:",
 result.riskLabel
 );
 
@@ -19459,10 +19484,7 @@ videoResult.videoSampling = videoSampling;
 videoResult.videoTemporalAudit = videoTemporalAudit;
 
 console.log(
-"VIDEO ANALYSIS COMPLETE"
-);
-console.log(
-"VIDEO RESULT:",
+"VIDEO MODEL RESULT:",
 videoResult
 );
 // =====================================================
@@ -19486,6 +19508,12 @@ videoRisk.riskLabel;
 
 videoResult.categories =
 videoRisk.categories;
+console.log("VIDEO FINAL RISK:", JSON.stringify({
+  overallRisk: videoRisk.overallRisk,
+  riskLabel: videoRisk.riskLabel,
+  categories: videoRisk.categories,
+  source: "check-status-risk-v2",
+}));
 
 // =====================================================
 // FINAL VIDEO SCORE
