@@ -6050,13 +6050,54 @@ async function runOpenSourceForensics({ targetPath, targetBuffer=null, type='ima
   };
 }
 
-async function runStatementPdfForensics(filePath, buffer) {
+function statementPdfMoneyCents(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? Math.round(value * 100) : null;
+  const raw = String(value ?? '').trim().replace(/[^\d,.-]/g, '');
+  if (!raw || !/\d/.test(raw)) return null;
+  const comma = raw.lastIndexOf(',');
+  const dot = raw.lastIndexOf('.');
+  const decimalAt = Math.max(comma, dot);
+  let normalized;
+  if (decimalAt >= 0 && raw.length - decimalAt - 1 <= 2) {
+    normalized = raw.slice(0, decimalAt).replace(/[,.]/g, '') + '.' + raw.slice(decimalAt + 1);
+  } else {
+    normalized = raw.replace(/[,.]/g, '');
+  }
+  const number = Number(normalized);
+  return Number.isFinite(number) ? Math.round(number * 100) : null;
+}
+
+function statementPdfDateKey(value) {
+  const text = String(value || '').trim();
+  // Accept DD.MM.YYYY and YYYY-MM-DD, including timestamps after the date.
+  const ymd = text.match(/(?:^|[^\d])(20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?:$|[^\d])/);
+  if (ymd) return `${ymd[1]}${ymd[2].padStart(2, '0')}${ymd[3].padStart(2, '0')}`;
+  const dmy = text.match(/(?:^|[^\d])(\d{1,2})[./-](\d{1,2})[./-](20\d{2})(?:$|[^\d])/);
+  return dmy ? `${dmy[3]}${dmy[2].padStart(2, '0')}${dmy[1].padStart(2, '0')}` : '';
+}
+
+function statementPdfItemBox(item, viewport) {
+  const transform = item?.transform || [];
+  const x = Number(transform[4]) || 0;
+  const baselineY = Number(transform[5]) || 0;
+  const width = Math.max(0.1, Number(item?.width) || 0.1);
+  const height = Math.max(1, Number(item?.height) || 8);
+  return {
+    x: Math.max(0, Math.min(1, x / viewport.width)),
+    y: Math.max(0, Math.min(1, (viewport.height - baselineY - height) / viewport.height)),
+    width: Math.max(0.0001, Math.min(1, width / viewport.width)),
+    height: Math.max(0.0001, Math.min(1, height / viewport.height)),
+  };
+}
+
+async function runStatementPdfForensics(filePath, buffer, statementRows = []) {
   let pdf = null;
   try {
     pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
     const pageCount = Number(pdf.numPages) || 0;
     const structural = await runPdfStructuralForensics(filePath, buffer, null, { maxPages: pageCount });
     const pageAudits = [];
+    const rowAssociationDiagnostics = [];
 
     // Every statement page is raster-checked for copy-move candidates and
     // inspected for white/vector/image overlays on native financial values.
@@ -6072,18 +6113,75 @@ async function runStatementPdfForensics(filePath, buffer) {
         /^[+\-−]?(?:(?:\d{1,3}(?:[.\s]\d{3})+)|\d+)[,.]\d{2}\s*(?:TL|TRY)?$/i.test(String(item.str || '').trim())
       );
       const localizedOverlayCandidates = [];
+      const pageRows = (Array.isArray(statementRows) ? statementRows : []).filter(row => Number(row?.pageNumber) === pageNumber);
+      const pageItems = content.items || [];
+      for (const [rowIndex, row] of pageRows.entries()) {
+        const rowLabel = `sayfa ${pageNumber}, satır ${row?.rowNumber ?? rowIndex + 1}`;
+        const dateKey = statementPdfDateKey(row?.date);
+        const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
+        const rowAmountValue = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
+          : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
+        const expectedAmountCents = statementPdfMoneyCents(rowAmountValue);
+        const expectedBalanceCents = statementPdfMoneyCents(row?.balanceAfter);
+        let status = 'unresolved';
+        let reason = '';
+        if (!Number.isInteger(Number(row?.pageNumber))) reason = 'İşlem satırında sayfa numarası yok.';
+        else if (!dateKey) reason = 'Satır tarihi güvenilir biçimde okunamadı; sayfa içi satır ankrajı kurulamadı.';
+        else if (dateAnchors.length !== 1) reason = dateAnchors.length === 0
+          ? 'PDF metin katmanında bu satırın tarihi bulunamadı.'
+          : `Aynı tarih sayfada ${dateAnchors.length} kez geçtiği için satır tekilleştirilemedi.`;
+        else {
+          const anchor = dateAnchors[0];
+          const anchorY = Number(anchor?.transform?.[5]) || 0;
+          const rowLineItems = pageItems.filter(item => Math.abs((Number(item?.transform?.[5]) || 0) - anchorY) <= Math.max(3, Number(anchor?.height) || 8));
+          const amountItems = numericTokens.filter(item => Math.abs((Number(item?.transform?.[5]) || 0) - anchorY) <= Math.max(3, Number(anchor?.height) || 8));
+          const findUniqueValue = cents => {
+            if (cents == null) return [];
+            return amountItems.filter(item => statementPdfMoneyCents(item.str) === cents);
+          };
+          const matchedAmountItems = findUniqueValue(expectedAmountCents);
+          const matchedBalanceItems = findUniqueValue(expectedBalanceCents);
+          const description = statementNormalizeText(row?.description);
+          const descriptionTerms = description.split(' ').filter(term => term.length >= 4);
+          const lineText = statementNormalizeText(rowLineItems.map(item => item.str || '').join(' '));
+          const descriptionMatched = descriptionTerms.length === 0 || descriptionTerms.some(term => lineText.includes(term));
+          if (!descriptionMatched) reason = 'Tarih satırı bulundu ancak açıklama aynı görsel satırda doğrulanmadı.';
+          else if (expectedAmountCents == null) reason = 'Satırda borç/alacak tutarı yapılandırılmış değil.';
+          else if (matchedAmountItems.length !== 1) reason = matchedAmountItems.length === 0
+            ? 'Beklenen borç/alacak tutarı aynı satırda PDF metin kutusuyla eşleşmedi.'
+            : 'Beklenen borç/alacak tutarı aynı satırda birden fazla kez bulundu.';
+          else {
+            status = 'matched';
+            reason = 'Tarih, açıklama ve işlem tutarı aynı PDF satırında tekil olarak eşleşti.';
+            const fieldsToAudit = [{ field: row?.debitAmount != null && row?.debitAmount !== '' ? 'debitAmount' : 'creditAmount', value: rowAmountValue, item: matchedAmountItems[0] }];
+            if (expectedBalanceCents != null && matchedBalanceItems.length === 1) fieldsToAudit.push({ field: 'balanceAfter', value: row.balanceAfter, item: matchedBalanceItems[0] });
+            for (const field of fieldsToAudit) {
+              const targetBox = statementPdfItemBox(field.item, viewport);
+              for (const candidate of pdfAuditWhiteCoverCandidates(operators, viewport, targetBox, 'amount', String(field.item.str || '').trim())) {
+                localizedOverlayCandidates.push({
+                  pageNumber, rowNumber: row?.rowNumber ?? rowIndex + 1, transactionId: row?.transactionId || null,
+                  field: field.field, expectedValue: field.value, valueToken: String(field.item.str || '').trim(),
+                  associationStatus: 'matched', associationReason: reason,
+                  objectType: candidate.objectType, paintOrder: candidate.imagePaintOrderRelativeToFieldText,
+                  overlap: candidate.targetCoverage, box: candidate.box, evidence: candidate.evidence,
+                });
+              }
+            }
+            if (expectedBalanceCents != null && matchedBalanceItems.length !== 1) {
+              reason += ` Bakiye alanı ${matchedBalanceItems.length ? 'aynı satırda birden fazla eşleşti' : 'aynı satırda bulunamadı'}.`;
+            }
+          }
+        }
+        rowAssociationDiagnostics.push({
+          pageNumber, rowNumber: row?.rowNumber ?? rowIndex + 1, transactionId: row?.transactionId || null,
+          date: row?.date || null, status, reason,
+          amountMatched: status === 'matched',
+          balanceMatched: expectedBalanceCents != null && dateAnchors.length === 1 &&
+            numericTokens.filter(item => Math.abs((Number(item?.transform?.[5]) || 0) - (Number(dateAnchors[0]?.transform?.[5]) || 0)) <= Math.max(3, Number(dateAnchors[0]?.height) || 8) && statementPdfMoneyCents(item.str) === expectedBalanceCents).length === 1,
+        });
+      }
       for (const item of numericTokens) {
-        const transform = item.transform || [];
-        const x = Number(transform[4]) || 0;
-        const baselineY = Number(transform[5]) || 0;
-        const width = Math.max(0.1, Number(item.width) || 0.1);
-        const height = Math.max(1, Number(item.height) || 8);
-        const targetBox = {
-          x: Math.max(0, Math.min(1, x / viewport.width)),
-          y: Math.max(0, Math.min(1, (viewport.height - baselineY - height) / viewport.height)),
-          width: Math.max(0.0001, Math.min(1, width / viewport.width)),
-          height: Math.max(0.0001, Math.min(1, height / viewport.height)),
-        };
+        const targetBox = statementPdfItemBox(item, viewport);
         const candidates = pdfAuditWhiteCoverCandidates(operators, viewport, targetBox, 'amount', String(item.str || '').trim());
         for (const candidate of candidates) {
           localizedOverlayCandidates.push({
@@ -6115,9 +6213,14 @@ async function runStatementPdfForensics(filePath, buffer) {
         detail: `Sayfa ${candidate.pageNumber}: PDF içinde ${candidate.objectType === 'white-vector-fill' ? 'beyaz bir vektör şekli' : 'bir görsel nesne'} finansal sayı alanıyla örtüşüyor (${candidate.valueToken}; çizim sırası: ${candidate.paintOrder}). Bu kapatma/yapıştırma adayıdır; tek başına düzenleme veya sahtecilik kanıtı değildir.`,
       }));
     const copyMoveResults = pageAudits.map(page => ({ pageNumber: page.pageNumber, ...page.copyMove }));
+    const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched');
     const findings = [
       ...(structural?.findings || []).map(item => ({ severity: item.severity || 'low', detail: item.detail })),
       ...overlayFindings,
+      ...(unresolvedRowAssociations.length ? [{
+        severity: 'review',
+        detail: `${unresolvedRowAssociations.length}/${rowAssociationDiagnostics.length} işlem satırında tutar/bakiye PDF metin kutusu satıra güvenle bağlanamadı. Bu satırlarda lokal örtme denetimi sonuçsuzdur; örnekler: ${unresolvedRowAssociations.slice(0, 5).map(item => `s.${item.pageNumber ?? '?'} satır ${item.rowNumber}: ${item.reason}`).join('; ')}.`,
+      }] : []),
       ...copyMoveResults.filter(item => item.severity === 'strong' || item.severity === 'medium').map(item => ({
         severity: item.severity,
         detail: `Sayfa ${item.pageNumber}: olası kopyala-taşı görüntü bölgesi bulundu (${item.evidence || item.status}). Bu sinyal ayrıca incelenmelidir.`,
@@ -6125,6 +6228,7 @@ async function runStatementPdfForensics(filePath, buffer) {
     ];
     const reviewRequired = Boolean(
       overlayFindings.length ||
+      unresolvedRowAssociations.length > 0 ||
       structural?.findings?.some(item => item.severity === 'medium' || item.severity === 'strong') ||
       copyMoveResults.some(item => item.severity === 'strong')
     );
@@ -6134,6 +6238,12 @@ async function runStatementPdfForensics(filePath, buffer) {
       pageCount,
       pagesAnalyzed: pageAudits.length,
       everyPageAnalyzed: pageAudits.length === pageCount,
+      transactionRowAssociation: {
+        inputRows: Array.isArray(statementRows) ? statementRows.length : 0,
+        matchedRows: rowAssociationDiagnostics.filter(item => item.status === 'matched').length,
+        unresolvedRows: rowAssociationDiagnostics.filter(item => item.status !== 'matched').length,
+        rows: rowAssociationDiagnostics.slice(0, 200),
+      },
       structural,
       pages: pageAudits,
       findings,
@@ -18257,7 +18367,11 @@ fileName,
 statementReference
 );
 
-const statementPdfForensics = await runStatementPdfForensics(filePath, buffer);
+const statementPdfForensics = await runStatementPdfForensics(
+  filePath,
+  buffer,
+  statementModelResult?.transactionAnalysis?.rows || []
+);
 const statementPageCount = Number(statementPdfForensics?.pageCount) || 0;
 const statementResult = applyStatementLedgerChecks(
   statementModelResult,
@@ -18273,6 +18387,8 @@ console.log("HESAP ÖZETİ TÜM SAYFA DENETİMİ:", JSON.stringify({
   balanceChecks: statementResult?.transactionAnalysis?.rowByRowAudit?.balanceChecks || 0,
   balanceMismatches: statementResult?.transactionAnalysis?.rowByRowAudit?.balanceMismatchCount || 0,
   duplicateCandidates: statementResult?.transactionAnalysis?.rowByRowAudit?.duplicateCandidateCount || 0,
+  forensicRowsMatched: statementPdfForensics?.transactionRowAssociation?.matchedRows || 0,
+  forensicRowsUnresolved: statementPdfForensics?.transactionRowAssociation?.unresolvedRows || 0,
   pdfFindingCount: statementPdfForensics?.findings?.length || 0,
   manualReviewRequired: statementResult?.manualReviewRequired === true,
 }));
