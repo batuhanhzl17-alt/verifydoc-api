@@ -6622,6 +6622,35 @@ async function extractVideoFrames(
 videoPath
 ) {
 
+// ffmpeg reports container duration while probing the input. Keep the
+// extraction bounded, but sample across the complete clip instead of only
+// taking the first four seconds.
+let durationSeconds = null;
+try {
+  await execFileAsync(ffmpegPath, ["-hide_banner", "-i", videoPath], {
+    maxBuffer: 2 * 1024 * 1024,
+  });
+} catch (probeError) {
+  const probeText = `${probeError?.stderr || ""}\n${probeError?.message || ""}`;
+  const durationMatch = probeText.match(/Duration:\s*(\d{2,}):(\d{2}):(\d{2}(?:\.\d+)?)/i);
+  if (durationMatch) {
+    durationSeconds =
+      Number(durationMatch[1]) * 3600 +
+      Number(durationMatch[2]) * 60 +
+      Number(durationMatch[3]);
+  }
+}
+
+const maxFrameCount = 16;
+const targetIntervalSeconds = 2.5;
+const targetFrameCount = durationSeconds
+  ? Math.min(maxFrameCount, Math.max(1, Math.ceil(durationSeconds / targetIntervalSeconds)))
+  : maxFrameCount;
+const sampleRate = durationSeconds
+  ? Math.max(1 / durationSeconds, targetFrameCount / durationSeconds)
+  : 0.5;
+const expectedIntervalSeconds = 1 / sampleRate;
+
 const outputDir =
 `/tmp/verifydoc-${Date.now()}`;
 
@@ -6645,10 +6674,10 @@ ffmpegPath,
 "-i",
 videoPath,
 "-vf",
-"fps=1,scale=1280:-2",
+`fps=${sampleRate.toFixed(6)},scale=1280:-2`,
 
 "-frames:v",
-"4",
+String(targetFrameCount),
 "-q:v",
 "5",
 
@@ -6701,6 +6730,7 @@ frames.push({
 
 file,
 framePath,
+timestampSeconds: (frames.length * expectedIntervalSeconds),
 base64:
 buffer.toString(
 "base64"
@@ -6709,7 +6739,20 @@ buffer.toString(
 
 }
 
-return frames;
+const frameTimestampsSeconds = frames.map((frame) => frame.timestampSeconds);
+return {
+  frames,
+  sampling: {
+    durationSeconds,
+    method: "uniform-across-video",
+    maxFrameCount,
+    targetFrameCount,
+    extractedFrameCount: frames.length,
+    intervalSeconds: expectedIntervalSeconds,
+    frameTimestampsSeconds,
+    coverageComplete: Number.isFinite(durationSeconds) && durationSeconds > 0,
+  },
+};
 
 }
 
@@ -6757,6 +6800,7 @@ await runPaddleOCR(frame.framePath);
 return {
 frame: index + 1,
 file: frame.file,
+timestampSeconds: frame.timestampSeconds,
 text: ocrResult?.text || "",
 confidence:
 Number(ocrResult?.confidence) || 0,
@@ -6774,6 +6818,7 @@ error
 return {
 frame: index + 1,
 file: frame.file,
+timestampSeconds: frame.timestampSeconds,
 text: "",
 confidence: 0,
 success: false,
@@ -6802,6 +6847,7 @@ videoOCRResults
 
 return `
 KARE ${item.frame}
+ZAMAN: ${Number(item.timestampSeconds || 0).toFixed(2)} saniye
 DOSYA: ${item.file}
 OCR BAŞARILI: ${item.success}
 OCR CONFIDENCE: ${item.confidence}/100
@@ -6812,19 +6858,17 @@ ${item.text || "Metin okunamadı."}
 
 })
 .join("\n");
-const imageMessages =
-frames.map(
-(frame) => ({
-type:
-"input_image",
-
-image_url:
-`data:image/jpeg;base64,${frame.base64}`,
-
-detail:
-"high",
-})
-);
+const imageMessages = frames.flatMap((frame, index) => ([
+  {
+    type: "input_text",
+    text: `FRAME ${index + 1} — ZAMAN ${Number(frame.timestampSeconds || 0).toFixed(2)} saniye`,
+  },
+  {
+    type: "input_image",
+    image_url: `data:image/jpeg;base64,${frame.base64}`,
+    detail: "high",
+  },
+]));
 
 const videoPrompt = `
 
@@ -6834,6 +6878,10 @@ TÜM ANALİZ TÜRKÇE OLMALIDIR.
 
 Bu belge bir video içerisinden çıkarılmış
 ${frames.length} ayrı kare üzerinden analiz edilmektedir.
+Kareler videonun tamamına eşit aralıklarla yayılmıştır; her kare için
+zaman damgası aşağıdaki OCR bilgisinde ve hemen öncesindeki görsel etiketinde verilir.
+Bir değişiklik iddiası varsa yaklaşık zaman aralığını belirt; örneklenmeyen
+iki kare arasındaki görünmeyen bir kesintiyi kesin bulgu gibi sunma.
 
 Tüm kareleri birlikte değerlendir.
 
@@ -19227,16 +19275,24 @@ await extractVideoFrames(
 filePath
 );
 
+const videoSampling = frames.sampling;
+const extractedFrames = frames.frames;
+
 
 console.log(
 "VIDEO FRAMES EXTRACTED:",
-frames.length
+extractedFrames.length
+);
+console.log(
+"VIDEO SAMPLE COVERAGE:",
+JSON.stringify(videoSampling)
 );
 
 const videoResult =
 await analyzeVideoFrames(
-frames
+extractedFrames
 );
+videoResult.videoSampling = videoSampling;
 
 console.log(
 "VIDEO ANALYSIS COMPLETE"
@@ -19304,7 +19360,10 @@ bank,
 reference:
 null,
 videoFrames:
-frames.length,
+extractedFrames.length,
+videoDurationSeconds: videoSampling.durationSeconds,
+videoFrameTimestamps: videoSampling.frameTimestampsSeconds,
+videoSampling,
 
 ...videoResult,
 
