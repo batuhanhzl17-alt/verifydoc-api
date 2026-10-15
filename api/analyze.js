@@ -2716,24 +2716,39 @@ const STATEMENT_REFERENCE_MAP = {
 };
 
 function detectStatementBankFromText(text, fileName = "") {
-  const fullText = String(text || "")
+  const normalizeBankText = (value) => String(value || "")
     .toLocaleLowerCase("tr-TR")
     .replace(/ı/g, "i")
     .replace(/ş/g, "s")
     .replace(/ğ/g, "g")
     .replace(/ü/g, "u")
     .replace(/ö/g, "o")
-    .replace(/ç/g, "c")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/ç/g, "c");
+  const rawLines = normalizeBankText(text).split(/\r?\n/)
+    .map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const tableHeaderIndex = rawLines.findIndex(line =>
+    /islem tarihi/.test(line) && /tutar/.test(line) && /bakiye/.test(line)
+  );
+  const firstTransactionIndex = rawLines.findIndex(line =>
+    /^\d{1,2}[./-]\d{1,2}[./-]\d{4}\s+(?:mb|atm|fast|eft|havale)\b/.test(line)
+  );
+  const cutoffCandidates = [tableHeaderIndex, firstTransactionIndex].filter(index => index >= 0);
+  const tableCutoff = cutoffCandidates.length ? Math.min(...cutoffCandidates) : rawLines.length;
+  const headerLines = cutoffCandidates.length
+    ? rawLines.slice(0, tableCutoff).join(" ").slice(0, 1800)
+    : "";
 
-  // İşlem açıklamalarında başka bankaların isimleri geçebilir.
-  // Bu yüzden yalnızca "ilk bulunan banka"yı seçme.
-  // Belgenin başındaki/header bölümündeki güçlü banka ifadelerine
-  // çok daha yüksek ağırlık ver; hareket satırlarındaki tekil
-  // banka adları yanlış referans seçmesin.
-  const header = fullText.slice(0, 3000);
-  const compact = fullText.replace(/\s+/g, "");
+  // Issuer evidence may appear in a labeled legal-identity footer, but bank
+  // names inside transaction rows are counterparties and must never identify
+  // the statement issuer. Keep only short snippets tied to issuer labels.
+  const issuerFooterSnippets = [];
+  const joinedText = rawLines.join(" ");
+  for (const match of joinedText.matchAll(/(?:ticaret unvani|banka unvani|duzenleyen banka)\s*[:：]?\s*([^.;]{1,140})/g)) {
+    issuerFooterSnippets.push(match[1]);
+  }
+  const issuerEvidence = `${headerLines} ${issuerFooterSnippets.join(" ")}`.trim();
+  const header = issuerEvidence;
+  const compact = issuerEvidence.replace(/\s+/g, "");
 
   const fileText = String(fileName || "")
     .toLocaleLowerCase("tr-TR")
@@ -2767,10 +2782,7 @@ function detectStatementBankFromText(text, fileName = "") {
     scores[bank] += points;
   };
 
-  // Yüklenen dosya adı da güçlü bir yardımcı sinyaldir.
-  // Özellikle hesap ekstresi içindeki işlem açıklamalarında başka
-  // bankaların isimleri bulunabildiği için dosya adı yanlış referans
-  // seçimini engelleyen ek bir sinyal olarak kullanılır.
+  // Filename can help only when it names the bank explicitly.
   if (fileText.includes("akbank")) add("akbank", 220);
   if (fileText.includes("halkbank") || fileText.includes("halk bank")) {
     add("halkbank", 220);
@@ -2839,7 +2851,8 @@ function detectStatementBankFromText(text, fileName = "") {
   if (header.includes("teb")) add("teb", 45);
   if (header.includes("kuveyt turk") || header.includes("kuveytturk")) add("kuveytturk", 150);
 
-  // Header OCR'ı bozuk olsa bile compact metin üzerinden yardımcı sinyaller.
+  // Compact matching remains restricted to the issuer/header scope above;
+  // never scan the full transaction body for a bank-name substring.
   if (compact.includes("akbank")) add("akbank", 70);
   if (compact.includes("qnbbankas")) add("qnb", 70);
   if (compact.includes("halkbank")) add("halkbank", 70);
@@ -2858,6 +2871,12 @@ function detectStatementBankFromText(text, fileName = "") {
   const best = ranked[0];
   const runnerUp = ranked[1];
 
+  console.log("HESAP ÖZETİ BANKA METİN KAPSAMI:", JSON.stringify({
+    issuerEvidenceLength: issuerEvidence.length,
+    tableHeaderFound: tableHeaderIndex >= 0,
+    firstTransactionFound: firstTransactionIndex >= 0,
+    transactionBodyExcluded: cutoffCandidates.length > 0,
+  }));
   console.log("HESAP ÖZETİ BANKA SKORLARI:", JSON.stringify(scores));
   // A weak or near-tied result must not silently choose the wrong bank's
   // reference. The caller will continue without a baseline and request review.
@@ -18646,19 +18665,22 @@ const statementIdentityProbe = await analyzeStatement(base64, mime, fileName, nu
 const statementProbeBank = normalizeBank(statementIdentityProbe?.documentData?.bank) ||
   detectStatementBankFromText(String(statementIdentityProbe?.summary || "").slice(0, 700), "");
 const statementBank = statementProbeBank || null;
-const statementDetectionConflict = Boolean(
-  statementBank && (
-    (detectedStatementBank && statementBank !== detectedStatementBank) ||
-    (statementBankCandidate && statementBankCandidate !== statementBank)
-  )
+const statementTextBankConflict = Boolean(
+  statementBank && detectedStatementBank && statementBank !== detectedStatementBank
 );
+const statementRequestBankConflict = Boolean(
+  statementBank && statementBankCandidate && statementBank !== statementBankCandidate
+);
+const statementDetectionConflict = statementTextBankConflict || statementRequestBankConflict;
 
 console.log("HESAP ÖZETİ BANKA ÖN TARAMA:", JSON.stringify({
   requestBank: statementBankCandidate || null,
   textDetectedBank: detectedStatementBank || null,
   visualProbeBank: statementProbeBank || null,
   selectedIssuerBank: statementBank,
-  textVisualConflict: statementDetectionConflict,
+  textVisualConflict: statementTextBankConflict,
+  textBankConflict: statementTextBankConflict,
+  requestBankConflict: statementRequestBankConflict,
   referenceAuthorizedBy: statementBank ? "visual-document-identity-pass" : null,
 }));
 
@@ -18707,7 +18729,9 @@ console.log("HESAP ÖZETİ BANKA KİMLİĞİ ÇAPRAZ KONTROLÜ:", JSON.stringify
   modelBank: statementModelBank || null,
   textDetectedBank: detectedStatementBank || null,
   conflict: statementBankIdentityConflict,
-  textVisualConflict: statementDetectionConflict,
+  textVisualConflict: statementTextBankConflict,
+  textBankConflict: statementTextBankConflict,
+  requestBankConflict: statementRequestBankConflict,
   visualPassFinalConflict: statementFinalBankConflict,
   referenceBank: Array.isArray(statementReference)
     ? statementReference[0]?.bank || null
@@ -18727,7 +18751,13 @@ const statementResult = applyStatementLedgerChecks(
   statementPdfForensics
 );
 if (statementBankIdentityConflict) {
-  const bankConflictFinding = `Banka kimliği çelişkili: metin/OCR sınıflandırması ${statementBank}, görsel analiz ${statementModelBank} dedi. Seçilen referansın bu belgeye ait olduğu doğrulanamadı; referans uyumu ve banka bazlı risk yorumu manuel kontrol edilmeli.`;
+  const bankConflictReasons = [];
+  if (statementTextBankConflict) bankConflictReasons.push(`üst bilgi metin tespiti ${detectedStatementBank}, görsel ön tarama ${statementBank} dedi`);
+  if (statementRequestBankConflict) bankConflictReasons.push(`istek bankası ${statementBankCandidate}, belge görseli ${statementBank} olarak tanındı`);
+  if (statementReferencePassDiscarded) bankConflictReasons.push('referanslı analiz banka kimliğinde ön taramayla çelişti ve sonuç kullanılmadı');
+  if (statementFinalBankConflict) bankConflictReasons.push(`son analiz ${statementModelBank}, görsel ön tarama ${statementBank} dedi`);
+  if (statementReference && !statementModelBank) bankConflictReasons.push('referanslı analiz banka kimliğini doğrulayamadı');
+  const bankConflictFinding = `Banka kimliği kontrol gerektiriyor: ${bankConflictReasons.join('; ')}. Referans eşleşmesi ve banka bazlı yorum manuel doğrulanmalı.`;
   statementResult.manualReviewRequired = true;
   statementResult.statementReferenceIdentityValidated = false;
   statementResult.statementAuditFindings = [
