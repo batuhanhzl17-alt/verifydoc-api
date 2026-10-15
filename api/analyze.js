@@ -4452,6 +4452,7 @@ false,
 documentData: {
 type: "object",
 properties: {
+bank: { type: ["string", "null"] },
 accountHolderName: { type: ["string", "null"] },
 iban: { type: ["string", "null"] },
 accountNo: { type: ["string", "null"] },
@@ -4459,7 +4460,7 @@ branch: { type: ["string", "null"] },
 taxNo: { type: ["string", "null"] },
 address: { type: ["string", "null"] },
 },
-required: ["accountHolderName", "iban", "accountNo", "branch", "taxNo", "address"],
+required: ["bank", "accountHolderName", "iban", "accountNo", "branch", "taxNo", "address"],
 additionalProperties: false,
 },
 
@@ -15752,6 +15753,8 @@ Görülebiliyorsa:
 - açılış bakiyesi
 - kapanış bakiyesi
 
+Banka adını documentData.bank alanına, belgede görünen hesap özetini düzenleyen banka olarak yaz. İşlem satırlarının açıklamalarında geçen karşı banka adlarını düzenleyen banka sanma. Emin değilsen null döndür.
+
 Ayrıca yalnızca belgede gerçekten görülen bilgileri documentData alanında çıkar:
 - accountHolderName
 - iban
@@ -18635,60 +18638,77 @@ fileName
 // Hesap hareketlerinde belge üzerindeki banka adı önceliklidir.
 // Böylece önceki bir seçimden/stale parametreden gelen yanlış banka,
 // doğru referansın önüne geçemez.
-const statementBank =
-detectedStatementBank ||
-statementBankCandidate;
-
-console.log(
-"HESAP ÖZETİ BANKA ADAYI:",
-statementBankCandidate || "YOK"
+// Never send a bank baseline before an independent visual pass identifies the
+// issuer. Text extraction can contain destination-bank names in transaction
+// descriptions (e.g. QNB statement rows mentioning Ziraat), so it cannot by
+// itself authorize a reference choice.
+const statementIdentityProbe = await analyzeStatement(base64, mime, fileName, null);
+const statementProbeBank = normalizeBank(statementIdentityProbe?.documentData?.bank) ||
+  detectStatementBankFromText(String(statementIdentityProbe?.summary || "").slice(0, 700), "");
+const statementBank = statementProbeBank || null;
+const statementDetectionConflict = Boolean(
+  statementBank && (
+    (detectedStatementBank && statementBank !== detectedStatementBank) ||
+    (statementBankCandidate && statementBankCandidate !== statementBank)
+  )
 );
 
-console.log(
-"HESAP ÖZETİ BELGEDEN TESPİT:",
-detectedStatementBank || "YOK"
-);
+console.log("HESAP ÖZETİ BANKA ÖN TARAMA:", JSON.stringify({
+  requestBank: statementBankCandidate || null,
+  textDetectedBank: detectedStatementBank || null,
+  visualProbeBank: statementProbeBank || null,
+  selectedIssuerBank: statementBank,
+  textVisualConflict: statementDetectionConflict,
+  referenceAuthorizedBy: statementBank ? "visual-document-identity-pass" : null,
+}));
 
-console.log(
-"HESAP ÖZETİ BANKA:",
-statementBank || "YOK"
-);
+let statementReference = statementBank
+  ? await loadStatementReferenceFile(statementBank, statementDetectionText, fileName)
+  : null;
 
-const statementReference =
-await loadStatementReferenceFile(
-statementBank,
-statementDetectionText,
-fileName
-);
-
-console.log(
-"HESAP ÖZETİ REFERANS YÜKLENDİ:",
-Array.isArray(statementReference)
+console.log("HESAP ÖZETİ REFERANS YÜKLENDİ:", Array.isArray(statementReference)
   ? statementReference.map((r) => r.fileName).join(", ")
-  : statementReference?.fileName || "YOK"
-);
+  : statementReference?.fileName || "YOK");
 
-const statementModelResult =
-await analyzeStatement(
-base64,
-mime,
-fileName,
-statementReference
-);
+// The preliminary pass has no bank reference. If an identity was established,
+// run the actual analysis with only that bank's reference; otherwise retain the
+// unreferenced pass and require review.
+let statementModelResult = statementReference
+  ? await analyzeStatement(base64, mime, fileName, statementReference)
+  : statementIdentityProbe;
 
-// The model's first summary sentence is an independent bank-identity signal.
-// If it disagrees with the deterministic detector, neither side should be
-// silently treated as verified and any reference-based compatibility claim
-// must be reviewed.
-const statementModelBank = normalizeBank(statementModelResult?.documentData?.bank) ||
-  detectStatementBankFromText(String(statementModelResult?.summary || "").slice(0, 500), "");
-const statementBankIdentityConflict = Boolean(
+let statementModelBank = normalizeBank(statementModelResult?.documentData?.bank) ||
+  detectStatementBankFromText(String(statementModelResult?.summary || "").slice(0, 700), "");
+let statementFinalBankConflict = Boolean(
   statementBank && statementModelBank && statementBank !== statementModelBank
 );
+let statementReferencePassDiscarded = false;
+if (statementFinalBankConflict && statementReference) {
+  // A baseline-conditioned pass contradicted the no-reference identity pass.
+  // Discard its analysis instead of returning findings influenced by a
+  // potentially wrong-bank reference.
+  console.warn("HESAP ÖZETİ REFERANS ANALİZİ GEÇERSİZ KILINDI:", JSON.stringify({
+    identityPassBank: statementBank,
+    referencePassBank: statementModelBank,
+    discardedReference: Array.isArray(statementReference)
+      ? statementReference.map((r) => r.fileName)
+      : statementReference.fileName,
+  }));
+  statementModelResult = statementIdentityProbe;
+  statementModelBank = statementProbeBank;
+  statementReference = null;
+  statementReferencePassDiscarded = true;
+  statementFinalBankConflict = false;
+}
+const statementBankIdentityConflict = statementDetectionConflict || statementFinalBankConflict || statementReferencePassDiscarded ||
+  Boolean(statementReference && !statementModelBank);
 console.log("HESAP ÖZETİ BANKA KİMLİĞİ ÇAPRAZ KONTROLÜ:", JSON.stringify({
   detectedBank: statementBank || null,
   modelBank: statementModelBank || null,
+  textDetectedBank: detectedStatementBank || null,
   conflict: statementBankIdentityConflict,
+  textVisualConflict: statementDetectionConflict,
+  visualPassFinalConflict: statementFinalBankConflict,
   referenceBank: Array.isArray(statementReference)
     ? statementReference[0]?.bank || null
     : statementReference?.bank || null,
