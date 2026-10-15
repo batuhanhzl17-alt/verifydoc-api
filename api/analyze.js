@@ -6090,7 +6090,68 @@ function statementPdfItemBox(item, viewport) {
   };
 }
 
-async function runStatementPdfForensics(filePath, buffer, statementRows = []) {
+function statementPdfAzureBox(lineOrWord) {
+  const values = [lineOrWord?.xNorm, lineOrWord?.yNorm, lineOrWord?.widthNorm, lineOrWord?.heightNorm].map(Number);
+  if (!values.every(Number.isFinite) || values[2] <= 0 || values[3] <= 0) return null;
+  return { x: Math.max(0, Math.min(1, values[0])), y: Math.max(0, Math.min(1, values[1])),
+    width: Math.max(0.0001, Math.min(1, values[2])), height: Math.max(0.0001, Math.min(1, values[3])) };
+}
+
+function statementPdfMoneyTokens(text) {
+  const matches = String(text || '').match(/[+−-]?\s*(?:(?:\d{1,3}(?:[.\s]\d{3})+)|\d+)[,.]\d{2}/g) || [];
+  return matches.map(token => ({ text: token.trim(), cents: statementPdfMoneyCents(token) }));
+}
+
+function statementPdfResolveAzureRow(row, pageLines, pageWords) {
+  const dateKey = statementPdfDateKey(row?.date);
+  const amountValue = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
+    : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
+  const amountCents = statementPdfMoneyCents(amountValue);
+  const expectedAmount = amountCents == null ? null : Math.abs(amountCents);
+  const expectedBalance = statementPdfMoneyCents(row?.balanceAfter);
+  if (!dateKey || expectedAmount == null) return { status: 'unresolved', reason: 'Tarih veya tutar eksik.' };
+  const anchors = pageLines.filter(line => statementPdfDateKey(line?.text) === dateKey);
+  if (!anchors.length) return { status: 'unresolved', reason: 'Azure OCR satırlarında tarih bulunamadı.' };
+  const description = statementNormalizeText([row?.description, row?.counterparty].filter(Boolean).join(' '));
+  const terms = description.split(' ').filter(term => term.length >= 4);
+  const transactionId = String(row?.transactionId || '').replace(/\D/g, '');
+  const candidates = [];
+  for (const anchor of anchors) {
+    const anchorY = Number(anchor.yNorm) + (Number(anchor.heightNorm) || 0) / 2;
+    const tolerance = Math.max(0.004, (Number(anchor.heightNorm) || 0.006) * 1.8);
+    const band = pageLines.filter(line => Math.abs(Number(line.yNorm) + (Number(line.heightNorm) || 0) / 2 - anchorY) <= tolerance);
+    const text = statementNormalizeText(band.map(line => line.text || '').join(' '));
+    const hits = terms.filter(term => text.includes(term)).length;
+    const descriptionMatched = !terms.length || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
+    const idMatched = transactionId.length >= 5 && text.replace(/\D/g, '').includes(transactionId);
+    if (!descriptionMatched && !idMatched) continue;
+    const amountOccurrences = statementPdfMoneyTokens(band.map(line => line.text || '').join(' '))
+      .filter(token => token.cents != null && Math.abs(token.cents) === expectedAmount);
+    if (amountOccurrences.length !== 1) continue;
+    if (candidates.some(candidate => Math.abs(candidate.anchorY - anchorY) <= tolerance)) continue;
+    const words = pageWords.filter(word => Math.abs(Number(word.yNorm) + (Number(word.heightNorm) || 0) / 2 - anchorY) <= tolerance);
+    const amountWords = words.filter(word => {
+      const value = statementPdfMoneyCents(word.text);
+      return value != null && Math.abs(value) === expectedAmount;
+    });
+    const amountBox = amountWords.length === 1 ? statementPdfAzureBox(amountWords[0]) : null;
+    const balanceWords = expectedBalance == null ? [] : words.filter(word => statementPdfMoneyCents(word.text) === expectedBalance);
+    candidates.push({ anchorY, amountBox, balanceBox: balanceWords.length === 1 ? statementPdfAzureBox(balanceWords[0]) : null,
+      amountText: amountWords.length === 1 ? amountWords[0].text : amountOccurrences[0].text });
+  }
+  if (candidates.length !== 1) return { status: 'unresolved', dateAnchorCount: anchors.length,
+    distinctCandidateLineCount: candidates.length,
+    reason: candidates.length ? `${candidates.length} Azure satır adayı kaldı; güvenli seçim yapılamadı.`
+      : 'Azure OCR geometrisinde tarih, açıklama ve tutar aynı satırda doğrulanamadı.' };
+  const candidate = candidates[0];
+  if (!candidate.amountBox) return { status: 'unresolved', dateAnchorCount: anchors.length,
+    distinctCandidateLineCount: 1, reason: 'Satır bulundu; ancak tutara ait dar OCR kelime kutusu tekil bulunamadı.' };
+  return { status: 'matched', dateAnchorCount: anchors.length, distinctCandidateLineCount: 1,
+    reason: 'Azure OCR satır geometrisinde tarih, açıklama ve tutar tekil eşleşti.',
+    amountBox: candidate.amountBox, balanceBox: candidate.balanceBox, amountText: candidate.amountText };
+}
+
+async function runStatementPdfForensics(filePath, buffer, statementRows = [], azureLayout = null) {
   let pdf = null;
   try {
     pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
@@ -6115,6 +6176,8 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = []) {
       const localizedOverlayCandidates = [];
       const pageRows = (Array.isArray(statementRows) ? statementRows : []).filter(row => Number(row?.pageNumber) === pageNumber);
       const pageItems = content.items || [];
+      const azurePageLines = Array.isArray(azureLayout?.lines) ? azureLayout.lines.filter(line => Number(line.pageNumber) === pageNumber) : [];
+      const azurePageWords = Array.isArray(azureLayout?.words) ? azureLayout.words.filter(word => Number(word.pageNumber) === pageNumber) : [];
       for (const [rowIndex, row] of pageRows.entries()) {
         const dateKey = statementPdfDateKey(row?.date);
         const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
@@ -6132,8 +6195,28 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = []) {
         let selectedAmountItem = null;
         let selectedBalanceItem = null;
         let rowLineCandidates = [];
+        const azureResolved = azurePageLines.length ? statementPdfResolveAzureRow(row, azurePageLines, azurePageWords) : null;
         if (!Number.isInteger(Number(row?.pageNumber))) reason = 'İşlem satırında sayfa numarası yok.';
         else if (!dateKey) reason = 'Satır tarihi güvenilir biçimde okunamadı; sayfa içi satır ankrajı kurulamadı.';
+        else if (azureResolved?.status === 'matched') {
+          status = 'matched';
+          reason = azureResolved.reason;
+          rowLineCandidates = [azureResolved];
+          const targets = [{ field: row?.debitAmount != null && row?.debitAmount !== '' ? 'debitAmount' : 'creditAmount',
+            value: rowAmountValue, box: azureResolved.amountBox, text: azureResolved.amountText }];
+          if (azureResolved.balanceBox) targets.push({ field: 'balanceAfter', value: row.balanceAfter,
+            box: azureResolved.balanceBox, text: String(row.balanceAfter) });
+          for (const target of targets) {
+            for (const candidate of pdfAuditWhiteCoverCandidates(operators, viewport, target.box, 'amount', target.text)) {
+              localizedOverlayCandidates.push({ pageNumber, rowNumber: row?.rowNumber ?? rowIndex + 1,
+                transactionId: row?.transactionId || null, field: target.field, expectedValue: target.value,
+                valueToken: target.text, associationStatus: 'matched', associationReason: reason,
+                objectType: candidate.objectType, paintOrder: candidate.imagePaintOrderRelativeToFieldText,
+                overlap: candidate.targetCoverage, box: candidate.box, evidence: candidate.evidence });
+            }
+          }
+          selectedBalanceItem = azureResolved.balanceBox ? { azure: true } : null;
+        }
         else if (dateAnchors.length === 0) reason = 'PDF metin katmanında bu satırın tarihi bulunamadı.';
         else {
           const description = statementNormalizeText(row?.description);
@@ -6201,6 +6284,8 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = []) {
           distinctCandidateLineCount: rowLineCandidates.length,
           amountMatched: status === 'matched',
           balanceMatched: Boolean(selectedBalanceItem),
+          associationSource: azureResolved?.status === 'matched' ? 'azure-layout' : status === 'matched' ? 'pdf-native-text' : 'unresolved',
+          azureAssociationReason: azureResolved?.reason || null,
         });
       }
       for (const item of numericTokens) {
@@ -6265,6 +6350,11 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = []) {
         inputRows: Array.isArray(statementRows) ? statementRows.length : 0,
         matchedRows: rowAssociationDiagnostics.filter(item => item.status === 'matched').length,
         unresolvedRows: rowAssociationDiagnostics.filter(item => item.status !== 'matched').length,
+        sourceCounts: {
+          azureLayout: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-layout').length,
+          pdfNativeText: rowAssociationDiagnostics.filter(item => item.associationSource === 'pdf-native-text').length,
+        },
+        azureLayoutAvailable: Boolean(azureLayout?.available),
         rows: rowAssociationDiagnostics.slice(0, 200),
       },
       structural,
@@ -18393,7 +18483,8 @@ statementReference
 const statementPdfForensics = await runStatementPdfForensics(
   filePath,
   buffer,
-  statementModelResult?.transactionAnalysis?.rows || []
+  statementModelResult?.transactionAnalysis?.rows || [],
+  azureLayout
 );
 const statementPageCount = Number(statementPdfForensics?.pageCount) || 0;
 const statementResult = applyStatementLedgerChecks(
@@ -18412,6 +18503,7 @@ console.log("HESAP ÖZETİ TÜM SAYFA DENETİMİ:", JSON.stringify({
   duplicateCandidates: statementResult?.transactionAnalysis?.rowByRowAudit?.duplicateCandidateCount || 0,
   forensicRowsMatched: statementPdfForensics?.transactionRowAssociation?.matchedRows || 0,
   forensicRowsUnresolved: statementPdfForensics?.transactionRowAssociation?.unresolvedRows || 0,
+  forensicRowMatchSources: statementPdfForensics?.transactionRowAssociation?.sourceCounts || null,
   pdfFindingCount: statementPdfForensics?.findings?.length || 0,
   manualReviewRequired: statementResult?.manualReviewRequired === true,
 }));
