@@ -2264,9 +2264,51 @@ async function sendAnalysisResult(
  const transactionAnalysis = result?.transactionAnalysis || {};
  const rowByRowAudit = transactionAnalysis.rowByRowAudit || {};
  const statementPdfAudit = result?.statementPdfForensics || {};
+ const rowAssociation = statementPdfAudit.transactionRowAssociation || {};
+ const extractedRowCount = Number(rowByRowAudit.extractedRowCount ?? transactionAnalysis.rows?.length) || 0;
+ const declaredRowCount = Number(rowByRowAudit.declaredTransactionCount) || 0;
+ const matchedVisualRows = Number(rowAssociation.matchedRows) || 0;
+ const unresolvedVisualRows = Number(rowAssociation.unresolvedRows) || 0;
+ const balanceMismatchCount = Number(rowByRowAudit.balanceMismatchCount) || 0;
+ const pageCount = Number(statementPdfAudit.pageCount ?? rowByRowAudit.pageCount) || 0;
+ const pagesAnalyzed = Number(statementPdfAudit.pagesAnalyzed) || 0;
+ const rowCountIncomplete = rowByRowAudit.rowsIncomplete === true ||
+   Boolean(declaredRowCount && extractedRowCount < declaredRowCount);
+ const pageCoverageIncomplete = rowByRowAudit.pageCoverageComplete === false ||
+   (pageCount > 0 && pagesAnalyzed < pageCount);
+ const bankIdentityConflict = result?.statementBankIdentityConflict === true ||
+   (Array.isArray(result?.statementAuditFindings) && result.statementAuditFindings.some(item =>
+     /banka kimliği kontrol gerektiriyor|referanslı analiz banka kimliğinde .* çelişti/i.test(String(item || ''))
+   ));
+ // The legacy manualReviewRequired flag also covers unresolved ROI mappings and
+ // candidate-only PDF overlay signals. Those should advise a check, not imply
+ // that a confirmed document problem was found.
+ const verifiedStatementIssue = suspiciousFinding ||
+   result?.confirmedManipulation === true || result?.verifiedEditing === true ||
+   result?.editingConfirmed === true ||
+   balanceAnalysis.calculationConsistent === false || balanceMismatchCount > 0 ||
+   rowCountIncomplete || pageCoverageIncomplete || bankIdentityConflict;
+ const statementNeedsReview = manualReviewRequired || unresolvedVisualRows > 0 ||
+   Number(rowByRowAudit.duplicateCandidateCount) > 0 ||
+   statementPdfAudit.reviewRequired === true;
+ const statementReviewHeadline = verifiedStatementIssue
+   ? '🟠 KONTROL GEREKLİ'
+   : statementNeedsReview
+     ? '🟡 KONTROL TAVSİYE EDİLİR'
+     : suspiciousFinding || score >= 21
+       ? '🟡 BULGULARI İNCELEYİN'
+       : '🟢 BELİRGİN ŞÜPHELİ BULGU YOK';
  const statementCheckLine = rowByRowAudit.available
-   ? `Satır kontrolü: ${rowByRowAudit.extractedRowCount} işlem satırı, ${rowByRowAudit.balanceChecks} bakiye geçişi; ${rowByRowAudit.balanceMismatchCount ? `${rowByRowAudit.balanceMismatchCount} fark` : 'bakiye farkı yok'}. PDF sayfaları: ${statementPdfAudit.pagesAnalyzed || 0}/${statementPdfAudit.pageCount || 0}.`
-   : `Satır kontrolü: işlem satırları güvenilir biçimde çıkarılamadı. PDF sayfaları: ${statementPdfAudit.pagesAnalyzed || 0}/${statementPdfAudit.pageCount || 0}.`;
+   ? `Satır kontrolü: ${extractedRowCount} işlem satırı, ${rowByRowAudit.balanceChecks || 0} bakiye geçişi; ${balanceMismatchCount ? `${balanceMismatchCount} fark` : 'bakiye farkı yok'}. PDF sayfaları: ${pagesAnalyzed}/${pageCount}.`
+   : `Satır kontrolü: işlem satırları güvenilir biçimde çıkarılamadı. PDF sayfaları: ${pagesAnalyzed}/${pageCount}.`;
+ const visualRowMatchLine = rowAssociation.available || unresolvedVisualRows > 0 || matchedVisualRows > 0
+   ? `Görsel satır eşleşmesi: ${matchedVisualRows} eşleşti${unresolvedVisualRows ? `, ${unresolvedVisualRows} belirsiz` : ''}.`
+   : '';
+ const reviewReasonLine = unresolvedVisualRows > 0 && !verifiedStatementIssue
+   ? `${unresolvedVisualRows} satırın tutar/bakiye kutusu PDF’deki görsel konumuyla güvenilir biçimde eşleştirilemedi. Bu belirsizlik tek başına silme veya değiştirme kanıtı değildir; ilgili satırları kontrol etmeniz tavsiye edilir.`
+   : statementNeedsReview && !verifiedStatementIssue
+     ? 'Bazı otomatik kontroller kesin sonuca ulaşamadı. Bu durum tek başına belge düzenlendiğini göstermez; raporlanan belirsiz noktaları kontrol etmeniz tavsiye edilir.'
+     : '';
  for (const item of (Array.isArray(transactionAnalysis.suspiciousTransactions) ? transactionAnalysis.suspiciousTransactions : [])) {
    addFinding('Şüpheli işlem', item);
  }
@@ -2298,7 +2340,7 @@ async function sendAnalysisResult(
  const lines = [
    `${emoji} VERIFYDOC ÖN İNCELEMESİ`,
    '',
-   reviewHeadline,
+   statementReviewHeadline,
    '',
    `${result?.bank ? `Banka: ${getBankDisplayName(result.bank)}\n` : ''}Risk Skoru: ${score}/100`,
    '',
@@ -2308,7 +2350,8 @@ async function sendAnalysisResult(
    confidenceLine,
    '',
    statementCheckLine,
-   ...(manualReviewRequired ? ['', 'Risk seviyesi ile kontrol durumu farklı ölçümlerdir. Kritik alanlarda belirsizlik veya karşılaştırma gerektiren bulgu olduğu için manuel kontrol gerekiyor.'] : []),
+   ...(visualRowMatchLine ? [visualRowMatchLine] : []),
+   ...(reviewReasonLine ? ['', reviewReasonLine] : []),
    '',
    '━━━━━━━━━━━━━━'
  ];
