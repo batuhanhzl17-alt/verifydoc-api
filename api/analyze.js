@@ -6687,18 +6687,20 @@ try {
   }
 }
 
-const maxFrameCount = 16;
-const targetIntervalSeconds = 2.5;
+const maxFrameCount = 120;
+const targetIntervalSeconds = 0.5;
+// Sample at 2 fps, capped at 120 frames to bound per-video OCR/vision work.
+// Extract the final frame separately so a fractional-duration tail is covered.
 const targetFrameCount = durationSeconds
-  ? Math.min(maxFrameCount, Math.max(2, Math.ceil(durationSeconds / targetIntervalSeconds)))
+  ? Math.min(maxFrameCount, Math.max(2, Math.ceil(durationSeconds / targetIntervalSeconds) + 1))
   : maxFrameCount;
-// fps=N/duration stops at (N-1)/N of the clip. Space samples across the
-// duration minus a small end margin so the final extracted frame covers the
-// last second instead of leaving a blind tail.
-const endMarginSeconds = durationSeconds ? Math.min(0.35, durationSeconds * 0.05) : 0;
-const expectedIntervalSeconds = durationSeconds
-  ? Math.max(0.05, (durationSeconds - endMarginSeconds) / Math.max(1, targetFrameCount - 1))
-  : 2;
+const regularFrameCount = Math.max(1, targetFrameCount - 1);
+const endMarginSeconds = durationSeconds ? Math.min(0.1, durationSeconds / 4) : 0;
+const expectedIntervalSeconds = durationSeconds && targetFrameCount < maxFrameCount
+  ? targetIntervalSeconds
+  : durationSeconds
+    ? Math.max(targetIntervalSeconds, (durationSeconds - endMarginSeconds) / Math.max(1, regularFrameCount - 1))
+    : targetIntervalSeconds;
 const sampleRate = 1 / expectedIntervalSeconds;
 
 const outputDir =
@@ -6727,7 +6729,7 @@ videoPath,
 `fps=${sampleRate.toFixed(6)},scale=1280:-2`,
 
 "-frames:v",
-String(targetFrameCount),
+String(regularFrameCount),
 "-q:v",
 "5",
 
@@ -6754,6 +6756,24 @@ file.endsWith(".jpg")
 )
 .sort();
 
+// Add an explicit end-of-video still. A regular fps grid can stop before the
+// final fractional interval (for example, 28.0s in a 28.41s clip).
+let hasTerminalFrame = false;
+if (Number.isFinite(durationSeconds) && durationSeconds > 0) {
+  const terminalFramePath = `${outputDir}/frame-999.jpg`;
+  try {
+    await execFileAsync(ffmpegPath, [
+      "-hide_banner", "-loglevel", "error", "-sseof", `-${Math.max(0.05, endMarginSeconds).toFixed(3)}`,
+      "-i", videoPath, "-frames:v", "1", "-q:v", "5", terminalFramePath,
+    ], { maxBuffer: 2 * 1024 * 1024, timeout: 30000 });
+    const terminalStat = await fs.stat(terminalFramePath);
+    hasTerminalFrame = terminalStat.size > 0;
+    if (hasTerminalFrame) frameFiles.push("frame-999.jpg");
+  } catch (error) {
+    console.warn("VIDEO TERMINAL FRAME EXTRACTION FAILED:", error?.message || String(error));
+  }
+}
+
 if (
 !frameFiles.length
 ) {
@@ -6776,11 +6796,17 @@ const buffer =
 await fs.readFile(
 framePath
 );
+const regularFrameIndex = Number(file.match(/frame-(\d+)\.jpg$/)?.[1]);
+const timestampSeconds = regularFrameIndex === 999 && Number.isFinite(durationSeconds)
+  ? Math.max(0, durationSeconds - Math.max(0.05, endMarginSeconds))
+  : Number.isFinite(regularFrameIndex)
+    ? (regularFrameIndex - 1) * expectedIntervalSeconds
+    : frames.length * expectedIntervalSeconds;
 frames.push({
 
 file,
 framePath,
-timestampSeconds: (frames.length * expectedIntervalSeconds),
+timestampSeconds,
 base64:
 buffer.toString(
 "base64"
@@ -6800,16 +6826,18 @@ return {
   frames,
   sampling: {
     durationSeconds,
-    method: "uniform-across-video",
+    method: "uniform-0.5s-plus-terminal-frame",
     maxFrameCount,
     targetFrameCount,
     extractedFrameCount: frames.length,
     intervalSeconds: expectedIntervalSeconds,
+    targetIntervalSeconds,
+    terminalFrameIncluded: hasTerminalFrame,
     frameTimestampsSeconds,
     lastFrameSeconds,
     endGapSeconds,
     coverageComplete: Number.isFinite(durationSeconds) && durationSeconds > 0 &&
-      frames.length === targetFrameCount && endGapSeconds <= 1.0,
+      hasTerminalFrame && endGapSeconds <= 0.2,
   },
 };
 
@@ -6836,6 +6864,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
     await execFileAsync(ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 90000 });
     const metadata = await fs.readFile(metadataPath, "utf8").catch(() => "");
     const records = [];
+    const allScores = [];
     let parsedScoreCount = 0;
     let maxSceneScore = 0;
     let currentTime = null;
@@ -6847,6 +6876,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         const score = Number(scoreMatch[1]);
         parsedScoreCount += 1;
         maxSceneScore = Math.max(maxSceneScore, score);
+        allScores.push({ timestampSeconds: Number(currentTime.toFixed(3)), score: Number(score.toFixed(2)) });
         if (score >= 15) records.push({ timestampSeconds: currentTime, score: Number(score.toFixed(2)) });
       }
     }
@@ -6883,6 +6913,9 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       fullDurationScanned: Number.isFinite(durationSeconds) && durationSeconds <= maxScanSeconds,
       analyzedFrameCount: parsedScoreCount,
       maxSceneChangeScore: Number(maxSceneScore.toFixed(2)),
+      topSceneChangeScores: allScores
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 20),
       candidateCount: candidates.length,
       sceneChangeCandidates: candidates.slice(0, 30),
       interpretation: "Adaylar ani görüntü geçişlerini gösterir; tek başına kesme veya manipülasyon kanıtı değildir.",
