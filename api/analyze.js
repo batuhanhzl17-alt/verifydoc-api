@@ -6116,45 +6116,71 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = []) {
       const pageRows = (Array.isArray(statementRows) ? statementRows : []).filter(row => Number(row?.pageNumber) === pageNumber);
       const pageItems = content.items || [];
       for (const [rowIndex, row] of pageRows.entries()) {
-        const rowLabel = `sayfa ${pageNumber}, satır ${row?.rowNumber ?? rowIndex + 1}`;
         const dateKey = statementPdfDateKey(row?.date);
         const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
         const rowAmountValue = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
           : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
-        const expectedAmountCents = statementPdfMoneyCents(rowAmountValue);
+        // Statement rows model debit/credit as positive magnitudes even when
+        // the PDF's display text includes a minus sign. Use magnitude to map
+        // the visual amount cell; the ledger layer separately checks sign.
+        const parsedAmountCents = statementPdfMoneyCents(rowAmountValue);
+        const expectedAmountCents = parsedAmountCents == null ? null : Math.abs(parsedAmountCents);
         const expectedBalanceCents = statementPdfMoneyCents(row?.balanceAfter);
         let status = 'unresolved';
         let reason = '';
+        let selectedRowLine = null;
+        let selectedAmountItem = null;
+        let selectedBalanceItem = null;
+        let rowLineCandidates = [];
         if (!Number.isInteger(Number(row?.pageNumber))) reason = 'İşlem satırında sayfa numarası yok.';
         else if (!dateKey) reason = 'Satır tarihi güvenilir biçimde okunamadı; sayfa içi satır ankrajı kurulamadı.';
-        else if (dateAnchors.length !== 1) reason = dateAnchors.length === 0
-          ? 'PDF metin katmanında bu satırın tarihi bulunamadı.'
-          : `Aynı tarih sayfada ${dateAnchors.length} kez geçtiği için satır tekilleştirilemedi.`;
+        else if (dateAnchors.length === 0) reason = 'PDF metin katmanında bu satırın tarihi bulunamadı.';
         else {
-          const anchor = dateAnchors[0];
-          const anchorY = Number(anchor?.transform?.[5]) || 0;
-          const rowLineItems = pageItems.filter(item => Math.abs((Number(item?.transform?.[5]) || 0) - anchorY) <= Math.max(3, Number(anchor?.height) || 8));
-          const amountItems = numericTokens.filter(item => Math.abs((Number(item?.transform?.[5]) || 0) - anchorY) <= Math.max(3, Number(anchor?.height) || 8));
-          const findUniqueValue = cents => {
-            if (cents == null) return [];
-            return amountItems.filter(item => statementPdfMoneyCents(item.str) === cents);
-          };
-          const matchedAmountItems = findUniqueValue(expectedAmountCents);
-          const matchedBalanceItems = findUniqueValue(expectedBalanceCents);
           const description = statementNormalizeText(row?.description);
           const descriptionTerms = description.split(' ').filter(term => term.length >= 4);
-          const lineText = statementNormalizeText(rowLineItems.map(item => item.str || '').join(' '));
-          const descriptionMatched = descriptionTerms.length === 0 || descriptionTerms.some(term => lineText.includes(term));
-          if (!descriptionMatched) reason = 'Tarih satırı bulundu ancak açıklama aynı görsel satırda doğrulanmadı.';
-          else if (expectedAmountCents == null) reason = 'Satırda borç/alacak tutarı yapılandırılmış değil.';
-          else if (matchedAmountItems.length !== 1) reason = matchedAmountItems.length === 0
-            ? 'Beklenen borç/alacak tutarı aynı satırda PDF metin kutusuyla eşleşmedi.'
-            : 'Beklenen borç/alacak tutarı aynı satırda birden fazla kez bulundu.';
-          else {
+          const anchorLines = [];
+          for (const anchor of dateAnchors) {
+            const anchorY = Number(anchor?.transform?.[5]) || 0;
+            const tolerance = Math.max(3, Number(anchor?.height) || 8);
+            const lineItems = pageItems.filter(item => Math.abs((Number(item?.transform?.[5]) || 0) - anchorY) <= tolerance);
+            const amountItems = numericTokens.filter(item => Math.abs((Number(item?.transform?.[5]) || 0) - anchorY) <= tolerance);
+            // A date can occur in multiple columns or many times on a page.
+            // Collapse anchors on the same baseline, then disambiguate by the
+            // row's description and exact transaction amount.
+            if (anchorLines.some(line => Math.abs(line.anchorY - anchorY) <= tolerance)) continue;
+            const lineText = statementNormalizeText(lineItems.map(item => item.str || '').join(' '));
+            const descriptionHits = descriptionTerms.filter(term => lineText.includes(term)).length;
+            const descriptionMatched = descriptionTerms.length === 0 || descriptionHits >= Math.max(1, Math.ceil(descriptionTerms.length * 0.35));
+            const matchedAmountItems = expectedAmountCents == null ? [] : amountItems.filter(item => {
+              const cents = statementPdfMoneyCents(item.str);
+              return cents != null && Math.abs(cents) === expectedAmountCents;
+            });
+            const matchedBalanceItems = expectedBalanceCents == null ? [] : amountItems.filter(item => statementPdfMoneyCents(item.str) === expectedBalanceCents);
+            anchorLines.push({ anchorY, tolerance, lineText, descriptionHits, descriptionMatched, matchedAmountItems, matchedBalanceItems });
+          }
+          const amountDescriptionCandidates = anchorLines.filter(line => line.descriptionMatched && line.matchedAmountItems.length === 1);
+          const balanceDisambiguated = expectedBalanceCents == null ? [] : amountDescriptionCandidates.filter(line => line.matchedBalanceItems.length === 1);
+          rowLineCandidates = balanceDisambiguated.length ? balanceDisambiguated : amountDescriptionCandidates;
+          if (expectedAmountCents == null) reason = 'Satırda borç/alacak tutarı yapılandırılmış değil.';
+          else if (rowLineCandidates.length > 1) reason = `Tarih, açıklama ve tutar ölçütlerini karşılayan ${rowLineCandidates.length} ayrı satır bulundu; eşleşme belirsiz bırakıldı.`;
+          else if (rowLineCandidates.length === 0) {
+            const hasDescription = anchorLines.some(line => line.descriptionMatched);
+            const hasAmount = anchorLines.some(line => line.matchedAmountItems.length === 1);
+            reason = !hasDescription
+              ? `Aynı tarihli ${anchorLines.length} satır adayında açıklama eşleşmedi.`
+              : !hasAmount
+                ? 'Açıklamayla eşleşen tarih satırında beklenen tutar tekil olarak bulunamadı.'
+                : 'Tarih, açıklama ve tutar aynı görsel satırda tekil eşleşmedi.';
+          } else {
+            const matchedLine = rowLineCandidates[0];
+            selectedRowLine = matchedLine;
+            selectedAmountItem = matchedLine.matchedAmountItems[0];
+            selectedBalanceItem = matchedLine.matchedBalanceItems.length === 1 ? matchedLine.matchedBalanceItems[0] : null;
             status = 'matched';
-            reason = 'Tarih, açıklama ve işlem tutarı aynı PDF satırında tekil olarak eşleşti.';
-            const fieldsToAudit = [{ field: row?.debitAmount != null && row?.debitAmount !== '' ? 'debitAmount' : 'creditAmount', value: rowAmountValue, item: matchedAmountItems[0] }];
-            if (expectedBalanceCents != null && matchedBalanceItems.length === 1) fieldsToAudit.push({ field: 'balanceAfter', value: row.balanceAfter, item: matchedBalanceItems[0] });
+            reason = `Tarih (${dateAnchors.length} metin ankrajı), açıklama ve işlem tutarı aynı görsel satırda tekil eşleşti.`;
+            if (expectedBalanceCents != null && !selectedBalanceItem) reason += ' Bu satırın beklenen bakiyesi aynı satırda tekil bulunamadı.';
+            const fieldsToAudit = [{ field: row?.debitAmount != null && row?.debitAmount !== '' ? 'debitAmount' : 'creditAmount', value: rowAmountValue, item: selectedAmountItem }];
+            if (selectedBalanceItem) fieldsToAudit.push({ field: 'balanceAfter', value: row.balanceAfter, item: selectedBalanceItem });
             for (const field of fieldsToAudit) {
               const targetBox = statementPdfItemBox(field.item, viewport);
               for (const candidate of pdfAuditWhiteCoverCandidates(operators, viewport, targetBox, 'amount', String(field.item.str || '').trim())) {
@@ -6167,17 +6193,14 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = []) {
                 });
               }
             }
-            if (expectedBalanceCents != null && matchedBalanceItems.length !== 1) {
-              reason += ` Bakiye alanı ${matchedBalanceItems.length ? 'aynı satırda birden fazla eşleşti' : 'aynı satırda bulunamadı'}.`;
-            }
           }
         }
         rowAssociationDiagnostics.push({
           pageNumber, rowNumber: row?.rowNumber ?? rowIndex + 1, transactionId: row?.transactionId || null,
-          date: row?.date || null, status, reason,
+          date: row?.date || null, status, reason, dateAnchorCount: dateAnchors.length,
+          distinctCandidateLineCount: rowLineCandidates.length,
           amountMatched: status === 'matched',
-          balanceMatched: expectedBalanceCents != null && dateAnchors.length === 1 &&
-            numericTokens.filter(item => Math.abs((Number(item?.transform?.[5]) || 0) - (Number(dateAnchors[0]?.transform?.[5]) || 0)) <= Math.max(3, Number(dateAnchors[0]?.height) || 8) && statementPdfMoneyCents(item.str) === expectedBalanceCents).length === 1,
+          balanceMatched: Boolean(selectedBalanceItem),
         });
       }
       for (const item of numericTokens) {
