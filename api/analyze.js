@@ -6130,6 +6130,58 @@ function statementPdfAzureBox(lineOrWord) {
     width: Math.max(0.0001, Math.min(1, values[2])), height: Math.max(0.0001, Math.min(1, values[3])) };
 }
 
+function statementPdfResolveAzureRowsByOrder(pageRows, initialResolutions) {
+  const resolutions = Array.isArray(initialResolutions) ? initialResolutions.slice() : [];
+  const rows = Array.isArray(pageRows) ? pageRows : [];
+  const boxCenterY = box => box ? Number(box.y) + Number(box.height || 0) / 2 : null;
+  const sameBox = (a, b) => a && b && Math.abs(a.x - b.x) <= 0.0015 && Math.abs(a.y - b.y) <= 0.0015 &&
+    Math.abs(a.width - b.width) <= 0.003 && Math.abs(a.height - b.height) <= 0.003;
+
+  // Resolve only when page order and already anchored neighbors leave one
+  // possible amount box. This uses statement sequence as geometric evidence,
+  // without assigning an arbitrary candidate in an unconstrained region.
+  for (let pass = 0; pass < rows.length; pass++) {
+    let changed = false;
+    for (let i = 0; i < rows.length; i++) {
+      if (resolutions[i]?.status === 'matched') continue;
+      const candidates = Array.isArray(resolutions[i]?.orderCandidates) ? resolutions[i].orderCandidates : [];
+      if (!candidates.length) continue;
+      let previousY = null;
+      let nextY = null;
+      for (let j = i - 1; j >= 0; j--) {
+        if (resolutions[j]?.status !== 'matched') continue;
+        previousY = boxCenterY(resolutions[j].amountBox);
+        if (previousY != null) break;
+      }
+      for (let j = i + 1; j < rows.length; j++) {
+        if (resolutions[j]?.status !== 'matched') continue;
+        nextY = boxCenterY(resolutions[j].amountBox);
+        if (nextY != null) break;
+      }
+      if (previousY == null || nextY == null || nextY <= previousY) continue;
+      const occupied = resolutions.filter((item, index) => index !== i && item?.status === 'matched')
+        .map(item => item.amountBox).filter(Boolean);
+      const bounded = candidates.filter(candidate => {
+        const y = boxCenterY(candidate.amountBox);
+        if (y == null || occupied.some(box => sameBox(box, candidate.amountBox))) return false;
+        if (previousY != null && y <= previousY + 0.001) return false;
+        if (nextY != null && y >= nextY - 0.001) return false;
+        return true;
+      });
+      if (bounded.length !== 1) continue;
+      const candidate = bounded[0];
+      resolutions[i] = { status: 'matched', source: 'azure-table-order',
+        dateAnchorCount: resolutions[i]?.dateAnchorCount || 0, distinctCandidateLineCount: 1,
+        reason: 'Açıklama/bakiye çözümü belirsizdi; sayfa satır sırası ve iki komşu eşleşme tek bir tutar kutusu bıraktı.',
+        amountBox: candidate.amountBox, balanceBox: candidate.balanceBox || null,
+        amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
+      changed = true;
+    }
+    if (!changed) break;
+  }
+  return resolutions;
+}
+
 function statementPdfMoneyTokens(text) {
   const matches = String(text || '').match(/[+−-]?\s*(?:(?:\d{1,3}(?:[.\s]\d{3})+)|\d+)[,.]\d{2}/g) || [];
   return matches.map(token => ({ text: token.trim(), cents: statementPdfMoneyCents(token) }));
@@ -6245,6 +6297,10 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     amountCandidateCount: uniqueCandidates.length,
     semanticCandidateCount: semanticCandidates.length,
     balanceCandidateCount: exactBalanceCandidates.length,
+    orderCandidates: uniqueCandidates.filter(item => item.amountBox).map(item => ({
+      tableIndex: item.tableIndex, rowIndex: item.rowIndex, amountBox: item.amountBox,
+      balanceBox: item.balanceBox, amountText: item.amountText,
+    })),
     reason: uniqueCandidates.length ? `${uniqueCandidates.length} Azure tablo satırı adayı kaldı; açıklama ve bakiye tekil seçim sağlamadı.`
       : 'Azure tablo hücrelerinde tarih, açıklama/işlem numarası ve tutar birlikte eşleşmedi.' };
   if (!candidate.amountBox) return { status: 'unresolved', source: 'azure-table',
@@ -6333,6 +6389,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       const azurePageLines = Array.isArray(azureLayout?.lines) ? azureLayout.lines.filter(line => Number(line.pageNumber) === pageNumber) : [];
       const azurePageWords = Array.isArray(azureLayout?.words) ? azureLayout.words.filter(word => Number(word.pageNumber) === pageNumber) : [];
       const azurePageTableRows = Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.filter(row => Number(row.pageNumber) === pageNumber) : [];
+      const azureTableResolutions = statementPdfResolveAzureRowsByOrder(pageRows,
+        pageRows.map(row => azurePageTableRows.length
+          ? statementPdfResolveAzureTableRow(row, azurePageTableRows, azurePageWords) : null));
       for (const [rowIndex, row] of pageRows.entries()) {
         const dateKey = statementPdfDateKey(row?.date);
         const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
@@ -6350,8 +6409,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         let selectedAmountItem = null;
         let selectedBalanceItem = null;
         let rowLineCandidates = [];
-        const azureTableResolved = azurePageTableRows.length
-          ? statementPdfResolveAzureTableRow(row, azurePageTableRows, azurePageWords) : null;
+        const azureTableResolved = azureTableResolutions[rowIndex] || null;
         const azureLineResolved = azurePageLines.length
           ? statementPdfResolveAzureRow(row, azurePageLines, azurePageWords) : null;
         const azureResolved = azureTableResolved?.status === 'matched' ? azureTableResolved
