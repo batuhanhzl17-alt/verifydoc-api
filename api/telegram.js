@@ -866,7 +866,6 @@ function extractExpectedDetails(
 
  }
 
-
  // ===================================================
  // ALICI
  // ===================================================
@@ -2173,6 +2172,47 @@ async function sendAnalysisResult(
  emoji =
  " ";
 
+ }
+
+
+ // Video reports get their own compact format so temporal cut candidates are
+ // visible to the user instead of being buried in a generic image summary.
+ if (result?.type === 'video') {
+   const audit = result?.videoTemporalAudit || {};
+   const duration = Number(result?.videoDurationSeconds ?? audit.durationSeconds);
+   const formatTime = (seconds) => {
+     const value = Math.max(0, Math.floor(Number(seconds) || 0));
+     return `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
+   };
+   const candidates = Array.isArray(audit.sceneChangeCandidates) ? audit.sceneChangeCandidates : [];
+   const status = !audit.available
+     ? '🟡 Zaman akışı kontrolü çalışmadı'
+     : candidates.length
+       ? `🟡 ${candidates.length} ani görüntü geçişi adayı bulundu`
+       : '🟢 Taramada belirgin ani geçiş adayı bulunmadı';
+   const candidateLines = candidates.slice(0, 5).map((item) =>
+     `• ${formatTime(item.timestampSeconds)} civarı (görüntü geçiş skoru ${item.score})`
+   );
+   const coverage = audit.available
+     ? `Zaman taraması: ${formatTime(audit.scannedSeconds)}${audit.fullDurationScanned ? ' / videonun tamamı' : ' / süre sınırı nedeniyle kısmi'}`
+     : `Zaman taraması yapılamadı${audit.reason ? `: ${String(audit.reason).slice(0, 180)}` : '.'}`;
+   const videoText = [
+     '🎞️ VERIFYDOC VİDEO ÖN İNCELEMESİ',
+     '',
+     status,
+     `Risk: ${riskLabel} — ${score}/100`,
+     confidenceLine,
+     ...(Number.isFinite(duration) ? [`Süre: ${formatTime(duration)}`] : []),
+     coverage,
+     ...(candidateLines.length ? ['', 'İncelenecek zamanlar:', ...candidateLines] : []),
+     '',
+     String(summary).trim().slice(0, 1800),
+     '',
+     'Ani geçiş adayı tek başına kesme veya sahtecilik kanıtı değildir. Kamera hareketi ya da uygulama ekranı değişimi de bu sinyali üretebilir.',
+     'Aday bulunmaması da düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.'
+   ].filter(Boolean).join('\n');
+   await sendMessage(chatId, videoText, replyToMessageId);
+   return;
  }
 
 
