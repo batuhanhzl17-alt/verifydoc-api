@@ -2716,24 +2716,39 @@ const STATEMENT_REFERENCE_MAP = {
 };
 
 function detectStatementBankFromText(text, fileName = "") {
-  const fullText = String(text || "")
+  const normalizeBankText = (value) => String(value || "")
     .toLocaleLowerCase("tr-TR")
     .replace(/ı/g, "i")
     .replace(/ş/g, "s")
     .replace(/ğ/g, "g")
     .replace(/ü/g, "u")
     .replace(/ö/g, "o")
-    .replace(/ç/g, "c")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/ç/g, "c");
+  const rawLines = normalizeBankText(text).split(/\r?\n/)
+    .map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const tableHeaderIndex = rawLines.findIndex(line =>
+    /islem tarihi/.test(line) && /tutar/.test(line) && /bakiye/.test(line)
+  );
+  const firstTransactionIndex = rawLines.findIndex(line =>
+    /^\d{1,2}[./-]\d{1,2}[./-]\d{4}\s+(?:mb|atm|fast|eft|havale)\b/.test(line)
+  );
+  const cutoffCandidates = [tableHeaderIndex, firstTransactionIndex].filter(index => index >= 0);
+  const tableCutoff = cutoffCandidates.length ? Math.min(...cutoffCandidates) : rawLines.length;
+  const headerLines = cutoffCandidates.length
+    ? rawLines.slice(0, tableCutoff).join(" ").slice(0, 1800)
+    : "";
 
-  // İşlem açıklamalarında başka bankaların isimleri geçebilir.
-  // Bu yüzden yalnızca "ilk bulunan banka"yı seçme.
-  // Belgenin başındaki/header bölümündeki güçlü banka ifadelerine
-  // çok daha yüksek ağırlık ver; hareket satırlarındaki tekil
-  // banka adları yanlış referans seçmesin.
-  const header = fullText.slice(0, 3000);
-  const compact = fullText.replace(/\s+/g, "");
+  // Issuer evidence may appear in a labeled legal-identity footer, but bank
+  // names inside transaction rows are counterparties and must never identify
+  // the statement issuer. Keep only short snippets tied to issuer labels.
+  const issuerFooterSnippets = [];
+  const joinedText = rawLines.join(" ");
+  for (const match of joinedText.matchAll(/(?:ticaret unvani|banka unvani|duzenleyen banka)\s*[:：]?\s*([^.;]{1,140})/g)) {
+    issuerFooterSnippets.push(match[1]);
+  }
+  const issuerEvidence = `${headerLines} ${issuerFooterSnippets.join(" ")}`.trim();
+  const header = issuerEvidence;
+  const compact = issuerEvidence.replace(/\s+/g, "");
 
   const fileText = String(fileName || "")
     .toLocaleLowerCase("tr-TR")
@@ -2758,16 +2773,16 @@ function detectStatementBankFromText(text, fileName = "") {
     akbank: 0,
     isbankasi: 0,
     yapikredi: 0,
+    ing: 0,
+    teb: 0,
+    kuveytturk: 0,
   };
 
   const add = (bank, points) => {
     scores[bank] += points;
   };
 
-  // Yüklenen dosya adı da güçlü bir yardımcı sinyaldir.
-  // Özellikle hesap ekstresi içindeki işlem açıklamalarında başka
-  // bankaların isimleri bulunabildiği için dosya adı yanlış referans
-  // seçimini engelleyen ek bir sinyal olarak kullanılır.
+  // Filename can help only when it names the bank explicitly.
   if (fileText.includes("akbank")) add("akbank", 220);
   if (fileText.includes("halkbank") || fileText.includes("halk bank")) {
     add("halkbank", 220);
@@ -2786,6 +2801,9 @@ function detectStatementBankFromText(text, fileName = "") {
     fileText.includes("yapi-kredi") ||
     fileText.includes("yapi_kredi")
   ) add("yapikredi", 220);
+  if (fileCompact.startsWith("ing") || fileCompact.includes("ingbank")) add("ing", 220);
+  if (fileCompact.startsWith("teb") || fileCompact.includes("turkekonomi")) add("teb", 220);
+  if (fileCompact.includes("kuveytturk") || fileCompact.includes("kuveyt-turk")) add("kuveytturk", 220);
 
   // Güçlü/header göstergeleri
   if (header.includes("akbank")) add("akbank", 120);
@@ -2826,7 +2844,15 @@ function detectStatementBankFromText(text, fileName = "") {
   if (header.includes("yapi kredi bankasi")) add("yapikredi", 120);
   if (header.includes("yapi kredi finansal")) add("yapikredi", 80);
 
-  // Header OCR'ı bozuk olsa bile compact metin üzerinden yardımcı sinyaller.
+  // Explicitly score statement issuers that were previously missing from this
+  // detector. Prefer legal/brand phrases over names appearing in row details.
+  if (header.includes("ing bank") || header.includes("ing turkey")) add("ing", 150);
+  if (header.includes("turkiye ekonomi bankasi") || header.includes("turk ekonomi bankasi")) add("teb", 150);
+  if (header.includes("teb")) add("teb", 45);
+  if (header.includes("kuveyt turk") || header.includes("kuveytturk")) add("kuveytturk", 150);
+
+  // Compact matching remains restricted to the issuer/header scope above;
+  // never scan the full transaction body for a bank-name substring.
   if (compact.includes("akbank")) add("akbank", 70);
   if (compact.includes("qnbbankas")) add("qnb", 70);
   if (compact.includes("halkbank")) add("halkbank", 70);
@@ -2837,12 +2863,28 @@ function detectStatementBankFromText(text, fileName = "") {
   if (compact.includes("yapikredi")) add("yapikredi", 80);
   if (compact.includes("yapikredibankasi")) add("yapikredi", 90);
   if (compact.includes("enpara")) add("enpara", 70);
+  if (compact.includes("ingbank")) add("ing", 100);
+  if (compact.includes("turkekonomibankasi")) add("teb", 100);
+  if (compact.includes("kuveytturk")) add("kuveytturk", 100);
 
-  const best = Object.entries(scores)
-    .sort((a, b) => b[1] - a[1])[0];
+  const ranked = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const best = ranked[0];
+  const runnerUp = ranked[1];
 
+  console.log("HESAP ÖZETİ BANKA METİN KAPSAMI:", JSON.stringify({
+    issuerEvidenceLength: issuerEvidence.length,
+    tableHeaderFound: tableHeaderIndex >= 0,
+    firstTransactionFound: firstTransactionIndex >= 0,
+    transactionBodyExcluded: cutoffCandidates.length > 0,
+  }));
   console.log("HESAP ÖZETİ BANKA SKORLARI:", JSON.stringify(scores));
-  return best && best[1] > 0 ? best[0] : null;
+  // A weak or near-tied result must not silently choose the wrong bank's
+  // reference. The caller will continue without a baseline and request review.
+  if (!best || best[1] < 70 || (runnerUp && best[1] - runnerUp[1] < 25)) {
+    console.log("HESAP ÖZETİ BANKA TESPİTİ BELİRSİZ:", JSON.stringify({ best, runnerUp }));
+    return null;
+  }
+  return best[0];
 }
 
 async function loadStatementReferenceFile(bank, statementText = "", fileName = "") {
@@ -4429,6 +4471,7 @@ false,
 documentData: {
 type: "object",
 properties: {
+bank: { type: ["string", "null"] },
 accountHolderName: { type: ["string", "null"] },
 iban: { type: ["string", "null"] },
 accountNo: { type: ["string", "null"] },
@@ -4436,7 +4479,7 @@ branch: { type: ["string", "null"] },
 taxNo: { type: ["string", "null"] },
 address: { type: ["string", "null"] },
 },
-required: ["accountHolderName", "iban", "accountNo", "branch", "taxNo", "address"],
+required: ["bank", "accountHolderName", "iban", "accountNo", "branch", "taxNo", "address"],
 additionalProperties: false,
 },
 
@@ -6455,6 +6498,11 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       decisionRole: 'diagnostic-only',
     }));
     const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched');
+    const azurePageNumbers = new Set((Array.isArray(azureLayout?.pages) ? azureLayout.pages : [])
+      .map(page => Number(page?.pageNumber)).filter(Number.isInteger));
+    const unresolvedPagesWithoutAzure = [...new Set(unresolvedRowAssociations
+      .map(item => Number(item.pageNumber))
+      .filter(pageNumber => Number.isInteger(pageNumber) && azureLayout?.available && !azurePageNumbers.has(pageNumber)))];
     const findings = [
       ...(structural?.findings || []).map(item => ({ severity: item.severity || 'low', detail: item.detail })),
       ...overlayFindings,
@@ -6462,10 +6510,15 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         severity: 'review',
         detail: `${unresolvedRowAssociations.length}/${rowAssociationDiagnostics.length} işlem satırında tutar/bakiye PDF metin kutusu satıra güvenle bağlanamadı. Bu satırlarda lokal örtme denetimi sonuçsuzdur; örnekler: ${unresolvedRowAssociations.slice(0, 5).map(item => `s.${item.pageNumber ?? '?'} satır ${item.rowNumber}: ${item.reason}`).join('; ')}.`,
       }] : []),
+      ...(unresolvedPagesWithoutAzure.length ? [{
+        severity: 'review',
+        detail: `Azure OCR/layout ${pageCount} PDF sayfasının ${azurePageNumbers.size} tanesi için sayfa verisi döndürdü. Eşleşmeyen satır bulunan ancak Azure verisi olmayan sayfalar: ${unresolvedPagesWithoutAzure.join(', ')}. Bu sayfalarda satır ROI eşleşmesi doğrulanamadı.`,
+      }] : []),
     ];
     const reviewRequired = Boolean(
       overlayFindings.length ||
       unresolvedRowAssociations.length > 0 ||
+      unresolvedPagesWithoutAzure.length > 0 ||
       structural?.findings?.some(item => item.severity === 'medium' || item.severity === 'strong')
     );
     return {
@@ -6484,6 +6537,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           pdfNativeText: rowAssociationDiagnostics.filter(item => item.associationSource === 'pdf-native-text').length,
         },
         azureLayoutAvailable: Boolean(azureLayout?.available),
+        azurePageCount: Number(azureLayout?.pageCount) || 0,
+        azurePageNumbers: [...azurePageNumbers].sort((a, b) => a - b),
+        unresolvedPagesWithoutAzure,
         azureTableRowCount: Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.length : 0,
         rows: rowAssociationDiagnostics.slice(0, 200),
       },
@@ -15719,6 +15775,8 @@ Görülebiliyorsa:
 - açılış bakiyesi
 - kapanış bakiyesi
 
+Banka adını documentData.bank alanına, belgede görünen hesap özetini düzenleyen banka olarak yaz. İşlem satırlarının açıklamalarında geçen karşı banka adlarını düzenleyen banka sanma. Emin değilsen null döndür.
+
 Ayrıca yalnızca belgede gerçekten görülen bilgileri documentData alanında çıkar:
 - accountHolderName
 - iban
@@ -16009,9 +16067,14 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   // including the resulting balance, is identical. Repeated fees/ATM labels
   // with different balances are separate transactions, not duplicates.
   const duplicateGroups = new Map();
+  const repeatedPatternGroups = new Map();
   for (const row of orderedRows) {
     const date = statementNormalizeText(row.date);
     const description = statementNormalizeText(row.description);
+    const descriptionPattern = description
+      .replace(/\b(?:sorgu|dekont|islem)?\s*(?:no|numarasi|ref(?:erans)?)\s*[:#-]?\s*[a-z0-9/-]+/g, ' ')
+      .replace(/\b(?:[a-z]\d{7,}|\d{10,})\b/g, ' ')
+      .replace(/\s+/g, ' ').trim();
     const counterparty = statementNormalizeText(row.counterparty);
     const debit = statementCents(row.debitAmount);
     const credit = statementCents(row.creditAmount);
@@ -16020,12 +16083,34 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     const key = `${date}|${debit ?? 0}|${credit ?? 0}|${description}|${counterparty}|${balanceAfter}`;
     if (!duplicateGroups.has(key)) duplicateGroups.set(key, []);
     duplicateGroups.get(key).push(row);
+    const repeatKey = `${date}|${debit ?? 0}|${credit ?? 0}|${descriptionPattern}|${counterparty}`;
+    if (!repeatedPatternGroups.has(repeatKey)) repeatedPatternGroups.set(repeatKey, []);
+    repeatedPatternGroups.get(repeatKey).push(row);
   }
   const derivedDuplicates = [...duplicateGroups.values()].filter(group => group.length > 1).map(group => {
     const first = group[0];
     const amount = first.creditAmount != null ? `+${first.creditAmount}` : `-${first.debitAmount}`;
     const where = group.map(row => `sayfa ${row.pageNumber}, satır ${row.rowNumber}`).join('; ');
     return `${first.date || 'Tarih okunamadı'} / ${amount} / ${String(first.description || first.transactionId || 'Açıklama yok').trim()} işlemi ${group.length} kez görünüyor (${where}). Tekrar eden kayıt kontrol edilmeli; tek başına sahtecilik kanıtı değildir.`;
+  });
+  const repeatedPatterns = [...repeatedPatternGroups.values()].filter(group => group.length > 1).map(group => {
+    const first = group[0];
+    const amount = first.creditAmount != null ? `+${first.creditAmount}` : `-${first.debitAmount}`;
+    const references = [...new Set(group.map(row => String(row.transactionId || '').trim()).filter(Boolean))];
+    const where = group.map(row => `s.${row.pageNumber}/satır ${row.rowNumber}`).join(', ');
+    return {
+      date: first.date || null,
+      amount,
+      description: String(first.description || '').replace(/\b(?:sorgu|dekont|islem)?\s*(?:no|numarasi|ref(?:erans)?)\s*[:#-]?\s*[a-z0-9/-]+/ig, '').trim(),
+      counterparty: first.counterparty || null,
+      occurrences: group.length,
+      locations: where,
+      transactionIds: references,
+      distinctTransactionIds: references.length > 1,
+      note: references.length > 1
+        ? 'Aynı tarih/tutar/açıklama kalıbı tekrar ediyor ancak işlem numaraları farklı; ayrı işlemler olabilir.'
+        : 'Aynı işlem kalıbı tekrar ediyor; mükerrer kayıt olup olmadığı ayrıca incelenmeli.',
+    };
   });
 
   const evaluateOrder = (direction) => {
@@ -16126,6 +16211,7 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   }
   const existingDuplicates = Array.isArray(transactionAnalysis.duplicateTransactions) ? transactionAnalysis.duplicateTransactions : [];
   transactionAnalysis.duplicateTransactions = [...new Set([...existingDuplicates, ...derivedDuplicates])];
+  transactionAnalysis.repeatedTransactionPatterns = repeatedPatterns;
   transactionAnalysis.rows = orderedRows.map(({ _index, ...row }) => row);
   transactionAnalysis.rowByRowAudit = {
     available: usableRows.length > 0,
@@ -16137,6 +16223,8 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     balanceMismatchExamples: bestOrder.examples,
     duplicateCandidateCount: derivedDuplicates.length,
     duplicateCandidates: derivedDuplicates.slice(0, 20),
+    repeatedPatternCount: repeatedPatterns.length,
+    repeatedPatterns: repeatedPatterns.slice(0, 30),
     totalIncomingFromRows: totalIncomingCents === null ? null : Number((totalIncomingCents / 100).toFixed(2)),
     totalOutgoingFromRows: totalOutgoingCents === null ? null : Number((totalOutgoingCents / 100).toFixed(2)),
     netMovementFromRows: totalIncomingCents === null || totalOutgoingCents === null
@@ -16155,13 +16243,16 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   if (deterministicMismatch) findings.push('Satır bazlı bakiye hesabında fark bulundu; örnek satırlar ve beklenen bakiyeler rapora eklendi.');
   if (derivedDuplicates.length) findings.push(`${derivedDuplicates.length} olası yinelenen işlem grubu bulundu; tekrarlar ayrı listelendi.`);
   if (usableRows.length === 0) findings.push('Yapılandırılmış işlem satırı çıkarılamadığı için bakiye zinciri doğrulanamadı.');
-  else if (rowCountMismatch) findings.push(`Belgede bildirilen ${declaredCount} işlem satırı ile yapılandırılmış olarak çıkarılan ${usableRows.length} satır uyuşmuyor; tüm bakiye zinciri doğrulanmış sayılmamalı.`);
+  if (rowCountMismatch) findings.push(`Analizin bildirdiği ${declaredCount} işlem ile satır listesinden çıkarılan ${usableRows.length} işlem uyuşmuyor; tüm bakiye zinciri doğrulanmış sayılmamalı.`);
+  if (rowsIncomplete) findings.push(`Satır doğrulaması eksik: bakiye matematiği yalnızca çıkarılan ${usableRows.length} satır için geçerlidir; belgenin tamamı doğrulanmış sayılmaz.`);
   if (!pageCoverageComplete) findings.push(`PDF'nin ${pdfForensics?.pagesAnalyzed || 0}/${pdfPageCount || '?'} sayfasındaki yerel PDF denetimi tamamlanamadı.`);
   if (pdfForensics?.findings?.length) findings.push(...pdfForensics.findings.map(item => item.detail));
   result.manualReviewRequired = Boolean(deterministicMismatch || derivedDuplicates.length || rowsIncomplete || !pageCoverageComplete || pdfForensics?.reviewRequired);
   result.statementAuditFindings = findings;
   const summaryOnlyFindings = findings.filter(item =>
     item.startsWith('Model ') || item.startsWith("PDF'nin ") ||
+    item.startsWith('Yapılandırılmış ') || item.startsWith('Analizin bildirdiği ') ||
+    item.startsWith('Satır doğrulaması eksik:') ||
     (pdfForensics?.findings || []).some(pdfFinding => pdfFinding.detail === item)
   );
   if (summaryOnlyFindings.length) result.summary = [String(result.summary || '').trim(), ...summaryOnlyFindings.map(item => `• ${item}`)].filter(Boolean).join('\n');
@@ -18569,46 +18660,86 @@ fileName
 // Hesap hareketlerinde belge üzerindeki banka adı önceliklidir.
 // Böylece önceki bir seçimden/stale parametreden gelen yanlış banka,
 // doğru referansın önüne geçemez.
-const statementBank =
-detectedStatementBank ||
-statementBankCandidate;
-
-console.log(
-"HESAP ÖZETİ BANKA ADAYI:",
-statementBankCandidate || "YOK"
+// Never send a bank baseline before an independent visual pass identifies the
+// issuer. Text extraction can contain destination-bank names in transaction
+// descriptions (e.g. QNB statement rows mentioning Ziraat), so it cannot by
+// itself authorize a reference choice.
+const statementIdentityProbe = await analyzeStatement(base64, mime, fileName, null);
+const statementProbeBank = normalizeBank(statementIdentityProbe?.documentData?.bank) ||
+  detectStatementBankFromText(String(statementIdentityProbe?.summary || "").slice(0, 700), "");
+const statementBank = statementProbeBank || null;
+const statementTextBankConflict = Boolean(
+  statementBank && detectedStatementBank && statementBank !== detectedStatementBank
 );
-
-console.log(
-"HESAP ÖZETİ BELGEDEN TESPİT:",
-detectedStatementBank || "YOK"
+const statementRequestBankConflict = Boolean(
+  statementBank && statementBankCandidate && statementBank !== statementBankCandidate
 );
+const statementDetectionConflict = statementTextBankConflict || statementRequestBankConflict;
 
-console.log(
-"HESAP ÖZETİ BANKA:",
-statementBank || "YOK"
-);
+console.log("HESAP ÖZETİ BANKA ÖN TARAMA:", JSON.stringify({
+  requestBank: statementBankCandidate || null,
+  textDetectedBank: detectedStatementBank || null,
+  visualProbeBank: statementProbeBank || null,
+  selectedIssuerBank: statementBank,
+  textVisualConflict: statementTextBankConflict,
+  textBankConflict: statementTextBankConflict,
+  requestBankConflict: statementRequestBankConflict,
+  referenceAuthorizedBy: statementBank ? "visual-document-identity-pass" : null,
+}));
 
-const statementReference =
-await loadStatementReferenceFile(
-statementBank,
-statementDetectionText,
-fileName
-);
+let statementReference = statementBank
+  ? await loadStatementReferenceFile(statementBank, statementDetectionText, fileName)
+  : null;
 
-console.log(
-"HESAP ÖZETİ REFERANS YÜKLENDİ:",
-Array.isArray(statementReference)
+console.log("HESAP ÖZETİ REFERANS YÜKLENDİ:", Array.isArray(statementReference)
   ? statementReference.map((r) => r.fileName).join(", ")
-  : statementReference?.fileName || "YOK"
-);
+  : statementReference?.fileName || "YOK");
 
-const statementModelResult =
-await analyzeStatement(
-base64,
-mime,
-fileName,
-statementReference
+// The preliminary pass has no bank reference. If an identity was established,
+// run the actual analysis with only that bank's reference; otherwise retain the
+// unreferenced pass and require review.
+let statementModelResult = statementReference
+  ? await analyzeStatement(base64, mime, fileName, statementReference)
+  : statementIdentityProbe;
+
+let statementModelBank = normalizeBank(statementModelResult?.documentData?.bank) ||
+  detectStatementBankFromText(String(statementModelResult?.summary || "").slice(0, 700), "");
+let statementFinalBankConflict = Boolean(
+  statementBank && statementModelBank && statementBank !== statementModelBank
 );
+let statementReferencePassDiscarded = false;
+if (statementFinalBankConflict && statementReference) {
+  // A baseline-conditioned pass contradicted the no-reference identity pass.
+  // Discard its analysis instead of returning findings influenced by a
+  // potentially wrong-bank reference.
+  console.warn("HESAP ÖZETİ REFERANS ANALİZİ GEÇERSİZ KILINDI:", JSON.stringify({
+    identityPassBank: statementBank,
+    referencePassBank: statementModelBank,
+    discardedReference: Array.isArray(statementReference)
+      ? statementReference.map((r) => r.fileName)
+      : statementReference.fileName,
+  }));
+  statementModelResult = statementIdentityProbe;
+  statementModelBank = statementProbeBank;
+  statementReference = null;
+  statementReferencePassDiscarded = true;
+  statementFinalBankConflict = false;
+}
+const statementBankIdentityConflict = statementDetectionConflict || statementFinalBankConflict || statementReferencePassDiscarded ||
+  Boolean(statementReference && !statementModelBank);
+console.log("HESAP ÖZETİ BANKA KİMLİĞİ ÇAPRAZ KONTROLÜ:", JSON.stringify({
+  detectedBank: statementBank || null,
+  modelBank: statementModelBank || null,
+  textDetectedBank: detectedStatementBank || null,
+  conflict: statementBankIdentityConflict,
+  textVisualConflict: statementTextBankConflict,
+  textBankConflict: statementTextBankConflict,
+  requestBankConflict: statementRequestBankConflict,
+  visualPassFinalConflict: statementFinalBankConflict,
+  referenceBank: Array.isArray(statementReference)
+    ? statementReference[0]?.bank || null
+    : statementReference?.bank || null,
+}));
 
 const statementPdfForensics = await runStatementPdfForensics(
   filePath,
@@ -18622,15 +18753,58 @@ const statementResult = applyStatementLedgerChecks(
   statementPageCount,
   statementPdfForensics
 );
+if (statementBankIdentityConflict) {
+  const bankConflictReasons = [];
+  if (statementTextBankConflict) bankConflictReasons.push(`üst bilgi metin tespiti ${detectedStatementBank}, görsel ön tarama ${statementBank} dedi`);
+  if (statementRequestBankConflict) bankConflictReasons.push(`istek bankası ${statementBankCandidate}, belge görseli ${statementBank} olarak tanındı`);
+  if (statementReferencePassDiscarded) bankConflictReasons.push('referanslı analiz banka kimliğinde ön taramayla çelişti ve sonuç kullanılmadı');
+  if (statementFinalBankConflict) bankConflictReasons.push(`son analiz ${statementModelBank}, görsel ön tarama ${statementBank} dedi`);
+  if (statementReference && !statementModelBank) bankConflictReasons.push('referanslı analiz banka kimliğini doğrulayamadı');
+  const bankConflictFinding = `Banka kimliği kontrol gerektiriyor: ${bankConflictReasons.join('; ')}. Referans eşleşmesi ve banka bazlı yorum manuel doğrulanmalı.`;
+  statementResult.manualReviewRequired = true;
+  statementResult.statementReferenceIdentityValidated = false;
+  statementResult.statementAuditFindings = [
+    ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
+    bankConflictFinding,
+  ];
+  statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), bankConflictFinding])];
+  statementResult.summary = [String(statementResult.summary || "").trim(), `• ${bankConflictFinding}`].filter(Boolean).join("\n");
+} else {
+  statementResult.statementReferenceIdentityValidated = Boolean(statementReference && statementBank &&
+    (Array.isArray(statementReference)
+      ? statementReference.every(item => normalizeBank(item?.bank) === statementBank)
+      : normalizeBank(statementReference?.bank) === statementBank));
+}
+if (!statementBank || !statementReference) {
+  const unavailableReason = !statementBank
+    ? "Belgeden banka kimliği güvenilir biçimde seçilemedi; banka referans karşılaştırması yapılmadı."
+    : ` ${statementBank} için yapılandırılmış hesap özeti referansı yüklenemedi; referans karşılaştırması yapılmadı.`;
+  statementResult.manualReviewRequired = true;
+  statementResult.statementReferenceIdentityValidated = false;
+  statementResult.statementAuditFindings = [
+    ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
+    unavailableReason,
+  ];
+  statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), unavailableReason])];
+  statementResult.summary = [String(statementResult.summary || "").trim(), `• ${unavailableReason}`].filter(Boolean).join("\n");
+}
 
 console.log("HESAP ÖZETİ TÜM SAYFA DENETİMİ:", JSON.stringify({
   pageCount: statementPageCount,
   pagesAnalyzed: statementPdfForensics?.pagesAnalyzed || 0,
   everyPageAnalyzed: statementPdfForensics?.everyPageAnalyzed === true,
+  azurePageCount: statementPdfForensics?.transactionRowAssociation?.azurePageCount || 0,
+  azurePageNumbers: statementPdfForensics?.transactionRowAssociation?.azurePageNumbers || [],
+  unresolvedPagesWithoutAzure: statementPdfForensics?.transactionRowAssociation?.unresolvedPagesWithoutAzure || [],
+  modelDeclaredTransactionCount: statementResult?.transactionAnalysis?.rowByRowAudit?.declaredTransactionCount || null,
+  structuredModelRowCount: statementPdfForensics?.transactionRowAssociation?.inputRows || 0,
   transactionRows: statementResult?.transactionAnalysis?.rowByRowAudit?.extractedRowCount || 0,
   balanceChecks: statementResult?.transactionAnalysis?.rowByRowAudit?.balanceChecks || 0,
   balanceMismatches: statementResult?.transactionAnalysis?.rowByRowAudit?.balanceMismatchCount || 0,
   duplicateCandidates: statementResult?.transactionAnalysis?.rowByRowAudit?.duplicateCandidateCount || 0,
+  repeatedPatternCount: statementResult?.transactionAnalysis?.rowByRowAudit?.repeatedPatternCount || 0,
+  rowsIncomplete: statementResult?.transactionAnalysis?.rowByRowAudit?.rowsIncomplete === true,
+  pageCoverageComplete: statementResult?.transactionAnalysis?.rowByRowAudit?.pageCoverageComplete === true,
   forensicRowsMatched: statementPdfForensics?.transactionRowAssociation?.matchedRows || 0,
   forensicRowsUnresolved: statementPdfForensics?.transactionRowAssociation?.unresolvedRows || 0,
   forensicRowMatchSources: statementPdfForensics?.transactionRowAssociation?.sourceCounts || null,
@@ -18665,6 +18839,8 @@ for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
   }
   console.log("HESAP ÖZETİ SATIR ROI EŞLEŞME DETAYI:", JSON.stringify({
     pageNumber,
+    azurePagePresent: (statementPdfForensics?.transactionRowAssociation?.azurePageNumbers || []).includes(pageNumber),
+    modelRowsOnPage: pageRows.length,
     matched: matched.map(item => ({
       rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
       source: item.associationSource, amountBox: item.amountBox, balanceBox: item.balanceBox,
@@ -18729,6 +18905,7 @@ fileName,
 type:
 "statement",
 bank:
+statementBank ||
 bank ||
 null,
 
