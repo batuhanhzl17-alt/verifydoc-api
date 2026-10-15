@@ -1472,7 +1472,10 @@ function normalizeAzureLayoutResult(payload) {
   const pages = Array.isArray(ar.pages) ? ar.pages : [];
   const paragraphs = Array.isArray(ar.paragraphs) ? ar.paragraphs : [];
   const tables = Array.isArray(ar.tables) ? ar.tables : [];
-  const lines = [], words = [];
+  const lines = [], words = [], tableRows = [];
+  const pageDimensions = new Map(pages.map(page => [Number(page?.pageNumber) || 1, {
+    width: Number(page?.width) || 0, height: Number(page?.height) || 0,
+  }]));
 
   for (const page of pages) {
     const pageNumber = Number(page?.pageNumber) || 1;
@@ -1507,6 +1510,34 @@ function normalizeAzureLayoutResult(payload) {
     }
   }
 
+  const tableRowMap = new Map();
+  for (const [tableIndex, table] of tables.entries()) {
+    for (const cell of (Array.isArray(table?.cells) ? table.cells : [])) {
+      const rowIndex = Number(cell?.rowIndex);
+      const columnIndex = Number(cell?.columnIndex);
+      if (!Number.isInteger(rowIndex) || !Number.isInteger(columnIndex)) continue;
+      for (const region of (Array.isArray(cell?.boundingRegions) ? cell.boundingRegions : [])) {
+        const pageNumber = Number(region?.pageNumber) || 1;
+        const dims = pageDimensions.get(pageNumber);
+        const box = azurePointBoxToRect(region?.polygon);
+        if (!box || !dims?.width || !dims?.height) continue;
+        const key = `${tableIndex}:${pageNumber}:${rowIndex}`;
+        if (!tableRowMap.has(key)) tableRowMap.set(key, { tableIndex, pageNumber, rowIndex, cells: [] });
+        tableRowMap.get(key).cells.push({
+          columnIndex,
+          text: String(cell?.content || '').trim(),
+          box,
+          xNorm: box.x1 / dims.width,
+          yNorm: box.y1 / dims.height,
+          widthNorm: (box.x2 - box.x1) / dims.width,
+          heightNorm: (box.y2 - box.y1) / dims.height,
+        });
+      }
+    }
+  }
+  tableRows.push(...tableRowMap.values());
+  for (const row of tableRows) row.cells.sort((a, b) => a.columnIndex - b.columnIndex);
+
   return {
     available: true,
     engine: "azure-document-intelligence-layout-v4",
@@ -1525,6 +1556,7 @@ function normalizeAzureLayoutResult(payload) {
     })),
     lines,
     words,
+    tableRows,
     paragraphs: paragraphs.map((p) => ({
       content: String(p?.content || "").trim(),
       role: p?.role || null,
@@ -1583,6 +1615,7 @@ async function runAzureDocumentLayout(filePath) {
           wordCount: normalized.words.length,
           paragraphCount: normalized.paragraphs.length,
           tableCount: normalized.tableCount,
+          tableRowCount: normalized.tableRows.length,
           apiVersion: normalized.apiVersion,
         }));
         return normalized;
@@ -6102,6 +6135,83 @@ function statementPdfMoneyTokens(text) {
   return matches.map(token => ({ text: token.trim(), cents: statementPdfMoneyCents(token) }));
 }
 
+function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
+  const dateKey = statementPdfDateKey(row?.date);
+  const rawAmount = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
+    : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
+  const parsedAmount = statementPdfMoneyCents(rawAmount);
+  const expectedAmount = parsedAmount == null ? null : Math.abs(parsedAmount);
+  const expectedBalance = statementPdfMoneyCents(row?.balanceAfter);
+  if (!dateKey || expectedAmount == null) return { status: 'unresolved', reason: 'Tablo eşleştirmesi için tarih veya tutar eksik.' };
+  const description = statementNormalizeText([row?.description, row?.counterparty].filter(Boolean).join(' '));
+  const terms = description.split(' ').filter(term => term.length >= 4);
+  const transactionId = String(row?.transactionId || '').replace(/\D/g, '');
+  const candidates = [];
+
+  for (const tableRow of (Array.isArray(tableRows) ? tableRows : [])) {
+    if (Number(tableRow.pageNumber) !== Number(row.pageNumber)) continue;
+    const cells = Array.isArray(tableRow.cells) ? tableRow.cells : [];
+    if (!cells.some(cell => statementPdfDateKey(cell.text) === dateKey)) continue;
+    const rowText = statementNormalizeText(cells.map(cell => cell.text).join(' '));
+    const hits = terms.filter(term => rowText.includes(term)).length;
+    const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
+    const idMatched = transactionId.length >= 5 && rowText.replace(/\D/g, '').includes(transactionId);
+    if (!descriptionMatched && !idMatched) continue;
+
+    let amountCells = cells.filter(cell => statementPdfMoneyTokens(cell.text)
+      .some(token => token.cents != null && Math.abs(token.cents) === expectedAmount));
+    const balanceCells = expectedBalance == null ? [] : cells.filter(cell =>
+      statementPdfMoneyTokens(cell.text).some(token => token.cents === expectedBalance));
+    if (amountCells.length > 1 && balanceCells.length === 1) {
+      amountCells = amountCells.filter(cell => cell !== balanceCells[0]);
+    }
+    if (amountCells.length !== 1) continue;
+    const amountCell = amountCells[0];
+    let amountBox = null;
+    let amountText = statementPdfMoneyTokens(amountCell.text).find(token => Math.abs(token.cents) === expectedAmount)?.text || amountCell.text;
+    const cellBox = statementPdfAzureBox(amountCell);
+    if (cellBox) {
+      const wordsInCell = pageWords.filter(word => {
+        if (Number(word.pageNumber) !== Number(row.pageNumber)) return false;
+        const wordBox = statementPdfAzureBox(word);
+        if (!wordBox) return false;
+        const ix = Math.max(0, Math.min(cellBox.x + cellBox.width, wordBox.x + wordBox.width) - Math.max(cellBox.x, wordBox.x));
+        const iy = Math.max(0, Math.min(cellBox.y + cellBox.height, wordBox.y + wordBox.height) - Math.max(cellBox.y, wordBox.y));
+        const overlap = ix * iy;
+        const wordArea = wordBox.width * wordBox.height;
+        const value = statementPdfMoneyCents(word.text);
+        return wordArea > 0 && overlap / wordArea >= 0.5 && value != null && Math.abs(value) === expectedAmount;
+      });
+      if (wordsInCell.length === 1) {
+        amountBox = statementPdfAzureBox(wordsInCell[0]);
+        amountText = wordsInCell[0].text;
+      } else {
+        const residual = String(amountCell.text || '').replace(/[+−-]?\s*(?:(?:\d{1,3}(?:[.\s]\d{3})+)|\d+)[,.]\d{2}/g, '')
+          .replace(/\b(?:TL|TRY)\b/gi, '').replace(/[\s:]/g, '');
+        if (!residual) amountBox = cellBox;
+      }
+    }
+    const balanceBox = balanceCells.length === 1 ? statementPdfAzureBox(balanceCells[0]) : null;
+    candidates.push({ tableIndex: tableRow.tableIndex, rowIndex: tableRow.rowIndex, amountCell,
+      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1 });
+  }
+
+  if (candidates.length !== 1) return { status: 'unresolved', source: 'azure-table',
+    dateAnchorCount: (tableRows || []).filter(item => Number(item.pageNumber) === Number(row.pageNumber) &&
+      item.cells?.some(cell => statementPdfDateKey(cell.text) === dateKey)).length,
+    distinctCandidateLineCount: candidates.length,
+    reason: candidates.length ? `${candidates.length} Azure tablo satırı adayı kaldı; güvenli seçim yapılamadı.`
+      : 'Azure tablo hücrelerinde tarih, açıklama/işlem numarası ve tutar birlikte eşleşmedi.' };
+  const candidate = candidates[0];
+  if (!candidate.amountBox) return { status: 'unresolved', source: 'azure-table',
+    dateAnchorCount: 1, distinctCandidateLineCount: 1,
+    reason: 'Azure tablo satırı bulundu; ancak tutar için dar ve güvenilir hücre/kelime kutusu üretilemedi.' };
+  return { status: 'matched', source: 'azure-table', dateAnchorCount: 1,
+    distinctCandidateLineCount: 1, reason: 'Azure tablo satırında tarih, açıklama/işlem numarası ve tutar tekil eşleşti.',
+    amountBox: candidate.amountBox, balanceBox: candidate.balanceBox,
+    amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
+}
+
 function statementPdfResolveAzureRow(row, pageLines, pageWords) {
   const dateKey = statementPdfDateKey(row?.date);
   const amountValue = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
@@ -6146,7 +6256,7 @@ function statementPdfResolveAzureRow(row, pageLines, pageWords) {
   const candidate = candidates[0];
   if (!candidate.amountBox) return { status: 'unresolved', dateAnchorCount: anchors.length,
     distinctCandidateLineCount: 1, reason: 'Satır bulundu; ancak tutara ait dar OCR kelime kutusu tekil bulunamadı.' };
-  return { status: 'matched', dateAnchorCount: anchors.length, distinctCandidateLineCount: 1,
+  return { status: 'matched', source: 'azure-lines', dateAnchorCount: anchors.length, distinctCandidateLineCount: 1,
     reason: 'Azure OCR satır geometrisinde tarih, açıklama ve tutar tekil eşleşti.',
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox, amountText: candidate.amountText };
 }
@@ -6178,6 +6288,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       const pageItems = content.items || [];
       const azurePageLines = Array.isArray(azureLayout?.lines) ? azureLayout.lines.filter(line => Number(line.pageNumber) === pageNumber) : [];
       const azurePageWords = Array.isArray(azureLayout?.words) ? azureLayout.words.filter(word => Number(word.pageNumber) === pageNumber) : [];
+      const azurePageTableRows = Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.filter(row => Number(row.pageNumber) === pageNumber) : [];
       for (const [rowIndex, row] of pageRows.entries()) {
         const dateKey = statementPdfDateKey(row?.date);
         const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
@@ -6195,7 +6306,13 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         let selectedAmountItem = null;
         let selectedBalanceItem = null;
         let rowLineCandidates = [];
-        const azureResolved = azurePageLines.length ? statementPdfResolveAzureRow(row, azurePageLines, azurePageWords) : null;
+        const azureTableResolved = azurePageTableRows.length
+          ? statementPdfResolveAzureTableRow(row, azurePageTableRows, azurePageWords) : null;
+        const azureLineResolved = azurePageLines.length
+          ? statementPdfResolveAzureRow(row, azurePageLines, azurePageWords) : null;
+        const azureResolved = azureTableResolved?.status === 'matched' ? azureTableResolved
+          : azureLineResolved?.status === 'matched' ? azureLineResolved
+            : azureTableResolved || azureLineResolved;
         if (!Number.isInteger(Number(row?.pageNumber))) reason = 'İşlem satırında sayfa numarası yok.';
         else if (!dateKey) reason = 'Satır tarihi güvenilir biçimde okunamadı; sayfa içi satır ankrajı kurulamadı.';
         else if (azureResolved?.status === 'matched') {
@@ -6284,8 +6401,16 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           distinctCandidateLineCount: rowLineCandidates.length,
           amountMatched: status === 'matched',
           balanceMatched: Boolean(selectedBalanceItem),
-          associationSource: azureResolved?.status === 'matched' ? 'azure-layout' : status === 'matched' ? 'pdf-native-text' : 'unresolved',
+          amountValue: rowAmountValue,
+          amountBox: azureResolved?.status === 'matched' ? azureResolved.amountBox
+            : selectedAmountItem ? statementPdfItemBox(selectedAmountItem, viewport) : null,
+          balanceBox: azureResolved?.status === 'matched' ? azureResolved.balanceBox
+            : selectedBalanceItem && !selectedBalanceItem.azure ? statementPdfItemBox(selectedBalanceItem, viewport) : null,
+          associationSource: azureResolved?.status === 'matched' ? azureResolved.source || 'azure-layout'
+            : status === 'matched' ? 'pdf-native-text' : 'unresolved',
           azureAssociationReason: azureResolved?.reason || null,
+          azureTableReason: azureTableResolved?.reason || null,
+          azureLineReason: azureLineResolved?.reason || null,
         });
       }
       for (const item of numericTokens) {
@@ -6351,10 +6476,12 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         matchedRows: rowAssociationDiagnostics.filter(item => item.status === 'matched').length,
         unresolvedRows: rowAssociationDiagnostics.filter(item => item.status !== 'matched').length,
         sourceCounts: {
-          azureLayout: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-layout').length,
+          azureTable: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-table').length,
+          azureLines: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-lines' || item.associationSource === 'azure-layout').length,
           pdfNativeText: rowAssociationDiagnostics.filter(item => item.associationSource === 'pdf-native-text').length,
         },
         azureLayoutAvailable: Boolean(azureLayout?.available),
+        azureTableRowCount: Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.length : 0,
         rows: rowAssociationDiagnostics.slice(0, 200),
       },
       structural,
@@ -18504,9 +18631,35 @@ console.log("HESAP ÖZETİ TÜM SAYFA DENETİMİ:", JSON.stringify({
   forensicRowsMatched: statementPdfForensics?.transactionRowAssociation?.matchedRows || 0,
   forensicRowsUnresolved: statementPdfForensics?.transactionRowAssociation?.unresolvedRows || 0,
   forensicRowMatchSources: statementPdfForensics?.transactionRowAssociation?.sourceCounts || null,
+  azureTableRowCount: statementPdfForensics?.transactionRowAssociation?.azureTableRowCount || 0,
   pdfFindingCount: statementPdfForensics?.findings?.length || 0,
   manualReviewRequired: statementResult?.manualReviewRequired === true,
 }));
+
+const rowForensicDiagnostics = statementPdfForensics?.transactionRowAssociation?.rows || [];
+for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
+  const pageRows = rowForensicDiagnostics.filter(item => Number(item.pageNumber) === pageNumber);
+  const matched = pageRows.filter(item => item.status === 'matched');
+  const unresolved = pageRows.filter(item => item.status !== 'matched');
+  const reasonCounts = {};
+  for (const item of unresolved) {
+    const reason = String(item.reason || 'Neden belirtilmedi.').split('.')[0].slice(0, 110);
+    reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
+  }
+  console.log("HESAP ÖZETİ SATIR ROI EŞLEŞME DETAYI:", JSON.stringify({
+    pageNumber,
+    matched: matched.map(item => ({
+      rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
+      source: item.associationSource, amountBox: item.amountBox, balanceBox: item.balanceBox,
+    })),
+    unresolvedCount: unresolved.length,
+    unresolvedReasonCounts: reasonCounts,
+    unresolvedExamples: unresolved.slice(0, 5).map(item => ({
+      rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
+      reason: item.reason, azureTableReason: item.azureTableReason, azureLineReason: item.azureLineReason,
+    })),
+  }));
+}
 
 
 const statementScore =
