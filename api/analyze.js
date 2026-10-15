@@ -2758,6 +2758,9 @@ function detectStatementBankFromText(text, fileName = "") {
     akbank: 0,
     isbankasi: 0,
     yapikredi: 0,
+    ing: 0,
+    teb: 0,
+    kuveytturk: 0,
   };
 
   const add = (bank, points) => {
@@ -2786,6 +2789,9 @@ function detectStatementBankFromText(text, fileName = "") {
     fileText.includes("yapi-kredi") ||
     fileText.includes("yapi_kredi")
   ) add("yapikredi", 220);
+  if (fileCompact.startsWith("ing") || fileCompact.includes("ingbank")) add("ing", 220);
+  if (fileCompact.startsWith("teb") || fileCompact.includes("turkekonomi")) add("teb", 220);
+  if (fileCompact.includes("kuveytturk") || fileCompact.includes("kuveyt-turk")) add("kuveytturk", 220);
 
   // Güçlü/header göstergeleri
   if (header.includes("akbank")) add("akbank", 120);
@@ -2826,6 +2832,13 @@ function detectStatementBankFromText(text, fileName = "") {
   if (header.includes("yapi kredi bankasi")) add("yapikredi", 120);
   if (header.includes("yapi kredi finansal")) add("yapikredi", 80);
 
+  // Explicitly score statement issuers that were previously missing from this
+  // detector. Prefer legal/brand phrases over names appearing in row details.
+  if (header.includes("ing bank") || header.includes("ing turkey")) add("ing", 150);
+  if (header.includes("turkiye ekonomi bankasi") || header.includes("turk ekonomi bankasi")) add("teb", 150);
+  if (header.includes("teb")) add("teb", 45);
+  if (header.includes("kuveyt turk") || header.includes("kuveytturk")) add("kuveytturk", 150);
+
   // Header OCR'ı bozuk olsa bile compact metin üzerinden yardımcı sinyaller.
   if (compact.includes("akbank")) add("akbank", 70);
   if (compact.includes("qnbbankas")) add("qnb", 70);
@@ -2837,12 +2850,22 @@ function detectStatementBankFromText(text, fileName = "") {
   if (compact.includes("yapikredi")) add("yapikredi", 80);
   if (compact.includes("yapikredibankasi")) add("yapikredi", 90);
   if (compact.includes("enpara")) add("enpara", 70);
+  if (compact.includes("ingbank")) add("ing", 100);
+  if (compact.includes("turkekonomibankasi")) add("teb", 100);
+  if (compact.includes("kuveytturk")) add("kuveytturk", 100);
 
-  const best = Object.entries(scores)
-    .sort((a, b) => b[1] - a[1])[0];
+  const ranked = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const best = ranked[0];
+  const runnerUp = ranked[1];
 
   console.log("HESAP ÖZETİ BANKA SKORLARI:", JSON.stringify(scores));
-  return best && best[1] > 0 ? best[0] : null;
+  // A weak or near-tied result must not silently choose the wrong bank's
+  // reference. The caller will continue without a baseline and request review.
+  if (!best || best[1] < 70 || (runnerUp && best[1] - runnerUp[1] < 25)) {
+    console.log("HESAP ÖZETİ BANKA TESPİTİ BELİRSİZ:", JSON.stringify({ best, runnerUp }));
+    return null;
+  }
+  return best[0];
 }
 
 async function loadStatementReferenceFile(bank, statementText = "", fileName = "") {
@@ -6130,58 +6153,6 @@ function statementPdfAzureBox(lineOrWord) {
     width: Math.max(0.0001, Math.min(1, values[2])), height: Math.max(0.0001, Math.min(1, values[3])) };
 }
 
-function statementPdfResolveAzureRowsByOrder(pageRows, initialResolutions) {
-  const resolutions = Array.isArray(initialResolutions) ? initialResolutions.slice() : [];
-  const rows = Array.isArray(pageRows) ? pageRows : [];
-  const boxCenterY = box => box ? Number(box.y) + Number(box.height || 0) / 2 : null;
-  const sameBox = (a, b) => a && b && Math.abs(a.x - b.x) <= 0.0015 && Math.abs(a.y - b.y) <= 0.0015 &&
-    Math.abs(a.width - b.width) <= 0.003 && Math.abs(a.height - b.height) <= 0.003;
-
-  // Resolve only when page order and already anchored neighbors leave one
-  // possible amount box. This uses statement sequence as geometric evidence,
-  // without assigning an arbitrary candidate in an unconstrained region.
-  for (let pass = 0; pass < rows.length; pass++) {
-    let changed = false;
-    for (let i = 0; i < rows.length; i++) {
-      if (resolutions[i]?.status === 'matched') continue;
-      const candidates = Array.isArray(resolutions[i]?.orderCandidates) ? resolutions[i].orderCandidates : [];
-      if (!candidates.length) continue;
-      let previousY = null;
-      let nextY = null;
-      for (let j = i - 1; j >= 0; j--) {
-        if (resolutions[j]?.status !== 'matched') continue;
-        previousY = boxCenterY(resolutions[j].amountBox);
-        if (previousY != null) break;
-      }
-      for (let j = i + 1; j < rows.length; j++) {
-        if (resolutions[j]?.status !== 'matched') continue;
-        nextY = boxCenterY(resolutions[j].amountBox);
-        if (nextY != null) break;
-      }
-      if (previousY == null || nextY == null || nextY <= previousY) continue;
-      const occupied = resolutions.filter((item, index) => index !== i && item?.status === 'matched')
-        .map(item => item.amountBox).filter(Boolean);
-      const bounded = candidates.filter(candidate => {
-        const y = boxCenterY(candidate.amountBox);
-        if (y == null || occupied.some(box => sameBox(box, candidate.amountBox))) return false;
-        if (previousY != null && y <= previousY + 0.001) return false;
-        if (nextY != null && y >= nextY - 0.001) return false;
-        return true;
-      });
-      if (bounded.length !== 1) continue;
-      const candidate = bounded[0];
-      resolutions[i] = { status: 'matched', source: 'azure-table-order',
-        dateAnchorCount: resolutions[i]?.dateAnchorCount || 0, distinctCandidateLineCount: 1,
-        reason: 'Açıklama/bakiye çözümü belirsizdi; sayfa satır sırası ve iki komşu eşleşme tek bir tutar kutusu bıraktı.',
-        amountBox: candidate.amountBox, balanceBox: candidate.balanceBox || null,
-        amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
-      changed = true;
-    }
-    if (!changed) break;
-  }
-  return resolutions;
-}
-
 function statementPdfMoneyTokens(text) {
   const matches = String(text || '').match(/[+−-]?\s*(?:(?:\d{1,3}(?:[.\s]\d{3})+)|\d+)[,.]\d{2}/g) || [];
   return matches.map(token => ({ text: token.trim(), cents: statementPdfMoneyCents(token) }));
@@ -6208,6 +6179,7 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     const hits = terms.filter(term => rowText.includes(term)).length;
     const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
     const idMatched = transactionId.length >= 5 && rowText.replace(/\D/g, '').includes(transactionId);
+    if (!descriptionMatched && !idMatched) continue;
 
     let amountCells = cells.filter(cell => statementPdfMoneyTokens(cell.text)
       .some(token => token.cents != null && Math.abs(token.cents) === expectedAmount));
@@ -6244,70 +6216,21 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     }
     const balanceBox = balanceCells.length === 1 ? statementPdfAzureBox(balanceCells[0]) : null;
     candidates.push({ tableIndex: tableRow.tableIndex, rowIndex: tableRow.rowIndex, amountCell,
-      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1,
-      descriptionMatched, idMatched, rowText });
+      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1 });
   }
 
-  // Azure can split a visually continuous statement table into overlapping
-  // tables. Collapse duplicate detections of the same amount box before
-  // deciding whether the transaction row is ambiguous.
-  const uniqueCandidates = [];
-  for (const candidate of candidates) {
-    const existing = candidate.amountBox && uniqueCandidates.find(item => item.amountBox &&
-      Math.abs(item.amountBox.x - candidate.amountBox.x) <= 0.0015 &&
-      Math.abs(item.amountBox.y - candidate.amountBox.y) <= 0.0015 &&
-      Math.abs(item.amountBox.width - candidate.amountBox.width) <= 0.003 &&
-      Math.abs(item.amountBox.height - candidate.amountBox.height) <= 0.003);
-    if (!existing) uniqueCandidates.push(candidate);
-    else {
-      existing.balanceMatched ||= candidate.balanceMatched;
-      existing.balanceBox ||= candidate.balanceBox;
-      existing.descriptionMatched ||= candidate.descriptionMatched;
-      existing.idMatched ||= candidate.idMatched;
-    }
-  }
-
-  const semanticCandidates = uniqueCandidates.filter(candidate => candidate.descriptionMatched || candidate.idMatched);
-  const exactBalanceCandidates = uniqueCandidates.filter(candidate => candidate.balanceMatched);
-  let candidate = null;
-  let matchReason = '';
-  if (exactBalanceCandidates.length === 1) {
-    candidate = exactBalanceCandidates[0];
-    matchReason = 'Tarih, tutar ve satır bakiyesi tekil eşleşti.';
-  } else if (semanticCandidates.length === 1) {
-    candidate = semanticCandidates[0];
-    matchReason = 'Tarih, açıklama/işlem numarası ve tutar tekil eşleşti.';
-  } else if (semanticCandidates.length > 1) {
-    const semanticBalanceCandidates = semanticCandidates.filter(item => item.balanceMatched);
-    if (semanticBalanceCandidates.length === 1) {
-      candidate = semanticBalanceCandidates[0];
-      matchReason = 'Açıklama ve tutar adayları, satır bakiyesiyle tekil hâle getirildi.';
-    }
-  } else if (uniqueCandidates.length === 1) {
-    candidate = uniqueCandidates[0];
-    matchReason = candidate.balanceMatched
-      ? 'Açıklama OCR eşleşmesi zayıf; tarih, tutar ve tekil satır bakiyesi eşleşti.'
-      : 'Açıklama OCR eşleşmesi zayıf; sayfadaki tek tarih+tutar satırı kullanıldı.';
-  }
-
-  if (!candidate) return { status: 'unresolved', source: 'azure-table',
+  if (candidates.length !== 1) return { status: 'unresolved', source: 'azure-table',
     dateAnchorCount: (tableRows || []).filter(item => Number(item.pageNumber) === Number(row.pageNumber) &&
       item.cells?.some(cell => statementPdfDateKey(cell.text) === dateKey)).length,
-    distinctCandidateLineCount: uniqueCandidates.length,
-    amountCandidateCount: uniqueCandidates.length,
-    semanticCandidateCount: semanticCandidates.length,
-    balanceCandidateCount: exactBalanceCandidates.length,
-    orderCandidates: uniqueCandidates.filter(item => item.amountBox).map(item => ({
-      tableIndex: item.tableIndex, rowIndex: item.rowIndex, amountBox: item.amountBox,
-      balanceBox: item.balanceBox, amountText: item.amountText,
-    })),
-    reason: uniqueCandidates.length ? `${uniqueCandidates.length} Azure tablo satırı adayı kaldı; açıklama ve bakiye tekil seçim sağlamadı.`
+    distinctCandidateLineCount: candidates.length,
+    reason: candidates.length ? `${candidates.length} Azure tablo satırı adayı kaldı; güvenli seçim yapılamadı.`
       : 'Azure tablo hücrelerinde tarih, açıklama/işlem numarası ve tutar birlikte eşleşmedi.' };
+  const candidate = candidates[0];
   if (!candidate.amountBox) return { status: 'unresolved', source: 'azure-table',
     dateAnchorCount: 1, distinctCandidateLineCount: 1,
     reason: 'Azure tablo satırı bulundu; ancak tutar için dar ve güvenilir hücre/kelime kutusu üretilemedi.' };
   return { status: 'matched', source: 'azure-table', dateAnchorCount: 1,
-    distinctCandidateLineCount: 1, reason: matchReason,
+    distinctCandidateLineCount: 1, reason: 'Azure tablo satırında tarih, açıklama/işlem numarası ve tutar tekil eşleşti.',
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox,
     amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
 }
@@ -6389,9 +6312,6 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       const azurePageLines = Array.isArray(azureLayout?.lines) ? azureLayout.lines.filter(line => Number(line.pageNumber) === pageNumber) : [];
       const azurePageWords = Array.isArray(azureLayout?.words) ? azureLayout.words.filter(word => Number(word.pageNumber) === pageNumber) : [];
       const azurePageTableRows = Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.filter(row => Number(row.pageNumber) === pageNumber) : [];
-      const azureTableResolutions = statementPdfResolveAzureRowsByOrder(pageRows,
-        pageRows.map(row => azurePageTableRows.length
-          ? statementPdfResolveAzureTableRow(row, azurePageTableRows, azurePageWords) : null));
       for (const [rowIndex, row] of pageRows.entries()) {
         const dateKey = statementPdfDateKey(row?.date);
         const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
@@ -6409,7 +6329,8 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         let selectedAmountItem = null;
         let selectedBalanceItem = null;
         let rowLineCandidates = [];
-        const azureTableResolved = azureTableResolutions[rowIndex] || null;
+        const azureTableResolved = azurePageTableRows.length
+          ? statementPdfResolveAzureTableRow(row, azurePageTableRows, azurePageWords) : null;
         const azureLineResolved = azurePageLines.length
           ? statementPdfResolveAzureRow(row, azurePageLines, azurePageWords) : null;
         const azureResolved = azureTableResolved?.status === 'matched' ? azureTableResolved
@@ -6549,12 +6470,21 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       }));
     const copyMoveResults = pageAudits.map(page => ({ pageNumber: page.pageNumber, ...page.copyMove }));
     const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched');
+    const azurePageNumbers = new Set((Array.isArray(azureLayout?.pages) ? azureLayout.pages : [])
+      .map(page => Number(page?.pageNumber)).filter(Number.isInteger));
+    const unresolvedPagesWithoutAzure = [...new Set(unresolvedRowAssociations
+      .map(item => Number(item.pageNumber))
+      .filter(pageNumber => Number.isInteger(pageNumber) && azureLayout?.available && !azurePageNumbers.has(pageNumber)))];
     const findings = [
       ...(structural?.findings || []).map(item => ({ severity: item.severity || 'low', detail: item.detail })),
       ...overlayFindings,
       ...(unresolvedRowAssociations.length ? [{
         severity: 'review',
         detail: `${unresolvedRowAssociations.length}/${rowAssociationDiagnostics.length} işlem satırında tutar/bakiye PDF metin kutusu satıra güvenle bağlanamadı. Bu satırlarda lokal örtme denetimi sonuçsuzdur; örnekler: ${unresolvedRowAssociations.slice(0, 5).map(item => `s.${item.pageNumber ?? '?'} satır ${item.rowNumber}: ${item.reason}`).join('; ')}.`,
+      }] : []),
+      ...(unresolvedPagesWithoutAzure.length ? [{
+        severity: 'review',
+        detail: `Azure OCR/layout ${pageCount} PDF sayfasının ${azurePageNumbers.size} tanesi için sayfa verisi döndürdü. Eşleşmeyen satır bulunan ancak Azure verisi olmayan sayfalar: ${unresolvedPagesWithoutAzure.join(', ')}. Bu sayfalarda satır ROI eşleşmesi doğrulanamadı.`,
       }] : []),
       ...copyMoveResults.filter(item => item.severity === 'strong' || item.severity === 'medium').map(item => ({
         severity: item.severity,
@@ -6564,6 +6494,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
     const reviewRequired = Boolean(
       overlayFindings.length ||
       unresolvedRowAssociations.length > 0 ||
+      unresolvedPagesWithoutAzure.length > 0 ||
       structural?.findings?.some(item => item.severity === 'medium' || item.severity === 'strong') ||
       copyMoveResults.some(item => item.severity === 'strong')
     );
@@ -6583,6 +6514,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           pdfNativeText: rowAssociationDiagnostics.filter(item => item.associationSource === 'pdf-native-text').length,
         },
         azureLayoutAvailable: Boolean(azureLayout?.available),
+        azurePageCount: Number(azureLayout?.pageCount) || 0,
+        azurePageNumbers: [...azurePageNumbers].sort((a, b) => a - b),
+        unresolvedPagesWithoutAzure,
         azureTableRowCount: Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.length : 0,
         rows: rowAssociationDiagnostics.slice(0, 200),
       },
@@ -16108,9 +16042,14 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   // including the resulting balance, is identical. Repeated fees/ATM labels
   // with different balances are separate transactions, not duplicates.
   const duplicateGroups = new Map();
+  const repeatedPatternGroups = new Map();
   for (const row of orderedRows) {
     const date = statementNormalizeText(row.date);
     const description = statementNormalizeText(row.description);
+    const descriptionPattern = description
+      .replace(/\b(?:sorgu|dekont|islem)?\s*(?:no|numarasi|ref(?:erans)?)\s*[:#-]?\s*[a-z0-9/-]+/g, ' ')
+      .replace(/\b(?:[a-z]\d{7,}|\d{10,})\b/g, ' ')
+      .replace(/\s+/g, ' ').trim();
     const counterparty = statementNormalizeText(row.counterparty);
     const debit = statementCents(row.debitAmount);
     const credit = statementCents(row.creditAmount);
@@ -16119,12 +16058,34 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     const key = `${date}|${debit ?? 0}|${credit ?? 0}|${description}|${counterparty}|${balanceAfter}`;
     if (!duplicateGroups.has(key)) duplicateGroups.set(key, []);
     duplicateGroups.get(key).push(row);
+    const repeatKey = `${date}|${debit ?? 0}|${credit ?? 0}|${descriptionPattern}|${counterparty}`;
+    if (!repeatedPatternGroups.has(repeatKey)) repeatedPatternGroups.set(repeatKey, []);
+    repeatedPatternGroups.get(repeatKey).push(row);
   }
   const derivedDuplicates = [...duplicateGroups.values()].filter(group => group.length > 1).map(group => {
     const first = group[0];
     const amount = first.creditAmount != null ? `+${first.creditAmount}` : `-${first.debitAmount}`;
     const where = group.map(row => `sayfa ${row.pageNumber}, satır ${row.rowNumber}`).join('; ');
     return `${first.date || 'Tarih okunamadı'} / ${amount} / ${String(first.description || first.transactionId || 'Açıklama yok').trim()} işlemi ${group.length} kez görünüyor (${where}). Tekrar eden kayıt kontrol edilmeli; tek başına sahtecilik kanıtı değildir.`;
+  });
+  const repeatedPatterns = [...repeatedPatternGroups.values()].filter(group => group.length > 1).map(group => {
+    const first = group[0];
+    const amount = first.creditAmount != null ? `+${first.creditAmount}` : `-${first.debitAmount}`;
+    const references = [...new Set(group.map(row => String(row.transactionId || '').trim()).filter(Boolean))];
+    const where = group.map(row => `s.${row.pageNumber}/satır ${row.rowNumber}`).join(', ');
+    return {
+      date: first.date || null,
+      amount,
+      description: String(first.description || '').replace(/\b(?:sorgu|dekont|islem)?\s*(?:no|numarasi|ref(?:erans)?)\s*[:#-]?\s*[a-z0-9/-]+/ig, '').trim(),
+      counterparty: first.counterparty || null,
+      occurrences: group.length,
+      locations: where,
+      transactionIds: references,
+      distinctTransactionIds: references.length > 1,
+      note: references.length > 1
+        ? 'Aynı tarih/tutar/açıklama kalıbı tekrar ediyor ancak işlem numaraları farklı; ayrı işlemler olabilir.'
+        : 'Aynı işlem kalıbı tekrar ediyor; mükerrer kayıt olup olmadığı ayrıca incelenmeli.',
+    };
   });
 
   const evaluateOrder = (direction) => {
@@ -16225,6 +16186,7 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   }
   const existingDuplicates = Array.isArray(transactionAnalysis.duplicateTransactions) ? transactionAnalysis.duplicateTransactions : [];
   transactionAnalysis.duplicateTransactions = [...new Set([...existingDuplicates, ...derivedDuplicates])];
+  transactionAnalysis.repeatedTransactionPatterns = repeatedPatterns;
   transactionAnalysis.rows = orderedRows.map(({ _index, ...row }) => row);
   transactionAnalysis.rowByRowAudit = {
     available: usableRows.length > 0,
@@ -16236,6 +16198,8 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     balanceMismatchExamples: bestOrder.examples,
     duplicateCandidateCount: derivedDuplicates.length,
     duplicateCandidates: derivedDuplicates.slice(0, 20),
+    repeatedPatternCount: repeatedPatterns.length,
+    repeatedPatterns: repeatedPatterns.slice(0, 30),
     totalIncomingFromRows: totalIncomingCents === null ? null : Number((totalIncomingCents / 100).toFixed(2)),
     totalOutgoingFromRows: totalOutgoingCents === null ? null : Number((totalOutgoingCents / 100).toFixed(2)),
     netMovementFromRows: totalIncomingCents === null || totalOutgoingCents === null
@@ -16254,13 +16218,16 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   if (deterministicMismatch) findings.push('Satır bazlı bakiye hesabında fark bulundu; örnek satırlar ve beklenen bakiyeler rapora eklendi.');
   if (derivedDuplicates.length) findings.push(`${derivedDuplicates.length} olası yinelenen işlem grubu bulundu; tekrarlar ayrı listelendi.`);
   if (usableRows.length === 0) findings.push('Yapılandırılmış işlem satırı çıkarılamadığı için bakiye zinciri doğrulanamadı.');
-  else if (rowCountMismatch) findings.push(`Belgede bildirilen ${declaredCount} işlem satırı ile yapılandırılmış olarak çıkarılan ${usableRows.length} satır uyuşmuyor; tüm bakiye zinciri doğrulanmış sayılmamalı.`);
+  if (rowCountMismatch) findings.push(`Analizin bildirdiği ${declaredCount} işlem ile satır listesinden çıkarılan ${usableRows.length} işlem uyuşmuyor; tüm bakiye zinciri doğrulanmış sayılmamalı.`);
+  if (rowsIncomplete) findings.push(`Satır doğrulaması eksik: bakiye matematiği yalnızca çıkarılan ${usableRows.length} satır için geçerlidir; belgenin tamamı doğrulanmış sayılmaz.`);
   if (!pageCoverageComplete) findings.push(`PDF'nin ${pdfForensics?.pagesAnalyzed || 0}/${pdfPageCount || '?'} sayfasındaki yerel PDF denetimi tamamlanamadı.`);
   if (pdfForensics?.findings?.length) findings.push(...pdfForensics.findings.map(item => item.detail));
   result.manualReviewRequired = Boolean(deterministicMismatch || derivedDuplicates.length || rowsIncomplete || !pageCoverageComplete || pdfForensics?.reviewRequired);
   result.statementAuditFindings = findings;
   const summaryOnlyFindings = findings.filter(item =>
     item.startsWith('Model ') || item.startsWith("PDF'nin ") ||
+    item.startsWith('Yapılandırılmış ') || item.startsWith('Analizin bildirdiği ') ||
+    item.startsWith('Satır doğrulaması eksik:') ||
     (pdfForensics?.findings || []).some(pdfFinding => pdfFinding.detail === item)
   );
   if (summaryOnlyFindings.length) result.summary = [String(result.summary || '').trim(), ...summaryOnlyFindings.map(item => `• ${item}`)].filter(Boolean).join('\n');
@@ -18709,6 +18676,24 @@ fileName,
 statementReference
 );
 
+// The model's first summary sentence is an independent bank-identity signal.
+// If it disagrees with the deterministic detector, neither side should be
+// silently treated as verified and any reference-based compatibility claim
+// must be reviewed.
+const statementModelBank = normalizeBank(statementModelResult?.documentData?.bank) ||
+  detectStatementBankFromText(String(statementModelResult?.summary || "").slice(0, 500), "");
+const statementBankIdentityConflict = Boolean(
+  statementBank && statementModelBank && statementBank !== statementModelBank
+);
+console.log("HESAP ÖZETİ BANKA KİMLİĞİ ÇAPRAZ KONTROLÜ:", JSON.stringify({
+  detectedBank: statementBank || null,
+  modelBank: statementModelBank || null,
+  conflict: statementBankIdentityConflict,
+  referenceBank: Array.isArray(statementReference)
+    ? statementReference[0]?.bank || null
+    : statementReference?.bank || null,
+}));
+
 const statementPdfForensics = await runStatementPdfForensics(
   filePath,
   buffer,
@@ -18721,15 +18706,52 @@ const statementResult = applyStatementLedgerChecks(
   statementPageCount,
   statementPdfForensics
 );
+if (statementBankIdentityConflict) {
+  const bankConflictFinding = `Banka kimliği çelişkili: metin/OCR sınıflandırması ${statementBank}, görsel analiz ${statementModelBank} dedi. Seçilen referansın bu belgeye ait olduğu doğrulanamadı; referans uyumu ve banka bazlı risk yorumu manuel kontrol edilmeli.`;
+  statementResult.manualReviewRequired = true;
+  statementResult.statementReferenceIdentityValidated = false;
+  statementResult.statementAuditFindings = [
+    ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
+    bankConflictFinding,
+  ];
+  statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), bankConflictFinding])];
+  statementResult.summary = [String(statementResult.summary || "").trim(), `• ${bankConflictFinding}`].filter(Boolean).join("\n");
+} else {
+  statementResult.statementReferenceIdentityValidated = Boolean(statementReference && statementBank &&
+    (Array.isArray(statementReference)
+      ? statementReference.every(item => normalizeBank(item?.bank) === statementBank)
+      : normalizeBank(statementReference?.bank) === statementBank));
+}
+if (!statementBank || !statementReference) {
+  const unavailableReason = !statementBank
+    ? "Belgeden banka kimliği güvenilir biçimde seçilemedi; banka referans karşılaştırması yapılmadı."
+    : ` ${statementBank} için yapılandırılmış hesap özeti referansı yüklenemedi; referans karşılaştırması yapılmadı.`;
+  statementResult.manualReviewRequired = true;
+  statementResult.statementReferenceIdentityValidated = false;
+  statementResult.statementAuditFindings = [
+    ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
+    unavailableReason,
+  ];
+  statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), unavailableReason])];
+  statementResult.summary = [String(statementResult.summary || "").trim(), `• ${unavailableReason}`].filter(Boolean).join("\n");
+}
 
 console.log("HESAP ÖZETİ TÜM SAYFA DENETİMİ:", JSON.stringify({
   pageCount: statementPageCount,
   pagesAnalyzed: statementPdfForensics?.pagesAnalyzed || 0,
   everyPageAnalyzed: statementPdfForensics?.everyPageAnalyzed === true,
+  azurePageCount: statementPdfForensics?.transactionRowAssociation?.azurePageCount || 0,
+  azurePageNumbers: statementPdfForensics?.transactionRowAssociation?.azurePageNumbers || [],
+  unresolvedPagesWithoutAzure: statementPdfForensics?.transactionRowAssociation?.unresolvedPagesWithoutAzure || [],
+  modelDeclaredTransactionCount: statementResult?.transactionAnalysis?.rowByRowAudit?.declaredTransactionCount || null,
+  structuredModelRowCount: statementPdfForensics?.transactionRowAssociation?.inputRows || 0,
   transactionRows: statementResult?.transactionAnalysis?.rowByRowAudit?.extractedRowCount || 0,
   balanceChecks: statementResult?.transactionAnalysis?.rowByRowAudit?.balanceChecks || 0,
   balanceMismatches: statementResult?.transactionAnalysis?.rowByRowAudit?.balanceMismatchCount || 0,
   duplicateCandidates: statementResult?.transactionAnalysis?.rowByRowAudit?.duplicateCandidateCount || 0,
+  repeatedPatternCount: statementResult?.transactionAnalysis?.rowByRowAudit?.repeatedPatternCount || 0,
+  rowsIncomplete: statementResult?.transactionAnalysis?.rowByRowAudit?.rowsIncomplete === true,
+  pageCoverageComplete: statementResult?.transactionAnalysis?.rowByRowAudit?.pageCoverageComplete === true,
   forensicRowsMatched: statementPdfForensics?.transactionRowAssociation?.matchedRows || 0,
   forensicRowsUnresolved: statementPdfForensics?.transactionRowAssociation?.unresolvedRows || 0,
   forensicRowMatchSources: statementPdfForensics?.transactionRowAssociation?.sourceCounts || null,
@@ -18750,6 +18772,8 @@ for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
   }
   console.log("HESAP ÖZETİ SATIR ROI EŞLEŞME DETAYI:", JSON.stringify({
     pageNumber,
+    azurePagePresent: (statementPdfForensics?.transactionRowAssociation?.azurePageNumbers || []).includes(pageNumber),
+    modelRowsOnPage: pageRows.length,
     matched: matched.map(item => ({
       rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
       source: item.associationSource, amountBox: item.amountBox, balanceBox: item.balanceBox,
@@ -18814,6 +18838,7 @@ fileName,
 type:
 "statement",
 bank:
+statementBank ||
 bank ||
 null,
 
