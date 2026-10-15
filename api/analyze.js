@@ -6613,6 +6613,45 @@ files,
 
 }
 
+async function readSmallJsonBody(req, maxBytes = 64 * 1024) {
+  if (req.body && typeof req.body === "object") return req.body;
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const chunk of req) {
+    const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += data.length;
+    if (totalBytes > maxBytes) throw new Error("JSON isteği izin verilen boyutu aşıyor.");
+    chunks.push(data);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+async function downloadTelegramFileForAnalysis(fileId) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken) throw new Error("TELEGRAM_BOT_TOKEN analiz API ortamında tanımlı değil.");
+  const fileInfoResponse = await fetch(`https://api.telegram.org/bot${botToken}/getFile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_id: fileId }),
+  });
+  const fileInfoPayload = await fileInfoResponse.json();
+  const fileInfo = fileInfoPayload?.result;
+  if (!fileInfoResponse.ok || !fileInfoPayload?.ok || !fileInfo?.file_path) {
+    throw new Error(fileInfoPayload?.description || "Telegram dosya yolu alınamadı.");
+  }
+  const maxBytes = 20 * 1024 * 1024;
+  if (Number(fileInfo.file_size) > maxBytes) {
+    throw new Error("Telegram video indirme sınırı 20 MB; dosya bu sınırı aşıyor.");
+  }
+  const fileResponse = await fetch(`https://api.telegram.org/file/bot${botToken}/${fileInfo.file_path}`);
+  if (!fileResponse.ok) throw new Error("Video Telegram sunucusundan indirilemedi.");
+  const contentLength = Number(fileResponse.headers.get("content-length"));
+  if (contentLength > maxBytes) throw new Error("Video Telegram indirme sınırı olan 20 MB'ı aşıyor.");
+  const buffer = Buffer.from(await fileResponse.arrayBuffer());
+  if (!buffer.length || buffer.length > maxBytes) throw new Error("İndirilen video boş veya 20 MB sınırını aşıyor.");
+  return { buffer, filePath: fileInfo.file_path };
+}
+
 
 // =====================================================
 // VIDEO → FRAME ÇIKARMA
@@ -16936,7 +16975,7 @@ res.setHeader(
 
 res.setHeader(
 "Access-Control-Allow-Headers",
-"Content-Type"
+"Content-Type, x-verifydoc-telegram-secret"
 );
 
 if (
@@ -16965,6 +17004,7 @@ error:
 }
 
 
+let telegramVideoTempPath = null;
 try {
 
 console.log(
@@ -16995,20 +17035,52 @@ throw new Error(
 // FORM DATA
 // -------------------------------------------------
 
-const {
-fields,
-files
-} =
-await parseMultipart(req);
+let fields;
+let files;
+let uploadedFile;
+const requestContentType = String(req.headers?.["content-type"] || "").toLowerCase();
+if (requestContentType.includes("application/json")) {
+  const payload = await readSmallJsonBody(req);
+  const expectedSecret = process.env.VERIFYDOC_TELEGRAM_ANALYSIS_SECRET;
+  const suppliedSecret = String(req.headers?.["x-verifydoc-telegram-secret"] || "");
+  if (!expectedSecret) {
+    return res.status(503).json({ success: false, error: "VERIFYDOC_TELEGRAM_ANALYSIS_SECRET API ortamında tanımlı değil." });
+  }
+  if (suppliedSecret !== expectedSecret) {
+    return res.status(401).json({ success: false, error: "Telegram video aktarımı yetkilendirilemedi." });
+  }
+  if (payload?.source !== "telegram-video" || payload?.type !== "video" || typeof payload?.fileId !== "string" || !payload.fileId.trim()) {
+    return res.status(400).json({ success: false, error: "Geçersiz Telegram video aktarım isteği." });
+  }
+  const downloadedTelegramVideo = await downloadTelegramFileForAnalysis(payload.fileId.trim());
+  const safeName = path.basename(String(payload.fileName || "telegram-video.mp4")).replace(/[^\w.() -]/g, "_");
+  const extension = path.extname(safeName) || ".mp4";
+  telegramVideoTempPath = `/tmp/verifydoc-telegram-${Date.now()}-${Math.random().toString(16).slice(2)}${extension}`;
+  await fs.writeFile(telegramVideoTempPath, downloadedTelegramVideo.buffer);
+  uploadedFile = {
+    filepath: telegramVideoTempPath,
+    originalFilename: safeName,
+    mimetype: String(payload.mimeType || "video/mp4"),
+    size: downloadedTelegramVideo.buffer.length,
+  };
+  fields = {
+    type: "video",
+    fileName: safeName,
+    mimeType: uploadedFile.mimetype,
+    bank: payload.bank || "",
+    statementMode: payload.statementMode ? "true" : "false",
+    providedInfo: payload.providedInfo ? JSON.stringify(payload.providedInfo) : "",
+  };
+  files = {};
+  console.log("TELEGRAM VIDEO DOWNLOADED BY ANALYSIS API:", JSON.stringify({ size: uploadedFile.size, fileName: safeName }));
+} else {
+  ({ fields, files } = await parseMultipart(req));
+  uploadedFile = findUploadedFile(files);
+}
 
 
 console.log(
 "FORM PARSED"
-);
-
-const uploadedFile =
-findUploadedFile(
-files
 );
 
 if (
@@ -17182,7 +17254,7 @@ filePath
 // Telegram filename or client-supplied MIME type.
 const pdfHeader = buffer.subarray(0, Math.min(buffer.length, 1024)).toString('latin1');
 const isPdfUpload = /%PDF-\d\.\d/.test(pdfHeader);
-if (!isPdfUpload) {
+if (!isPdfUpload && (type !== "video" || !String(mime).toLowerCase().startsWith("video/"))) {
   console.warn('NON-PDF UPLOAD REJECTED:', JSON.stringify({ fileName, mime: uploadedFile.mimetype || null }));
   return res.status(415).json({
     success: false,
@@ -17190,10 +17262,17 @@ if (!isPdfUpload) {
     code: 'PDF_ONLY',
   });
 }
-if (!statementMode) type = 'pdf';
-mime = 'application/pdf';
-activeReferenceFormat = 'pdf';
-console.log('PDF-ONLY INPUT ACCEPTED:', JSON.stringify({ fileName, type, signatureValidated: true }));
+if (isPdfUpload) {
+  if (!statementMode) type = 'pdf';
+  mime = 'application/pdf';
+  activeReferenceFormat = 'pdf';
+  console.log('PDF-ONLY INPUT ACCEPTED:', JSON.stringify({ fileName, type, signatureValidated: true }));
+} else {
+  mime = uploadedFile.mimetype || "video/mp4";
+  if (!mime.startsWith("video/")) mime = "video/mp4";
+  activeReferenceFormat = null;
+  console.log('VIDEO INPUT ACCEPTED:', JSON.stringify({ fileName, mime, signatureValidated: true }));
+}
 
 const fileFingerprint =
 createHash("sha256")
@@ -23339,5 +23418,10 @@ err?.message ||
 
 });
 
+}
+finally {
+  if (telegramVideoTempPath) {
+    try { await fs.unlink(telegramVideoTempPath); } catch {}
+  }
 }
 }
