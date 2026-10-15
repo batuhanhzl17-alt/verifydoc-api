@@ -6683,12 +6683,16 @@ try {
 const maxFrameCount = 16;
 const targetIntervalSeconds = 2.5;
 const targetFrameCount = durationSeconds
-  ? Math.min(maxFrameCount, Math.max(1, Math.ceil(durationSeconds / targetIntervalSeconds)))
+  ? Math.min(maxFrameCount, Math.max(2, Math.ceil(durationSeconds / targetIntervalSeconds)))
   : maxFrameCount;
-const sampleRate = durationSeconds
-  ? Math.max(1 / durationSeconds, targetFrameCount / durationSeconds)
-  : 0.5;
-const expectedIntervalSeconds = 1 / sampleRate;
+// fps=N/duration stops at (N-1)/N of the clip. Space samples across the
+// duration minus a small end margin so the final extracted frame covers the
+// last second instead of leaving a blind tail.
+const endMarginSeconds = durationSeconds ? Math.min(0.35, durationSeconds * 0.05) : 0;
+const expectedIntervalSeconds = durationSeconds
+  ? Math.max(0.05, (durationSeconds - endMarginSeconds) / Math.max(1, targetFrameCount - 1))
+  : 2;
+const sampleRate = 1 / expectedIntervalSeconds;
 
 const outputDir =
 `/tmp/verifydoc-${Date.now()}`;
@@ -6779,6 +6783,12 @@ buffer.toString(
 }
 
 const frameTimestampsSeconds = frames.map((frame) => frame.timestampSeconds);
+const lastFrameSeconds = frameTimestampsSeconds.length
+  ? frameTimestampsSeconds[frameTimestampsSeconds.length - 1]
+  : null;
+const endGapSeconds = Number.isFinite(durationSeconds) && Number.isFinite(lastFrameSeconds)
+  ? Math.max(0, durationSeconds - lastFrameSeconds)
+  : null;
 return {
   frames,
   sampling: {
@@ -6789,10 +6799,82 @@ return {
     extractedFrameCount: frames.length,
     intervalSeconds: expectedIntervalSeconds,
     frameTimestampsSeconds,
-    coverageComplete: Number.isFinite(durationSeconds) && durationSeconds > 0,
+    lastFrameSeconds,
+    endGapSeconds,
+    coverageComplete: Number.isFinite(durationSeconds) && durationSeconds > 0 &&
+      frames.length === targetFrameCount && endGapSeconds <= 1.0,
   },
 };
 
+}
+
+// Full-duration temporal pass to flag abrupt visual transitions that sparse
+// still samples can miss. Candidates are not proof: normal camera movement,
+// app screens, and scene changes can all produce a high scene-change score.
+async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null) {
+  const maxScanSeconds = 180;
+  const scanSeconds = Number.isFinite(durationSeconds) && durationSeconds > 0
+    ? Math.min(durationSeconds, maxScanSeconds)
+    : maxScanSeconds;
+  const outputDir = `/tmp/verifydoc-video-temporal-${Date.now()}`;
+  const metadataPath = `${outputDir}/scene-metadata.txt`;
+  await fs.mkdir(outputDir, { recursive: true });
+  try {
+    const args = [
+      "-hide_banner", "-loglevel", "error", "-i", videoPath,
+      "-t", String(scanSeconds),
+      "-vf", `scdet=threshold=15,metadata=print:file=${metadataPath}`,
+      "-an", "-f", "null", "-"
+    ];
+    await execFileAsync(ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 90000 });
+    const metadata = await fs.readFile(metadataPath, "utf8").catch(() => "");
+    const records = [];
+    let currentTime = null;
+    for (const line of metadata.split(/\r?\n/)) {
+      const frameMatch = line.match(/pts_time:([0-9]+(?:\.[0-9]+)?)/);
+      if (frameMatch) currentTime = Number(frameMatch[1]);
+      const scoreMatch = line.match(/lavfi\.scd\.score=([0-9]+(?:\.[0-9]+)?)/);
+      if (scoreMatch && Number.isFinite(currentTime)) {
+        const score = Number(scoreMatch[1]);
+        if (score >= 15) records.push({ timestampSeconds: currentTime, score: Number(score.toFixed(2)) });
+      }
+    }
+    const candidates = [];
+    for (const item of records) {
+      const previous = candidates[candidates.length - 1];
+      if (previous && item.timestampSeconds - previous.timestampSeconds < 0.75) {
+        if (item.score > previous.score) {
+          previous.timestampSeconds = item.timestampSeconds;
+          previous.score = item.score;
+        }
+      } else {
+        candidates.push({ ...item });
+      }
+    }
+    return {
+      available: true,
+      engine: "ffmpeg-scdet-temporal-audit-v1",
+      threshold: 15,
+      durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
+      scannedSeconds: Number(scanSeconds.toFixed(3)),
+      fullDurationScanned: Number.isFinite(durationSeconds) && durationSeconds <= maxScanSeconds,
+      candidateCount: candidates.length,
+      sceneChangeCandidates: candidates.slice(0, 30),
+      interpretation: "Adaylar ani görüntü geçişlerini gösterir; tek başına kesme veya manipülasyon kanıtı değildir.",
+      limitations: "Orijinal video olmadan kesilen bölüm kesin belirlenemez. Kamera hareketi ve doğal ekran/sahne geçişleri de aday üretebilir; ince sinyaller kaçabilir."
+    };
+  } catch (error) {
+    return {
+      available: false,
+      engine: "ffmpeg-scdet-temporal-audit-v1",
+      durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
+      scannedSeconds: Number(scanSeconds.toFixed(3)),
+      fullDurationScanned: false,
+      candidateCount: null,
+      sceneChangeCandidates: [],
+      reason: error?.message || String(error)
+    };
+  }
 }
 
 // =====================================================
@@ -17873,7 +17955,7 @@ if (type === "image" || type === "pdf") {
   })());
 }
 
-prepTasks.push((async () => {
+if (type === "image" || type === "pdf") prepTasks.push((async () => {
   try {
     const al = await runAzureDocumentLayout(forensicTargetPath);
     if (al?.available && bank && reference) {
@@ -19356,6 +19438,7 @@ filePath
 
 const videoSampling = frames.sampling;
 const extractedFrames = frames.frames;
+const videoTemporalAudit = await analyzeVideoTemporalContinuity(filePath, videoSampling.durationSeconds);
 
 
 console.log(
@@ -19366,12 +19449,14 @@ console.log(
 "VIDEO SAMPLE COVERAGE:",
 JSON.stringify(videoSampling)
 );
+console.log("VIDEO TEMPORAL CONTINUITY AUDIT:", JSON.stringify(videoTemporalAudit));
 
 const videoResult =
 await analyzeVideoFrames(
 extractedFrames
 );
 videoResult.videoSampling = videoSampling;
+videoResult.videoTemporalAudit = videoTemporalAudit;
 
 console.log(
 "VIDEO ANALYSIS COMPLETE"
