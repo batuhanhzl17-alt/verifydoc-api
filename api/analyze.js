@@ -6156,7 +6156,6 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     const hits = terms.filter(term => rowText.includes(term)).length;
     const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
     const idMatched = transactionId.length >= 5 && rowText.replace(/\D/g, '').includes(transactionId);
-    if (!descriptionMatched && !idMatched) continue;
 
     let amountCells = cells.filter(cell => statementPdfMoneyTokens(cell.text)
       .some(token => token.cents != null && Math.abs(token.cents) === expectedAmount));
@@ -6193,21 +6192,66 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     }
     const balanceBox = balanceCells.length === 1 ? statementPdfAzureBox(balanceCells[0]) : null;
     candidates.push({ tableIndex: tableRow.tableIndex, rowIndex: tableRow.rowIndex, amountCell,
-      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1 });
+      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1,
+      descriptionMatched, idMatched, rowText });
   }
 
-  if (candidates.length !== 1) return { status: 'unresolved', source: 'azure-table',
+  // Azure can split a visually continuous statement table into overlapping
+  // tables. Collapse duplicate detections of the same amount box before
+  // deciding whether the transaction row is ambiguous.
+  const uniqueCandidates = [];
+  for (const candidate of candidates) {
+    const existing = candidate.amountBox && uniqueCandidates.find(item => item.amountBox &&
+      Math.abs(item.amountBox.x - candidate.amountBox.x) <= 0.0015 &&
+      Math.abs(item.amountBox.y - candidate.amountBox.y) <= 0.0015 &&
+      Math.abs(item.amountBox.width - candidate.amountBox.width) <= 0.003 &&
+      Math.abs(item.amountBox.height - candidate.amountBox.height) <= 0.003);
+    if (!existing) uniqueCandidates.push(candidate);
+    else {
+      existing.balanceMatched ||= candidate.balanceMatched;
+      existing.balanceBox ||= candidate.balanceBox;
+      existing.descriptionMatched ||= candidate.descriptionMatched;
+      existing.idMatched ||= candidate.idMatched;
+    }
+  }
+
+  const semanticCandidates = uniqueCandidates.filter(candidate => candidate.descriptionMatched || candidate.idMatched);
+  const exactBalanceCandidates = uniqueCandidates.filter(candidate => candidate.balanceMatched);
+  let candidate = null;
+  let matchReason = '';
+  if (exactBalanceCandidates.length === 1) {
+    candidate = exactBalanceCandidates[0];
+    matchReason = 'Tarih, tutar ve satır bakiyesi tekil eşleşti.';
+  } else if (semanticCandidates.length === 1) {
+    candidate = semanticCandidates[0];
+    matchReason = 'Tarih, açıklama/işlem numarası ve tutar tekil eşleşti.';
+  } else if (semanticCandidates.length > 1) {
+    const semanticBalanceCandidates = semanticCandidates.filter(item => item.balanceMatched);
+    if (semanticBalanceCandidates.length === 1) {
+      candidate = semanticBalanceCandidates[0];
+      matchReason = 'Açıklama ve tutar adayları, satır bakiyesiyle tekil hâle getirildi.';
+    }
+  } else if (uniqueCandidates.length === 1) {
+    candidate = uniqueCandidates[0];
+    matchReason = candidate.balanceMatched
+      ? 'Açıklama OCR eşleşmesi zayıf; tarih, tutar ve tekil satır bakiyesi eşleşti.'
+      : 'Açıklama OCR eşleşmesi zayıf; sayfadaki tek tarih+tutar satırı kullanıldı.';
+  }
+
+  if (!candidate) return { status: 'unresolved', source: 'azure-table',
     dateAnchorCount: (tableRows || []).filter(item => Number(item.pageNumber) === Number(row.pageNumber) &&
       item.cells?.some(cell => statementPdfDateKey(cell.text) === dateKey)).length,
-    distinctCandidateLineCount: candidates.length,
-    reason: candidates.length ? `${candidates.length} Azure tablo satırı adayı kaldı; güvenli seçim yapılamadı.`
+    distinctCandidateLineCount: uniqueCandidates.length,
+    amountCandidateCount: uniqueCandidates.length,
+    semanticCandidateCount: semanticCandidates.length,
+    balanceCandidateCount: exactBalanceCandidates.length,
+    reason: uniqueCandidates.length ? `${uniqueCandidates.length} Azure tablo satırı adayı kaldı; açıklama ve bakiye tekil seçim sağlamadı.`
       : 'Azure tablo hücrelerinde tarih, açıklama/işlem numarası ve tutar birlikte eşleşmedi.' };
-  const candidate = candidates[0];
   if (!candidate.amountBox) return { status: 'unresolved', source: 'azure-table',
     dateAnchorCount: 1, distinctCandidateLineCount: 1,
     reason: 'Azure tablo satırı bulundu; ancak tutar için dar ve güvenilir hücre/kelime kutusu üretilemedi.' };
   return { status: 'matched', source: 'azure-table', dateAnchorCount: 1,
-    distinctCandidateLineCount: 1, reason: 'Azure tablo satırında tarih, açıklama/işlem numarası ve tutar tekil eşleşti.',
+    distinctCandidateLineCount: 1, reason: matchReason,
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox,
     amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
 }
