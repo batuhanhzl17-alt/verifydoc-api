@@ -2242,6 +2242,13 @@ async function sendAnalysisResult(
    const coverage = audit.available
      ? `Zaman taraması: ${formatTime(audit.scannedSeconds)}${audit.fullDurationScanned ? ' / videonun tamamı' : ' / süre sınırı nedeniyle kısmi'}`
      : `Zaman taraması yapılamadı${audit.reason ? `: ${String(audit.reason).slice(0, 180)}` : '.'}`;
+   const aiCheck = result?.checks?.aiGeneratedIndicators || {};
+   const aiEvidence = String(aiCheck.evidence || '').replace(/\s+/g, ' ').trim().slice(0, 420);
+   const aiAssessment = aiCheck.status === 'fail'
+     ? `🟠 Olası sentetik/değiştirilmiş görüntü sinyali (görsel model ön taraması): ${aiEvidence || 'Model görsel tutarsızlık bildirdi.'}`
+     : aiCheck.status === 'pass'
+       ? '🟢 Örneklenen karelerde belirgin AI/görüntü sentezi sinyali görülmedi.'
+       : '⚪ Örneklenen karelerle AI/görüntü sentezi yönünden güvenilir değerlendirme yapılamadı.';
    const videoText = [
      '🎞️ VERIFYDOC VİDEO ÖN İNCELEMESİ',
      '',
@@ -2252,10 +2259,13 @@ async function sendAnalysisResult(
      coverage,
      ...(candidateLines.length ? ['', ...candidateLines] : []),
      '',
+     '🤖 AI / GÖRÜNTÜ SENTEZİ ÖN TARAMASI',
+     aiAssessment,
+     '',
      String(summary).trim().slice(0, 1800),
      '',
      'Ani geçiş adayı tek başına kesme veya sahtecilik kanıtı değildir. Kamera hareketi ya da uygulama ekranı değişimi de bu sinyali üretebilir.',
-     'Aday bulunmaması da düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.'
+     'AI/görüntü ön taraması kesin dedektör değildir; ses üretimini incelemez ve tek başına AI müdahalesini kanıtlamaz. C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması da düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.'
    ].filter(Boolean).join('\n');
    await sendMessage(chatId, videoText, replyToMessageId);
    return;
