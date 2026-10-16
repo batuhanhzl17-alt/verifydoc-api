@@ -3436,6 +3436,7 @@ editingRisk: {
 copyPasteRegions: 1.0,
 editingTraces: 1.0,
 photoshopArtifacts: 1.0,
+
 aiGeneratedIndicators: 0.8,
 
 suspiciousElements: 1.0,
@@ -7263,6 +7264,32 @@ Aşağıdakileri yalnızca gerçekten görünüyorsa değerlendir:
 Somut kanıt yoksa şüpheli sonuç üretme.
 
 =====================================================
+AI / SENTETİK GÖRÜNTÜ ÖN TARAMASI
+=====================================================
+
+aiGeneratedIndicators kontrolünü ayrıca ve yalnızca görüntüdeki
+kanıtlara dayanarak değerlendir. Bu kontrol bir AI dedektörü veya
+kesin sınıflandırma değildir; örneklenen kareler için görsel ön taramadır.
+
+- Tamamen sentetik görünen görüntü, yüz/nesne değiştirme veya ekleme,
+  üretken doldurma ile uyumlu olabilecek somut uzamsal ya da kareler
+  arası tutarsızlıkları ara.
+- Işık, doku, kenar, yansıma, hareket ve nesne biçiminin kareler boyunca
+  tutarlılığını değerlendir; bulgu varsa ilgili kare zamanlarını belirt.
+- Kamera hareketi, odak/pozlama değişimi, ekran parlaması, parmakla
+  örtülme, perspektif ve video sıkıştırmasını tek başına AI sinyali sayma.
+- Sadece “garip görünüyor” izlenimiyle fail verme. Somut, konumlandırılabilir
+  görsel belirti yoksa ve kareler değerlendirilebiliyorsa pass; görüntü kalitesi
+  veya örnekleme nedeniyle karar verilemiyorsa unknown kullan.
+- fail, AI kullanıldığının kanıtı değil; yalnızca olası sentetik/değiştirilmiş
+  görüntüyle uyumlu bir görsel sinyal bulunduğu anlamına gelir.
+- Videonun sesini bu görevde incelemiyorsun; ses klonlama veya ses üretimi
+  hakkında sonuç çıkarma.
+
+evidence alanında belirtiyi ve mümkünse yaklaşık kare zamanını yaz. Sinyal
+yoksa bunun yalnızca örneklenen kareler için geçerli olduğunu belirt.
+
+=====================================================
 TUTAR
 =====================================================
 
@@ -7311,6 +7338,10 @@ summary:
 başlıklar kullanılmamalıdır.
 - Önemli bulgular tek bir genel analiz içerisinde
 birleştirilmelidir.
+
+AI/görüntü sentezi kontrolünün durumunu summary içine yalnızca sonuç için
+önemliyse kısa ve temkinli biçimde ekle. AI müdahalesini kesin olarak
+var/yok diye ilan etme.
 
 Örneğin belge tutarlıysa:
 
@@ -19664,10 +19695,19 @@ videoResult
 // DETERMINISTIK VIDEO RISK MOTORU
 // =====================================================
 
-const videoRisk =
-calculateOverallRisk(
-videoResult
-);
+// The AI visual screening is advisory-only until separately calibrated.
+// Keep its finding visible in the report, but prevent it from changing video risk.
+const videoRiskInput = {
+  ...videoResult,
+  checks: {
+    ...(videoResult?.checks || {}),
+    aiGeneratedIndicators: {
+      ...(videoResult?.checks?.aiGeneratedIndicators || {}),
+      status: "unknown",
+    },
+  },
+};
+const videoRisk = calculateOverallRisk(videoRiskInput);
 
 // =====================================================
 // AI RISK SKORU KULLANILMAZ
