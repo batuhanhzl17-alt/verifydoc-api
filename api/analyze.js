@@ -7041,6 +7041,109 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         affectsRiskScore: false,
         note: "Düşük ses aralıkları tespit edilir; doğal duraklamalar da olabilir ve tek başına kesme/düzenleme kanıtı değildir.",
       };
+      // Compare short PCM windows for abrupt loudness and coarse frequency-balance
+      // changes. This is a review signal, not a detector of edits or speech meaning.
+      let changeAudit = { available: false, reason: "Ses özellikleri çıkarılamadı.", candidateCount: null, candidates: [] };
+      const pcmPath = path.join(path.dirname(videoPath), `verifydoc-audio-${Date.now()}-${Math.random().toString(36).slice(2)}.s16le`);
+      try {
+        await execFileAsync(ffmpegPath, [
+          "-hide_banner", "-loglevel", "error", "-i", videoPath, "-t", String(scanSeconds),
+          "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-f", "s16le", pcmPath,
+        ], { maxBuffer: 2 * 1024 * 1024, timeout: 90000 });
+        const pcm = await fs.readFile(pcmPath);
+        const sampleRate = 16000;
+        const samplesPerWindow = 4000; // 0.25 seconds
+        const alpha = Math.exp((-2 * Math.PI * 700) / sampleRate);
+        const features = [];
+        let lowPassState = 0;
+        let previousSample = 0;
+        for (let offset = 0; offset + 1 < pcm.length; offset += samplesPerWindow * 2) {
+          const end = Math.min(pcm.length, offset + samplesPerWindow * 2);
+          let sampleCount = 0;
+          let totalEnergy = 0;
+          let lowEnergy = 0;
+          let highEnergy = 0;
+          let crossings = 0;
+          for (let byteOffset = offset; byteOffset + 1 < end; byteOffset += 2) {
+            const sample = pcm.readInt16LE(byteOffset) / 32768;
+            lowPassState = alpha * lowPassState + (1 - alpha) * sample;
+            const high = sample - lowPassState;
+            totalEnergy += sample * sample;
+            lowEnergy += lowPassState * lowPassState;
+            highEnergy += high * high;
+            if (sampleCount && ((sample >= 0) !== (previousSample >= 0))) crossings++;
+            previousSample = sample;
+            sampleCount++;
+          }
+          if (!sampleCount) continue;
+          const rms = Math.sqrt(totalEnergy / sampleCount);
+          features.push({
+            timestampSeconds: Number((offset / 2 / sampleRate).toFixed(3)),
+            rmsDb: Number((20 * Math.log10(Math.max(rms, 1e-8))).toFixed(2)),
+            highLowEnergyDb: Number((10 * Math.log10((highEnergy + 1e-12) / (lowEnergy + 1e-12))).toFixed(2)),
+            zeroCrossingRate: Number((crossings / sampleCount).toFixed(4)),
+          });
+        }
+        const transitions = [];
+        for (let index = 1; index < features.length; index++) {
+          const previous = features[index - 1];
+          const current = features[index];
+          transitions.push({
+            timestampSeconds: current.timestampSeconds,
+            rmsDeltaDb: Math.abs(current.rmsDb - previous.rmsDb),
+            highLowEnergyDeltaDb: Math.abs(current.highLowEnergyDb - previous.highLowEnergyDb),
+            previousRmsDb: previous.rmsDb,
+            currentRmsDb: current.rmsDb,
+          });
+        }
+        const median = (values) => {
+          if (!values.length) return 0;
+          const sorted = [...values].sort((a, b) => a - b);
+          const middle = Math.floor(sorted.length / 2);
+          return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+        };
+        const rmsDeltas = transitions.map((item) => item.rmsDeltaDb);
+        const bandDeltas = transitions.map((item) => item.highLowEnergyDeltaDb);
+        const rmsMedian = median(rmsDeltas);
+        const bandMedian = median(bandDeltas);
+        const rmsThresholdDb = Math.max(12, rmsMedian + 6 * median(rmsDeltas.map((value) => Math.abs(value - rmsMedian))));
+        const bandThresholdDb = Math.max(8, bandMedian + 6 * median(bandDeltas.map((value) => Math.abs(value - bandMedian))));
+        const rawCandidates = transitions
+          .filter((item) => Math.max(item.previousRmsDb, item.currentRmsDb) >= -48
+            && (item.rmsDeltaDb >= rmsThresholdDb || item.highLowEnergyDeltaDb >= bandThresholdDb))
+          .map((item) => ({
+            ...item,
+            score: Number(Math.max(item.rmsDeltaDb / rmsThresholdDb, item.highLowEnergyDeltaDb / bandThresholdDb).toFixed(2)),
+          }))
+          .sort((a, b) => a.timestampSeconds - b.timestampSeconds);
+        const mergedCandidates = [];
+        for (const item of rawCandidates) {
+          const previous = mergedCandidates[mergedCandidates.length - 1];
+          if (previous && item.timestampSeconds - previous.timestampSeconds <= 0.5) {
+            if (item.score > previous.score) mergedCandidates[mergedCandidates.length - 1] = item;
+          } else {
+            mergedCandidates.push(item);
+          }
+        }
+        changeAudit = {
+          available: features.length >= 4,
+          method: "pcm-short-window-rms-and-low-high-energy-balance-v1",
+          sampleWindowSeconds: 0.25,
+          frequencySplitHz: 700,
+          featureWindowCount: features.length,
+          loudnessDeltaThresholdDb: Number(rmsThresholdDb.toFixed(2)),
+          bandBalanceDeltaThresholdDb: Number(bandThresholdDb.toFixed(2)),
+          candidateCount: mergedCandidates.length,
+          candidates: mergedCandidates.sort((a, b) => b.score - a.score).slice(0, 20),
+          affectsRiskScore: false,
+          note: "Ses şiddeti ve düşük/yüksek frekans enerji dengesi değişimleri incelendi; ortam, mikrofon ve konuşma değişimleri de aday üretebilir.",
+        };
+      } catch (featureError) {
+        changeAudit.reason = featureError?.message || String(featureError);
+      } finally {
+        await fs.unlink(pcmPath).catch(() => {});
+      }
+      audioContentAudit.changeAudit = changeAudit;
     } catch (audioError) {
       audioTimeline.reason = audioError?.message || String(audioError);
       audioContentAudit.reason = audioError?.message || String(audioError);
