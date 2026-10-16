@@ -6689,8 +6689,9 @@ try {
 }
 
 const maxFrameCount = 120;
-const targetIntervalSeconds = 0.5;
-// Sample at 2 fps, capped at 120 frames to bound per-video OCR/vision work.
+const targetIntervalSeconds = 0.25;
+// Sample at up to 4 fps, capped at 120 frames. OCR uses every other frame so
+// denser visual sampling does not double PaddleOCR work.
 // Extract the final frame separately so a fractional-duration tail is covered.
 const targetFrameCount = durationSeconds
   ? Math.min(maxFrameCount, Math.max(2, Math.ceil(durationSeconds / targetIntervalSeconds) + 1))
@@ -6827,7 +6828,7 @@ return {
   frames,
   sampling: {
     durationSeconds,
-    method: "uniform-0.5s-plus-terminal-frame",
+    method: "uniform-0.25s-capped-plus-terminal-frame",
     maxFrameCount,
     targetFrameCount,
     extractedFrameCount: frames.length,
@@ -7159,8 +7160,10 @@ frames.length
 // VIDEO FRAME PADDLEOCR
 // =====================================================
 
+const ocrFrames = frames.filter((_, index) => index % 2 === 0 || index === frames.length - 1);
+console.log("VIDEO OCR FRAME SAYISI:", ocrFrames.length);
 const videoOCRResults = await Promise.all(
-frames.map(async (frame, index) => {
+ocrFrames.map(async (frame, index) => {
 
 console.log(
 `VIDEO FRAME ${index + 1}/${frames.length} PADDLEOCR`
@@ -7330,6 +7333,11 @@ kesin sınıflandırma değildir; örneklenen kareler için görsel ön taramad�
   arası tutarsızlıkları ara.
 - Işık, doku, kenar, yansıma, hareket ve nesne biçiminin kareler boyunca
   tutarlılığını değerlendir; bulgu varsa ilgili kare zamanlarını belirt.
+- İnsan görünüyorsa beden, kol, el ve parmak biçimlerinin ardışık karelerdeki
+  sürekliliğini de incele. Uzuvların aniden biçim değiştirmesi, kaybolup
+  belirmesi, birleşmesi veya eklem hareketinin fiziksel olarak açıklanamayacak
+  şekilde kayması gibi somut belirtileri ara. Bunları yalnızca birden fazla
+  yakın örnek karede açıkça görülüyorsa bildir.
 - Kamera hareketi, odak/pozlama değişimi, ekran parlaması, parmakla
   örtülme, perspektif ve video sıkıştırmasını tek başına AI sinyali sayma.
 - Sadece “garip görünüyor” izlenimiyle fail verme. Somut, konumlandırılabilir
