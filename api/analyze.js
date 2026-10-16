@@ -6976,13 +6976,15 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
     // ffprobe-like packet/frame timeline check using FFmpeg's decoded frame
     // PTS, plus audio sample timestamps when the source has an audio stream.
     let audioTimeline = { available: false, reason: "Ses akışı bulunamadı veya zaman damgaları okunamadı.", packetCount: 0, gapCount: null, gaps: [] };
+    let audioContentAudit = { available: false, reason: "Ses akışı bulunamadı veya sessizlik taraması çalışmadı.", candidateCount: null, quietIntervals: [] };
     try {
       const audioPass = await execFileAsync(ffmpegPath, [
         "-hide_banner", "-loglevel", "info", "-i", videoPath, "-t", String(scanSeconds),
-        "-map", "0:a:0", "-af", "ashowinfo", "-vn", "-f", "null", "-",
+        "-map", "0:a:0", "-af", "silencedetect=noise=-42dB:d=0.20,ashowinfo", "-vn", "-f", "null", "-",
       ], { maxBuffer: 8 * 1024 * 1024, timeout: 90000 });
+      const audioLogLines = String(audioPass?.stderr || "").split(/\r?\n/);
       const audioFrames = [];
-      for (const line of String(audioPass?.stderr || "").split(/\r?\n/)) {
+      for (const line of audioLogLines) {
         const match = line.match(/pts_time:\s*(-?\d+(?:\.\d+)?).*?rate:\s*(\d+).*?nb_samples:\s*(\d+)/);
         if (match) audioFrames.push({
           timestampSeconds: Number(match[1]),
@@ -7011,8 +7013,37 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         scannedSeconds: Number(scanSeconds.toFixed(3)),
         note: "Zaman damgası sürekliliği incelendi; ses içeriğinin düzenlenmediğini kanıtlamaz.",
       };
+      const quietIntervals = [];
+      let pendingSilenceStart = null;
+      for (const line of audioLogLines) {
+        const startMatch = line.match(/silence_start:\s*(-?\d+(?:\.\d+)?)/);
+        if (startMatch) pendingSilenceStart = Number(startMatch[1]);
+        const endMatch = line.match(/silence_end:\s*(-?\d+(?:\.\d+)?).*?silence_duration:\s*(\d+(?:\.\d+)?)/);
+        if (endMatch && pendingSilenceStart !== null) {
+          const startSeconds = pendingSilenceStart;
+          const endSeconds = Number(endMatch[1]);
+          const duration = Number(endMatch[2]);
+          quietIntervals.push({ startSeconds: Number(startSeconds.toFixed(3)), endSeconds: Number(endSeconds.toFixed(3)), durationSeconds: Number(duration.toFixed(3)) });
+          pendingSilenceStart = null;
+        }
+      }
+      if (pendingSilenceStart !== null && scanSeconds - pendingSilenceStart >= 0.20) {
+        quietIntervals.push({ startSeconds: Number(pendingSilenceStart.toFixed(3)), endSeconds: Number(scanSeconds.toFixed(3)), durationSeconds: Number((scanSeconds - pendingSilenceStart).toFixed(3)) });
+      }
+      audioContentAudit = {
+        available: audioFrames.length > 0,
+        method: "ffmpeg-silencedetect",
+        thresholdDb: -42,
+        minimumDurationSeconds: 0.20,
+        candidateCount: quietIntervals.length,
+        quietIntervals: quietIntervals.slice(0, 30),
+        scannedSeconds: Number(scanSeconds.toFixed(3)),
+        affectsRiskScore: false,
+        note: "Düşük ses aralıkları tespit edilir; doğal duraklamalar da olabilir ve tek başına kesme/düzenleme kanıtı değildir.",
+      };
     } catch (audioError) {
       audioTimeline.reason = audioError?.message || String(audioError);
+      audioContentAudit.reason = audioError?.message || String(audioError);
     }
     if (parsedScoreCount === 0) {
       return {
@@ -7039,6 +7070,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
           anomalies: videoTimestampAnomalies,
         },
         audioTimestampAudit: audioTimeline,
+        audioContentAudit,
         secondDetector: {
           available: lumaDifferenceScores.length > 0,
           engine: "ffmpeg-signalstats-ydif-robust-outlier-v1",
@@ -7085,6 +7117,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         note: "Decoded frame PTS continuity only; a re-encoded edit may have a clean timeline.",
       },
       audioTimestampAudit: audioTimeline,
+      audioContentAudit,
       secondDetector: {
         available: lumaDifferenceScores.length > 0,
         engine: "ffmpeg-signalstats-ydif-robust-outlier-v1",
@@ -19741,6 +19774,7 @@ console.log(
 JSON.stringify(videoSampling)
 );
 console.log("VIDEO TEMPORAL CONTINUITY AUDIT:", JSON.stringify(videoTemporalAudit));
+console.log("VIDEO AUDIO CONTENT AUDIT:", JSON.stringify(videoTemporalAudit?.audioContentAudit || {}));
 
 const videoResult =
 await analyzeVideoFrames(
