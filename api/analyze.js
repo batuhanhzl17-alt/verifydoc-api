@@ -6856,15 +6856,16 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
   await fs.mkdir(outputDir, { recursive: true });
   try {
     const args = [
-      "-hide_banner", "-loglevel", "error", "-i", videoPath,
+      "-hide_banner", "-loglevel", "info", "-i", videoPath,
       "-t", String(scanSeconds),
-      "-vf", `scdet=threshold=15,metadata=mode=print:file=${metadataPath}`,
+      "-vf", `scdet=threshold=15,signalstats,metadata=mode=print:file=${metadataPath},showinfo`,
       "-an", "-f", "null", "-"
     ];
-    await execFileAsync(ffmpegPath, args, { maxBuffer: 4 * 1024 * 1024, timeout: 90000 });
+    const videoPass = await execFileAsync(ffmpegPath, args, { maxBuffer: 12 * 1024 * 1024, timeout: 120000 });
     const metadata = await fs.readFile(metadataPath, "utf8").catch(() => "");
     const records = [];
     const allScores = [];
+    const lumaDifferenceScores = [];
     let parsedScoreCount = 0;
     let maxSceneScore = 0;
     let currentTime = null;
@@ -6872,6 +6873,10 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       const frameMatch = line.match(/pts_time:([0-9]+(?:\.[0-9]+)?)/);
       if (frameMatch) currentTime = Number(frameMatch[1]);
       const scoreMatch = line.match(/lavfi\.scd\.score=([0-9]+(?:\.[0-9]+)?)/);
+      const lumaMatch = line.match(/lavfi\.signalstats\.YDIF=([0-9]+(?:\.[0-9]+)?)/);
+      if (lumaMatch && Number.isFinite(currentTime)) {
+        lumaDifferenceScores.push({ timestampSeconds: Number(currentTime.toFixed(3)), score: Number(lumaMatch[1]) });
+      }
       if (scoreMatch && Number.isFinite(currentTime)) {
         const score = Number(scoreMatch[1]);
         parsedScoreCount += 1;
@@ -6879,6 +6884,97 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         allScores.push({ timestampSeconds: Number(currentTime.toFixed(3)), score: Number(score.toFixed(2)) });
         if (score >= 15) records.push({ timestampSeconds: currentTime, score: Number(score.toFixed(2)) });
       }
+    }
+    const framePts = [];
+    for (const line of String(videoPass?.stderr || "").split(/\r?\n/)) {
+      const match = line.match(/\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:\s*(-?\d+(?:\.\d+)?)/);
+      if (match) framePts.push({ frame: Number(match[1]), pts: Number(match[2]), timestampSeconds: Number(match[3]) });
+    }
+    const videoDeltas = framePts.slice(1).map((item, index) => ({
+      fromSeconds: framePts[index].timestampSeconds,
+      toSeconds: item.timestampSeconds,
+      deltaSeconds: item.timestampSeconds - framePts[index].timestampSeconds,
+    }));
+    const sortedDeltas = videoDeltas.map((item) => item.deltaSeconds).filter((value) => value > 0).sort((a, b) => a - b);
+    const medianVideoDelta = sortedDeltas.length
+      ? sortedDeltas[Math.floor(sortedDeltas.length / 2)]
+      : null;
+    const videoTimestampAnomalies = videoDeltas.filter((item) =>
+      item.deltaSeconds <= 0 || (Number.isFinite(medianVideoDelta) &&
+        item.deltaSeconds > Math.max(medianVideoDelta * 1.75, medianVideoDelta + 0.08))
+    ).slice(0, 30).map((item) => ({
+      fromSeconds: Number(item.fromSeconds.toFixed(3)),
+      toSeconds: Number(item.toSeconds.toFixed(3)),
+      deltaSeconds: Number(item.deltaSeconds.toFixed(4)),
+      kind: item.deltaSeconds <= 0 ? "duplicate-or-nonmonotonic-pts" : "unusually-large-frame-interval",
+    }));
+
+    // Independent, luma-based companion signal. This is diagnostic only and
+    // is deliberately not treated as a cut/fraud verdict without calibration.
+    const sortedLuma = lumaDifferenceScores.map((item) => item.score).sort((a, b) => a - b);
+    const medianLumaDelta = sortedLuma.length ? sortedLuma[Math.floor(sortedLuma.length / 2)] : null;
+    const lumaMad = sortedLuma.length
+      ? [...sortedLuma].map((value) => Math.abs(value - medianLumaDelta)).sort((a, b) => a - b)[Math.floor(sortedLuma.length / 2)]
+      : null;
+    const lumaThreshold = Number.isFinite(medianLumaDelta) && Number.isFinite(lumaMad)
+      ? medianLumaDelta + Math.max(6 * lumaMad, 8)
+      : null;
+    const lumaCandidateFrames = Number.isFinite(lumaThreshold)
+      ? lumaDifferenceScores.filter((item) => item.score >= lumaThreshold)
+      : [];
+    const lumaCandidates = [];
+    for (const item of lumaCandidateFrames.sort((a, b) => a.timestampSeconds - b.timestampSeconds)) {
+      const previous = lumaCandidates[lumaCandidates.length - 1];
+      if (previous && item.timestampSeconds - previous.timestampSeconds < 0.75) {
+        if (item.score > previous.score) {
+          previous.timestampSeconds = item.timestampSeconds;
+          previous.score = item.score;
+        }
+      } else {
+        lumaCandidates.push({ ...item });
+      }
+    }
+
+    // ffprobe-like packet/frame timeline check using FFmpeg's decoded frame
+    // PTS, plus audio sample timestamps when the source has an audio stream.
+    let audioTimeline = { available: false, reason: "Ses akışı bulunamadı veya zaman damgaları okunamadı.", packetCount: 0, gapCount: null, gaps: [] };
+    try {
+      const audioPass = await execFileAsync(ffmpegPath, [
+        "-hide_banner", "-loglevel", "info", "-i", videoPath, "-t", String(scanSeconds),
+        "-map", "0:a:0", "-af", "ashowinfo", "-vn", "-f", "null", "-",
+      ], { maxBuffer: 8 * 1024 * 1024, timeout: 90000 });
+      const audioFrames = [];
+      for (const line of String(audioPass?.stderr || "").split(/\r?\n/)) {
+        const match = line.match(/pts_time:\s*(-?\d+(?:\.\d+)?).*?rate:\s*(\d+).*?nb_samples:\s*(\d+)/);
+        if (match) audioFrames.push({
+          timestampSeconds: Number(match[1]),
+          sampleRate: Number(match[2]),
+          sampleCount: Number(match[3]),
+        });
+      }
+      const audioGaps = [];
+      for (let index = 1; index < audioFrames.length; index++) {
+        const previous = audioFrames[index - 1];
+        const current = audioFrames[index];
+        const expectedNext = previous.timestampSeconds + previous.sampleCount / previous.sampleRate;
+        const gapSeconds = current.timestampSeconds - expectedNext;
+        if (Math.abs(gapSeconds) > 0.05) audioGaps.push({
+          fromSeconds: Number(expectedNext.toFixed(3)),
+          toSeconds: Number(current.timestampSeconds.toFixed(3)),
+          deltaSeconds: Number(gapSeconds.toFixed(4)),
+          kind: gapSeconds > 0 ? "audio-timestamp-gap" : "audio-timestamp-overlap",
+        });
+      }
+      audioTimeline = {
+        available: audioFrames.length > 0,
+        packetCount: audioFrames.length,
+        gapCount: audioGaps.length,
+        gaps: audioGaps.slice(0, 30),
+        scannedSeconds: Number(scanSeconds.toFixed(3)),
+        note: "Zaman damgası sürekliliği incelendi; ses içeriğinin düzenlenmediğini kanıtlamaz.",
+      };
+    } catch (audioError) {
+      audioTimeline.reason = audioError?.message || String(audioError);
     }
     if (parsedScoreCount === 0) {
       return {
@@ -6889,7 +6985,26 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         fullDurationScanned: Number.isFinite(durationSeconds) && durationSeconds <= maxScanSeconds,
         candidateCount: null,
         sceneChangeCandidates: [],
-        reason: "FFmpeg kare puanlarını metadata dosyasına yazmadı; sıfır aday sonucu güvenilir değil."
+        reason: "FFmpeg scdet puanlarını metadata dosyasına yazmadı; sıfır aday sonucu güvenilir değil.",
+        frameTimestampAudit: {
+          available: framePts.length > 0,
+          decodedFrameCount: framePts.length,
+          medianFrameIntervalSeconds: Number.isFinite(medianVideoDelta) ? Number(medianVideoDelta.toFixed(5)) : null,
+          anomalyCount: videoTimestampAnomalies.length,
+          anomalies: videoTimestampAnomalies,
+        },
+        audioTimestampAudit: audioTimeline,
+        secondDetector: {
+          available: lumaDifferenceScores.length > 0,
+          engine: "ffmpeg-signalstats-ydif-robust-outlier-v1",
+          metric: "Adjacent-frame average luma difference (YDIF), separate from scdet score.",
+          scoreCount: lumaDifferenceScores.length,
+          adaptiveThreshold: Number.isFinite(lumaThreshold) ? Number(lumaThreshold.toFixed(3)) : null,
+          candidateCount: lumaCandidates.length,
+          candidates: lumaCandidates.slice(0, 20),
+          topScores: lumaDifferenceScores.sort((a, b) => b.score - a.score).slice(0, 20),
+          affectsRiskScore: false,
+        },
       };
     }
     const candidates = [];
@@ -6916,6 +7031,31 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       topSceneChangeScores: allScores
         .sort((a, b) => b.score - a.score)
         .slice(0, 20),
+      frameTimestampAudit: {
+        available: framePts.length > 0,
+        decodedFrameCount: framePts.length,
+        medianFrameIntervalSeconds: Number.isFinite(medianVideoDelta) ? Number(medianVideoDelta.toFixed(5)) : null,
+        anomalyCount: videoTimestampAnomalies.length,
+        anomalies: videoTimestampAnomalies,
+        note: "Decoded frame PTS continuity only; a re-encoded edit may have a clean timeline.",
+      },
+      audioTimestampAudit: audioTimeline,
+      secondDetector: {
+        available: lumaDifferenceScores.length > 0,
+        engine: "ffmpeg-signalstats-ydif-robust-outlier-v1",
+        metric: "Adjacent-frame average luma difference (YDIF), separate from scdet score.",
+        scoreCount: lumaDifferenceScores.length,
+        adaptiveThreshold: Number.isFinite(lumaThreshold) ? Number(lumaThreshold.toFixed(3)) : null,
+        candidateCount: lumaCandidates.length,
+        candidates: lumaCandidates
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 20),
+        topScores: lumaDifferenceScores
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 20),
+        affectsRiskScore: false,
+        note: "Adaptive luma outliers are review candidates, not proof of editing; motion and exposure changes can trigger them.",
+      },
       candidateCount: candidates.length,
       sceneChangeCandidates: candidates.slice(0, 30),
       interpretation: "Adaylar ani görüntü geçişlerini gösterir; tek başına kesme veya manipülasyon kanıtı değildir.",
