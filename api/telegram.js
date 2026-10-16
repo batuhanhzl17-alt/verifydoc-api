@@ -2257,11 +2257,19 @@ async function sendAnalysisResult(
      : `Zaman taraması yapılamadı${audit.reason ? `: ${String(audit.reason).slice(0, 180)}` : '.'}`;
    const audioContentAudit = audit.audioContentAudit || {};
    const audioQuietIntervals = Array.isArray(audioContentAudit.quietIntervals) ? audioContentAudit.quietIntervals : [];
-   const audioReviewLine = !audioContentAudit.available
+   const audioChangeAudit = audioContentAudit.changeAudit || {};
+   const audioChangeCandidates = Array.isArray(audioChangeAudit.candidates) ? audioChangeAudit.candidates : [];
+   const audioQuietLine = !audioContentAudit.available
      ? '🔊 Ses akışında düşük ses aralığı kontrolü yapılamadı.'
      : audioQuietIntervals.length
        ? `🔊 ${audioContentAudit.candidateCount} düşük ses aralığı adayı (≥0,20 sn, ≤−42 dB): ${audioQuietIntervals.slice(0, 3).map((item) => `${formatSeconds(item.startSeconds)}–${formatSeconds(item.endSeconds)} sn`).join(', ')}.`
        : '🔊 Ses taramasında ≥0,20 saniye süren düşük ses aralığı adayı bulunmadı.';
+   const audioChangeLine = !audioChangeAudit.available
+     ? 'Ses seviyesi/frekans dengesi değişim taraması yapılamadı.'
+     : audioChangeCandidates.length
+       ? `Ses seviyesi/frekans dengesi değişim adayı (${audioChangeAudit.candidateCount}): ${audioChangeCandidates.slice(0, 3).map((item) => `${formatSeconds(item.timestampSeconds)} sn (seviye ${formatSeconds(item.rmsDeltaDb)} dB, bant dengesi ${formatSeconds(item.highLowEnergyDeltaDb)} dB)`).join('; ')}.`
+       : 'Belirgin ani ses seviyesi/frekans dengesi değişim adayı bulunmadı.';
+   const audioReviewLine = [audioQuietLine, audioChangeLine].filter(Boolean).join('\n');
    const aiCheck = result?.checks?.aiGeneratedIndicators || {};
    const aiEvidence = String(aiCheck.evidence || '').replace(/\s+/g, ' ').trim().slice(0, 420);
    const aiAssessment = aiCheck.status === 'fail'
@@ -2286,7 +2294,7 @@ async function sendAnalysisResult(
      String(summary).trim().slice(0, 1800),
      '',
      'Ani geçiş adayı tek başına kesme veya sahtecilik kanıtı değildir. Kamera hareketi ya da uygulama ekranı değişimi de bu sinyali üretebilir.',
-    'AI/görüntü ön taraması sesi incelemez. Ses taraması yalnızca en az 0,20 saniyelik düşük ses aralıklarını işaretler; doğal duraklamalar da görülebilir ve bu bulgu montaj kanıtı değildir. Ses içeriğinin anlamı veya konuşma düzenlemesi analiz edilmez. C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması da düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.'
+    'AI/görüntü ön taraması sesi incelemez. Ses taraması düşük ses aralıklarını ve ses seviyesi/frekans dengesi değişimlerini işaretler; doğal duraklamalar, konuşmacı veya ortam değişimi de aday oluşturabilir. Bu sinyaller ses montajını kanıtlamaz; konuşma anlamı analiz edilmez ve bulgular risk skorunu etkilemez. C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması da düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.'
    ].filter(Boolean).join('\n');
    await sendMessage(chatId, videoText, replyToMessageId);
    return;
