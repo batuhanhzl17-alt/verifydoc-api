@@ -2255,6 +2255,13 @@ async function sendAnalysisResult(
    const coverage = audit.available
      ? `Zaman taraması: ${formatTime(audit.scannedSeconds)}${audit.fullDurationScanned ? ' / videonun tamamı' : ' / süre sınırı nedeniyle kısmi'}`
      : `Zaman taraması yapılamadı${audit.reason ? `: ${String(audit.reason).slice(0, 180)}` : '.'}`;
+   const audioContentAudit = audit.audioContentAudit || {};
+   const audioQuietIntervals = Array.isArray(audioContentAudit.quietIntervals) ? audioContentAudit.quietIntervals : [];
+   const audioReviewLine = !audioContentAudit.available
+     ? '🔊 Ses akışında düşük ses aralığı kontrolü yapılamadı.'
+     : audioQuietIntervals.length
+       ? `🔊 ${audioContentAudit.candidateCount} düşük ses aralığı adayı (≥0,20 sn, ≤−42 dB): ${audioQuietIntervals.slice(0, 3).map((item) => `${formatSeconds(item.startSeconds)}–${formatSeconds(item.endSeconds)} sn`).join(', ')}.`
+       : '🔊 Ses taramasında ≥0,20 saniye süren düşük ses aralığı adayı bulunmadı.';
    const aiCheck = result?.checks?.aiGeneratedIndicators || {};
    const aiEvidence = String(aiCheck.evidence || '').replace(/\s+/g, ' ').trim().slice(0, 420);
    const aiAssessment = aiCheck.status === 'fail'
@@ -2270,6 +2277,7 @@ async function sendAnalysisResult(
      confidenceLine,
      ...(Number.isFinite(duration) ? [`Süre: ${formatTime(duration)}`] : []),
      coverage,
+    audioReviewLine,
      ...(candidateLines.length ? ['', ...candidateLines] : []),
      '',
      '🤖 AI / GÖRÜNTÜ SENTEZİ ÖN TARAMASI',
@@ -2278,7 +2286,7 @@ async function sendAnalysisResult(
      String(summary).trim().slice(0, 1800),
      '',
      'Ani geçiş adayı tek başına kesme veya sahtecilik kanıtı değildir. Kamera hareketi ya da uygulama ekranı değişimi de bu sinyali üretebilir.',
-     'AI/görüntü ön taraması kesin dedektör değildir; ses üretimini incelemez ve tek başına AI müdahalesini kanıtlamaz. C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması da düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.'
+    'AI/görüntü ön taraması sesi incelemez. Ses taraması yalnızca en az 0,20 saniyelik düşük ses aralıklarını işaretler; doğal duraklamalar da görülebilir ve bu bulgu montaj kanıtı değildir. Ses içeriğinin anlamı veya konuşma düzenlemesi analiz edilmez. C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması da düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.'
    ].filter(Boolean).join('\n');
    await sendMessage(chatId, videoText, replyToMessageId);
    return;
