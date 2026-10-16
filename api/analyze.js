@@ -7052,7 +7052,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         ], { maxBuffer: 2 * 1024 * 1024, timeout: 90000 });
         const pcm = await fs.readFile(pcmPath);
         const sampleRate = 16000;
-        const samplesPerWindow = 4000; // 0.25 seconds
+        const samplesPerWindow = 8000; // 0.50 seconds at 16 kHz
         const alpha = Math.exp((-2 * Math.PI * 700) / sampleRate);
         const features = [];
         let lowPassState = 0;
@@ -7128,7 +7128,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         changeAudit = {
           available: features.length >= 4,
           method: "pcm-short-window-rms-and-low-high-energy-balance-v1",
-          sampleWindowSeconds: 0.25,
+          sampleWindowSeconds: 0.50,
           frequencySplitHz: 700,
           featureWindowCount: features.length,
           loudnessDeltaThresholdDb: Number(rmsThresholdDb.toFixed(2)),
