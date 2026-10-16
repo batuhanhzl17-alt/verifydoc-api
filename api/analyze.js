@@ -6886,6 +6886,42 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         if (score >= 15) records.push({ timestampSeconds: currentTime, score: Number(score.toFixed(2)) });
       }
     }
+    // Keep the fixed FFmpeg threshold for high-confidence scene changes, but
+    // also surface unusually large transitions relative to this video's own
+    // baseline. This catches low-contrast edits that score below 15. The
+    // adaptive signal is advisory only and never changes the risk score.
+    const sceneScoreValues = allScores.map((item) => item.score).filter(Number.isFinite).sort((a, b) => a - b);
+    const medianOf = (values) => values.length
+      ? (values.length % 2
+        ? values[(values.length - 1) / 2]
+        : (values[values.length / 2 - 1] + values[values.length / 2]) / 2)
+      : null;
+    const medianSceneScore = medianOf(sceneScoreValues);
+    const sceneScoreMad = Number.isFinite(medianSceneScore)
+      ? medianOf(sceneScoreValues.map((value) => Math.abs(value - medianSceneScore)).sort((a, b) => a - b))
+      : null;
+    // 5 is a floor to avoid flagging tiny score jitter; 6*MAD is robust to
+    // occasional camera shake and exposure changes. This is not a universal
+    // authenticity threshold and candidates are reported for review only.
+    const adaptiveSceneThreshold = Number.isFinite(medianSceneScore) && Number.isFinite(sceneScoreMad)
+      ? Math.max(5, medianSceneScore + Math.max(6 * sceneScoreMad, 1))
+      : null;
+    const adaptiveSceneCandidates = [];
+    if (Number.isFinite(adaptiveSceneThreshold)) {
+      for (const item of allScores
+        .filter((score) => score.score >= adaptiveSceneThreshold)
+        .sort((a, b) => a.timestampSeconds - b.timestampSeconds)) {
+        const previous = adaptiveSceneCandidates[adaptiveSceneCandidates.length - 1];
+        if (previous && item.timestampSeconds - previous.timestampSeconds < 0.75) {
+          if (item.score > previous.score) {
+            previous.timestampSeconds = item.timestampSeconds;
+            previous.score = item.score;
+          }
+        } else {
+          adaptiveSceneCandidates.push({ ...item });
+        }
+      }
+    }
     const framePts = [];
     for (const line of String(videoPass?.stderr || "").split(/\r?\n/)) {
       const match = line.match(/\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:\s*(-?\d+(?:\.\d+)?)/);
@@ -6986,6 +7022,13 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         fullDurationScanned: Number.isFinite(durationSeconds) && durationSeconds <= maxScanSeconds,
         candidateCount: null,
         sceneChangeCandidates: [],
+        adaptiveSceneChange: {
+          available: false,
+          candidateCount: null,
+          candidates: [],
+          reason: "FFmpeg sahne değişimi puanı üretmedi.",
+          affectsRiskScore: false,
+        },
         reason: "FFmpeg scdet puanlarını metadata dosyasına yazmadı; sıfır aday sonucu güvenilir değil.",
         frameTimestampAudit: {
           available: framePts.length > 0,
@@ -7059,6 +7102,17 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       },
       candidateCount: candidates.length,
       sceneChangeCandidates: candidates.slice(0, 30),
+      adaptiveSceneChange: {
+        available: true,
+        method: "per-video-median-plus-six-MAD",
+        baselineMedian: Number(medianSceneScore.toFixed(3)),
+        baselineMAD: Number(sceneScoreMad.toFixed(3)),
+        threshold: Number(adaptiveSceneThreshold.toFixed(3)),
+        candidateCount: adaptiveSceneCandidates.length,
+        candidates: adaptiveSceneCandidates.slice(0, 30),
+        affectsRiskScore: false,
+        note: "Videonun kendi geçiş dağılımına göre sıra dışı kare farklarını işaretler; kesme veya sahtecilik kanıtı değildir.",
+      },
       interpretation: "Adaylar ani görüntü geçişlerini gösterir; tek başına kesme veya manipülasyon kanıtı değildir.",
       limitations: "Orijinal video olmadan kesilen bölüm kesin belirlenemez. Kamera hareketi ve doğal ekran/sahne geçişleri de aday üretebilir; ince sinyaller kaçabilir."
     };
