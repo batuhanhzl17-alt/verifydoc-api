@@ -2187,13 +2187,17 @@ async function sendAnalysisResult(
    const sceneCandidates = Array.isArray(audit.sceneChangeCandidates)
      ? audit.sceneChangeCandidates.map((item) => ({ ...item, signal: 'scene' }))
      : [];
+   const adaptiveSceneAudit = audit.adaptiveSceneChange || {};
+   const adaptiveSceneCandidates = Array.isArray(adaptiveSceneAudit.candidates)
+     ? adaptiveSceneAudit.candidates.map((item) => ({ ...item, signal: 'adaptive-scene' }))
+     : [];
    const secondDetector = audit.secondDetector || {};
    const lumaCandidates = Array.isArray(secondDetector.candidates)
      ? secondDetector.candidates.map((item) => ({ ...item, signal: 'luma' }))
      : [];
    // Report the strongest candidate from either detector. If both detectors
    // flag nearly the same moment, combine them into one user-facing event.
-   const candidates = [...sceneCandidates, ...lumaCandidates]
+   const candidates = [...sceneCandidates, ...adaptiveSceneCandidates, ...lumaCandidates]
      .sort((a, b) => Number(a.timestampSeconds) - Number(b.timestampSeconds))
      .reduce((merged, item) => {
        const previous = merged[merged.length - 1];
@@ -2234,6 +2238,15 @@ async function sendAnalysisResult(
          `• ${formatWindow(item.timestampSeconds)}`,
        ];
      }
+    if (item.signals.includes('adaptive-scene')) {
+      const threshold = Number.isFinite(Number(adaptiveSceneAudit.threshold))
+        ? formatSeconds(adaptiveSceneAudit.threshold)
+        : null;
+      return [
+        `• Videonun ${timestamp} saniyesinde, bu videonun olağan geçişlerine göre belirgin bir görüntü farkı adayı bulundu (${formatSeconds(item.score)}${threshold ? `; bağıl eşik ${threshold}` : ''}).`,
+        `• ${formatWindow(item.timestampSeconds)}`,
+      ];
+    }
      return [
        `• Videonun ${timestamp} saniyesinde ani görüntü geçişi adayı bulundu (geçiş skoru ${item.score}).`,
        `• ${formatWindow(item.timestampSeconds)}`,
@@ -2245,9 +2258,9 @@ async function sendAnalysisResult(
    const aiCheck = result?.checks?.aiGeneratedIndicators || {};
    const aiEvidence = String(aiCheck.evidence || '').replace(/\s+/g, ' ').trim().slice(0, 420);
    const aiAssessment = aiCheck.status === 'fail'
-     ? `🟠 Olası sentetik/değiştirilmiş görüntü sinyali (görsel model ön taraması): ${aiEvidence || 'Model görsel tutarsızlık bildirdi.'}`
+     ? `🟠 Görsel model ön taramasında olası sentetik/değiştirilmiş görüntü sinyali: ${aiEvidence || 'Model görsel tutarsızlık bildirdi.'} Bu tek başına AI üretimini kanıtlamaz.`
      : aiCheck.status === 'pass'
-       ? '🟢 Örneklenen karelerde belirgin AI/görüntü sentezi sinyali görülmedi.'
+       ? '⚪ Örneklenen karelerde belirgin görsel AI sinyali belirlenmedi; bu ön tarama AI üretimini dışlayamaz.'
        : '⚪ Örneklenen karelerle AI/görüntü sentezi yönünden güvenilir değerlendirme yapılamadı.';
    const videoText = [
      '🎞️ VERIFYDOC VİDEO ÖN İNCELEMESİ',
