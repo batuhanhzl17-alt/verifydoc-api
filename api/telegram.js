@@ -2184,15 +2184,61 @@ async function sendAnalysisResult(
      const value = Math.max(0, Math.floor(Number(seconds) || 0));
      return `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
    };
-   const candidates = Array.isArray(audit.sceneChangeCandidates) ? audit.sceneChangeCandidates : [];
-   const status = !audit.available
+   const sceneCandidates = Array.isArray(audit.sceneChangeCandidates)
+     ? audit.sceneChangeCandidates.map((item) => ({ ...item, signal: 'scene' }))
+     : [];
+   const secondDetector = audit.secondDetector || {};
+   const lumaCandidates = Array.isArray(secondDetector.candidates)
+     ? secondDetector.candidates.map((item) => ({ ...item, signal: 'luma' }))
+     : [];
+   // Report the strongest candidate from either detector. If both detectors
+   // flag nearly the same moment, combine them into one user-facing event.
+   const candidates = [...sceneCandidates, ...lumaCandidates]
+     .sort((a, b) => Number(a.timestampSeconds) - Number(b.timestampSeconds))
+     .reduce((merged, item) => {
+       const previous = merged[merged.length - 1];
+       if (previous && Math.abs(Number(item.timestampSeconds) - Number(previous.timestampSeconds)) <= 0.5) {
+         previous.signals.push(item.signal);
+         // The two detector scores have different scales. Prefer the luma
+         // timestamp when available instead of comparing unlike score values.
+         if (item.signal === 'luma') {
+           previous.timestampSeconds = item.timestampSeconds;
+           previous.score = item.score;
+           previous.signal = 'luma';
+         }
+       } else {
+         merged.push({ ...item, signals: [item.signal] });
+       }
+       return merged;
+     }, []);
+   const formatSeconds = (seconds) => (Number(seconds) || 0).toFixed(2).replace('.', ',');
+   const formatWindow = (seconds) => {
+     const start = Math.max(0, Number(seconds) - 0.25);
+     const end = Number(seconds) + 0.25;
+     return `${start.toFixed(1).replace('.', ',')}–${end.toFixed(1).replace('.', ',')} saniye aralığını kontrol edin.`;
+   };
+   const status = !audit.available && !secondDetector.available
      ? '🟡 Zaman akışı kontrolü çalışmadı'
      : candidates.length
-       ? `🟡 ${candidates.length} ani görüntü geçişi adayı bulundu`
+       ? '🟠 İnceleme önerilir'
        : '🟢 Taramada belirgin ani geçiş adayı bulunmadı';
-   const candidateLines = candidates.slice(0, 5).map((item) =>
-     `• ${formatTime(item.timestampSeconds)} civarı (görüntü geçiş skoru ${item.score})`
-   );
+   const candidateLines = candidates.slice(0, 5).flatMap((item) => {
+     const timestamp = formatSeconds(item.timestampSeconds);
+     if (item.signals.includes('luma')) {
+       const measured = formatSeconds(item.score);
+       const threshold = Number.isFinite(Number(secondDetector.adaptiveThreshold))
+         ? formatSeconds(secondDetector.adaptiveThreshold)
+         : null;
+       return [
+         `• Videonun ${timestamp} saniyesinde kareler arası görüntü farkı inceleme eşiğini aştı (${measured}${threshold ? `; eşik ${threshold}` : ''}).`,
+         `• ${formatWindow(item.timestampSeconds)}`,
+       ];
+     }
+     return [
+       `• Videonun ${timestamp} saniyesinde ani görüntü geçişi adayı bulundu (geçiş skoru ${item.score}).`,
+       `• ${formatWindow(item.timestampSeconds)}`,
+     ];
+   });
    const coverage = audit.available
      ? `Zaman taraması: ${formatTime(audit.scannedSeconds)}${audit.fullDurationScanned ? ' / videonun tamamı' : ' / süre sınırı nedeniyle kısmi'}`
      : `Zaman taraması yapılamadı${audit.reason ? `: ${String(audit.reason).slice(0, 180)}` : '.'}`;
@@ -2204,7 +2250,7 @@ async function sendAnalysisResult(
      confidenceLine,
      ...(Number.isFinite(duration) ? [`Süre: ${formatTime(duration)}`] : []),
      coverage,
-     ...(candidateLines.length ? ['', 'İncelenecek zamanlar:', ...candidateLines] : []),
+     ...(candidateLines.length ? ['', ...candidateLines] : []),
      '',
      String(summary).trim().slice(0, 1800),
      '',
