@@ -6689,7 +6689,7 @@ try {
 }
 
 const maxFrameCount = 120;
-const targetIntervalSeconds = 0.25;
+const targetIntervalSeconds = 0.5;
 // Sample at up to 4 fps, capped at 120 frames. OCR uses every other frame so
 // denser visual sampling does not double PaddleOCR work.
 // Extract the final frame separately so a fractional-duration tail is covered.
