@@ -1643,6 +1643,23 @@ async function runAzureDocumentLayout(filePath) {
 // bir gözle doğrulamaktır. Tek başına sahtecilik kararı üretmez.
 const azureReferenceLayoutCache = new Map();
 
+function normalizeReferencePathSelection(selection) {
+  const values = Array.isArray(selection) ? selection : selection ? [selection] : [];
+  return [...new Set(values
+    .filter(value => typeof value === 'string' && value.trim())
+    .map(value => path.resolve(value.trim())))]
+    .sort();
+}
+
+function selectReferencePaths(allReferencePaths, selection) {
+  const all = Array.isArray(allReferencePaths) ? allReferencePaths : [];
+  const requested = normalizeReferencePathSelection(selection);
+  if (!requested.length) return all;
+  const requestedSet = new Set(requested);
+  const selected = all.filter(referencePath => requestedSet.has(path.resolve(referencePath)));
+  return selected.length ? selected : all;
+}
+
 function azureReferenceAnchorLines(layout) {
   const out = [];
   if (!layout?.available || !Array.isArray(layout.lines)) return out;
@@ -1708,18 +1725,15 @@ async function getAzureReferenceLayouts(bank, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return [];
 
-  const selectedKey = selectedReferencePath ? path.resolve(selectedReferencePath) : "ALL";
+  const requestedPaths = normalizeReferencePathSelection(selectedReferencePath);
+  const selectedKey = requestedPaths.length ? requestedPaths.join('|') : "ALL";
   const cacheKey = `azure-reference-layout:v2:${normalizedBank}:${selectedKey}`;
   if (azureReferenceLayoutCache.has(cacheKey)) {
     return azureReferenceLayoutCache.get(cacheKey);
   }
 
   const allReferencePaths = await getReferenceFiles(normalizedBank);
-  const requestedPaths = Array.isArray(selectedReferencePath)
-    ? selectedReferencePath.filter(Boolean)
-    : selectedReferencePath ? [selectedReferencePath] : [];
-  const selectedPaths = requestedPaths.filter(requested => allReferencePaths.includes(requested));
-  const referencePaths = selectedPaths.length ? selectedPaths : allReferencePaths;
+  const referencePaths = selectReferencePaths(allReferencePaths, requestedPaths);
   const layouts = [];
 
   for (const referencePath of referencePaths) {
@@ -8872,7 +8886,8 @@ async function extractWholePageStructureSignature(buffer) {
 async function runReferenceLayoutForensics(targetPath, bank, selectedReferencePath = null) {
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank || !targetPath) return null;
-  const selectedKey = selectedReferencePath ? path.resolve(selectedReferencePath) : "ALL";
+  const requestedPaths = normalizeReferencePathSelection(selectedReferencePath);
+  const selectedKey = requestedPaths.length ? requestedPaths.join('|') : "ALL";
   const cacheKey = `layout:v3:${normalizedBank}:${selectedKey}`;
 
   try {
@@ -8884,9 +8899,7 @@ async function runReferenceLayoutForensics(targetPath, bank, selectedReferencePa
     let ensemble = referenceLayoutForensicsCache.get(cacheKey);
     if (!ensemble) {
       const allReferencePaths = await getReferenceFiles(normalizedBank);
-      const referencePaths = selectedReferencePath && allReferencePaths.includes(selectedReferencePath)
-        ? [selectedReferencePath]
-        : allReferencePaths;
+      const referencePaths = selectReferencePaths(allReferencePaths, requestedPaths);
       if (!referencePaths.length) return null;
       const fingerprints = [];
       for (const referencePath of referencePaths) {
@@ -12583,14 +12596,13 @@ async function buildReferenceTemplateProfile(bank, selectedReferencePath = null)
   const normalizedBank = normalizeBank(bank);
   if (!normalizedBank) return null;
   const allReferencePaths = await getReferenceFiles(normalizedBank);
-  const referencePaths = selectedReferencePath && allReferencePaths.includes(selectedReferencePath)
-    ? [selectedReferencePath]
-    : allReferencePaths;
+  const requestedPaths = normalizeReferencePathSelection(selectedReferencePath);
+  const referencePaths = selectReferencePaths(allReferencePaths, requestedPaths);
   const statParts = [];
   for (const referencePath of referencePaths) {
     try { const st = await fs.stat(referencePath); statParts.push(`${referencePath}:${st.mtimeMs}:${st.size}`); } catch {}
   }
-  const selectedKey = selectedReferencePath ? path.resolve(selectedReferencePath) : "ALL";
+  const selectedKey = requestedPaths.length ? requestedPaths.join('|') : "ALL";
   const cacheKey = `${normalizedBank}|${selectedKey}|${statParts.sort().join('|')}`;
   if (referenceTemplateProfileCache.has(cacheKey)) return referenceTemplateProfileCache.get(cacheKey);
 
