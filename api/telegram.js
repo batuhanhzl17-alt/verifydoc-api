@@ -2261,6 +2261,8 @@ async function sendAnalysisResult(
    const audioChangeCandidates = Array.isArray(audioChangeAudit.candidates) ? audioChangeAudit.candidates : [];
    const audioBoundaryAudit = audioContentAudit.boundaryAudit || {};
    const audioBoundaryCandidates = Array.isArray(audioBoundaryAudit.candidates) ? audioBoundaryAudit.candidates : [];
+   const speechActivityAudit = audioContentAudit.speechActivityAudit || {};
+   const speechActivitySegments = Array.isArray(speechActivityAudit.segments) ? speechActivityAudit.segments : [];
    const audioQuietLine = !audioContentAudit.available
      ? '🔊 Ses akışında düşük ses aralığı kontrolü yapılamadı.'
      : audioQuietIntervals.length
@@ -2276,7 +2278,12 @@ async function sendAnalysisResult(
      : audioBoundaryCandidates.length
        ? `🔎 Yerel ses profili sınırı adayı (${audioBoundaryAudit.candidateCount}): ${audioBoundaryCandidates.slice(0, 3).map((item) => `${formatSeconds(item.fromSeconds)}–${formatSeconds(item.toSeconds)} sn`).join('; ')}. Bu zamanlar ekleme kanıtı değildir; ses/ortam değişimleri de benzer iz bırakabilir.`
        : 'Belirgin yerel ses profili sınırı adayı bulunmadı; bu, ses eklenmediğini kanıtlamaz.';
-   const audioReviewLine = [audioQuietLine, audioChangeLine, audioBoundaryLine].filter(Boolean).join('\n');
+   const speechActivityLine = !speechActivityAudit.available
+     ? `Konuşma etkinliği taraması yapılamadı${speechActivityAudit.reason ? `: ${String(speechActivityAudit.reason).slice(0, 140)}` : '.'}`
+     : speechActivitySegments.length
+       ? `🗣️ Konuşma etkinliği (Silero VAD): ${speechActivitySegments.slice(0, 3).map((item) => `${formatSeconds(item.startSeconds)}–${formatSeconds(item.endSeconds)} sn`).join('; ')}${speechActivitySegments.length > 3 ? ` (+${speechActivitySegments.length - 3} aralık)` : ''}. Bu, sesin eklendiğini veya değiştirildiğini göstermez.`
+       : 'Silero VAD taramasında belirgin konuşma aralığı bulunmadı; bu, videoda hiç konuşma olmadığı veya sesin değiştirilmediği anlamına gelmez.';
+   const audioReviewLine = [audioQuietLine, audioChangeLine, audioBoundaryLine, speechActivityLine].filter(Boolean).join('\n');
    const aiCheck = result?.checks?.aiGeneratedIndicators || {};
    const aiEvidence = String(aiCheck.evidence || '').replace(/\s+/g, ' ').trim().slice(0, 420);
    const aiAssessment = aiCheck.status === 'fail'
