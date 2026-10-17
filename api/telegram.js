@@ -77,7 +77,8 @@ async function sendMessage(
  chatId,
  text,
  replyToMessageId = null,
- replyMarkup = null
+ replyMarkup = null,
+ parseMode = null
 ) {
 
  const body = {
@@ -115,6 +116,12 @@ async function sendMessage(
 
  body.reply_markup =
  replyMarkup;
+
+ }
+
+ if (parseMode) {
+
+ body.parse_mode = parseMode;
 
  }
 
@@ -2261,6 +2268,10 @@ async function sendAnalysisResult(
    const audioChangeCandidates = Array.isArray(audioChangeAudit.candidates) ? audioChangeAudit.candidates : [];
    const audioBoundaryAudit = audioContentAudit.boundaryAudit || {};
    const audioBoundaryCandidates = Array.isArray(audioBoundaryAudit.candidates) ? audioBoundaryAudit.candidates : [];
+   const speechBoundaryContinuity = audioBoundaryAudit.speechBoundaryContinuity || {};
+   const speechBoundaryItems = Array.isArray(speechBoundaryContinuity.boundaries) ? speechBoundaryContinuity.boundaries : [];
+   const speechSegmentContinuity = audioBoundaryAudit.speechSegmentContinuity || {};
+   const speechContinuitySegments = Array.isArray(speechSegmentContinuity.segments) ? speechSegmentContinuity.segments : [];
    const speechActivityAudit = audioContentAudit.speechActivityAudit || {};
    const speechActivitySegments = Array.isArray(speechActivityAudit.segments) ? speechActivityAudit.segments : [];
    const audioQuietLine = !audioContentAudit.available
@@ -2283,7 +2294,25 @@ async function sendAnalysisResult(
      : speechActivitySegments.length
        ? `🗣️ Konuşma etkinliği (Silero VAD): ${speechActivitySegments.slice(0, 3).map((item) => `${formatSeconds(item.startSeconds)}–${formatSeconds(item.endSeconds)} sn`).join('; ')}${speechActivitySegments.length > 3 ? ` (+${speechActivitySegments.length - 3} aralık)` : ''}. Bu, sesin eklendiğini veya değiştirildiğini göstermez.`
        : 'Silero VAD taramasında belirgin konuşma aralığı bulunmadı; bu, videoda hiç konuşma olmadığı veya sesin değiştirilmediği anlamına gelmez.';
-   const audioReviewLine = [audioQuietLine, audioChangeLine, audioBoundaryLine, speechActivityLine].filter(Boolean).join('\n');
+   const speechBoundaryLine = !speechActivityAudit.available
+     ? ''
+     : !speechBoundaryContinuity.available
+       ? 'Konuşma başlangıç/bitiş çevresi ses profili karşılaştırılamadı.'
+       : speechBoundaryItems.some((item) => item.available && item.profileChangeCandidate)
+         ? `🧭 Konuşma aralığı sınırında ses profili farkı adayı: ${speechBoundaryItems.filter((item) => item.available && item.profileChangeCandidate).slice(0, 3).map((item) => `${formatSeconds(item.timestampSeconds)} sn (${item.edge === 'start' ? 'başlangıç' : 'bitiş'})`).join('; ')}. Bu tek başına sonradan ses ekleme kanıtı değildir.`
+         : 'Konuşma başlangıç/bitiş çevresinde belirgin ses profili farkı adayı bulunmadı; bu, sesin eklenmediğini kanıtlamaz.';
+   const audioReviewLine = [audioQuietLine, audioChangeLine, audioBoundaryLine, speechActivityLine, speechBoundaryLine].filter(Boolean).join('\n');
+   const speechContinuityDetails = speechContinuitySegments.map((item) => {
+     const ambient = item.ambientComparison;
+     const ambientLine = ambient
+       ? `Ortam/gürültü pencereleri ${item.ambientBeforeSeconds.join('–')} sn ve ${item.ambientAfterSeconds.join('–')} sn: seviye farkı ${Number(ambient.levelDeltaDb).toFixed(1)} dB, mel profil uzaklığı ${Number(ambient.melProfileDistance).toFixed(3)}, düşük/orta bant farkı ${Number(ambient.lowMidDeltaDb).toFixed(1)} dB, orta/yüksek bant farkı ${Number(ambient.highMidDeltaDb).toFixed(1)} dB, spektral düzlemsellik farkı ${Number(ambient.spectralFlatnessDelta).toFixed(3)}${item.ambientChangeCandidate ? ' — profil farkı adayı' : ''}.`
+       : 'Konuşma öncesi/sonrası ortam sesi pencereleri karşılaştırmak için yeterli değil.';
+     const tail = item.reverbTailProxy;
+     const tailLine = tail?.available
+       ? `Konuşma sonrası yankı kuyruğu göstergesi: konuşmadan erken kuyruğa düşüş ${tail.speechToEarlyTailDropDb} dB, erken/geç kuyruk seviye farkı ${tail.earlyToLateDecayDb} dB${tail.lateTailAbovePreSpeechRoomToneDb === null ? '' : `, geç kuyruk önceki ortam seviyesinin ${tail.lateTailAbovePreSpeechRoomToneDb} dB üstünde`}. Bu kaba bir seviye ölçümüdür, yankı teşhisi değildir.`
+       : `Yankı kuyruğu göstergesi ölçülemedi: ${tail?.reason || 'yeterli örnek yok'}`;
+     return `Konuşma ${formatSeconds(item.speechStartSeconds)}–${formatSeconds(item.speechEndSeconds)} sn. ${ambientLine} ${tailLine}`;
+   });
    const aiCheck = result?.checks?.aiGeneratedIndicators || {};
    const aiEvidence = String(aiCheck.evidence || '').replace(/\s+/g, ' ').trim().slice(0, 420);
    const aiAssessment = aiCheck.status === 'fail'
@@ -2291,26 +2320,71 @@ async function sendAnalysisResult(
      : aiCheck.status === 'pass'
        ? '⚪ Örneklenen karelerde belirgin görsel AI sinyali belirlenmedi; bu ön tarama AI üretimini dışlayamaz.'
        : '⚪ Örneklenen karelerle AI/görüntü sentezi yönünden güvenilir değerlendirme yapılamadı.';
-   const videoText = [
-     '🎞️ VERIFYDOC VİDEO ÖN İNCELEMESİ',
-     '',
+   const compactCandidateLines = candidates.slice(0, 3).flatMap((item) => [
+     `• ${formatSeconds(item.timestampSeconds)} sn: Geçiş adayı`,
+     `• ${formatWindow(item.timestampSeconds)}`,
+   ]);
+   const compactAudioLines = [];
+   if (audioQuietIntervals.length) {
+     compactAudioLines.push(`• Düşük ses adayı: ${audioQuietIntervals.slice(0, 3).map((item) => `${formatSeconds(item.startSeconds)}–${formatSeconds(item.endSeconds)} sn`).join(', ')}`);
+   }
+   if (audioChangeCandidates.length) {
+     compactAudioLines.push(`• Ani ses değişimi adayı: ${audioChangeCandidates.slice(0, 3).map((item) => `${formatSeconds(item.timestampSeconds)} sn`).join(', ')}`);
+   }
+   if (audioBoundaryCandidates.length) {
+     compactAudioLines.push(`• Ses profili sınırı adayı: ${audioBoundaryCandidates.slice(0, 3).map((item) => `${formatSeconds(item.fromSeconds)}–${formatSeconds(item.toSeconds)} sn`).join(', ')}`);
+   }
+   if (speechActivitySegments.length) {
+     compactAudioLines.push(`• Konuşma algılandı: ${speechActivitySegments.slice(0, 3).map((item) => `${formatSeconds(item.startSeconds)}–${formatSeconds(item.endSeconds)} sn`).join(', ')}`);
+   }
+   const continuityFindings = speechContinuitySegments.filter((item) => item.ambientChangeCandidate);
+   if (continuityFindings.length) {
+     compactAudioLines.push(`• Konuşma çevresi ortam profili fark adayı: ${continuityFindings.slice(0, 3).map((item) => `${formatSeconds(item.speechStartSeconds)}–${formatSeconds(item.speechEndSeconds)} sn`).join(', ')}`);
+   }
+   if (speechBoundaryItems.some((item) => item.available && item.profileChangeCandidate)) {
+     compactAudioLines.push(`• Konuşma sınırında ses profili fark adayı: ${speechBoundaryItems.filter((item) => item.available && item.profileChangeCandidate).slice(0, 3).map((item) => `${formatSeconds(item.timestampSeconds)} sn`).join(', ')}`);
+   }
+   if (!audioContentAudit.available) compactAudioLines.push('• Ses taraması yapılamadı.');
+   else if (!compactAudioLines.length) compactAudioLines.push('• Belirgin ses değişim adayı bulunmadı.');
+
+   const escapeTelegramHtml = (value) => String(value ?? '')
+     .replace(/&/g, '&amp;')
+     .replace(/</g, '&lt;')
+     .replace(/>/g, '&gt;');
+   const visibleVideoText = [
+     '🎞️ VİDEO ÖN İNCELEMESİ',
      status,
-     `Risk: ${riskLabel} — ${score}/100`,
-     confidenceLine,
-     ...(Number.isFinite(duration) ? [`Süre: ${formatTime(duration)}`] : []),
-     coverage,
-    audioReviewLine,
-     ...(candidateLines.length ? ['', ...candidateLines] : []),
+     `Otomatik risk puanı: ${score}/100 · ${confidenceLine}${Number.isFinite(duration) ? ` · Süre: ${formatTime(duration)}` : ''}`,
      '',
-     '🤖 AI / GÖRÜNTÜ SENTEZİ ÖN TARAMASI',
-     aiAssessment,
+     'GÖRÜNTÜ',
+     ...(compactCandidateLines.length ? compactCandidateLines : ['• Belirgin ani geçiş adayı bulunmadı.']),
      '',
+     'SES',
+     ...compactAudioLines,
+     '',
+     'AI ÖN TARAMASI',
+     `• ${aiAssessment.replace(/^⚪\s*/u, '')}`,
+     '',
+     'ℹ️ Ayrıntılı açıklama (dokunarak açın):',
+   ].join('\n');
+   const detailedVideoText = [
      String(summary).trim().slice(0, 1800),
      '',
-     'Ani geçiş adayı tek başına kesme veya sahtecilik kanıtı değildir. Kamera hareketi ya da uygulama ekranı değişimi de bu sinyali üretebilir.',
-    'AI/görüntü ön taraması sesi incelemez. Ses taraması düşük ses aralıklarını ve ses seviyesi/frekans dengesi değişimlerini işaretler; doğal duraklamalar, konuşmacı veya ortam değişimi de aday oluşturabilir. Bu sinyaller ses montajını kanıtlamaz; konuşma anlamı analiz edilmez ve bulgular risk skorunu etkilemez. C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması da düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.'
+     `Zaman kapsamı: ${coverage}`,
+     '',
+     'Ayrıntılı ses taraması:',
+     audioReviewLine,
+     ...speechContinuityDetails,
+     '',
+     'Ani geçiş adayı tek başına kesme veya sahtecilik kanıtı değildir. Kamera hareketi ya da uygulama ekranı değişimi de benzer sinyal üretebilir.',
+     'AI/görüntü ön taraması sesi incelemez. Ses pencerelerindeki seviye, frekans, gürültü dokusu ve kısa konuşma sonrası seviye kuyruğu değişimleri düzenleme kanıtı değildir; doğal konuşma, konuşmacı, ortam, mikrofon veya miks değişimleri benzer izler oluşturabilir. Yankı kuyruğu ölçümü yalnızca kaba bir göstergedir. Konuşma içeriği veya konuşmacı kimliği analiz edilmez; ses bulguları risk skorunu etkilemez.',
+     'C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.',
    ].filter(Boolean).join('\n');
-   await sendMessage(chatId, videoText, replyToMessageId);
+   const escapedVisibleText = escapeTelegramHtml(visibleVideoText).slice(0, 3500).replace(/&(?:amp|lt|gt)?$/u, '');
+   const detailBudget = Math.max(0, 4080 - escapedVisibleText.length - 28);
+   const escapedDetails = escapeTelegramHtml(detailedVideoText).slice(0, detailBudget).replace(/&(?:amp|lt|gt)?$/u, '');
+   const videoText = `${escapedVisibleText}\n<tg-spoiler>${escapedDetails}</tg-spoiler>`;
+   await sendMessage(chatId, videoText, replyToMessageId, null, 'HTML');
    return;
  }
 
