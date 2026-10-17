@@ -14,6 +14,7 @@ import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIba
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
 import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
+import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -7047,6 +7048,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       let changeAudit = { available: false, reason: "Ses özellikleri çıkarılamadı.", candidateCount: null, candidates: [] };
       const pcmPath = path.join(path.dirname(videoPath), `verifydoc-audio-${Date.now()}-${Math.random().toString(36).slice(2)}.s16le`);
       let boundaryAudit = { available: false, candidateCount: null, candidates: [], reason: "Ses sınır analizi çalışmadı." };
+      let speechActivityAudit = { available: false, speechSegmentCount: null, segments: [], reason: "Konuşma etkinliği taraması çalışmadı.", affectsRiskScore: false };
       try {
         await execFileAsync(ffmpegPath, [
           "-hide_banner", "-loglevel", "error", "-i", videoPath, "-t", String(scanSeconds),
@@ -7055,6 +7057,11 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         const pcm = await fs.readFile(pcmPath);
         const sampleRate = 16000;
         boundaryAudit = analyzeAudioBoundaryChanges(pcm, sampleRate);
+        try {
+          speechActivityAudit = await analyzeSpeechActivity(pcm);
+        } catch (vadError) {
+          speechActivityAudit = { available: false, speechSegmentCount: null, segments: [], reason: String(vadError?.message || vadError).slice(0, 240), affectsRiskScore: false };
+        }
         const samplesPerWindow = 8000; // 0.50 seconds at 16 kHz
         const alpha = Math.exp((-2 * Math.PI * 700) / sampleRate);
         const features = [];
@@ -7148,6 +7155,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       }
       audioContentAudit.changeAudit = changeAudit;
       audioContentAudit.boundaryAudit = boundaryAudit;
+      audioContentAudit.speechActivityAudit = speechActivityAudit;
     } catch (audioError) {
       audioTimeline.reason = audioError?.message || String(audioError);
       audioContentAudit.reason = audioError?.message || String(audioError);
