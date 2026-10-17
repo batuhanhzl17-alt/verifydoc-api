@@ -127,7 +127,13 @@ async function sendMessage(
 
  console.log(
  "TELEGRAM SEND:",
- JSON.stringify(body)
+ JSON.stringify({
+   chat_id: body.chat_id,
+   textLength: String(body.text || "").length,
+   reply_to_message_id: body.reply_parameters?.message_id || null,
+   hasReplyMarkup: Boolean(body.reply_markup),
+   parse_mode: body.parse_mode || null,
+ })
  );
 
  return telegram(
@@ -2347,10 +2353,6 @@ async function sendAnalysisResult(
    if (!audioContentAudit.available) compactAudioLines.push('• Ses taraması yapılamadı.');
    else if (!compactAudioLines.length) compactAudioLines.push('• Belirgin ses değişim adayı bulunmadı.');
 
-   const escapeTelegramHtml = (value) => String(value ?? '')
-     .replace(/&/g, '&amp;')
-     .replace(/</g, '&lt;')
-     .replace(/>/g, '&gt;');
    const visibleVideoText = [
      '🎞️ VİDEO ÖN İNCELEMESİ',
      status,
@@ -2365,7 +2367,6 @@ async function sendAnalysisResult(
      'AI ÖN TARAMASI',
      `• ${aiAssessment.replace(/^⚪\s*/u, '')}`,
      '',
-     'ℹ️ Ayrıntılı açıklama (dokunarak açın):',
    ].join('\n');
    const detailedVideoText = [
      String(summary).trim().slice(0, 1800),
@@ -2380,11 +2381,21 @@ async function sendAnalysisResult(
      'AI/görüntü ön taraması sesi incelemez. Ses pencerelerindeki seviye, frekans, gürültü dokusu ve kısa konuşma sonrası seviye kuyruğu değişimleri düzenleme kanıtı değildir; doğal konuşma, konuşmacı, ortam, mikrofon veya miks değişimleri benzer izler oluşturabilir. Yankı kuyruğu ölçümü yalnızca kaba bir göstergedir. Konuşma içeriği veya konuşmacı kimliği analiz edilmez; ses bulguları risk skorunu etkilemez.',
      'C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.',
    ].filter(Boolean).join('\n');
-   const escapedVisibleText = escapeTelegramHtml(visibleVideoText).slice(0, 3500).replace(/&(?:amp|lt|gt)?$/u, '');
-   const detailBudget = Math.max(0, 4080 - escapedVisibleText.length - 28);
-   const escapedDetails = escapeTelegramHtml(detailedVideoText).slice(0, detailBudget).replace(/&(?:amp|lt|gt)?$/u, '');
-   const videoText = `${escapedVisibleText}\n<tg-spoiler>${escapedDetails}</tg-spoiler>`;
-   await sendMessage(chatId, videoText, replyToMessageId, null, 'HTML');
+   const fullVideoText = `${visibleVideoText}\n\n📖 AYRINTILI AÇIKLAMA\n\n${detailedVideoText}`;
+   const chunks = [];
+   let remaining = fullVideoText;
+   while (remaining.length > 3900) {
+     let cutAt = remaining.lastIndexOf('\n', 3900);
+     if (cutAt < 2500) cutAt = 3900;
+     chunks.push(remaining.slice(0, cutAt));
+     remaining = remaining.slice(cutAt).replace(/^\n+/u, '');
+   }
+   if (remaining) chunks.push(remaining);
+   let previousMessageId = replyToMessageId;
+   for (const chunk of chunks) {
+     const sent = await sendMessage(chatId, chunk, previousMessageId);
+     if (sent?.message_id) previousMessageId = sent.message_id;
+   }
    return;
  }
 
@@ -2762,15 +2773,13 @@ async function processCallbackQuery(
 
  }
 
+ const chatId = menuMessage?.chat?.id;
+
 
  await answerCallbackQuery(
  callbackId,
  "Analiz hazırlanıyor..."
  );
-
-
- const chatId =
- menuMessage?.chat?.id;
 
 
  if (
