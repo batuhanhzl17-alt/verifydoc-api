@@ -99,12 +99,40 @@ const profileDistance = (leftFrames, rightFrames, bandCount) => {
   return 0.5 * leftNorm.reduce((sum, value, index) => sum + Math.abs(value - rightNorm[index]), 0);
 };
 
+const summarizeAudioFrames = (frames, startSeconds, endSeconds) => {
+  const selected = frames.filter((frame) => frame.timestampSeconds >= startSeconds && frame.timestampSeconds + 0.10 <= endSeconds);
+  if (selected.length < 2) return null;
+  const medianKey = (key) => median(selected.map((frame) => frame[key]));
+  const melBands = selected[0].melBands.map((_, band) => median(selected.map((frame) => frame.melBands[band])));
+  return {
+    frameCount: selected.length,
+    rmsDb: medianKey("rmsDb"),
+    lowMidDb: medianKey("lowMidDb"),
+    highMidDb: medianKey("highMidDb"),
+    zeroCrossingRate: medianKey("zeroCrossingRate"),
+    spectralFlatness: medianKey("spectralFlatness"),
+    melBands,
+  };
+};
+
+const compareAudioProfiles = (left, right, bandCount) => {
+  if (!left || !right) return null;
+  return {
+    levelDeltaDb: right.rmsDb - left.rmsDb,
+    lowMidDeltaDb: right.lowMidDb - left.lowMidDb,
+    highMidDeltaDb: right.highMidDb - left.highMidDb,
+    zeroCrossingDelta: right.zeroCrossingRate - left.zeroCrossingRate,
+    spectralFlatnessDelta: right.spectralFlatness - left.spectralFlatness,
+    melProfileDistance: profileDistance([left], [right], bandCount),
+  };
+};
+
 /**
  * Finds abrupt local changes in a decoded mono signed-16 PCM stream.
  * This is an audio-edit review signal; it cannot identify the source of a sound
  * or prove that a segment was added, especially after mixing/re-encoding.
  */
-export function analyzeAudioBoundaryChanges(pcm, sampleRate = 16000) {
+export function analyzeAudioBoundaryChanges(pcm, sampleRate = 16000, speechSegments = []) {
   const frameSeconds = 0.10;
   const hopSeconds = 0.05;
   const frameSamples = Math.max(1, Math.round(frameSeconds * sampleRate));
@@ -194,6 +222,13 @@ export function analyzeAudioBoundaryChanges(pcm, sampleRate = 16000) {
       frameCount: frames.length,
       spectrogram: { available: false, fftSize, melBandCount },
       activityIntervals: [],
+      speechBoundaryContinuity: {
+        available: false,
+        boundaryCount: 0,
+        boundaries: [],
+        reason: "Konuşma sınırlarını karşılaştırmak için yeterli ses süresi yok.",
+        affectsRiskScore: false,
+      },
       reason: "Yerel ses değişimlerini güvenilir karşılaştırmak için yeterli süre yok (en az 0,6 sn gerekir).",
       affectsRiskScore: false,
     };
@@ -315,6 +350,150 @@ export function analyzeAudioBoundaryChanges(pcm, sampleRate = 16000) {
     };
   }).sort((a, b) => b.score - a.score).slice(0, 12);
 
+  // Inspect the acoustic profile immediately before and after each VAD speech
+  // edge. This is a review cue only: ordinary speech onset/offset also changes
+  // the profile, so it cannot establish that audio was inserted.
+  const speechBoundaries = [];
+  for (const [segmentIndex, segment] of (Array.isArray(speechSegments) ? speechSegments : []).entries()) {
+    for (const edge of ["start", "end"]) {
+      const boundarySeconds = Number(segment?.[edge === "start" ? "startSeconds" : "endSeconds"]);
+      if (!Number.isFinite(boundarySeconds)) continue;
+      let nearest = null;
+      for (const item of changes) {
+        const distance = Math.abs(item.timestampSeconds - boundarySeconds);
+        if (!nearest || distance < nearest.distance) nearest = { item, distance };
+      }
+      if (!nearest || nearest.distance > hopSeconds) {
+        speechBoundaries.push({
+          segmentIndex,
+          edge,
+          timestampSeconds: Number(boundarySeconds.toFixed(3)),
+          available: false,
+          reason: "Sınırın iki yanında yeterli ses örneği yok.",
+        });
+        continue;
+      }
+      const item = nearest.item;
+      const signals = [];
+      if (item.rmsDeltaDb >= limits.rmsDeltaDb) signals.push("loudness");
+      if (item.lowMidDeltaDb >= limits.lowMidDeltaDb) signals.push("low-mid-balance");
+      if (item.highMidDeltaDb >= limits.highMidDeltaDb) signals.push("mid-high-balance");
+      if (item.zeroCrossingDelta >= limits.zeroCrossingDelta) signals.push("zero-crossing-rate");
+      if (item.spectralProfileDistance >= limits.spectralProfileDistance) signals.push("mel-spectrogram-profile");
+      if (item.spectralCentroidDeltaHz >= limits.spectralCentroidDeltaHz) signals.push("spectral-centroid");
+      const strongSingle = item.rmsDeltaDb >= Math.max(12, limits.rmsDeltaDb * 1.7)
+        || item.lowMidDeltaDb >= Math.max(12, limits.lowMidDeltaDb * 1.7)
+        || item.highMidDeltaDb >= Math.max(14, limits.highMidDeltaDb * 1.7);
+      speechBoundaries.push({
+        segmentIndex,
+        edge,
+        timestampSeconds: Number(boundarySeconds.toFixed(3)),
+        comparedAtSeconds: Number(item.timestampSeconds.toFixed(3)),
+        available: true,
+        profileChangeCandidate: signals.length >= 2 || strongSingle,
+        signalCount: signals.length,
+        signals,
+        rmsDeltaDb: Number(item.rmsDeltaDb.toFixed(2)),
+        lowMidDeltaDb: Number(item.lowMidDeltaDb.toFixed(2)),
+        highMidDeltaDb: Number(item.highMidDeltaDb.toFixed(2)),
+        zeroCrossingDelta: Number(item.zeroCrossingDelta.toFixed(4)),
+        spectralCentroidDeltaHz: Number(item.spectralCentroidDeltaHz.toFixed(1)),
+        melProfileDistance: Number(item.spectralProfileDistance.toFixed(3)),
+      });
+    }
+  }
+  const speechBoundaryContinuity = {
+    available: speechBoundaries.some((item) => item.available),
+    method: "vad-edge-local-audio-profile-comparison-v1",
+    sideWindowSeconds: Number((sideFrames * hopSeconds).toFixed(2)),
+    guardBandSeconds: Number((guardFrames * hopSeconds).toFixed(2)),
+    boundaryCount: speechBoundaries.filter((item) => item.available).length,
+    candidateCount: speechBoundaries.filter((item) => item.available && item.profileChangeCandidate).length,
+    boundaries: speechBoundaries,
+    affectsRiskScore: false,
+    note: "Konuşma segmentlerinin başlangıç ve bitiş çevresindeki ses profili karşılaştırılır. Doğal konuşma başlangıcı/bitişi de fark yaratabilir; aday, sonradan ses ekleme kanıtı değildir.",
+  };
+
+  // Compare non-speech room-tone windows before/after each speech segment and
+  // measure a short post-speech decay proxy. These are observables, not proof
+  // of room identity, reverberation, or inserted audio.
+  const speechSegmentContinuity = (Array.isArray(speechSegments) ? speechSegments : []).slice(0, 30).map((segment, segmentIndex) => {
+    const startSeconds = Number(segment?.startSeconds);
+    const endSeconds = Number(segment?.endSeconds);
+    if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) return null;
+    const beforeWindow = { start: Math.max(0, startSeconds - 0.50), end: startSeconds - 0.10 };
+    const afterWindow = { start: endSeconds + 0.10, end: endSeconds + 0.50 };
+    const overlapsSpeech = (window) => (Array.isArray(speechSegments) ? speechSegments : []).some((other, otherIndex) => {
+      if (otherIndex === segmentIndex) return false;
+      const otherStart = Number(other?.startSeconds);
+      const otherEnd = Number(other?.endSeconds);
+      return Number.isFinite(otherStart) && Number.isFinite(otherEnd) && otherStart < window.end && otherEnd > window.start;
+    });
+    const beforeRoomTone = !overlapsSpeech(beforeWindow) && beforeWindow.end > beforeWindow.start
+      ? summarizeAudioFrames(frames, beforeWindow.start, beforeWindow.end)
+      : null;
+    const afterRoomTone = !overlapsSpeech(afterWindow) && afterWindow.end > afterWindow.start
+      ? summarizeAudioFrames(frames, afterWindow.start, afterWindow.end)
+      : null;
+    const ambientComparison = compareAudioProfiles(beforeRoomTone, afterRoomTone, melBandCount);
+    const secondaryProfileChanges = ambientComparison
+      ? [
+        Math.abs(ambientComparison.lowMidDeltaDb) >= 8,
+        Math.abs(ambientComparison.highMidDeltaDb) >= 8,
+        Math.abs(ambientComparison.zeroCrossingDelta) >= 0.12,
+        Math.abs(ambientComparison.spectralFlatnessDelta) >= 0.20,
+      ].filter(Boolean).length
+      : 0;
+    const ambientChangeCandidate = Boolean(ambientComparison && (
+      (Math.abs(ambientComparison.levelDeltaDb) >= 10 && secondaryProfileChanges >= 1)
+      || (ambientComparison.melProfileDistance >= 0.30 && secondaryProfileChanges >= 1)
+      || Math.abs(ambientComparison.levelDeltaDb) >= 16
+    ));
+
+    const speechBeforeEnd = summarizeAudioFrames(frames, Math.max(startSeconds, endSeconds - 0.30), endSeconds - 0.05);
+    const earlyTail = summarizeAudioFrames(frames, endSeconds + 0.05, endSeconds + 0.25);
+    const lateTail = summarizeAudioFrames(frames, endSeconds + 0.25, endSeconds + 0.50);
+    const tailOverlapsSpeech = (window) => overlapsSpeech(window);
+    const reverbTailProxy = speechBeforeEnd && earlyTail && lateTail
+      && !tailOverlapsSpeech({ start: endSeconds + 0.05, end: endSeconds + 0.50 })
+      ? {
+        available: true,
+        earlyTailLevelDb: Number(earlyTail.rmsDb.toFixed(2)),
+        lateTailLevelDb: Number(lateTail.rmsDb.toFixed(2)),
+        speechToEarlyTailDropDb: Number((speechBeforeEnd.rmsDb - earlyTail.rmsDb).toFixed(2)),
+        earlyToLateDecayDb: Number((earlyTail.rmsDb - lateTail.rmsDb).toFixed(2)),
+        lateTailAbovePreSpeechRoomToneDb: beforeRoomTone
+          ? Number((lateTail.rmsDb - beforeRoomTone.rmsDb).toFixed(2))
+          : null,
+        interpretation: "Kısa konuşma sonrası seviye kuyruğu ölçümüdür; yankı veya ekleme teşhisi değildir.",
+      }
+      : { available: false, reason: "Konuşma sonrası yeterli ve başka konuşmayla örtüşmeyen örnek yok." };
+
+    return {
+      segmentIndex,
+      speechStartSeconds: Number(startSeconds.toFixed(3)),
+      speechEndSeconds: Number(endSeconds.toFixed(3)),
+      ambientComparisonAvailable: Boolean(ambientComparison),
+      ambientBeforeSeconds: [Number(beforeWindow.start.toFixed(3)), Number(beforeWindow.end.toFixed(3))],
+      ambientAfterSeconds: [Number(afterWindow.start.toFixed(3)), Number(afterWindow.end.toFixed(3))],
+      ambientBeforeFrameCount: beforeRoomTone?.frameCount || 0,
+      ambientAfterFrameCount: afterRoomTone?.frameCount || 0,
+      ambientComparison: ambientComparison ? Object.fromEntries(Object.entries(ambientComparison).map(([key, value]) => [key, Number(value.toFixed(4))])) : null,
+      ambientChangeCandidate,
+      reverbTailProxy,
+      affectsRiskScore: false,
+    };
+  }).filter(Boolean);
+  const speechSegmentContinuityAudit = {
+    available: speechSegmentContinuity.length > 0,
+    method: "vad-segment-roomtone-profile-and-postspeech-decay-v1",
+    segmentCount: speechSegmentContinuity.length,
+    ambientChangeCandidateCount: speechSegmentContinuity.filter((item) => item.ambientChangeCandidate).length,
+    segments: speechSegmentContinuity,
+    affectsRiskScore: false,
+    note: "Konuşma segmentlerinin öncesi/sonrasındaki konuşma dışı kısa pencerelerde ses seviyesi, spektral profil ve gürültü dokusu karşılaştırılır. Konuşma sonrası kısa seviye kuyruğu yankı için yalnızca kaba bir göstergedir; ortam, konuşma ve miks değişimleri aynı sinyalleri üretebilir. Sonradan ses ekleme hükmü vermez.",
+  };
+
   return {
     available: true,
     method: "pcm-mel-spectrogram-local-change-point-v2",
@@ -330,6 +509,8 @@ export function analyzeAudioBoundaryChanges(pcm, sampleRate = 16000) {
       .sort((a, b) => b.score - a.score)
       .slice(0, 20),
     topChangePoints,
+    speechBoundaryContinuity,
+    speechSegmentContinuity: speechSegmentContinuityAudit,
     activity: { available: true, method: "adaptive-rms-activity-not-speech-classification", noiseFloorDb: Number(noiseFloorDb.toFixed(2)), activeThresholdDb: Number(activeFloorDb.toFixed(2)), intervalCount: activityIntervals.length, intervals: activityIntervals.slice(0, 30) },
     affectsRiskScore: false,
     note: "Log-Mel profili, spektral merkez, seviye ve etkin aralık değişimleri incelenir. Etkinlik aralıkları konuşma sınıflandırması değildir. Sınır adayı ekleme/kesme kanıtı değildir; konuşma, ortam, mikrofon, miksleme ve yeniden kodlama sinyal üretebilir veya izleri azaltabilir.",
