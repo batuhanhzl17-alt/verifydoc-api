@@ -16,6 +16,9 @@ const FIELD_LABELS = {
     /^LEM\s+TUTAR(?:I)?$/,
     /^TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
     /^PARA\s+CINSI\s+TUTAR$/,
+    // Enpara receipts label the amount column "B/A Para Cinsi Tutar".
+    // Accept both the slash form and text extraction that separates B and A.
+    /^B\s*\/?\s*A\s+PARA\s+CINSI\s+TUTAR$/,
   ],
 };
 
@@ -64,8 +67,9 @@ function validValue(field, value) {
   if (!text) return false;
   if (field === 'recipientIBAN') return validTurkishIban(text);
   if (field === 'amount') {
-    return /^(?:[-+]?\s*)?(?:₺\s*)?\d[\d. ]*(?:,\d{1,2})?\s*(?:TL|TRY|₺)?$/i.test(text) &&
-      !/\d{1,2}[./-]\d{1,2}[./-]\d{2,4}/.test(text);
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    const amountPattern = /^(?:[-+]?\s*)?(?:₺\s*)?(?:(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?|(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:TL|TRY|₺)?$/i;
+    return amountPattern.test(normalized) && !/\d{1,2}[./-]\d{1,2}[./-]\d{2,4}/.test(normalized);
   }
   const clean = text.replace(/[^\p{L}'’ .-]/gu, ' ').replace(/\s+/g, ' ').trim();
   return clean.length >= 3 && clean.split(' ').filter(Boolean).length >= 2;
