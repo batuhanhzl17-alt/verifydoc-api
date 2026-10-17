@@ -2259,6 +2259,8 @@ async function sendAnalysisResult(
    const audioQuietIntervals = Array.isArray(audioContentAudit.quietIntervals) ? audioContentAudit.quietIntervals : [];
    const audioChangeAudit = audioContentAudit.changeAudit || {};
    const audioChangeCandidates = Array.isArray(audioChangeAudit.candidates) ? audioChangeAudit.candidates : [];
+   const audioBoundaryAudit = audioContentAudit.boundaryAudit || {};
+   const audioBoundaryCandidates = Array.isArray(audioBoundaryAudit.candidates) ? audioBoundaryAudit.candidates : [];
    const audioQuietLine = !audioContentAudit.available
      ? '🔊 Ses akışında düşük ses aralığı kontrolü yapılamadı.'
      : audioQuietIntervals.length
@@ -2269,7 +2271,12 @@ async function sendAnalysisResult(
      : audioChangeCandidates.length
        ? `Ses seviyesi/frekans dengesi değişim adayı (${audioChangeAudit.candidateCount}): ${audioChangeCandidates.slice(0, 3).map((item) => `${formatSeconds(item.timestampSeconds)} sn (seviye ${formatSeconds(item.rmsDeltaDb)} dB, bant dengesi ${formatSeconds(item.highLowEnergyDeltaDb)} dB)`).join('; ')}.`
        : 'Belirgin ani ses seviyesi/frekans dengesi değişim adayı bulunmadı.';
-   const audioReviewLine = [audioQuietLine, audioChangeLine].filter(Boolean).join('\n');
+   const audioBoundaryLine = !audioBoundaryAudit.available
+     ? `Yerel ses sınırı taraması yapılamadı${audioBoundaryAudit.reason ? `: ${String(audioBoundaryAudit.reason).slice(0, 140)}` : '.'}`
+     : audioBoundaryCandidates.length
+       ? `🔎 Yerel ses profili sınırı adayı (${audioBoundaryAudit.candidateCount}): ${audioBoundaryCandidates.slice(0, 3).map((item) => `${formatSeconds(item.fromSeconds)}–${formatSeconds(item.toSeconds)} sn`).join('; ')}. Bu zamanlar ekleme kanıtı değildir; ses/ortam değişimleri de benzer iz bırakabilir.`
+       : 'Belirgin yerel ses profili sınırı adayı bulunmadı; bu, ses eklenmediğini kanıtlamaz.';
+   const audioReviewLine = [audioQuietLine, audioChangeLine, audioBoundaryLine].filter(Boolean).join('\n');
    const aiCheck = result?.checks?.aiGeneratedIndicators || {};
    const aiEvidence = String(aiCheck.evidence || '').replace(/\s+/g, ' ').trim().slice(0, 420);
    const aiAssessment = aiCheck.status === 'fail'
