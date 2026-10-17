@@ -5178,7 +5178,9 @@ async function listPaintOverV2Samples(bank, kind = "genuine") {
 async function extractPaintOverV2Vector(targetPath, amountForensics = null, bank = null) {
   if (!targetPath) return null;
   try {
-    const encoded = await fs.readFile(targetPath);
+    const encoded = /\.pdf$/i.test(String(targetPath))
+      ? (await pfLoadVisualBuffer(targetPath, 1)).buffer
+      : await fs.readFile(targetPath);
     const meta = await sharp(encoded).metadata();
     const sourceW = Number(meta.width) || 0;
     const sourceH = Number(meta.height) || 0;
@@ -5361,12 +5363,14 @@ function vectorSimilarity(a,b) {
   return Math.max(0,Math.min(1,dot/(Math.sqrt(na)*Math.sqrt(nb))));
 }
 
-async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=null, negativeSamples=null) {
+async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=null, negativeSamples=null, genuineReferencePaths=null, targetModality='raster') {
   const engine='paint-over-erase-rewrite-forensics-v2-calibrated';
   try {
     if(!targetPath) return {available:false,engine,score:0,severity:'unknown',reason:'no-target'};
     const stat=await fs.stat(targetPath);
-    const cacheKey=`paintover-v2:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${JSON.stringify(amountForensics?.region||null)}`;
+    const modality=String(targetModality||'raster').toLowerCase()==='pdf'?'pdf':'raster';
+    const sameFormatRefs=Array.isArray(genuineReferencePaths)?genuineReferencePaths.filter(Boolean):[];
+    const cacheKey=`paintover-v2:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${modality}:${sameFormatRefs.map(p=>path.basename(p)).join(',')}:${JSON.stringify(amountForensics?.region||null)}`;
     const cached=paintOverV2Cache.get(cacheKey);
     if(cached) return JSON.parse(JSON.stringify(cached));
 
@@ -5380,23 +5384,29 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
       roi:amountForensics?.region || null,
     };
 
-    const genuinePaths=await listPaintOverV2Samples(bank,'genuine');
+    // Never calibrate a PDF target against Telegram JPG/PNG samples. Their
+    // rasterization/compression artifacts differ by modality and can erase a
+    // genuine local edit signal (as happened when PDF rawScore 91 became 0).
+    const genuinePaths=modality==='pdf'
+      ? sameFormatRefs.filter(p=>/\.pdf$/i.test(String(p)))
+      : await listPaintOverV2Samples(bank,'genuine');
     const genuineVectors=[];
     for(const samplePath of genuinePaths){
       const v=await extractPaintOverV2Vector(samplePath,null,bank);
       if(v) genuineVectors.push({path:samplePath,vector:v});
     }
 
-    console.log('PAINTOVER V2 GENUINE TELEGRAM BASELINE SAMPLES:', JSON.stringify({
+    console.log('PAINTOVER V2 SAME-MODALITY GENUINE BASELINE SAMPLES:', JSON.stringify({
       bank: normalizeBank(bank),
+      targetModality: modality,
       sampleCount: genuineVectors.length,
       samples: genuineVectors.map(x => ({ file: path.basename(x.path), path: x.path, rawScore: x.vector.rawScore }))
     }));
     const baselineScores=genuineVectors.map(x=>x.vector.rawScore);
     // A single clean reference is not a usable calibration set: its dynamic
-    // amount and PDF/raster renderer can themselves be local outliers. Require
-    // at least three independent genuine raster samples before turning this
-    // raw local residual detector into a calibrated score.
+    // amount and renderer can themselves be local outliers. Require at least
+    // three independent genuine samples of the same modality before turning
+    // this raw local residual detector into a calibrated score.
     const baselineAvailable=baselineScores.length>=3;
     const baselineCalibrationQuality = genuineVectors.length >= 3 ? 'multi-sample' : genuineVectors.length === 2 ? 'insufficient-two-sample' : genuineVectors.length === 1 ? 'insufficient-single-sample' : 'unavailable';
     const baselineMedian=robustMedian(baselineScores);
@@ -5404,16 +5414,16 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
     const baselineP90=baselineScores.length?baselineScores.slice().sort((a,b)=>a-b)[Math.min(baselineScores.length-1,Math.ceil(baselineScores.length*.90)-1)]:0;
     const baselinePercentile=baselineScores.length?percentileRank(target.rawScore,baselineScores):0;
 
-    // A genuine Telegram baseline is a subtraction/calibration layer, not a
-    // second risk score. A target at or below the genuine p90 receives no
-    // Telegram-adjusted PaintOver evidence.
+    // A genuine same-modality baseline is a calibration layer, not a second
+    // risk score. A target at or below the genuine p90 receives no adjusted
+    // PaintOver evidence.
     const telegramAdjusted=baselineAvailable
       ? clamp100(((target.rawScore-Math.max(baselineP90,baselineMedian+2*baselineMad))/Math.max(1,100-Math.max(baselineP90,baselineMedian+2*baselineMad)))*100)
       : null;
 
-    const negPaths=Array.isArray(negativeSamples)&&negativeSamples.length
+    const negPaths=modality==='pdf' ? [] : (Array.isArray(negativeSamples)&&negativeSamples.length
       ? negativeSamples.map(x=>typeof x==='string'?x:x.path).filter(Boolean).slice(0,12)
-      : await listPaintOverV2Samples(bank,'negative');
+      : await listPaintOverV2Samples(bank,'negative'));
     const negativeVectors=[];
     for(const samplePath of negPaths){
       const v=await extractPaintOverV2Vector(samplePath,null,bank);
@@ -5501,7 +5511,9 @@ async function runPaintOverForensicsV2(targetPath, amountForensics=null, bank=nu
         amountForensics:{score:Math.round(amountScore),strong:amountStrong,usedAsFixedSupport:false}
       },
       evidence: !baselineAvailable
-        ? 'Paint-Over ham sinyali hesaplandı ancak en az üç gerçek referans görüntüsüyle kalibre edilemedi; adli skor ve risk katkısı üretilmedi.'
+        ? modality==='pdf'
+          ? 'PDF Paint-Over ham sinyali yalnızca PDF referanslarıyla kalibre edilir. En az üç aynı-format örneği bulunmadığından JPG/PNG baseline kullanılmadı; skor ve risk katkısı üretilmedi.'
+          : 'Paint-Over ham sinyali hesaplandı ancak en az üç gerçek referans görüntüsüyle kalibre edilemedi; adli skor ve risk katkısı üretilmedi.'
         : strong
         ? 'Telegram baseline kalibrasyonundan sonra lokal Paint-Over sinyali yüksek kaldı ve bağımsız desteklerle güçlendi.'
         : moderate
@@ -19193,7 +19205,9 @@ if ((type === "image" || type === "pdf") && bank && reference) {
       forensicTargetPath,
       amountForensics,
       bank,
-      paintOverV2NegativeSamples
+      paintOverV2NegativeSamples,
+      trustedReferencePaths,
+      type === 'pdf' ? 'pdf' : 'raster'
     );
     console.log("PAINT-OVER FORENSICS V2 CALIBRATED:", JSON.stringify(paintOverForensicsV2));
   } catch (error) {
