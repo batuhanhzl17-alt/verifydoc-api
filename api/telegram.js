@@ -2369,12 +2369,9 @@ async function sendAnalysisResult(
      '',
    ].join('\n');
    const detailedVideoText = [
-     String(summary).trim().slice(0, 1800),
-     '',
-     `Zaman kapsamı: ${coverage}`,
-     '',
-     'Bu rapor otomatik ön incelemedir. Görüntü veya ses değişim adayları tek başına kesme, ekleme ya da sahtecilik kanıtı değildir; kamera, uygulama, ortam ve mikrofon değişimleri de benzer sinyaller üretebilir.',
-     'AI ön taraması yalnızca örneklenen görüntü karelerini değerlendirir; aday bulunmaması AI üretimini veya düzenlemeyi dışlamaz.',
+     String(summary).trim()
+       .replace(/\s*Kareler arasında tutar, tarih, açıklama ve ekran öğelerinde sonradan ekleme[\s\S]*$/iu, '')
+       .slice(0, 1800),
    ].filter(Boolean).join('\n');
    const fullVideoText = `${visibleVideoText}\n\n📖 AYRINTILI AÇIKLAMA\n\n${detailedVideoText}`;
    const chunks = [];
