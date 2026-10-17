@@ -3086,6 +3086,7 @@ async function loadReferenceFile(bank, targetOCR = null, targetFormat = null) {
 // V63 ZIRAAT/VARIANT FIX: Her analiz isteği kendi referans varyantını baştan seçsin.
 // Önceki isteğin activeReferenceVariant değeri yeni isteğin adaylarını filtrelemesin.
 activeReferenceVariant = null;
+activeSelectedReferencePath = null;
 if (targetFormat) activeReferenceFormat = normalizeReferenceFormat(targetFormat);
 const normalizedBank = normalizeBank(bank);
 if (!normalizedBank) {
@@ -3185,6 +3186,7 @@ if (!selectedPath) {
 
 selectedVariant = await readReferenceVariant(selectedPath);
 activeReferenceVariant = selectedVariant || detectedVariant || null;
+activeSelectedReferencePath = selectedPath;
 
 // If a target variant was detected and we found trusted same-variant raster
 // references, carry only those paths forward. This prevents Yapı Kredi FAST
@@ -5518,7 +5520,8 @@ async function runV68Forensics(targetPath, amountForensics=null, bank=null, refe
   if(!targetPath) return null;
   try {
     const stat=await fs.stat(targetPath);
-    const cacheKey=`v68:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}`;
+    const referenceKey=(referencePaths||[]).map(p=>path.basename(p)).join(',');
+    const cacheKey=`v68:${path.resolve(targetPath)}:${stat.size}:${stat.mtimeMs}:${bank||''}:${referenceKey}`;
     const cached=advancedForensicsCache.get(cacheKey); if(cached) return JSON.parse(JSON.stringify(cached));
     const encoded=await fs.readFile(targetPath);
     const meta=await sharp(encoded).metadata();
@@ -5552,7 +5555,10 @@ async function runV68Forensics(targetPath, amountForensics=null, bank=null, refe
       try {
         const anchor=await getReferenceAmountAnchor(bank);
         const refPath=referencePaths[0];
-        const rb=await fs.readFile(refPath);
+        // Reference inputs can be PDFs. Rasterize the selected reference page
+        // with PDF.js before asking Sharp to decode it; Sharp does not read PDF.
+        const loadedReference=await pfLoadVisualBuffer(refPath,anchor?.pageNumber||1);
+        const rb=loadedReference.buffer;
         const rm=await sharp(rb).metadata();
         if(anchor && rm.width && rm.height){
           const rr={x1:Math.round(anchor.xNorm*W),y1:Math.round(anchor.yNorm*H),x2:Math.round((anchor.xNorm+anchor.widthNorm)*W),y2:Math.round((anchor.yNorm+anchor.heightNorm)*H)};
@@ -5560,7 +5566,9 @@ async function runV68Forensics(targetPath, amountForensics=null, bank=null, refe
           const tf=v68ChannelFeatures(rgbRaw,W,H,amountRoi), rf=v68ChannelFeatures(refRaw,W,H,rr);
           const lumaDelta=Math.abs(tf.luma.mean-rf.luma.mean)/255;
           const chromaDelta=(Math.abs(tf.chroma.rgMean-rf.chroma.rgMean)+Math.abs(tf.chroma.gbMean-rf.chroma.gbMean))/256;
-          referenceTone={available:true,lumaDelta:Number(lumaDelta.toFixed(4)),chromaDelta:Number(chromaDelta.toFixed(4)),score:Math.round(v68Clamp(lumaDelta*120+chromaDelta*100)),referenceFile:path.basename(refPath)};
+          referenceTone={available:true,lumaDelta:Number(lumaDelta.toFixed(4)),chromaDelta:Number(chromaDelta.toFixed(4)),score:Math.round(v68Clamp(lumaDelta*120+chromaDelta*100)),referenceFile:path.basename(refPath),referenceSourceType:loadedReference.sourceType};
+        } else {
+          referenceTone={available:false,reason:anchor?'reference-image-dimensions-unavailable':'trusted-reference-amount-anchor-unavailable',referenceFile:path.basename(refPath)};
         }
       } catch(error){ referenceTone={available:false,error:error?.message||String(error)}; }
     }
@@ -7946,7 +7954,8 @@ async function getReferenceAmountAnchor(bank) {
   const targetBoxKey = targetBox
     ? `${Number(targetBox.x).toFixed(4)},${Number(targetBox.y).toFixed(4)},${Number(targetBox.width).toFixed(4)},${Number(targetBox.height).toFixed(4)}`
     : 'no-target-box';
-  const cacheKey = `amount-anchor:v19:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}:${targetVariant || 'unknown'}:${targetBoxKey}`;
+  const selectedReferenceKey = activeSelectedReferencePath ? path.basename(activeSelectedReferencePath) : 'unselected';
+  const cacheKey = `amount-anchor:v20:${normalizedBank}:${normalizeReferenceFormat(activeReferenceFormat) || 'auto'}:${targetVariant || 'unknown'}:${selectedReferenceKey}:${targetBoxKey}`;
   if (referenceAmountAnchorCache.has(cacheKey)) return referenceAmountAnchorCache.get(cacheKey);
 
   const moneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)?\s*[-+]?\d{1,3}(?:[. ]\d{3})*(?:[,.]\d{1,2})?\s*(?:TL|TRY|₺|EUR|USD|GBP)?/i;
@@ -7971,6 +7980,14 @@ async function getReferenceAmountAnchor(bank) {
       .filter(p => pdfReferenceMode
         ? /\.pdf$/i.test(String(p || ''))
         : /\.(?:jpe?g|png|webp)$/i.test(String(p || '')));
+    if (activeSelectedReferencePath && referencePaths.includes(activeSelectedReferencePath)) {
+      referencePaths = [activeSelectedReferencePath];
+      console.log('REFERENCE AMOUNT ANCHOR EXACT SELECTED REFERENCE:', JSON.stringify({
+        referenceFile: path.basename(activeSelectedReferencePath),
+        targetVariant,
+        targetBoxAvailable: Boolean(targetBox),
+      }));
+    }
     if (!referencePaths.length) {
       referenceAmountAnchorCache.set(cacheKey, null);
       return null;
@@ -8546,6 +8563,12 @@ function referenceFieldRuleForText(text) {
   // matcher so labels such as İŞLEM TARİHİ are not silently lost.
   const label = rfLabelPart(String(text || ""));
   const value = normalizeFieldTextForMatch(label);
+  // Enpara's table header may arrive as one OCR/PDF line containing both
+  // "Açıklama" and "B/A Para Cinsi Tutar". Prefer the explicit amount-column
+  // label so that the header cannot be registered as an explanation field.
+  if (/\bB\s*\/?\s*A\s+PARA\s+CINSI\s+TUTAR\b/.test(value)) {
+    return REFERENCE_FIELD_RULES.find(rule => rule.key === 'amount') || null;
+  }
   if (recipientNameLabel(text)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'recipientName') || null;
   if (recipientIbanLabel(label)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'recipientIban') || null;
   if (senderIbanLabel(label)) return REFERENCE_FIELD_RULES.find(rule => rule.key === 'senderIban') || null;
@@ -12049,6 +12072,10 @@ function synchronizeReferenceForensicDecision(forensic) {
 // Aynı banka farklı dekont ailelerine sahipse, hedef belgenin işlem ailesine
 // uygun referansı seçeriz. Tutar/isim/IBAN gibi dinamik değerler seçimde kullanılmaz.
 let activeReferenceVariant = null;
+// Anchor extraction follows the exact reference selected for this request.
+// Sibling references can share a transaction family while placing the amount
+// in nearby but distinct boxes, which otherwise creates false ambiguity.
+let activeSelectedReferencePath = null;
 // Target PDF's validated amount box is used to select the closest native
 // reference layout; it prevents averaging unrelated PDF variants together.
 let activeTargetPdfAmountBox = null;
@@ -12734,6 +12761,10 @@ function normalizeFieldTextForMatch(text) {
 function isAdministrativeLabelText(text) {
   const t = normalizeFieldTextForMatch(text);
   if (!t) return true;
+  if (/\bB\s*\/?\s*A\s+PARA\s+CINSI\s+TUTAR\b/.test(t)) return true;
+  // A participant bank line is not an individual recipient name, even when
+  // OCR joins the label and the bank's legal name into one text region.
+  if (/(?:^|\s)KATILIMCI(?:\s|:|$)/.test(t)) return true;
 
   const labelOnly = [
     "BELGE TARIHI", "ISLEM TARIHI", "ISLEM TARTHI", "TARIH", "SAAT", "TIME",
