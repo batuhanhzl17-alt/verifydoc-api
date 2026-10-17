@@ -22840,16 +22840,19 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
     });
   }
 
-  // 5) Strong field placement is concrete even when no local pixel crop is
-  // available. Sorgu Numarası gibi fields can be located from their OCR label.
-  // KUVEYT TÜRK: after the bank-specific global-Y normalization, a raw
-  // positionScore alone is not enough to expose a user-facing field-position
-  // finding. Require the engine's own consensus decision for this bank only.
-  const normalizedReportBank = normalizeBank(bank);
-  const kuveytTurkPositionGate = normalizedReportBank === 'kuveytturk';
+  // 5) A raw position score is not enough to claim that a field moved.
+  // Require both the forensic engine's consensus decision and a localized
+  // target box, so the user can see exactly which target field was compared.
+  // This also prevents weak/missing OCR associations from becoming red boxes.
   for (const f of (Array.isArray(forensic?.fields) ? forensic.fields : [])) {
     if (Number(f?.positionScore || 0) < 70) continue;
-    if (kuveytTurkPositionGate && f?.suspicious !== true) continue;
+    if (f?.suspicious !== true) continue;
+    const targetBox = f?.targetValueRegion || f?.targetBox || null;
+    const boxX = Number(targetBox?.x1 ?? targetBox?.x);
+    const boxY = Number(targetBox?.y1 ?? targetBox?.y);
+    const boxRight = Number(targetBox?.x2 ?? (boxX + Number(targetBox?.width)));
+    const boxBottom = Number(targetBox?.y2 ?? (boxY + Number(targetBox?.height)));
+    if (![boxX, boxY, boxRight, boxBottom].every(Number.isFinite) || boxRight <= boxX || boxBottom <= boxY) continue;
     const field = String(f?.field || '').replace(/:value$/i,'');
     if (!field) continue;
     const title = fieldName(field);
@@ -22862,7 +22865,7 @@ function buildHumanReadableReferenceForensicReport(forensic, layout = null, loca
       detail: 'Bu alanın referansa göre dikey konumu belirgin şekilde farklı.',
       kind: 'field-position',
       evidenceField: field,
-      targetBox: null
+      targetBox
     });
   }
 
