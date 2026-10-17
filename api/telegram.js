@@ -2373,13 +2373,8 @@ async function sendAnalysisResult(
      '',
      `Zaman kapsamı: ${coverage}`,
      '',
-     'Ayrıntılı ses taraması:',
-     audioReviewLine,
-     ...speechContinuityDetails,
-     '',
-     'Ani geçiş adayı tek başına kesme veya sahtecilik kanıtı değildir. Kamera hareketi ya da uygulama ekranı değişimi de benzer sinyal üretebilir.',
-     'AI/görüntü ön taraması sesi incelemez. Ses pencerelerindeki seviye, frekans, gürültü dokusu ve kısa konuşma sonrası seviye kuyruğu değişimleri düzenleme kanıtı değildir; doğal konuşma, konuşmacı, ortam, mikrofon veya miks değişimleri benzer izler oluşturabilir. Yankı kuyruğu ölçümü yalnızca kaba bir göstergedir. Konuşma içeriği veya konuşmacı kimliği analiz edilmez; ses bulguları risk skorunu etkilemez.',
-     'C2PA/Content Credentials imzası bu sürümde doğrulanmaz. Aday bulunmaması düzenleme olmadığını kanıtlamaz; sonuç videonun tek başına otomatik ön incelemesidir.',
+     'Bu rapor otomatik ön incelemedir. Görüntü veya ses değişim adayları tek başına kesme, ekleme ya da sahtecilik kanıtı değildir; kamera, uygulama, ortam ve mikrofon değişimleri de benzer sinyaller üretebilir.',
+     'AI ön taraması yalnızca örneklenen görüntü karelerini değerlendirir; aday bulunmaması AI üretimini veya düzenlemeyi dışlamaz.',
    ].filter(Boolean).join('\n');
    const fullVideoText = `${visibleVideoText}\n\n📖 AYRINTILI AÇIKLAMA\n\n${detailedVideoText}`;
    const chunks = [];
