@@ -147,6 +147,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
   const trace = { typedLabelCandidates: 0, multilineJoinAttempts: 0, checksumValidValues: 0 };
   for (const row of rows) {
     for (const label of labelSpans(row, field)) {
+      let usedAmountHeaderNextRow = false;
       trace.typedLabelCandidates++;
       const labelRight = Math.max(...label.items.map(item => item.x + item.width));
       const labelLeft = Math.min(...label.items.map(item => item.x));
@@ -158,6 +159,35 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       );
       let valueItems = sameRow;
       let valueText = sameRow.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
+
+      // Enpara receipts place the "B/A Para Cinsi Tutar" heading on the
+      // table-header row, while the transaction amount sits directly below it.
+      // Associate only a unique, amount-shaped text item in the next lower row
+      // and within the header's column; never guess when multiple values fit.
+      if (field === 'amount' && !validValue(field, valueText)) {
+        const labelHeight = Math.max(1, ...label.items.map(item => item.height));
+        const belowRows = rows
+          .filter(candidate => candidate !== row && candidate.baseline > row.baseline + 1 &&
+            candidate.baseline - row.baseline <= Math.max(20, labelHeight * 4.5))
+          .sort((a, b) => a.baseline - b.baseline);
+        const nextRow = belowRows[0];
+        if (nextRow) {
+          const labelLeft = Math.min(...label.items.map(item => item.x));
+          const labelRight = Math.max(...label.items.map(item => item.x + item.width));
+          const columnRight = labelRight + Math.max(30, (labelRight - labelLeft) * 0.75);
+          const amountCandidates = nextRow.items.filter(item =>
+            item.x < columnRight && item.x + item.width > labelLeft && validValue(field, item.text)
+          );
+          const distinctAmounts = new Map(amountCandidates.map(item => [
+            String(item.text).replace(/[^0-9,.-]/g, ''), item
+          ]));
+          if (distinctAmounts.size === 1) {
+            valueItems = [distinctAmounts.values().next().value];
+            valueText = valueItems[0].text;
+            usedAmountHeaderNextRow = true;
+          }
+        }
+      }
 
       // PDF text can split a long IBAN into neighboring lines. Only collect
       // TR-prefixed fragments in the narrow horizontal band to the right of
@@ -258,7 +288,9 @@ function resolveField(field, rows, pageWidth, pageHeight) {
         valueBox,
         resolver: field === 'recipientIBAN'
           ? 'pdf-text-layer-typed-label-coordinate-v2-top-down-iban-join'
-          : 'pdf-text-layer-typed-label-coordinate-v1',
+          : usedAmountHeaderNextRow
+            ? 'pdf-text-layer-typed-amount-header-next-row-column-v1'
+            : 'pdf-text-layer-typed-label-coordinate-v1',
         validation: field === 'recipientIBAN' ? 'TR-IBAN-checksum' : field === 'amount' ? 'typed-amount-format' : 'typed-name-shape',
         associationValidated: true,
         ...(field === 'recipientIBAN' ? { associationTrace: trace } : {}),
