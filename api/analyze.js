@@ -7056,12 +7056,12 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         ], { maxBuffer: 2 * 1024 * 1024, timeout: 90000 });
         const pcm = await fs.readFile(pcmPath);
         const sampleRate = 16000;
-        boundaryAudit = analyzeAudioBoundaryChanges(pcm, sampleRate);
         try {
           speechActivityAudit = await analyzeSpeechActivity(pcm);
         } catch (vadError) {
           speechActivityAudit = { available: false, speechSegmentCount: null, segments: [], reason: String(vadError?.message || vadError).slice(0, 240), affectsRiskScore: false };
         }
+        boundaryAudit = analyzeAudioBoundaryChanges(pcm, sampleRate, speechActivityAudit.segments);
         const samplesPerWindow = 8000; // 0.50 seconds at 16 kHz
         const alpha = Math.exp((-2 * Math.PI * 700) / sampleRate);
         const features = [];
