@@ -15,6 +15,7 @@ import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./mult
 import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
+import { analyzePdfStructure } from "./pdf_structure_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -17877,6 +17878,7 @@ filePath
 // Telegram filename or client-supplied MIME type.
 const pdfHeader = buffer.subarray(0, Math.min(buffer.length, 1024)).toString('latin1');
 const isPdfUpload = /%PDF-\d\.\d/.test(pdfHeader);
+let pdfStructureForensics = null;
 if (!isPdfUpload && (type !== "video" || !String(mime).toLowerCase().startsWith("video/"))) {
   console.warn('NON-PDF UPLOAD REJECTED:', JSON.stringify({ fileName, mime: uploadedFile.mimetype || null }));
   return res.status(415).json({
@@ -17934,6 +17936,19 @@ data: new Uint8Array(buffer),
 }).promise;
 
 pdfNativeFieldAssociation = await extractPdfNativeFieldAssociations(pdf);
+try {
+  pdfStructureForensics = await analyzePdfStructure({ pdf, buffer, pdfjsLib });
+  console.log('PDF STRUCTURE FORENSICS NODE:', JSON.stringify({
+    available: pdfStructureForensics.available,
+    engine: pdfStructureForensics.engine || null,
+    fileBytes: pdfStructureForensics.fileBytes || null,
+    pageCount: pdfStructureForensics.pageCount || null,
+    normalizedOperatorCounts: pdfStructureForensics.normalizedOperatorCounts || null,
+  }));
+} catch (error) {
+  pdfStructureForensics = { available: false, status: 'analysis-error', error: String(error?.message || error).slice(0, 240) };
+  console.warn('PDF STRUCTURE FORENSICS NODE ERROR:', pdfStructureForensics.error);
+}
 const targetNativeAmount = pdfNativeFieldAssociation?.fields?.amount;
 if (targetNativeAmount?.status === 'matched' && targetNativeAmount?.associationValidated && targetNativeAmount?.valueBox) {
   const box = targetNativeAmount.valueBox;
@@ -20445,6 +20460,10 @@ result =
 parseAIResponse(
 response.output_text
 );
+
+if (pdfStructureForensics) {
+  result.pdfStructureForensics = pdfStructureForensics;
+}
 
 // Semantic fusion is evidence-only: it records agreement or disagreement
 // between the visual reader, PaddleOCR, and the primary extraction. No value
