@@ -1423,6 +1423,53 @@ return paddleOCRClient;
 
 }
 
+// PaddleOCR-VL-1.6 is used as a second, diagnostic document reader.
+// Its output is logged for comparison and does not affect risk scoring.
+async function runPaddleOCRVL16(filePath) {
+  const client = getPaddleOCRClient();
+  if (!client || !filePath) {
+    return { available: false, reason: !filePath ? "missing-file" : "missing-client" };
+  }
+
+  try {
+    const result = await client.parseDocument({
+      filePath,
+      model: Model.PaddleOCRVL16,
+      options: {
+        useLayoutDetection: true,
+        temperature: 0,
+        prettifyMarkdown: false,
+      },
+    });
+
+    const pages = Array.isArray(result?.pages) ? result.pages : [];
+    const pageTexts = pages.map((page) => String(page?.markdownText || "").trim());
+    const text = pageTexts.filter(Boolean).join("\n\n");
+    const amountCandidates = [...new Set(
+      (text.match(/(?:₺\s*)?\d{1,3}(?:[., ]\d{3})*(?:[.,]\d{2})\s*(?:TL|TRY|₺)|\d+(?:[.,]\d{2})\s*(?:TL|TRY|₺)/giu) || [])
+        .map((value) => value.replace(/\s+/g, " ").trim())
+    )].slice(0, 40);
+
+    return {
+      available: true,
+      success: Boolean(text),
+      model: "PaddleOCR-VL-1.6",
+      jobId: result?.jobId || null,
+      pageCount: pages.length,
+      characterCount: text.length,
+      amountCandidates,
+      text: text.slice(0, 12000),
+    };
+  } catch (error) {
+    return {
+      available: true,
+      success: false,
+      model: "PaddleOCR-VL-1.6",
+      error: String(error?.message || error).slice(0, 1000),
+    };
+  }
+}
+
 // =====================================================
 // PADDLEOCR OCR
 // =====================================================
@@ -20127,6 +20174,29 @@ console.log(
 // -------------------------------------------------
 // DETERMINISTIK TUTAR FORENSICS CONTEXT
 // -------------------------------------------------
+// PaddleOCR-VL-1.6 ikinci OCR/layout okuyucusu olarak yalnızca PDF'lerde
+// çalışır. İlk aşamada sonucu karşılaştırma loguna yazar; mevcut analizi,
+// risk puanını veya Telegram kararını değiştirmez.
+if (
+  type === "pdf" &&
+  process.env.PADDLEOCR_ACCESS_TOKEN
+) {
+  const paddleOcrVlResult = await runPaddleOCRVL16(filePath);
+  console.log(
+    "PADDLEOCR VL 1.6 DIAGNOSTIC:",
+    JSON.stringify({
+      available: paddleOcrVlResult.available,
+      success: paddleOcrVlResult.success,
+      model: paddleOcrVlResult.model,
+      jobId: paddleOcrVlResult.jobId || null,
+      pageCount: paddleOcrVlResult.pageCount || 0,
+      characterCount: paddleOcrVlResult.characterCount || 0,
+      amountCandidates: paddleOcrVlResult.amountCandidates || [],
+      error: paddleOcrVlResult.error || null,
+    })
+  );
+}
+
 if (
 amountForensics
 ) {
