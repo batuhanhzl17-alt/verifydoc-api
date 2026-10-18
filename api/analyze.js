@@ -20606,7 +20606,7 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
   // PDF share one canonical family. Never choose arbitrarily among families.
   const catalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
     .map(font => font?.family || fontFamily(font?.fontName))
-    .map(value => clean(value))
+    .map(value => String(value ?? '').trim())
     .filter(Boolean))];
   const uniqueCatalogFamily = catalogFamilies.length === 1 ? catalogFamilies[0] : null;
   const matched = [];
@@ -20657,7 +20657,7 @@ if (fontForensics) {
   );
   const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
     const families = [...new Set((profile?.fonts || [])
-      .map(font => clean(font?.family || fontFamily(font?.fontName)))
+      .map(font => String(font?.family || fontFamily(font?.fontName) || '').trim())
       .filter(Boolean))];
     return {
       referenceFile: profile.fileName,
