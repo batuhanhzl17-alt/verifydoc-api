@@ -2080,8 +2080,11 @@ function formatPdfStructureForensics(triage) {
   if (Number.isFinite(Number(triage.fileBytes))) {
     lines.push(`• PDF boyutu: ${Number(triage.fileBytes).toLocaleString('tr-TR')} bayt · ${triage.pageCount || '?'} sayfa`);
   }
-  lines.push(`• PDF.js metin çizim işlemleri: ${counts.textShow ?? 0} · görsel işlemleri: ${counts.imagePaint ?? 0} · vektör yolları: ${counts.vectorPath ?? 0}`);
-  lines.push('• PDF.js işlem sayıları Tj/TJ ham komutlarının birebir sayımı değildir; nesne sayıları tek başına düzenleme veya sahtecilik kanıtı olmaz.');
+  lines.push(`• Metin komutları: Tj ${counts.textTj ?? 0} · TJ ${counts.textTJ ?? 0} · toplam ${counts.textShow ?? 0}`);
+  const quoteOps = (counts.nextLineShowText ?? 0) + (counts.nextLineSetSpacingShowText ?? 0);
+  if (quoteOps) lines.push(`• Kısaltılmış satır/metin komutları: ${quoteOps} (Tj/TJ sayımına dahil değil)`);
+  lines.push(`• Görsel işlemleri: ${counts.imagePaint ?? 0} · vektör yolları: ${counts.vectorPath ?? 0}`);
+  lines.push('• Sayımlar PDF.js’in ayrıştırdığı sayfa işlemleridir; tek başına düzenleme veya sahtecilik kanıtı olmaz.');
   return lines.join('\n');
 }
 
