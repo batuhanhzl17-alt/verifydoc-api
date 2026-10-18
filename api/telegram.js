@@ -2109,11 +2109,23 @@ function formatFontForensicsWarning(fontForensics) {
    return 'belirlenemedi';
  };
  lines.push(`• Hedef (${targetAmountFont.amount || 'tutar'}): ${formatAmountFont(targetAmountFont)}`);
- if (amountTypography.referenceFile) {
+ const referenceFontComparisons = Array.isArray(amountTypography.referenceFontComparisons)
+   ? amountTypography.referenceFontComparisons
+   : [];
+ if (referenceFontComparisons.length) {
+   const comparisons = referenceFontComparisons.map(item => {
+     const family = item.family || 'font ailesi belirlenemedi';
+     const result = item.matchesTargetFamily === true ? 'eşleşiyor' : item.matchesTargetFamily === false ? 'farklı' : 'karşılaştırılamadı';
+     return `${item.referenceFile}: ${family} (${result})`;
+   });
+   lines.push(`• Referans şablonları: ${comparisons.join('; ')}`);
+ } else if (amountTypography.referenceFile) {
    lines.push(`• Referans (${amountTypography.referenceFile}): ${formatAmountFont(referenceAmountFont)}`);
  }
- if (targetAmountFont.status === 'resolved' && referenceAmountFont.status === 'resolved' && targetAmountFont.family !== referenceAmountFont.family) {
-   lines.push('• Tutar font ailesi referanstan farklı; bu tek başına düzenleme veya sahtecilik kanıtı değildir.');
+ const hasResolvedReference = referenceFontComparisons.some(item => item.status === 'resolved-from-single-family-pdf');
+ const hasFamilyMatch = referenceFontComparisons.some(item => item.matchesTargetFamily === true);
+ if (targetAmountFont.status === 'resolved' && hasResolvedReference && !hasFamilyMatch) {
+   lines.push('• Tutar font ailesi mevcut referans şablonlarla eşleşmedi; bu tek başına düzenleme veya sahtecilik kanıtı değildir.');
  }
  const score = Number(f.score) || 0;
  if (score < 18) return amountTypography.target ? lines.join('\n') : '';
