@@ -20587,6 +20587,70 @@ if (visualForensics) {
 if (layoutForensics) {
   result.layoutForensics = layoutForensics;
 }
+function normalizeAmountForFontMatch(value) {
+  const text = String(value || '').replace(/\b(?:TL|TRY)\b|₺/gi, '').replace(/\s+/g, '');
+  const match = text.match(/[-+]?\d[\d.,]*/);
+  if (!match) return null;
+  let normalized = match[0];
+  if (normalized.includes(',') && normalized.includes('.')) normalized = normalized.replace(/\./g, '').replace(',', '.');
+  else if (normalized.includes(',')) normalized = normalized.replace(',', '.');
+  else if ((normalized.match(/\./g) || []).length > 1) normalized = normalized.replace(/\./g, '');
+  const number = Number(normalized);
+  return Number.isFinite(number) ? number.toFixed(2) : null;
+}
+
+function summarizeAmountFont(usages, amountValue) {
+  const normalizedAmount = normalizeAmountForFontMatch(amountValue);
+  if (!normalizedAmount || !Array.isArray(usages)) return { status: 'unavailable' };
+  const matched = [];
+  for (const usage of usages) {
+    for (const box of usage?.boxes || []) {
+      if (normalizeAmountForFontMatch(box?.text) !== normalizedAmount) continue;
+      const candidates = [
+        ...(Array.isArray(usage.resolvedFontNames) ? usage.resolvedFontNames : []),
+        usage.resolvedFamily,
+        usage.family,
+        usage.fontName,
+      ].filter(value => value && !/^g_d\d+_f\d+$/i.test(String(value)));
+      const heights = (usage.boxes || [])
+        .filter(item => normalizeAmountForFontMatch(item?.text) === normalizedAmount)
+        .map(item => Number(item.height)).filter(value => Number.isFinite(value) && value > 0);
+      matched.push({
+        family: candidates[0] || null,
+        style: usage.resolvedStyle || usage.style || 'unknown',
+        fontSizePtEstimate: heights.length ? Number((heights.reduce((sum, value) => sum + value, 0) / heights.length).toFixed(2)) : null,
+        pageNumber: Number(box.pageNumber) || null,
+        matchedText: String(box.text || '').slice(0, 80),
+      });
+    }
+  }
+  const unique = [...new Map(matched.map(item => [`${item.family || 'unknown'}|${item.style}|${item.pageNumber}|${item.matchedText}`, item])).values()];
+  if (!unique.length) return { status: 'amount-font-not-matched', amount: String(amountValue || '') };
+  if (unique.length > 1) return { status: 'ambiguous', amount: String(amountValue || ''), candidates: unique.slice(0, 6) };
+  return { status: unique[0].family ? 'resolved' : 'family-unresolved', amount: String(amountValue || ''), ...unique[0] };
+}
+
+if (fontForensics) {
+  const targetAmountFont = summarizeAmountFont(
+    fontForensics.targetActiveFontUsages,
+    pdfNativeFieldAssociation?.fields?.amount?.value,
+  );
+  const selectedReferenceFontProfile = (fontForensics.referenceFontProfiles || []).find(profile =>
+    profile.fileName === path.basename(reference?.path || '')
+  ) || null;
+  const referenceAmountFont = summarizeAmountFont(
+    selectedReferenceFontProfile?.activeFontUsages,
+    pdfReferenceFieldAssociation?.fields?.amount?.value,
+  );
+  fontForensics.amountTypography = {
+    target: targetAmountFont,
+    reference: referenceAmountFont,
+    referenceFile: selectedReferenceFontProfile?.fileName || null,
+    note: 'Punto tahmini metin kutusu yüksekliğinden gelir; PDF’nin gerçek font-size değeriyle her belgede birebir aynı olmayabilir. Font farkı tek başına sahtecilik kanıtı değildir.',
+  };
+  console.log('AMOUNT FONT PROFILE:', JSON.stringify(fontForensics.amountTypography));
+}
+
 if (fontForensics) {
   result.fontForensics = fontForensics;
   console.log("FONT FORENSICS RESULT ATTACHED:", JSON.stringify({
