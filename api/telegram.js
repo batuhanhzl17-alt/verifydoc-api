@@ -2071,6 +2071,21 @@ function formatHistoricalWarning(historicalMatch) {
 }
 
 // =====================================================
+// PDF STRUCTURE TRIAGE — EVIDENCE ONLY
+// =====================================================
+function formatPdfStructureForensics(triage) {
+  if (triage?.available !== true) return '';
+  const counts = triage.normalizedOperatorCounts || {};
+  const lines = ['\n🧪 PDF YAPISAL TARAMA (Node.js)'];
+  if (Number.isFinite(Number(triage.fileBytes))) {
+    lines.push(`• PDF boyutu: ${Number(triage.fileBytes).toLocaleString('tr-TR')} bayt · ${triage.pageCount || '?'} sayfa`);
+  }
+  lines.push(`• PDF.js metin çizim işlemleri: ${counts.textShow ?? 0} · görsel işlemleri: ${counts.imagePaint ?? 0} · vektör yolları: ${counts.vectorPath ?? 0}`);
+  lines.push('• PDF.js işlem sayıları Tj/TJ ham komutlarının birebir sayımı değildir; nesne sayıları tek başına düzenleme veya sahtecilik kanıtı olmaz.');
+  return lines.join('\n');
+}
+
+// =====================================================
 // FONT FORENSICS UYARISI
 // =====================================================
 function formatFontForensicsWarning(fontForensics) {
@@ -2630,7 +2645,7 @@ ${manualReviewRequired ? '\nRisk seviyesi ile kontrol durumu farklı ölçümler
 
 ━━━━━━━━━━━━━━
 
-${summaryGeneral}${criticalReferenceFindings.length || fallbackCriticalReferenceLines.length ? `\n\n🔎 KRİTİK ALAN REFERANS KONTROLÜ\n${criticalReferenceFindings.length ? criticalReferenceFindings.map(item => `• ${item.title}: ${item.detail}`).join('\n') : fallbackCriticalReferenceLines.join('\n')}` : ''}${comparisonWarning}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
+${summaryGeneral}${criticalReferenceFindings.length || fallbackCriticalReferenceLines.length ? `\n\n🔎 KRİTİK ALAN REFERANS KONTROLÜ\n${criticalReferenceFindings.length ? criticalReferenceFindings.map(item => `• ${item.title}: ${item.detail}`).join('\n') : fallbackCriticalReferenceLines.join('\n')}` : ''}${comparisonWarning}${formatPdfStructureForensics(result?.pdfStructureForensics)}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
 
 ━━━━━━━━━━━━━━
 
