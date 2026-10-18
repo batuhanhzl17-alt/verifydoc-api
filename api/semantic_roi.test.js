@@ -75,4 +75,3 @@ test('recipient IBAN resolver joins a line-wrapped Turkish IBAN and returns the 
   assert.equal(resolved.region.y2, 40);
 });
 
-
