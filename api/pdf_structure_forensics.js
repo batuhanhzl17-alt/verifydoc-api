@@ -10,9 +10,9 @@ const OPS_GROUPS = {
 };
 
 /**
- * Collect normalized PDF.js structural observations. PDF.js may normalize
- * source Tj/TJ tokens into showText/showSpacedText operators, so these are
- * semantic operation counts, not literal raw-token counts.
+ * Collect PDF.js structural observations. PDF.js maps Tj and TJ to distinct
+ * showText and showSpacedText operators. The quote shorthand operators are
+ * reported separately because they are not Tj/TJ.
  */
 export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DEFAULT_MAX_PAGES }) {
   if (!pdf || !buffer?.length || !pdfjsLib?.OPS) {
@@ -21,7 +21,17 @@ export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DE
 
   const inspectedCount = Math.min(Number(pdf.numPages) || 0, maxPages);
   const opNameById = new Map(Object.entries(pdfjsLib.OPS).map(([name, id]) => [id, name]));
-  const totals = { textShow: 0, imagePaint: 0, vectorPath: 0, operatorCount: 0, annotationCount: 0 };
+  const totals = {
+    textShow: 0,
+    textTj: 0,
+    textTJ: 0,
+    nextLineShowText: 0,
+    nextLineSetSpacingShowText: 0,
+    imagePaint: 0,
+    vectorPath: 0,
+    operatorCount: 0,
+    annotationCount: 0,
+  };
   const pages = [];
   const fontNames = new Set();
 
@@ -32,18 +42,34 @@ export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DE
       page.getOperatorList(),
       page.getAnnotations({ intent: 'display' }).catch(() => []),
     ]);
-    const counts = { textShow: 0, imagePaint: 0, vectorPath: 0, operatorCount: operators.fnArray.length };
+    const counts = {
+      textShow: 0,
+      textTj: 0,
+      textTJ: 0,
+      nextLineShowText: 0,
+      nextLineSetSpacingShowText: 0,
+      imagePaint: 0,
+      vectorPath: 0,
+      operatorCount: operators.fnArray.length,
+    };
     for (const item of text.items || []) {
       if (item.fontName) fontNames.add(String(item.fontName));
     }
     for (const fn of operators.fnArray || []) {
       const name = opNameById.get(fn);
       if (!name) continue;
-      if (OPS_GROUPS.textShow.includes(name)) counts.textShow++;
+      if (name === 'showText') { counts.textShow++; counts.textTj++; }
+      if (name === 'showSpacedText') { counts.textShow++; counts.textTJ++; }
+      if (name === 'nextLineShowText') counts.nextLineShowText++;
+      if (name === 'nextLineSetSpacingShowText') counts.nextLineSetSpacingShowText++;
       if (OPS_GROUPS.imagePaint.includes(name)) counts.imagePaint++;
       if (OPS_GROUPS.vectorPath.includes(name)) counts.vectorPath++;
     }
     totals.textShow += counts.textShow;
+    totals.textTj += counts.textTj;
+    totals.textTJ += counts.textTJ;
+    totals.nextLineShowText += counts.nextLineShowText;
+    totals.nextLineSetSpacingShowText += counts.nextLineSetSpacingShowText;
     totals.imagePaint += counts.imagePaint;
     totals.vectorPath += counts.vectorPath;
     totals.operatorCount += counts.operatorCount;
@@ -65,7 +91,9 @@ export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DE
     pdfJsFontResourceNames: [...fontNames].slice(0, 80),
     pageDetails: pages,
     notes: [
-      'showText/showSpacedText are normalized PDF.js operations and are not literal Tj/TJ token counts.',
+      'PDF.js maps Tj to showText and TJ to showSpacedText; counts are reported separately.',
+      'The single-quote and double-quote text-show shorthand operators are counted separately and are not included in Tj/TJ.',
+      'Counts are from PDF.js parsed page operator lists, not a byte-level search of compressed content streams.',
       'Counts describe PDF structure; different export software can produce different structures without tampering.',
       'This inventory is a review aid and does not decide authenticity or affect risk scoring.',
     ],
