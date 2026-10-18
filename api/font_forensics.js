@@ -522,7 +522,10 @@ function extractPdfUsedFontNamesFromBuffer(buffer) {
     }
     const direct = obj.dictionary.match(/\/Font\s*<<([\s\S]*?)>>/i);
     if (direct) {
-      for (const m of direct[1].matchAll(/\/(F\w+)\s+(\d+)\s+(\d+)\s+R/g)) maps.push([m[1], `${m[2]} ${m[3]}`]);
+      // PDF resource names are not required to use the conventional F1/F2
+      // spelling. Some PDFs use names such as /g_d38_f1, which PDF.js may
+      // expose as its text-item fontName as well.
+      for (const m of direct[1].matchAll(/\/([A-Za-z][A-Za-z0-9._-]*)\s+(\d+)\s+(\d+)\s+R/g)) maps.push([m[1], `${m[2]} ${m[3]}`]);
     }
     if (maps.length) resourceFontMaps.push({ object: obj.key, maps: new Map(maps) });
   }
@@ -960,35 +963,34 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     }))
     .sort((a,b) => b.charCount - a.charCount);
 
-  // Bridge PDF.js internal names such as g_d3_f3 to the actual PDF resource
-  // selected by Tf (F3) when the document exposes that resource mapping.
-  // The suffix is intentionally used only as a conservative bridge: it must
-  // match an actually selected F<number> resource, otherwise no inference is
-  // made. This turns the raw usage into a canonical family without changing
-  // the forensic score.
+  // Resolve PDF.js text-item font ids (e.g. g_d38_f1) against the actual
+  // resource names selected by Tf. Prefer an exact resource-name match; retain
+  // the F<number> suffix bridge for PDFs where PDF.js rewrites the resource id.
   const resourceDetails = Array.isArray(usedFontGraph.resourceFontDetails)
     ? usedFontGraph.resourceFontDetails
     : [];
   const selectedResourceMap = new Map();
   for (const d of resourceDetails) {
     const rn = clean(d?.resourceName);
-    if (!rn || !/^F\d+$/i.test(rn)) continue;
+    if (!rn) continue;
     const names = [...new Set((d?.fontNames || []).map(normalizeFontName).filter(Boolean))];
     if (!names.length) continue;
-    selectedResourceMap.set(rn.toUpperCase(), {
+    const resource = {
       resourceName: rn,
       fontRef: d?.fontRef || null,
       fontNames: names,
       family: fontFamily(names[0]),
       style: fontStyle(names[0]),
-    });
+    };
+    selectedResourceMap.set(rn.toUpperCase(), resource);
+    const suffix = rn.match(/(?:^|_)F?(\d+)$/i);
+    if (suffix && /^F\d+$/i.test(rn)) selectedResourceMap.set(`F${suffix[1]}`, resource);
   }
 
   for (const usage of activeFontUsages) {
     const raw = clean(usage.rawFontName || usage.fontName);
     const m = raw.match(/_f(\d+)$/i);
-    if (!m) continue;
-    const resource = selectedResourceMap.get(`F${m[1]}`);
+    const resource = selectedResourceMap.get(raw.toUpperCase()) || (m ? selectedResourceMap.get(`F${m[1]}`) : null);
     if (!resource) continue;
     usage.pdfResourceName = resource.resourceName;
     usage.pdfFontRef = resource.fontRef;
