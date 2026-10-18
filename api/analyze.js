@@ -8,7 +8,7 @@ import { promisify } from "util"
 import ffmpegPath from "ffmpeg-static"
 import sharp from "sharp"
 import { runVisualForensics } from "./visual_forensics.js";
-import { analyzeFontForensics } from "./font_forensics.js";
+import { analyzeFontForensics, fontFamily, normalizeFontName } from "./font_forensics.js";
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
@@ -20599,9 +20599,16 @@ function normalizeAmountForFontMatch(value) {
   return Number.isFinite(number) ? number.toFixed(2) : null;
 }
 
-function summarizeAmountFont(usages, amountValue) {
+function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
   const normalizedAmount = normalizeAmountForFontMatch(amountValue);
   if (!normalizedAmount || !Array.isArray(usages)) return { status: 'unavailable' };
+  // Resolve a PDF.js-generated font alias only when all active fonts in that
+  // PDF share one canonical family. Never choose arbitrarily among families.
+  const catalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
+    .map(font => font?.family || fontFamily(font?.fontName))
+    .map(value => clean(value))
+    .filter(Boolean))];
+  const uniqueCatalogFamily = catalogFamilies.length === 1 ? catalogFamilies[0] : null;
   const matched = [];
   for (const usage of usages) {
     for (const box of usage?.boxes || []) {
@@ -20612,11 +20619,15 @@ function summarizeAmountFont(usages, amountValue) {
         usage.family,
         usage.fontName,
       ].filter(value => value && !/^g_d\d+_f\d+$/i.test(String(value)));
+      const canonicalFamily = candidates.length
+        ? (fontFamily(candidates[0]) || candidates[0])
+        : uniqueCatalogFamily;
       const heights = (usage.boxes || [])
         .filter(item => normalizeAmountForFontMatch(item?.text) === normalizedAmount)
         .map(item => Number(item.height)).filter(value => Number.isFinite(value) && value > 0);
       matched.push({
-        family: candidates[0] || null,
+        family: canonicalFamily || null,
+        familyResolution: candidates.length ? 'text-font-resource' : (uniqueCatalogFamily ? 'single-active-family-catalog' : 'unresolved'),
         style: usage.resolvedStyle || usage.style || 'unknown',
         fontSizePtEstimate: heights.length ? Number((heights.reduce((sum, value) => sum + value, 0) / heights.length).toFixed(2)) : null,
         pageNumber: Number(box.pageNumber) || null,
@@ -20634,6 +20645,7 @@ if (fontForensics) {
   const targetAmountFont = summarizeAmountFont(
     fontForensics.targetActiveFontUsages,
     pdfNativeFieldAssociation?.fields?.amount?.value,
+    fontForensics.targetFonts,
   );
   const selectedReferenceFontProfile = (fontForensics.referenceFontProfiles || []).find(profile =>
     profile.fileName === path.basename(reference?.path || '')
@@ -20641,11 +20653,31 @@ if (fontForensics) {
   const referenceAmountFont = summarizeAmountFont(
     selectedReferenceFontProfile?.activeFontUsages,
     pdfReferenceFieldAssociation?.fields?.amount?.value,
+    selectedReferenceFontProfile?.fonts,
   );
+  const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
+    const families = [...new Set((profile?.fonts || [])
+      .map(font => clean(font?.family || fontFamily(font?.fontName)))
+      .filter(Boolean))];
+    return {
+      referenceFile: profile.fileName,
+      family: families.length === 1 ? families[0] : null,
+      status: families.length === 1 ? 'resolved-from-single-family-pdf' : (families.length ? 'multiple-families' : 'unresolved'),
+    };
+  });
+  const referenceFontComparisons = targetAmountFont.status === 'resolved'
+    ? referenceAmountFonts.map(profile => ({
+        ...profile,
+        matchesTargetFamily: profile.status === 'resolved-from-single-family-pdf'
+          ? normalizeFontName(profile.family) === normalizeFontName(targetAmountFont.family)
+          : null,
+      }))
+    : referenceAmountFonts.map(profile => ({ ...profile, matchesTargetFamily: null }));
   fontForensics.amountTypography = {
     target: targetAmountFont,
     reference: referenceAmountFont,
     referenceFile: selectedReferenceFontProfile?.fileName || null,
+    referenceFontComparisons,
     note: 'Punto tahmini metin kutusu yüksekliğinden gelir; PDF’nin gerçek font-size değeriyle her belgede birebir aynı olmayabilir. Font farkı tek başına sahtecilik kanıtı değildir.',
   };
   console.log('AMOUNT FONT PROFILE:', JSON.stringify(fontForensics.amountTypography));
