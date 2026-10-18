@@ -2094,15 +2094,36 @@ function formatPdfStructureForensics(triage) {
 function formatFontForensicsWarning(fontForensics) {
  const f = fontForensics || {};
  if (f.available !== true) return '';
+ const amountTypography = f.amountTypography || {};
+ const targetAmountFont = amountTypography.target || {};
+ const referenceAmountFont = amountTypography.reference || {};
+ const lines = ['\n🅰️ TUTAR FONT BİLGİSİ'];
+ const formatAmountFont = (item) => {
+   if (item.status === 'resolved') {
+     const style = item.style && item.style !== 'unknown' ? `, ${item.style}` : '';
+     const size = item.fontSizePtEstimate != null && Number.isFinite(Number(item.fontSizePtEstimate)) ? `, yaklaşık ${Number(item.fontSizePtEstimate).toLocaleString('tr-TR')} pt` : '';
+     return `${item.family}${style}${size}`;
+   }
+   if (item.status === 'family-unresolved') return 'PDF font kaynağı bulundu; aile adı çözülemedi';
+   if (item.status === 'ambiguous') return 'birden fazla font adayı bulundu';
+   return 'belirlenemedi';
+ };
+ lines.push(`• Hedef (${targetAmountFont.amount || 'tutar'}): ${formatAmountFont(targetAmountFont)}`);
+ if (amountTypography.referenceFile) {
+   lines.push(`• Referans (${amountTypography.referenceFile}): ${formatAmountFont(referenceAmountFont)}`);
+ }
+ if (targetAmountFont.status === 'resolved' && referenceAmountFont.status === 'resolved' && targetAmountFont.family !== referenceAmountFont.family) {
+   lines.push('• Tutar font ailesi referanstan farklı; bu tek başına düzenleme veya sahtecilik kanıtı değildir.');
+ }
  const score = Number(f.score) || 0;
- if (score < 18) return '';
+ if (score < 18) return amountTypography.target ? lines.join('\n') : '';
  const targetOnly = Array.isArray(f.targetOnlyFamiliesAcrossReferences)
    ? f.targetOnlyFamiliesAcrossReferences.filter(Boolean).slice(0, 5)
    : [];
  const fieldMismatches = Array.isArray(f.comparisons?.[0]?.comparison?.fieldMismatches)
    ? f.comparisons[0].comparison.fieldMismatches.slice(0, 4)
    : [];
- const lines = ['\n🅰️ FONT ANALİZİ'];
+ lines.push('\n🅰️ GENEL FONT KARŞILAŞTIRMASI');
  if (targetOnly.length) {
    lines.push(`• Referanslarda bulunmayan hedef font: ${targetOnly.join(', ')}`);
  }
