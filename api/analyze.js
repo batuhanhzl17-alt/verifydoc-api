@@ -8213,6 +8213,10 @@ async function getReferenceAmountAnchor(bank) {
     let nativePdfReferenceCount = 0;
     for (const referencePath of referencePaths) {
       try {
+        let ocr = null;
+        let rendered = null;
+        let ocrAlreadyLoaded = false;
+        let rasterReferencePageNumber = 1;
         if (/\.pdf$/i.test(String(referencePath || ''))) {
           const pdfBuffer = await fs.readFile(referencePath);
           const pdf = await getPdfDocument({ data: new Uint8Array(pdfBuffer) }).promise;
@@ -8235,6 +8239,7 @@ async function getReferenceAmountAnchor(bank) {
               labelText: amount.labelText || null,
               valueBoxNorm: box,
             }));
+            continue;
           } else {
             console.warn('PDF NATIVE REFERENCE AMOUNT BOX UNAVAILABLE:', JSON.stringify({
               referenceFile: path.basename(referencePath),
@@ -8242,25 +8247,77 @@ async function getReferenceAmountAnchor(bank) {
               reason: amount?.reason || 'typed-amount-label-not-found',
             }));
           }
-          continue;
-        }
-        const stat = await fs.stat(referencePath);
-        const ocrKey = `ref-image-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
-        let cached = referenceRasterOcrCache.get(ocrKey);
-        let ocr = cached?.ocr || cached || null;
-        let rendered = cached?.rendered || null;
 
-        if (!cached) {
-          const buffer = await fs.readFile(referencePath);
-          const meta = await sharp(buffer).metadata();
-          rendered = { width: Number(meta?.width) || 0, height: Number(meta?.height) || 0 };
-          if (rendered.width && rendered.height) {
-            const tempPath = path.join('/tmp', `verifydoc-anchor-${createHash('sha256').update(ocrKey).digest('hex').slice(0,16)}${path.extname(referencePath).toLowerCase()}`);
-            await fs.writeFile(tempPath, buffer);
-            ocr = await runPaddleOCR(tempPath);
-            try { await fs.unlink(tempPath); } catch {}
+          // Some bank reference PDFs are vectorized or have labels that the
+          // native text-layer resolver cannot associate. Do not stop here:
+          // render the trusted reference PDF and use the same positioned OCR
+          // anchor path as image references. This is geometry only; it never
+          // supplies transaction data or treats OCR text as verified values.
+          const pageNumber = Number(amount?.pageNumber) || 1;
+          rasterReferencePageNumber = pageNumber;
+          const stat = await fs.stat(referencePath);
+          const renderKey = `ref-pdf-amount-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}:${pageNumber}`;
+          let cached = referenceRasterOcrCache.get(renderKey);
+          ocr = cached?.ocr || cached || null;
+          rendered = cached?.rendered || null;
+          if (!cached) {
+            const pageRender = await renderPdfPagePng(pdf, pageNumber, 2);
+            if (pageRender?.buffer && pageRender.width && pageRender.height) {
+              rendered = { width: pageRender.width, height: pageRender.height };
+              const tempPath = path.join('/tmp', `verifydoc-anchor-${createHash('sha256').update(renderKey).digest('hex').slice(0,16)}.png`);
+              try {
+                await fs.writeFile(tempPath, pageRender.buffer);
+                ocr = await runPaddleOCR(tempPath);
+              } finally {
+                try { await fs.unlink(tempPath); } catch {}
+              }
+            }
+            referenceRasterOcrCache.set(renderKey, { ocr: ocr || null, rendered });
           }
-          referenceRasterOcrCache.set(ocrKey, { ocr: ocr || null, rendered });
+          ocrAlreadyLoaded = true;
+          const width = Number(rendered?.width) || 0;
+          const height = Number(rendered?.height) || 0;
+          const regions = Array.isArray(ocr?.regions)
+            ? ocr.regions.filter(x => x?.region && String(x.text || '').trim()).map(x => ({
+                text: String(x.text || '').trim(),
+                region: {
+                  x1: Number(x.region.x1) || 0, y1: Number(x.region.y1) || 0,
+                  x2: Number(x.region.x2) || 0, y2: Number(x.region.y2) || 0,
+                }
+              }))
+            : [];
+          if (!width || !height || !regions.length) {
+            console.warn('PDF REFERENCE RASTER AMOUNT OCR UNAVAILABLE:', JSON.stringify({
+              referenceFile: path.basename(referencePath), pageNumber,
+              rendered: Boolean(width && height), ocrAvailable: Boolean(ocr?.success),
+              regionCount: regions.length,
+            }));
+            continue;
+          }
+          console.log('PDF REFERENCE RASTER AMOUNT OCR READY:', JSON.stringify({
+            referenceFile: path.basename(referencePath), pageNumber,
+            width, height, regionCount: regions.length,
+          }));
+        }
+        if (!ocrAlreadyLoaded) {
+          const stat = await fs.stat(referencePath);
+          const ocrKey = `ref-image-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
+          const cached = referenceRasterOcrCache.get(ocrKey);
+          ocr = cached?.ocr || cached || null;
+          rendered = cached?.rendered || null;
+
+          if (!cached) {
+            const buffer = await fs.readFile(referencePath);
+            const meta = await sharp(buffer).metadata();
+            rendered = { width: Number(meta?.width) || 0, height: Number(meta?.height) || 0 };
+            if (rendered.width && rendered.height) {
+              const tempPath = path.join('/tmp', `verifydoc-anchor-${createHash('sha256').update(ocrKey).digest('hex').slice(0,16)}${path.extname(referencePath).toLowerCase()}`);
+              await fs.writeFile(tempPath, buffer);
+              ocr = await runPaddleOCR(tempPath);
+              try { await fs.unlink(tempPath); } catch {}
+            }
+            referenceRasterOcrCache.set(ocrKey, { ocr: ocr || null, rendered });
+          }
         }
 
         const width = Number(rendered?.width) || 0;
@@ -8561,7 +8618,22 @@ async function getReferenceAmountAnchor(bank) {
           widthNorm: Math.max(0.001, (r.x2-r.x1) / width),
           heightNorm: Math.max(0.001, (r.y2-r.y1) / height),
           referenceFile: path.basename(referencePath),
+          pageNumber: rasterReferencePageNumber,
         });
+        if (ocrAlreadyLoaded) {
+          console.log('PDF REFERENCE RASTER AMOUNT BOX:', JSON.stringify({
+            referenceFile: path.basename(referencePath),
+            pageNumber: rasterReferencePageNumber,
+            label: best.candidate.text === '__RASTER_AMOUNT_BOX__' ? best.label || null : null,
+            valueBoxNorm: {
+              x: r.x1 / width,
+              y: r.y1 / height,
+              width: Math.max(0.001, (r.x2-r.x1) / width),
+              height: Math.max(0.001, (r.y2-r.y1) / height),
+            },
+            source: best.source || 'paddle-ocr-label-value-geometry',
+          }));
+        }
       } catch (error) {
         console.warn('REFERENCE AMOUNT ANCHOR DOSYA HATASI:', path.basename(referencePath), error?.message || error);
       }
