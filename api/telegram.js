@@ -635,6 +635,14 @@ function determineDocumentType(
 
  }
 
+ if (
+ mime === "text/html" ||
+ mime === "application/xhtml+xml" ||
+ /\.(?:html?|xhtml)$/i.test(name)
+ ) {
+  return "html";
+ }
+
 
  if (
  mime.startsWith(
@@ -2077,15 +2085,8 @@ function formatPdfStructureForensics(triage) {
   if (triage?.available !== true) return '';
   const counts = triage.normalizedOperatorCounts || {};
   const lines = ['\n🧪 PDF YAPISAL TARAMA (Node.js)'];
-  const producer = triage.metadata?.producer || 'Belirtilmemiş';
-  const pdfVersion = triage.pdfVersion || 'Belirtilmemiş';
-  lines.push(`• PDF sürümü: ${pdfVersion} · Üretici: ${producer}`);
   if (Number.isFinite(Number(triage.fileBytes))) {
     lines.push(`• PDF boyutu: ${Number(triage.fileBytes).toLocaleString('tr-TR')} bayt · ${triage.pageCount || '?'} sayfa`);
-  }
-  if (triage.sizeComparison?.materiallySmaller) {
-    const referenceBytes = Number(triage.sizeComparison.referenceBytes).toLocaleString('tr-TR');
-    lines.push(`• Dosya boyutu, seçilen PDF referansından belirgin ölçüde düşük (${referenceBytes} bayt; ${triage.sizeComparison.referenceFile}). Yeniden dışa aktarma veya sıkıştırma da bu farkı oluşturabilir; tek başına düzenleme kanıtı değildir.`);
   }
   lines.push(`• Metin komutları: Tj ${counts.textTj ?? 0} · TJ ${counts.textTJ ?? 0} · toplam ${counts.textShow ?? 0}`);
   const quoteOps = (counts.nextLineShowText ?? 0) + (counts.nextLineSetSpacingShowText ?? 0);
@@ -2104,7 +2105,7 @@ function formatFontForensicsWarning(fontForensics) {
  const amountTypography = f.amountTypography || {};
  const targetAmountFont = amountTypography.target || {};
  const referenceAmountFont = amountTypography.reference || {};
- const amountLines = [];
+ const lines = ['\n🅰️ TUTAR FONT BİLGİSİ'];
  const formatAmountFont = (item) => {
    if (item.status === 'resolved') {
      const style = item.style && item.style !== 'unknown' ? `, ${item.style}` : '';
@@ -2115,6 +2116,7 @@ function formatFontForensicsWarning(fontForensics) {
    if (item.status === 'ambiguous') return 'birden fazla font adayı bulundu';
    return 'belirlenemedi';
  };
+ lines.push(`• Hedef (${targetAmountFont.amount || 'tutar'}): ${formatAmountFont(targetAmountFont)}`);
  const referenceFontComparisons = Array.isArray(amountTypography.referenceFontComparisons)
    ? amountTypography.referenceFontComparisons
    : [];
@@ -2124,22 +2126,17 @@ function formatFontForensicsWarning(fontForensics) {
      const result = item.matchesTargetFamily === true ? 'eşleşiyor' : item.matchesTargetFamily === false ? 'farklı' : 'karşılaştırılamadı';
      return `${item.referenceFile}: ${family} (${result})`;
    });
-   amountLines.push(`• Referans şablonları: ${comparisons.join('; ')}`);
+   lines.push(`• Referans şablonları: ${comparisons.join('; ')}`);
  } else if (amountTypography.referenceFile) {
-   amountLines.push(`• Referans (${amountTypography.referenceFile}): ${formatAmountFont(referenceAmountFont)}`);
+   lines.push(`• Referans (${amountTypography.referenceFile}): ${formatAmountFont(referenceAmountFont)}`);
  }
  const hasResolvedReference = referenceFontComparisons.some(item => item.status === 'resolved-from-single-family-pdf');
  const hasFamilyMatch = referenceFontComparisons.some(item => item.matchesTargetFamily === true);
- const amountFontMismatch = targetAmountFont.status === 'resolved' && hasResolvedReference && !hasFamilyMatch;
- let lines = [];
- if (amountFontMismatch) {
-   lines = ['\n🅰️ TUTAR FONT UYUMSUZLUĞU'];
-   lines.push(`• Hedef (${targetAmountFont.amount || 'tutar'}): ${formatAmountFont(targetAmountFont)}`);
-   lines.push(...amountLines);
-   lines.push('• Bu fark manuel inceleme gerektirir; tek başına düzenleme veya sahtecilik kanıtı değildir.');
+ if (targetAmountFont.status === 'resolved' && hasResolvedReference && !hasFamilyMatch) {
+   lines.push('• Tutar font ailesi mevcut referans şablonlarla eşleşmedi; bu tek başına düzenleme veya sahtecilik kanıtı değildir.');
  }
  const score = Number(f.score) || 0;
- if (score < 18) return lines.length ? lines.join('\n') : '';
+ if (score < 18) return amountTypography.target ? lines.join('\n') : '';
  const targetOnly = Array.isArray(f.targetOnlyFamiliesAcrossReferences)
    ? f.targetOnlyFamiliesAcrossReferences.filter(Boolean).slice(0, 5)
    : [];
@@ -2173,6 +2170,25 @@ async function sendAnalysisResult(
  statementMode
 ) {
 
+ if (result?.type === 'html') {
+  const html = result?.htmlForensics || {};
+  const visible = html.visibleFields || {};
+  const lines = [
+   '📄 HTML DEKONT ÖN İNCELEMESİ',
+   '',
+   result?.summary || 'HTML yapısal incelemesi tamamlandı.',
+   '',
+   `• Dosya: ${html.fileBytes ? `${Number(html.fileBytes).toLocaleString('tr-TR')} bayt` : 'boyut bilgisi yok'}`,
+  ];
+  if (visible.recognizedFieldLabels?.length) lines.push(`• Tanınan alan etiketleri: ${visible.recognizedFieldLabels.join(', ')}`);
+  if (visible.amountCandidates?.length) lines.push(`• Görünür tutar adayları: ${visible.amountCandidates.slice(0, 5).join(', ')}`);
+  if (visible.ibanCandidates?.length) lines.push(`• IBAN adayları: ${visible.ibanCandidates.slice(0, 3).join(', ')}`);
+  for (const item of (html.findings || []).slice(0, 4)) lines.push(`• ${item.detail}`);
+  lines.push('', 'Bu statik tarama HTML/JavaScript’i çalıştırmaz ve tarayıcıda oluşan görünümü doğrulamaz. Bulgular tek başına sahtecilik kanıtı değildir.');
+  await sendMessage(chatId, lines.join('\n'), replyToMessageId);
+  return;
+ }
+
  const score =
  Number(
  result?.score
@@ -2187,6 +2203,11 @@ async function sendAnalysisResult(
  hasConfidence
    ? Math.max(0, Math.min(100, Math.round(Number(result.confidence))))
    : null;
+
+
+ const riskLabel =
+ result?.riskLabel ||
+ "UNKNOWN";
 
 
  const summary =
@@ -2589,6 +2610,8 @@ async function sendAnalysisResult(
    '',
    `${result?.bank ? `Banka: ${getBankDisplayName(result.bank)}\n` : ''}Risk Skoru: ${score}/100`,
    '',
+   'Risk Seviyesi:',
+   riskLabel,
    '',
    confidenceLine,
    '',
@@ -2677,8 +2700,11 @@ async function sendAnalysisResult(
 
 ${reviewHeadline}
 
+Risk Seviyesi:
+${riskLabel}
+
 ${confidenceLine}
-${manualReviewRequired ? '\nKritik alanlardaki belirsizlik veya karşılaştırma gerektiren bulgular nedeniyle manuel kontrol önerilir.\n' : ''}
+${manualReviewRequired ? '\nRisk seviyesi ile kontrol durumu farklı ölçümlerdir. Kritik alanlarda belirsizlik veya karşılaştırma gerektiren bulgu olduğu için manuel kontrol gerekiyor.\n' : ''}
 
 ━━━━━━━━━━━━━━
 
