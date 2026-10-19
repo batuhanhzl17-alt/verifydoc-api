@@ -6,7 +6,6 @@ import {
   hasTurkishIbanShape,
   normalizeTurkishIban,
 } from './semantic_roi.js';
-import { matchesPdfFieldLabel } from './pdf_field_association.js';
 
 const FIELD_SCHEMA = {
   type: 'object',
@@ -112,7 +111,6 @@ function fieldLabel(field, text) {
   const raw = String(text || '').trim();
   const prefix = raw.split(/[:：]/, 1)[0].trim();
   const compact = prefix.toLocaleUpperCase('tr-TR').replace(/[^A-ZÇĞİÖŞÜ]/g, '');
-  if (['recipientName', 'recipientIBAN', 'amount'].includes(field) && matchesPdfFieldLabel(field, prefix)) return true;
   if (field === 'recipientName') return Boolean(recipientNameLabel(prefix));
   if (field === 'recipientIBAN') return Boolean(recipientIbanLabel(prefix));
   if (field === 'amount') {
@@ -244,7 +242,7 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
   return { available: true, status: 'ok', model: response.model || model, evidence };
 }
 
-export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primaryDocumentData, pdfNativeFields = null, referencePdfFields = null }) {
+export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primaryDocumentData, pdfNativeFields = null }) {
   if (evidenceResult?.available !== true || !evidenceResult.evidence) {
     return { available: false, status: evidenceResult?.status || 'multimodal-unavailable', fields: {} };
   }
@@ -264,25 +262,44 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
     const primaryText = String(mappings[field].primary || '').trim();
     const pdfNative = pdfNativeFields?.fields?.[field] || null;
     const nativeMatched = pdfNative?.status === 'matched' && pdfNative?.associationValidated === true;
-    const comparisonValue = value ||
-      (nativeMatched ? String(pdfNative.value || '').trim() : '') ||
-      (ocr.status === 'matched' ? String(ocr.text || '').trim() : '');
+    const nativeOcrCorroboration = Boolean(
+      nativeMatched && ocr.status === 'matched' &&
+      normalize(pdfNative.value, field) === normalize(ocr.text, field)
+    );
+    // A coordinate-associated PDF text value and a separate OCR value from
+    // the rendered page form the strongest available visible-field consensus.
+    // Use that consensus as the comparison value so an isolated vision-model
+    // transcription error does not create a false source conflict.
+    const comparisonValue = nativeOcrCorroboration
+      ? String(pdfNative.value || '').trim()
+      : value ||
+        (nativeMatched ? String(pdfNative.value || '').trim() : '') ||
+        (ocr.status === 'matched' ? String(ocr.text || '').trim() : '');
     const comparisonKey = normalize(comparisonValue, field);
     const ocrAgreement = Boolean(comparisonKey && ocr.status === 'matched' && normalize(ocr.text, field) === comparisonKey);
     const primaryAgreement = Boolean(comparisonKey && primaryText && normalize(primaryText, field) === comparisonKey);
+    const visualAgreement = Boolean(comparisonKey && value && key === comparisonKey);
     const pdfNativeAgreement = Boolean(
       pdfNative?.status === 'matched' && pdfNative?.associationValidated === true &&
       primaryText && normalize(primaryText, field) === normalize(pdfNative.value, field)
     );
-    const availableReadings = [
-      value,
+    const nonVisualReadings = [
       ocr.status === 'matched' ? ocr.text : '',
       nativeMatched ? pdfNative.value : '',
       primaryText,
     ].map(item => normalize(item, field)).filter(Boolean);
-    const sourceDisagreement = new Set(availableReadings).size > 1;
+    const visualDisagreement = Boolean(value && comparisonKey && key !== comparisonKey);
+    // Preserve genuine disagreement among the field-associated OCR, PDF text,
+    // and primary extraction. Ignore only an isolated secondary visual-reader
+    // outlier when both the native label/value association and rendered OCR
+    // independently agree.
+    const sourceDisagreement = new Set(nonVisualReadings).size > 1 ||
+      (visualDisagreement && !nativeOcrCorroboration);
     fields[field] = {
       visualEvidence: visual,
+      visualEvidenceAgreement: value ? (visualAgreement ? 'agreement' : 'disagreement') : 'unavailable',
+      independentOcrCorroboration: nativeOcrCorroboration,
+      sourceOutlier: nativeOcrCorroboration && visualDisagreement ? 'secondary-visual-reader' : null,
       paddleOCRAgreement: ocr.status === 'matched'
         ? (ocrAgreement ? 'agreement' : comparisonKey ? 'disagreement' : 'unavailable')
         : 'unavailable',
@@ -296,9 +313,6 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
       // association. It does not silently turn a failed OCR/vision check into
       // a fully corroborated field; the final review remains conservative.
       pdfNativeAssociation: pdfNative,
-      referenceFieldStatus: referencePdfFields?.fields?.[field]?.referencePresence || referencePdfFields?.fields?.[field]?.status || null,
-      crossSourceConflict: pdfNative?.crossSourceConflict === true,
-      nativeAssociationAmbiguous: pdfNative?.status === 'ambiguous',
       pdfNativeAgreement: pdfNativeAgreement ? 'agreement' : pdfNative?.status === 'matched' && primaryText ? 'disagreement' : 'unavailable',
       primaryAnalysisAgreement: primaryAgreement ? 'agreement' : comparisonValue && primaryText ? 'disagreement' : 'unavailable',
       sourceDisagreement,
@@ -308,18 +322,14 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
   // The user's fraud checks focus on the beneficiary IBAN and transaction
   // amount. A name-resolution failure is retained as evidence, but it must
   // not block these two critical fields or dominate the review status.
-  const criticalFieldNames = referencePdfFields?.available
-    ? ['amount', ...(referencePdfFields.fields?.recipientIBAN?.referencePresence !== 'absent' ? ['recipientIBAN'] : [])]
-    : ['recipientIBAN', 'amount'];
-  const criticalFields = criticalFieldNames.map(field => fields[field]);
+  const criticalFields = ['recipientIBAN', 'amount'].map(field => fields[field]);
   const requiresControl = criticalFields.some(row =>
     !row?.associationValidated ||
     row.primaryAnalysisAgreement !== 'agreement' ||
     row.sourceDisagreement ||
-    row.crossSourceConflict ||
-    row.nativeAssociationAmbiguous ||
     (row.paddleOCRStatus === 'matched' && row.paddleOCRAgreement !== 'agreement') ||
     (row.visualEvidence?.text && row.pdfNativeAssociation?.status === 'matched' &&
+      !row.independentOcrCorroboration &&
       normalize(row.visualEvidence.text, row === fields.recipientIBAN ? 'recipientIBAN' : 'amount') !==
       normalize(row.pdfNativeAssociation.value, row === fields.recipientIBAN ? 'recipientIBAN' : 'amount'))
   );
