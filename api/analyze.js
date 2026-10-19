@@ -17908,6 +17908,9 @@ if (isHtmlUpload) {
     fileBytes: htmlForensics.fileBytes,
     structure: htmlForensics.structure,
     visibleFields: htmlForensics.visibleFields,
+    labeledAmountFields: htmlForensics.labeledAmountFields,
+    amountStyleProfiles: htmlForensics.amountStyleProfiles,
+    cssHiddenElementCount: htmlForensics.cssHiddenElementCount,
     findingCodes: htmlForensics.findings.map(item => item.code),
   }));
   return res.status(200).json({
