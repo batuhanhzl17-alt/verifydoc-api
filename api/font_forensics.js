@@ -49,6 +49,11 @@ function normalizeFontName(value) {
   s = s.replace(/#([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
   // PDF subset prefix: ABCDEF+FontName
   s = s.replace(/^[A-Z]{3,8}\+/i, "");
+  // Some PDF producers serialize style names as `Arial,Bold` or leave a
+  // trailing delimiter (`Arial,`). Canonicalize those to the actual family
+  // and style instead of exposing punctuation as part of the font name.
+  s = s.replace(/,(?=(?:Bold|Italic|Oblique|Regular|Roman|Medium|Light|Black|Semibold|DemiBold)\b)/i, "-");
+  s = s.replace(/[,;]+$/, "");
   s = s.replace(/\s+/g, "");
   if (!s || /^Identity(?:-H|-V)?$/i.test(s)) return null;
   return s;
@@ -925,20 +930,47 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
         }
 
         const tr = Array.isArray(item.transform) ? item.transform : [];
-        const x = Number(tr[4]);
-        const y = Number(tr[5]);
-        const width = Number(item.width) || 0;
-        const height = Math.abs(Number(tr[3])) || Number(item.height) || 0;
+        const component = (index, fallback = 0) => Number.isFinite(Number(tr[index])) ? Number(tr[index]) : fallback;
+        const a = component(0, 1), b = component(1), c = component(2), d = component(3, 1);
+        const e = component(4), f = component(5);
+        const rawWidth = Math.max(0, Number(item.width) || 0);
+        const rawHeight = Math.max(1, Number(item.height) || Math.hypot(c, d) || 8);
+        const xAxisLength = Math.hypot(a, b) || 1;
+        const yAxisLength = Math.hypot(c, d) || 1;
+        const xAxis = [a / xAxisLength, b / xAxisLength];
+        const yAxis = [c / yAxisLength, d / yAxisLength];
+        const view = Array.isArray(viewport.transform) ? viewport.transform.map(Number) : [1, 0, 0, 1, 0, 0];
+        const origin = [
+          view[0] * e + view[2] * f + view[4],
+          view[1] * e + view[3] * f + view[5],
+        ];
+        const widthVector = [
+          view[0] * xAxis[0] * rawWidth + view[2] * xAxis[1] * rawWidth,
+          view[1] * xAxis[0] * rawWidth + view[3] * xAxis[1] * rawWidth,
+        ];
+        const heightVector = [
+          view[0] * yAxis[0] * rawHeight + view[2] * yAxis[1] * rawHeight,
+          view[1] * yAxis[0] * rawHeight + view[3] * yAxis[1] * rawHeight,
+        ];
+        const corners = [[0, 0], widthVector, heightVector,
+          [widthVector[0] + heightVector[0], widthVector[1] + heightVector[1]]]
+          .map(([dx, dy]) => [origin[0] + dx, origin[1] + dy]);
+        const x = Math.min(...corners.map(point => point[0]));
+        const right = Math.max(...corners.map(point => point[0]));
+        const top = Math.min(...corners.map(point => point[1]));
+        const bottom = Math.max(...corners.map(point => point[1]));
+        const width = Math.max(0.1, right - x);
+        const height = Math.max(1, bottom - top);
         const row = {
           pageNumber,
           text,
           x: Number.isFinite(x) ? x : 0,
-          y: Number.isFinite(y) ? y : 0,
+          y: Number.isFinite(top) ? top : 0,
           width,
           height,
           boxNorm: {
             x: Number((Math.max(0, Number.isFinite(x) ? x : 0) / viewport.width).toFixed(6)),
-            y: Number((Math.max(0, viewport.height - (Number.isFinite(y) ? y : 0) - height) / viewport.height).toFixed(6)),
+            y: Number((Math.max(0, Number.isFinite(top) ? top : 0) / viewport.height).toFixed(6)),
             width: Number((Math.max(0.1, width) / viewport.width).toFixed(6)),
             height: Number((Math.max(1, height) / viewport.height).toFixed(6)),
           },
