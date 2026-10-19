@@ -17942,6 +17942,8 @@ try {
     available: pdfStructureForensics.available,
     engine: pdfStructureForensics.engine || null,
     fileBytes: pdfStructureForensics.fileBytes || null,
+    pdfVersion: pdfStructureForensics.pdfVersion || null,
+    producer: pdfStructureForensics.metadata?.producer || null,
     pageCount: pdfStructureForensics.pageCount || null,
     normalizedOperatorCounts: pdfStructureForensics.normalizedOperatorCounts || null,
   }));
@@ -18309,6 +18311,24 @@ let pdfReferenceFieldAssociation = null;
 
 if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR, activeReferenceFormat);
+}
+
+if (type === "pdf" && pdfStructureForensics?.available && reference?.path && path.extname(reference.path).toLowerCase() === ".pdf") {
+  try {
+    const referenceStat = await fs.stat(reference.path);
+    const targetBytes = Number(pdfStructureForensics.fileBytes) || buffer.length;
+    const referenceBytes = Number(referenceStat.size) || 0;
+    pdfStructureForensics.sizeComparison = {
+      referenceFile: path.basename(reference.path),
+      referenceBytes,
+      targetToReferenceRatio: referenceBytes > 0 ? Number((targetBytes / referenceBytes).toFixed(3)) : null,
+      materiallySmaller: referenceBytes > 0 && targetBytes <= referenceBytes * 0.5,
+      comparisonRule: "target-at-or-below-half-of-selected-same-format-reference",
+    };
+    console.log("PDF REFERENCE SIZE COMPARISON:", JSON.stringify(pdfStructureForensics.sizeComparison));
+  } catch (error) {
+    console.warn("PDF REFERENCE SIZE COMPARISON ERROR:", error?.message || error);
+  }
 }
 
 if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCase() === ".pdf") {
@@ -20606,7 +20626,7 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
   // PDF share one canonical family. Never choose arbitrarily among families.
   const catalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
     .map(font => font?.family || fontFamily(font?.fontName))
-    .map(value => clean(value))
+    .map(value => String(value ?? '').trim())
     .filter(Boolean))];
   const uniqueCatalogFamily = catalogFamilies.length === 1 ? catalogFamilies[0] : null;
   const matched = [];
@@ -20657,7 +20677,7 @@ if (fontForensics) {
   );
   const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
     const families = [...new Set((profile?.fonts || [])
-      .map(font => clean(font?.family || fontFamily(font?.fontName)))
+      .map(font => String(font?.family || fontFamily(font?.fontName) || '').trim())
       .filter(Boolean))];
     return {
       referenceFile: profile.fileName,
