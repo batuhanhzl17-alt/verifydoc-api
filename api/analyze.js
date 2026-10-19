@@ -6593,7 +6593,13 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       ...page.copyMove,
       decisionRole: 'diagnostic-only',
     }));
-    const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched');
+    const nativeTextPages = new Set(pageAudits
+      .filter(pageAudit => Number(pageAudit?.textItemCount) > 0)
+      .map(pageAudit => Number(pageAudit.pageNumber)));
+    const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched' &&
+      (azureLayout?.available === true || nativeTextPages.has(Number(item.pageNumber))));
+    const rasterOnlyUnverifiableRows = rowAssociationDiagnostics.filter(item => item.status !== 'matched' &&
+      azureLayout?.available !== true && !nativeTextPages.has(Number(item.pageNumber))).length;
     const azurePageNumbers = new Set((Array.isArray(azureLayout?.pages) ? azureLayout.pages : [])
       .map(page => Number(page?.pageNumber)).filter(Number.isInteger));
     const unresolvedPagesWithoutAzure = [...new Set(unresolvedRowAssociations
@@ -6627,6 +6633,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         inputRows: Array.isArray(statementRows) ? statementRows.length : 0,
         matchedRows: rowAssociationDiagnostics.filter(item => item.status === 'matched').length,
         unresolvedRows: rowAssociationDiagnostics.filter(item => item.status !== 'matched').length,
+        rasterOnlyUnverifiableRows,
         sourceCounts: {
           azureTable: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-table').length,
           azureLines: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-lines' || item.associationSource === 'azure-layout').length,
@@ -16756,6 +16763,7 @@ Kesin gerçek veya kesin sahte kararı verme.
 `;
 
 function statementCents(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? Math.round(number * 100) : null;
 }
@@ -17157,6 +17165,136 @@ throw new Error(
 }
 
 return result;
+}
+
+// Long, image-only account statements can yield a correct headline transaction
+// count but only a partial row array when all pages are sent in one request.
+// Re-read pages that OCR says contain transaction rows but the first pass
+// omitted, one page per request, so each table gets its own output budget.
+async function completeStatementRowsPageByPage(statementResult, pdfBuffer, pageCount, ocrResult) {
+  const transactionAnalysis = statementResult?.transactionAnalysis;
+  if (!transactionAnalysis || !Buffer.isBuffer(pdfBuffer) || !Number.isInteger(pageCount) || pageCount < 1) {
+    return statementResult;
+  }
+  const currentRows = Array.isArray(transactionAnalysis.rows) ? transactionAnalysis.rows : [];
+  const ocrRegions = Array.isArray(ocrResult?.regions) ? ocrResult.regions : [];
+  if (!ocrRegions.length) return statementResult;
+
+  const needsPagePass = [];
+  for (let pageNumber = 1; pageNumber <= pageCount; pageNumber++) {
+    const pageRegions = ocrRegions.filter(item => Number(item?.pageIndex) + 1 === pageNumber);
+    const pageRows = currentRows.filter(row => Number(row?.pageNumber) === pageNumber);
+    const dateRows = [];
+    for (const item of pageRegions) {
+      if (!/(?:^|\D)\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\D|$)/.test(String(item?.text || ''))) continue;
+      const y = Number(item?.region?.y1);
+      if (Number.isFinite(y) && dateRows.some(value => Math.abs(value - y) <= 8)) continue;
+      if (Number.isFinite(y)) dateRows.push(y);
+      else dateRows.push(dateRows.length);
+    }
+    const likelyRowCount = dateRows.length;
+    const pageHasTableOCR = pageRegions.length >= 15;
+    if ((likelyRowCount >= 4 && pageRows.length < likelyRowCount - 2) ||
+        (pageRows.length === 0 && pageHasTableOCR)) {
+      needsPagePass.push({ pageNumber, ocrRegionCount: pageRegions.length, dateAnchorCount: likelyRowCount, existingRowCount: pageRows.length });
+    }
+  }
+  if (!needsPagePass.length) return statementResult;
+
+  console.log('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA BAŞLADI:', JSON.stringify({
+    pageCount, missingPages: needsPagePass, existingRows: currentRows.length,
+  }));
+
+  const pageRowsByNumber = new Map();
+  for (const row of currentRows) {
+    const page = Number(row?.pageNumber);
+    if (!pageRowsByNumber.has(page)) pageRowsByNumber.set(page, []);
+    pageRowsByNumber.get(page).push(row);
+  }
+
+  const pageRowItemSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      pageNumber: { type: 'integer', minimum: 1 },
+      rowNumber: { type: 'integer', minimum: 1 },
+      date: { type: ['string', 'null'] },
+      description: { type: 'string' },
+      counterparty: { type: ['string', 'null'] },
+      debitAmount: { type: ['number', 'null'] },
+      creditAmount: { type: ['number', 'null'] },
+      balanceAfter: { type: ['number', 'null'] },
+      transactionId: { type: ['string', 'null'] },
+    },
+    required: ['pageNumber', 'rowNumber', 'date', 'description', 'counterparty', 'debitAmount', 'creditAmount', 'balanceAfter', 'transactionId'],
+  };
+
+  for (const target of needsPagePass) {
+    try {
+      const rendered = await renderPdfPagePng(pdfBuffer, target.pageNumber, 2);
+      if (!rendered?.buffer?.length) {
+        console.warn('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA ATLANDI:', JSON.stringify({ ...target, reason: 'page-render-failed' }));
+        continue;
+      }
+      const response = await openai.responses.create({
+        model: 'gpt-5.6-terra',
+        input: [{
+          role: 'user',
+          content: [
+            { type: 'input_text', text: `Bu, ${pageCount} sayfalı hesap hareketi belgesinin yalnızca ${target.pageNumber}. sayfasıdır. Bu sayfadaki TÜM görünür işlem satırlarını tek tek çıkar; tablo satırlarını atlama veya birleştirme. rowNumber sayfanın üstünden aşağıya işlem satırı sırasıdır, başlık/toplam satırlarını işlem sayma. Borç/Alacak yönünü sütun başlıklarına göre belirle. Okunamayan alanı null yap, rakam uydurma. pageNumber alanını ${target.pageNumber} ver. Bu sayfa için JSON satır sayısı kadar visibleTransactionCount döndür. OCR ön taramasında yaklaşık ${target.dateAnchorCount} tarih ankrajı görüldü; bu sayı yönlendiricidir, belgedeki görünür satırları esas al.` },
+            { type: 'input_image', image_url: `data:image/png;base64,${rendered.buffer.toString('base64')}`, detail: 'high' },
+          ],
+        }],
+        text: {
+          format: {
+            type: 'json_schema',
+            name: 'verifydoc_statement_page_rows',
+            strict: true,
+            schema: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                visibleTransactionCount: { type: 'integer', minimum: 0 },
+                rows: { type: 'array', maxItems: 250, items: pageRowItemSchema },
+              },
+              required: ['visibleTransactionCount', 'rows'],
+            },
+          },
+        },
+        max_output_tokens: 12000,
+      });
+      const pageResult = parseAIResponse(response?.output_text || '');
+      const extractedRows = Array.isArray(pageResult?.rows) ? pageResult.rows
+        .filter(row => Number.isInteger(Number(row?.rowNumber)) && Number(row?.rowNumber) > 0 &&
+          (statementCents(row?.debitAmount) !== null || statementCents(row?.creditAmount) !== null))
+        .map(row => ({ ...row, pageNumber: target.pageNumber }))
+        .sort((a, b) => Number(a.rowNumber) - Number(b.rowNumber)) : [];
+      const previousRows = pageRowsByNumber.get(target.pageNumber) || [];
+      if (extractedRows.length > previousRows.length) pageRowsByNumber.set(target.pageNumber, extractedRows);
+      console.log('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA SONUCU:', JSON.stringify({
+        pageNumber: target.pageNumber,
+        ocrDateAnchorCount: target.dateAnchorCount,
+        modelVisibleTransactionCount: Number(pageResult?.visibleTransactionCount) || 0,
+        extractedRowCount: extractedRows.length,
+        previousRowCount: previousRows.length,
+        accepted: extractedRows.length > previousRows.length,
+      }));
+    } catch (error) {
+      console.warn('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA HATASI:', JSON.stringify({
+        pageNumber: target.pageNumber, error: String(error?.message || error).slice(0, 240),
+      }));
+    }
+  }
+
+  const mergedRows = [...pageRowsByNumber.values()].flat()
+    .sort((a, b) => Number(a.pageNumber) - Number(b.pageNumber) || Number(a.rowNumber) - Number(b.rowNumber));
+  if (mergedRows.length > currentRows.length) {
+    transactionAnalysis.rows = mergedRows;
+    console.log('HESAP ÖZETİ SAYFA BAZLI SATIRLAR BİRLEŞTİRİLDİ:', JSON.stringify({
+      before: currentRows.length, after: mergedRows.length,
+      declaredTransactionCount: Number(transactionAnalysis.transactionCount) || null,
+    }));
+  }
+  return statementResult;
 }
 
 // =====================================================
@@ -19493,6 +19631,13 @@ console.log("HESAP ÖZETİ REFERANS YÜKLENDİ:", Array.isArray(statementReferen
 let statementModelResult = statementReference
   ? await analyzeStatement(base64, mime, fileName, statementReference)
   : statementIdentityProbe;
+
+statementModelResult = await completeStatementRowsPageByPage(
+  statementModelResult,
+  buffer,
+  Number(pdfStructureForensics?.pageCount) || 0,
+  paddleDocumentOCR
+);
 
 let statementModelBank = normalizeBank(statementModelResult?.documentData?.bank) ||
   detectStatementBankFromText(String(statementModelResult?.summary || "").slice(0, 700), "");
