@@ -20,8 +20,8 @@ export function recipientNameLabel(value) {
   if (/^(MUSTERI|GONDEREN|GONDERICI)(?: |$)/.test(label)) return null;
 
   const compact = label.replace(/\s+/g, '');
-  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADISOYAD|ADISOYADI|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISMI))?$/.test(compact)) return 'recipientName';
-  if (/^(?:BENEFICIARY|BENEFICIARYNAME|PAYEE|PAYEENAME|RECEIVER|RECEIVERNAME|LEHDAR|LEHDARADI|LEHDARUNVANI)$/.test(compact)) return 'recipientName';
+  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADIUNVAN|ADISOYAD|ADISOYADI|ADISOYADUNVAN|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISIMUNVAN|ISMI))?$/.test(compact)) return 'recipientName';
+  if (/^(?:BENEFICIARY|BENEFICIARYNAME|PAYEE|PAYEENAME|RECEIVER|RECEIVERNAME|LEHDAR|LEHDARADI|LEHDARUNVANI|FAYDALANICI|FAYDALANICIADI|FAYDALANICIUNVANI)$/.test(compact)) return 'recipientName';
   return null;
 }
 
@@ -30,7 +30,7 @@ export function recipientIbanLabel(value) {
   const compact = normalizeSemanticLabel(String(value ?? '').split(/[:：]/, 1)[0]).replace(/\s+/g, '');
   // "ALICI BANKA" names the receiving bank; it does not identify an IBAN.
   // Only accept BANKA when the label explicitly continues with IBAN.
-  return /^(?:ALICI|ALACAKLI|LEHDAR)(?:(?:HESAP(?:NO|NUMARASI)?)(?:IBAN)?|BANKAIBAN|IBAN(?:NO|NUMARASI)?|HESABI)$/.test(compact) ||
+  return /^(?:ALICI|ALACAKLI|LEHDAR|FAYDALANICI|GONDERILEN|GONDERILECEK)(?:(?:HESAP(?:NO|NUMARASI)?)(?:IBAN)?|BANKAIBAN|IBAN(?:NO|NUMARASI)?|HESABI)$/.test(compact) ||
     /^(?:BENEFICIARY|PAYEE|RECEIVER)(?:(?:ACCOUNT|BANK))?(?:IBAN|IBANNO|ACCOUNT|ACCOUNTNUMBER)$/.test(compact);
 }
 
