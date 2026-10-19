@@ -1,6 +1,6 @@
 const FIELD_LABELS = {
   recipientName: [
-    /^(?:ALICI\s+AD\s+SOYAD(?:\s*\/\s*UNVAN)?|ALICI\s+ADI|ALACAKLI(?:\s+ADI)?|ALICI\s+UNVANI|LEHDAR(?:\s+ADI)?|FAYDALANICI(?:\s+ADI)?)$/,
+    /^(?:ALICI(?:\s+(?:ADI(?:\s+UNVANI?)?|AD\s+SOYADI?(?:\s+UNVANI?)?|ISIM(?:\s+UNVANI?)?|UNVANI?))?|ALACAKLI(?:\s+(?:ADI(?:\s+UNVANI?)?|AD\s+SOYADI?(?:\s+UNVANI?)?|ISIM(?:\s+UNVANI?)?|UNVANI?))?|LEHDAR(?:\s+(?:ADI|UNVANI?))?|FAYDALANICI(?:\s+(?:ADI|UNVANI?))?|BENEFICIARY(?:\s+NAME)?|PAYEE(?:\s+NAME)?|RECEIVER(?:\s+NAME)?)$/,
   ],
   recipientIBAN: [
     /^(?:ALICI|ALACAKLI)\s+(?:HESAP\s+NO\s*\/\s*)?IBAN$/,
@@ -9,9 +9,11 @@ const FIELD_LABELS = {
     // This is safe because the value must still pass the Turkish IBAN checksum.
     /^(?:ALICI|ALACAKLI)\s+HESAP(?:\s+(?:NO|NUMARASI))?$/,
     /^(?:LEHDAR|FAYDALANICI)\s+(?:HESAP(?:\s*(?:NO|NUMARASI))?\s*)?IBAN$/,
+    /^(?:GONDERILEN|GONDERILECEK)\s+(?:HESAP(?:\s*(?:NO|NUMARASI))?\s*)?IBAN$/,
+    /^(?:BENEFICIARY|PAYEE|RECEIVER)(?:\s+(?:ACCOUNT|BANK))?\s+(?:IBAN|ACCOUNT(?:\s+NUMBER)?)$/,
   ],
   amount: [
-    /^(?:ISLEM|TRANSFER|GONDERILEN|ODEME|ANA|GIDEN(?:\s+FAST(?:\s+EFT)?)?)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
+    /^(?:ISLEM|TRANSFER|HAVALE|EFT|GONDERILEN|ODEME|ANA|GIDEN(?:\s+FAST(?:\s+EFT)?)?)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
     // Vakifbank PDFs may omit the first glyph of the embedded-font label
     // during text extraction ("İŞLEM TUTARI" becomes "LEM TUTARI").
     /^LEM\s+TUTAR(?:I)?$/,
@@ -20,7 +22,7 @@ const FIELD_LABELS = {
     // Enpara receipts label the amount column "B/A Para Cinsi Tutar".
     // Accept both the slash form and text extraction that separates B and A.
     /^B\s*\/?\s*A\s+PARA\s+CINSI\s+TUTAR$/,
-    /^(?:FAST|FAST\s+ISLEM|FAST\s+TRANSFER|FAST\s+ODEME|FAST\s+GONDERIM|ISLEM|TRANSFER|GONDERIM|GONDERILEN|ALICIYA\s+GIDEN)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
+    /^(?:FAST|EFT|HAVALE|FAST\s+ISLEM|FAST\s+TRANSFER|FAST\s+ODEME|FAST\s+GONDERIM|ISLEM|TRANSFER|GONDERIM|GONDERILEN|ALICIYA\s+GIDEN)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
     /^(?:ISLEM|TRANSFER|FAST|GIDEN\s+FAST)\s+TUTAR(?:I)?\s*\(\s*(?:TL|TRY)\s*\)$/,
   ],
 };
@@ -46,8 +48,10 @@ function matchesLabel(field, value) {
     if (/^(?:ALICI|ALACAKLI)(?:IBAN|IBANNO|IBANNUMARASI|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN|HESAPNOIBAN|HESAPNUMARASIIBAN)$/.test(compact)) return true;
     if (/^(?:LEHDAR)(?:IBAN|IBANNO|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN|HESAPNOIBAN)$/.test(compact)) return true;
     if (/^(?:FAYDALANICI)(?:IBAN|IBANNO|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN)$/.test(compact)) return true;
+    if (/^(?:GONDERILEN|GONDERILECEK)(?:IBAN|IBANNO|IBANNUMARASI|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN)$/.test(compact)) return true;
   }
-  return (FIELD_LABELS[field] || []).some(pattern => pattern.test(normalized));
+  const candidates = field === 'recipientName' ? [normalized, normalized.replace(/[\\/]/g, ' ')] : [normalized];
+  return (FIELD_LABELS[field] || []).some(pattern => candidates.some(candidate => pattern.test(candidate)));
 }
 
 export function matchesPdfFieldLabel(field, value) {
@@ -153,6 +157,31 @@ function labelSpans(row, field) {
       if (inline && matchesLabel(field, inline[1])) {
         spans.push({ text: inline[1].trim(), inlineValue: inline[2].trim(), items: group, start, end });
       }
+      // Some bank PDFs encode several labelled fields into one PDF.js text
+      // item, e.g. "Alıcı Hesap: TR... Alıcı: Name". The first label belongs
+      // to the IBAN; find the later, explicitly typed recipient-name label
+      // without treating the whole item as a name value.
+      if (field === 'recipientName' && group.length === 1) {
+        const itemText = String(group[0].text || '');
+        const scanText = itemText.toLocaleUpperCase('tr-TR').replace(/İ|I|ı/g, 'I').replace(/Ğ/g, 'G').replace(/Ü/g, 'U').replace(/Ş/g, 'S').replace(/Ö/g, 'O').replace(/Ç/g, 'C');
+        const pattern = /(?:^|\s)(ALICI|ALACAKLI|LEHDAR|FAYDALANICI)\s*(?:ADI(?:\s*(?:[\\/]\s*)?UNVAN)?|AD\s*SOYADI?(?:\s*(?:[\\/]\s*)?UNVAN)?|UNVANI?|ISIM(?:\s*(?:[\\/]\s*)?UNVAN)?|ISMI)?\s*[:：]\s*(\S[\s\S]*)$/giu;
+        for (const match of scanText.matchAll(pattern)) {
+          const labelStart = match.index + (match[0].length - match[0].trimStart().length);
+          const colonAt = match[0].search(/[:：]/);
+          const valueStart = match.index + colonAt + 1 + (match[0].slice(colonAt + 1).length - match[0].slice(colonAt + 1).trimStart().length);
+          const labelText = match[0].slice(0, colonAt).trim();
+          if (!matchesLabel(field, labelText) || valueStart >= itemText.length) continue;
+          spans.push({
+            text: labelText,
+            inlineValue: itemText.slice(valueStart).trim(),
+            inlineStart: labelStart,
+            inlineValueStart: valueStart,
+            items: group,
+            start,
+            end,
+          });
+        }
+      }
     }
   }
   return spans.sort((a, b) => (a.end - a.start) - (b.end - b.start));
@@ -247,18 +276,23 @@ function resolveField(field, rows, pageWidth, pageHeight) {
 
       let labelBoxItems = label.items;
       if (label.inlineValue) {
-        const colonIndex = label.items.findIndex(item => /[:：]/.test(String(item.text || '')));
+        const colonIndex = label.items.length === 1 && Number.isFinite(label.inlineStart)
+          ? 0
+          : label.items.findIndex(item => /[:：]/.test(String(item.text || '')));
         if (colonIndex >= 0) {
           labelBoxItems = label.items.slice(0, colonIndex + 1);
           const colonItem = labelBoxItems[labelBoxItems.length - 1];
           const colonText = String(colonItem.text || '');
-          const colonPosition = colonText.search(/[:：]/);
+          const colonPosition = Number.isFinite(label.inlineStart)
+            ? colonText.slice(label.inlineStart).search(/[:：]/) + label.inlineStart
+            : colonText.search(/[:：]/);
           if (colonPosition >= 0 && colonPosition < colonText.length - 1) {
             const prefixLength = colonPosition + 1;
             labelBoxItems[labelBoxItems.length - 1] = {
               ...colonItem,
-              text: colonText.slice(0, prefixLength),
-              width: colonItem.width * prefixLength / Math.max(1, colonText.length),
+              text: colonText.slice(Number.isFinite(label.inlineStart) ? label.inlineStart : 0, prefixLength),
+              x: colonItem.x + colonItem.width * (Number.isFinite(label.inlineStart) ? label.inlineStart : 0) / Math.max(1, colonText.length),
+              width: colonItem.width * (prefixLength - (Number.isFinite(label.inlineStart) ? label.inlineStart : 0)) / Math.max(1, colonText.length),
             };
           }
         }
@@ -269,7 +303,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       const inlineIbanSpan = field === 'recipientIBAN' ? turkishIbanSpan(rawInlineValue) : null;
       if (label.inlineValue && validValue(field, rawInlineValue)) {
         const colonIndex = label.items.findIndex(item => /[:：]/.test(String(item.text || '')));
-        if (colonIndex >= 0) {
+        if (colonIndex >= 0 && !Number.isFinite(label.inlineValueStart)) {
           const colonItem = label.items[colonIndex];
           const colonText = String(colonItem.text || '');
           const separatorIndex = colonText.search(/[:：]/);
@@ -307,7 +341,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
         } else if (label.items.length === 1) {
           const item = label.items[0];
           const fullText = String(item.text || '');
-          const valueStart = fullText.indexOf(label.inlineValue);
+          const valueStart = Number.isFinite(label.inlineValueStart) ? label.inlineValueStart : fullText.indexOf(label.inlineValue);
           if (valueStart >= 0 && fullText.length > 0) {
             const start = valueStart + (inlineIbanSpan?.start || 0);
             const length = inlineIbanSpan ? inlineIbanSpan.end - inlineIbanSpan.start : label.inlineValue.length;
