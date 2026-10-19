@@ -8263,7 +8263,10 @@ async function getReferenceAmountAnchor(bank) {
           if (!cached) {
             const pageRender = await renderPdfPagePng(pdf, pageNumber, 2);
             if (pageRender?.buffer && pageRender.width && pageRender.height) {
-              rendered = { width: pageRender.width, height: pageRender.height };
+              // Keep the PNG bytes with the cached geometry. The projection
+              // fallback below needs pixels, and the original referencePath is
+              // a PDF (not an image Sharp can decode directly).
+              rendered = { width: pageRender.width, height: pageRender.height, buffer: pageRender.buffer };
               const tempPath = path.join('/tmp', `verifydoc-anchor-${createHash('sha256').update(renderKey).digest('hex').slice(0,16)}.png`);
               try {
                 await fs.writeFile(tempPath, pageRender.buffer);
@@ -8466,7 +8469,9 @@ async function getReferenceAmountAnchor(bank) {
         // projection fallback on the SAME reference image instead.
         if (!best && amountLabels.length) {
           try {
-            const buffer = await fs.readFile(referencePath);
+            const buffer = ocrAlreadyLoaded && rendered?.buffer
+              ? rendered.buffer
+              : await fs.readFile(referencePath);
             const raw = await sharp(buffer).greyscale().raw().toBuffer({ resolveWithObject: true });
             const imgW = Number(raw.info?.width) || width;
             const imgH = Number(raw.info?.height) || height;
