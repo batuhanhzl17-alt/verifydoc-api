@@ -6378,43 +6378,108 @@ function statementPdfResolvePaddleRow(row, pageRegions) {
   }).map(item => ({ text: String(item.text || '').trim(), score: Number(item.score) || 0,
     x1: Number(item.region.x1), y1: Number(item.region.y1), x2: Number(item.region.x2), y2: Number(item.region.y2),
     cy: (Number(item.region.y1) + Number(item.region.y2)) / 2,
-    height: Number(item.region.y2) - Number(item.region.y1) }));
-  const anchors = regions.filter(item => statementPdfDateKey(item.text) === dateKey);
-  if (!anchors.length) return { status: 'unresolved', reason: 'PaddleOCR bölgelerinde tarih ankrajı bulunamadı.' };
+    height: Number(item.region.y2) - Number(item.region.y1),
+    dateKey: statementPdfDateKey(item.text),
+    moneyTokens: statementPdfMoneyTokens(item.text),
+  }));
+  const anchors = regions.filter(item => item.dateKey === dateKey);
+  const medianHeight = [...regions.map(item => item.height).filter(value => value > 0)]
+    .sort((a, b) => a - b)[Math.floor(regions.filter(item => item.height > 0).length / 2)] || 12;
   const description = statementNormalizeText([row?.description, row?.counterparty].filter(Boolean).join(' '));
   const terms = description.split(' ').filter(term => term.length >= 4);
   const transactionId = String(row?.transactionId || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const amountAnchors = regions.filter(item => item.moneyTokens.some(token =>
+    token.cents != null && Math.abs(token.cents) === expectedAmount));
+  if (!amountAnchors.length) return { status: 'unresolved', reason: anchors.length
+    ? 'PaddleOCR tarihleri bulundu; beklenen tutar için OCR bölgesi bulunamadı.'
+    : 'PaddleOCR bölgelerinde tarih ankrajı ve beklenen tutar birlikte doğrulanamadı.' };
   const candidates = [];
-  for (const anchor of anchors) {
-    const tolerance = Math.max(5, anchor.height * 1.35);
+  for (const anchor of amountAnchors) {
+    // OCR may split one visual table row into separate date, description,
+    // debit/credit and balance boxes. Anchor the search on the exact amount,
+    // then use a wider local band plus the balance/date/description as cross-checks.
+    const tolerance = Math.max(6, Math.min(30, Math.max(anchor.height, medianHeight) * 1.7));
     const band = regions.filter(item => Math.abs(item.cy - anchor.cy) <= tolerance);
     const bandText = band.map(item => item.text).join(' ');
     const normalizedBand = statementNormalizeText(bandText);
     const hits = terms.filter(term => normalizedBand.includes(term)).length;
-    const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
+    const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.2));
     const idMatched = transactionId.length >= 5 && bandText.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(transactionId);
-    if (!descriptionMatched && !idMatched) continue;
-    const amountTokens = statementPdfMoneyTokens(bandText).filter(token => token.cents != null && Math.abs(token.cents) === expectedAmount);
-    if (amountTokens.length !== 1) continue;
-    const balanceMatched = expectedBalance == null || statementPdfMoneyTokens(bandText).some(token => token.cents === expectedBalance);
-    const dedupeKey = Math.round(anchor.cy / tolerance);
-    if (candidates.some(candidate => candidate.dedupeKey === dedupeKey)) continue;
-    const matchedRegions = band.filter(item => statementPdfDateKey(item.text) === dateKey ||
-      statementPdfMoneyTokens(item.text).some(token => token.cents != null && Math.abs(token.cents) === expectedAmount) ||
-      (expectedBalance != null && statementPdfMoneyTokens(item.text).some(token => token.cents === expectedBalance)));
-    candidates.push({ dedupeKey, balanceMatched, boxPixels: matchedRegions.length ? {
-      x1: Math.min(...matchedRegions.map(item => item.x1)), y1: Math.min(...matchedRegions.map(item => item.y1)),
-      x2: Math.max(...matchedRegions.map(item => item.x2)), y2: Math.max(...matchedRegions.map(item => item.y2)),
-    } : null });
+    const dateMatched = band.some(item => item.dateKey === dateKey) || anchors.some(item => Math.abs(item.cy - anchor.cy) <= tolerance * 1.5);
+    const balanceRegions = expectedBalance == null ? [] : band.filter(item => item.moneyTokens.some(token => token.cents === expectedBalance));
+    const balanceMatched = balanceRegions.length > 0;
+    // A unique exact amount is useful, but repeated fees/amounts require another
+    // independent row cue. A matching balance is especially discriminative.
+    const independentCue = idMatched || (dateMatched && descriptionMatched) ||
+      (balanceMatched && (dateMatched || descriptionMatched));
+    if (!independentCue) continue;
+    const amountRegions = band.filter(item => item.moneyTokens.some(token =>
+      token.cents != null && Math.abs(token.cents) === expectedAmount));
+    const lineY = anchor.cy;
+    const matchedRegions = band.filter(item => Math.abs(item.cy - lineY) <= tolerance &&
+      (item.dateKey === dateKey || item.moneyTokens.length ||
+        terms.some(term => statementNormalizeText(item.text).includes(term)) ||
+        (transactionId.length >= 5 && item.text.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(transactionId))));
+    candidates.push({
+      y: lineY,
+      tolerance,
+      dateMatched,
+      descriptionMatched,
+      idMatched,
+      balanceMatched,
+      balanceBoxPixels: balanceRegions.length ? {
+        x1: Math.min(...balanceRegions.map(item => item.x1)), y1: Math.min(...balanceRegions.map(item => item.y1)),
+        x2: Math.max(...balanceRegions.map(item => item.x2)), y2: Math.max(...balanceRegions.map(item => item.y2)),
+      } : null,
+      amountBoxPixels: amountRegions.length ? {
+        x1: Math.min(...amountRegions.map(item => item.x1)), y1: Math.min(...amountRegions.map(item => item.y1)),
+        x2: Math.max(...amountRegions.map(item => item.x2)), y2: Math.max(...amountRegions.map(item => item.y2)),
+      } : null,
+      boxPixels: matchedRegions.length ? {
+        x1: Math.min(...matchedRegions.map(item => item.x1)), y1: Math.min(...matchedRegions.map(item => item.y1)),
+        x2: Math.max(...matchedRegions.map(item => item.x2)), y2: Math.max(...matchedRegions.map(item => item.y2)),
+      } : null,
+    });
   }
-  let selected = candidates;
+  // Multiple OCR regions can represent one amount (currency suffix or split
+  // glyph box). Collapse nearby detections before deciding whether a row is unique.
+  const clustered = [];
+  for (const candidate of candidates.sort((a, b) => a.y - b.y)) {
+    const previous = clustered[clustered.length - 1];
+    if (previous && Math.abs(previous.y - candidate.y) <= Math.min(previous.tolerance, candidate.tolerance) * 0.55) {
+      previous.dateMatched ||= candidate.dateMatched;
+      previous.descriptionMatched ||= candidate.descriptionMatched;
+      previous.idMatched ||= candidate.idMatched;
+      previous.balanceMatched ||= candidate.balanceMatched;
+      previous.boxPixels = previous.boxPixels || candidate.boxPixels;
+      previous.amountBoxPixels = previous.amountBoxPixels || candidate.amountBoxPixels;
+      previous.balanceBoxPixels = previous.balanceBoxPixels || candidate.balanceBoxPixels;
+    } else clustered.push({ ...candidate });
+  }
+  let selected = clustered;
   if (selected.length > 1) {
-    const balanceCandidates = selected.filter(item => item.balanceMatched);
-    if (balanceCandidates.length) selected = balanceCandidates;
+    const strongest = selected.filter(item => item.balanceMatched && (item.dateMatched || item.descriptionMatched));
+    if (strongest.length) selected = strongest;
+  }
+  if (selected.length > 1) {
+    const described = selected.filter(item => item.idMatched || (item.dateMatched && item.descriptionMatched));
+    if (described.length) selected = described;
   }
   return selected.length === 1
-    ? { status: 'matched', source: 'paddle-regions', reason: 'PaddleOCR bölgelerinde tarih, açıklama ve tutar aynı satır bandında tekil eşleşti.', boxPixels: selected[0].boxPixels }
-    : { status: 'unresolved', reason: selected.length ? `${selected.length} OCR satır adayı kaldı; tekil eşleşme yok.` : 'OCR bölgelerinde tarih, açıklama ve tutar aynı satır bandında tekil eşleşmedi.', candidateCount: selected.length };
+    ? { status: 'matched', source: 'paddle-regions', reason: `PaddleOCR satır bandında tutar; ${[
+        selected[0].balanceMatched ? 'bakiye' : null,
+        selected[0].dateMatched ? 'tarih' : null,
+        selected[0].descriptionMatched ? 'açıklama' : null,
+        selected[0].idMatched ? 'işlem numarası' : null,
+      ].filter(Boolean).join(' + ')} ile tekil eşleşti.`,
+      boxPixels: selected[0].boxPixels, amountBoxPixels: selected[0].amountBoxPixels,
+      balanceBoxPixels: selected[0].balanceBoxPixels,
+      matchEvidence: { balanceMatched: selected[0].balanceMatched, dateMatched: selected[0].dateMatched,
+        descriptionMatched: selected[0].descriptionMatched, transactionIdMatched: selected[0].idMatched } }
+    : { status: 'unresolved', reason: selected.length
+      ? `${selected.length} OCR satır adayı kaldı; tarih/açıklama/bakiye ile güvenli tekil seçim yapılamadı.`
+      : 'OCR’de tutar adayı bulundu ancak aynı satır bandında bağımsız tarih, açıklama, işlem numarası veya bakiye doğrulaması yok.',
+      candidateCount: selected.length };
 }
 
 function statementPdfResolveAzureRow(row, pageLines, pageWords) {
@@ -6681,6 +6746,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       diagnostic.reason = resolved.reason;
       diagnostic.associationSource = 'paddle-regions';
       diagnostic.ocrBoxPixels = resolved.boxPixels || null;
+      diagnostic.ocrAmountBoxPixels = resolved.amountBoxPixels || null;
+      diagnostic.ocrBalanceBoxPixels = resolved.balanceBoxPixels || null;
+      diagnostic.paddleMatchEvidence = resolved.matchEvidence || null;
       diagnostic.amountMatched = true;
       diagnostic.distinctCandidateLineCount = 1;
       paddleMatchedRows++;
@@ -20081,7 +20149,7 @@ for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
   const unresolved = pageRows.filter(item => item.status !== 'matched');
   const reasonCounts = {};
   for (const item of unresolved) {
-    const reason = String(item.reason || 'Neden belirtilmedi.').split('.')[0].slice(0, 110);
+    const reason = String(item.paddleReason || item.azureTableReason || item.azureLineReason || item.reason || 'Neden belirtilmedi.').split('.')[0].slice(0, 110);
     reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
   }
   console.log("HESAP ÖZETİ SATIR ROI EŞLEŞME DETAYI:", JSON.stringify({
@@ -20090,13 +20158,17 @@ for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
     modelRowsOnPage: pageRows.length,
     matched: matched.map(item => ({
       rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
-      source: item.associationSource, amountBox: item.amountBox, balanceBox: item.balanceBox,
+      source: item.associationSource, amountBox: item.amountBox || item.ocrAmountBoxPixels,
+      amountBoxCoordinates: item.ocrAmountBoxPixels ? 'paddle-ocr-pixels' : 'pdf-normalized',
+      balanceBox: item.balanceBox || item.ocrBalanceBoxPixels,
+      paddleEvidence: item.paddleMatchEvidence || null,
     })),
     unresolvedCount: unresolved.length,
     unresolvedReasonCounts: reasonCounts,
     unresolvedExamples: unresolved.slice(0, 5).map(item => ({
       rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
-      reason: item.reason, azureTableReason: item.azureTableReason, azureLineReason: item.azureLineReason,
+      reason: item.paddleReason || item.azureTableReason || item.azureLineReason || item.reason,
+      originalReason: item.reason, azureTableReason: item.azureTableReason, azureLineReason: item.azureLineReason,
     })),
   }));
 }
@@ -21080,20 +21152,49 @@ function normalizeAmountForFontMatch(value) {
   return Number.isFinite(number) ? number.toFixed(2) : null;
 }
 
-function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
+function summarizeAmountFont(usages, amountValue, fontCatalog = [], fieldAssociation = null) {
   const normalizedAmount = normalizeAmountForFontMatch(amountValue);
   if (!normalizedAmount || !Array.isArray(usages)) return { status: 'unavailable' };
+  const fieldBox = fieldAssociation?.valueBox || null;
+  const fieldPage = Number(fieldAssociation?.pageNumber) || null;
   // Resolve a PDF.js-generated font alias only when all active fonts in that
   // PDF share one canonical family. Never choose arbitrarily among families.
   const catalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
     .map(font => font?.family || fontFamily(font?.fontName))
     .map(value => String(value ?? '').trim())
     .filter(Boolean))];
-  const uniqueCatalogFamily = catalogFamilies.length === 1 ? catalogFamilies[0] : null;
+  const activeCatalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
+    .filter(font => Number(font?.itemCount) > 0 || Number(font?.charCount) > 0 ||
+      (Array.isArray(font?.pages) && font.pages.some(page => Number(page) === Number(fieldPage))))
+    .map(font => font?.family || fontFamily(font?.fontName))
+    .map(value => String(value ?? '').trim())
+    .filter(Boolean))];
+  // A field-specific comparison must not borrow the only font declared in a
+  // PDF dictionary when that font has no visible text usage. That fallback
+  // caused a nearby/global family to be assigned to an unrelated amount.
+  const uniqueCatalogFamily = fieldBox
+    ? (activeCatalogFamilies.length === 1 ? activeCatalogFamilies[0] : null)
+    : (catalogFamilies.length === 1 ? catalogFamilies[0] : null);
   const matched = [];
   for (const usage of usages) {
     for (const box of usage?.boxes || []) {
       if (normalizeAmountForFontMatch(box?.text) !== normalizedAmount) continue;
+      const boxPage = Number(box?.pageNumber) || null;
+      const normBox = box?.boxNorm;
+      if (fieldBox && (!normBox || (fieldPage && boxPage !== fieldPage))) continue;
+      if (fieldBox) {
+        const targetCenterX = Number(fieldBox.x) + Number(fieldBox.width) / 2;
+        const targetCenterY = Number(fieldBox.y) + Number(fieldBox.height) / 2;
+        const itemCenterX = Number(normBox.x) + Number(normBox.width) / 2;
+        const itemCenterY = Number(normBox.y) + Number(normBox.height) / 2;
+        const centerDistance = Math.hypot(targetCenterX - itemCenterX, targetCenterY - itemCenterY);
+        const ix = Math.max(0, Math.min(Number(fieldBox.x) + Number(fieldBox.width), Number(normBox.x) + Number(normBox.width)) - Math.max(Number(fieldBox.x), Number(normBox.x)));
+        const iy = Math.max(0, Math.min(Number(fieldBox.y) + Number(fieldBox.height), Number(normBox.y) + Number(normBox.height)) - Math.max(Number(fieldBox.y), Number(normBox.y)));
+        const overlap = ix * iy;
+        const itemArea = Number(normBox.width) * Number(normBox.height);
+        const overlapRatio = itemArea > 0 ? overlap / itemArea : 0;
+        if (centerDistance > Math.max(0.012, Number(fieldBox.height) * 1.5) && overlapRatio < 0.25) continue;
+      }
       const candidates = [
         ...(Array.isArray(usage.resolvedFontNames) ? usage.resolvedFontNames : []),
         usage.resolvedFamily,
@@ -21103,16 +21204,15 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
       const canonicalFamily = candidates.length
         ? (fontFamily(candidates[0]) || candidates[0])
         : uniqueCatalogFamily;
-      const heights = (usage.boxes || [])
-        .filter(item => normalizeAmountForFontMatch(item?.text) === normalizedAmount)
-        .map(item => Number(item.height)).filter(value => Number.isFinite(value) && value > 0);
+      const heights = [Number(box.height)].filter(value => Number.isFinite(value) && value > 0);
       matched.push({
         family: canonicalFamily || null,
         familyResolution: candidates.length ? 'text-font-resource' : (uniqueCatalogFamily ? 'single-active-family-catalog' : 'unresolved'),
         style: usage.resolvedStyle || usage.style || 'unknown',
         fontSizePtEstimate: heights.length ? Number((heights.reduce((sum, value) => sum + value, 0) / heights.length).toFixed(2)) : null,
-        pageNumber: Number(box.pageNumber) || null,
+        pageNumber: boxPage,
         matchedText: String(box.text || '').slice(0, 80),
+        boxNorm: normBox || null,
       });
     }
   }
@@ -21127,6 +21227,7 @@ if (fontForensics) {
     fontForensics.targetActiveFontUsages,
     pdfNativeFieldAssociation?.fields?.amount?.value,
     fontForensics.targetFonts,
+    pdfNativeFieldAssociation?.fields?.amount,
   );
   const selectedReferenceFontProfile = (fontForensics.referenceFontProfiles || []).find(profile =>
     profile.fileName === path.basename(reference?.path || '')
@@ -21135,6 +21236,7 @@ if (fontForensics) {
     selectedReferenceFontProfile?.activeFontUsages,
     pdfReferenceFieldAssociation?.fields?.amount?.value,
     selectedReferenceFontProfile?.fonts,
+    pdfReferenceFieldAssociation?.fields?.amount,
   );
   const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
     const families = [...new Set((profile?.fonts || [])
