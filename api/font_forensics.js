@@ -4,8 +4,14 @@ import { inflateSync } from "zlib";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
-const pdfjsBuildDirectory = path.dirname(require.resolve("pdfjs-dist/build/pdf.mjs"));
-const pdfjsStandardFontDirectory = path.resolve(pdfjsBuildDirectory, "../standard_fonts") + path.sep;
+let pdfjsStandardFontDirectory = undefined;
+try {
+  const pdfjsBuildDirectory = path.dirname(require.resolve("pdfjs-dist/build/pdf.mjs"));
+  pdfjsStandardFontDirectory = path.resolve(pdfjsBuildDirectory, "../standard_fonts") + path.sep;
+} catch {
+  // Metadata-only helpers and unit tests can run without PDF.js installed.
+  // Actual PDF analysis still receives the application's pdfjsLib instance.
+}
 
 // =====================================================
 // VERIFYDOC FONT FORENSICS v3
@@ -1215,7 +1221,37 @@ function compareFontProfiles(reference, target) {
   };
 }
 
-export async function analyzeFontForensics({ targetPath, referencePath, referencePaths = [], pdfjsLib, maxPages = 5 }) {
+export function fieldFontUsages(profile, fieldAssociation) {
+  const field = fieldAssociation?.fields?.amount;
+  const roi = field?.status === 'matched' && field?.associationValidated ? field?.valueBox : null;
+  if (!roi || !Array.isArray(profile?.items)) return [];
+  const pageNumber = Number(field.pageNumber) || 1;
+  const rx1 = Number(roi.x), ry1 = Number(roi.y);
+  const rx2 = rx1 + Number(roi.width), ry2 = ry1 + Number(roi.height);
+  if (![rx1, ry1, rx2, ry2].every(Number.isFinite) || rx2 <= rx1 || ry2 <= ry1) return [];
+  return profile.items.filter(item => {
+    if (Number(item.pageNumber) !== pageNumber || !item.boxNorm) return false;
+    const b = item.boxNorm;
+    const x1 = Number(b.x), y1 = Number(b.y), x2 = x1 + Number(b.width), y2 = y1 + Number(b.height);
+    const iw = Math.max(0, Math.min(rx2, x2) - Math.max(rx1, x1));
+    const ih = Math.max(0, Math.min(ry2, y2) - Math.max(ry1, y1));
+    const itemArea = Math.max(1e-12, Number(b.width) * Number(b.height));
+    const verticalOverlap = ih / Math.max(1e-12, Number(b.height));
+    return iw > 0 && ih > 0 && (iw * ih / itemArea >= 0.25 || verticalOverlap >= 0.65);
+  }).map(item => ({
+    family: item.font?.family || (item.font?.fontName ? fontFamily(item.font.fontName) : null),
+    fontName: item.font?.fontName || item.font?.rawFontName || null,
+    resolvedFontNames: item.font?.objectFontNames || [],
+    style: item.font?.style || (item.font?.fontName ? fontStyle(item.font.fontName) : 'unknown'),
+    pageNumber,
+    matchedText: String(item.text || '').slice(0, 120),
+    fontSizePtEstimate: Number(item.height) || null,
+    boxNorm: item.boxNorm,
+    matchMethod: 'pdf-native-value-box-font-geometry',
+  }));
+}
+
+export async function analyzeFontForensics({ targetPath, referencePath, referencePaths = [], pdfjsLib, maxPages = 5, targetFieldAssociations = null, referenceFieldAssociationsByPath = {} }) {
   if (!targetPath || !pdfjsLib) return { available: false, reason: "missing-target-or-pdf-engine" };
   if (path.extname(targetPath).toLowerCase() !== ".pdf") {
     return { available: false, status: "unsupported", reason: "font-metadata-analysis-requires-pdf", evidence: "JPG/PNG gibi raster belgelerde gerçek embedded PDF font adı çıkarılamaz; görsel tipografi motoru ayrı çalışır." };
@@ -1261,6 +1297,10 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
     };
   }
 
+  targetProfile.amountFontUsages = fieldFontUsages(targetProfile, targetFieldAssociations);
+  for (const ref of referenceProfiles) {
+    ref.amountFontUsages = fieldFontUsages(ref, referenceFieldAssociationsByPath[ref.fileName] || referenceFieldAssociationsByPath[ref.path] || null);
+  }
   const comparisons = referenceProfiles.map(ref => ({ referenceFile: ref.fileName, comparison: compareFontProfiles(ref, targetProfile) }));
   comparisons.sort((a,b) => Number(a.comparison.score) - Number(b.comparison.score));
   const best = comparisons[0];
@@ -1282,8 +1322,9 @@ export async function analyzeFontForensics({ targetPath, referencePath, referenc
     targetFonts: targetProfile.fonts,
     targetFontCount: targetProfile.fontCount,
     referenceFiles: referenceProfiles.map(x => x.fileName),
-    referenceFontProfiles: referenceProfiles.map(x => ({ fileName: x.fileName, fonts: x.fonts, fontCount: x.fontCount, rawPdfFontNames: x.rawPdfFontNames, activeFontUsages: x.activeFontUsages || [] })),
+    referenceFontProfiles: referenceProfiles.map(x => ({ fileName: x.fileName, fonts: x.fonts, fontCount: x.fontCount, rawPdfFontNames: x.rawPdfFontNames, activeFontUsages: x.activeFontUsages || [], amountFontUsages: x.amountFontUsages || [] })),
     targetActiveFontUsages: targetProfile.activeFontUsages || [],
+    targetAmountFontUsages: targetProfile.amountFontUsages || [],
     targetOnlyFamiliesAcrossReferences: ensembleTargetOnlyFamilies,
     bestReference: best?.referenceFile || null,
     score: best?.comparison?.score || 0,
