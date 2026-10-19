@@ -978,7 +978,11 @@ function hasStrongAmountReferenceDifference(amount = {}) {
   const comparison = amount?.referenceComparison || {};
   const styleDistance = Number(comparison.styleDistance);
   const characterDistance = Number(comparison.characterDistance);
-  return comparison.available === true &&
+  // Amounts are dynamic transaction data. A raster comparison between, for
+  // example, 600 TRY and 1,000 TRY mostly measures different digits/widths,
+  // not evidence of editing. Only promote when the numeric values are
+  // equivalent and the comparator explicitly marks the crop risk-eligible.
+  return comparison.available === true && comparison.riskEligible === true &&
     Number.isFinite(styleDistance) && styleDistance >= 0.30 &&
     Number.isFinite(characterDistance) && characterDistance >= 0.36;
 }
@@ -19074,6 +19078,8 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         amountForensics.templateAmountText = amountReferenceComparison.referenceText;
         amountForensics.referenceComparison = {
         available: true,
+        riskEligible: amountReferenceComparison.riskEligible === true,
+        sameNumericValue: amountReferenceComparison.sameNumericValue === true,
         referenceFile: amountReferenceComparison.referenceFile,
         targetText: amountReferenceComparison.targetText,
         referenceText: amountReferenceComparison.referenceText,
@@ -19086,11 +19092,14 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
           ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
           : 'reference-local-crop-comparator-v3-same-selected-reference',
-        literalAmountEqualityRequired: false,
+        literalAmountEqualityRequired: true,
+        sameNumericValueRequiredForRiskPromotion: true,
         };
       }
       console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
         available: true,
+        riskEligible: amountReferenceComparison.riskEligible === true,
+        sameNumericValue: amountReferenceComparison.sameNumericValue === true,
         referenceFile: amountReferenceComparison.referenceFile,
         targetText: amountReferenceComparison.targetText,
         referenceText: amountReferenceComparison.referenceText,
@@ -19103,7 +19112,8 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
           ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
           : 'reference-local-crop-comparator-v3-same-selected-reference',
-        literalAmountEqualityRequired: false,
+        literalAmountEqualityRequired: true,
+        sameNumericValueRequiredForRiskPromotion: true,
       }));
     } else {
       console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
@@ -21271,6 +21281,9 @@ async function runReferenceLocalCropComparator(
         field,
         targetText,
         referenceText: refText,
+        sameNumericValue: field === 'amount'
+          ? normalizeOCRAmountLiteral(targetText) === normalizeOCRAmountLiteral(refText)
+          : undefined,
         referenceFile: path.basename(referencePath),
         styleDistance: Number.isFinite(styleDistance) ? Number(styleDistance.toFixed(4)) : null,
         characterDistance: Number.isFinite(charDistance) ? Number(charDistance.toFixed(4)) : null,
@@ -21303,6 +21316,9 @@ async function runReferenceLocalCropComparator(
 
     const findings = [];
     for (const o of observations) {
+      // Different transaction amounts are expected across receipts. Their
+      // glyph shapes and crop widths must not become a reference anomaly.
+      if (o.field === 'amount' && o.sameNumericValue !== true) continue;
       const styleExcess = Number.isFinite(o.styleDistance)
         ? relativeBaselineAvailable
           ? Math.max(0, o.styleDistance - styleBaseline)
@@ -21339,8 +21355,8 @@ async function runReferenceLocalCropComparator(
     return {
       available: true,
       engine: nativePdfAmountPairAvailable
-        ? 'reference-local-crop-comparator-v4-pdf-native-amount-handoff'
-        : 'reference-local-crop-comparator-v3-all-points',
+        ? 'reference-local-crop-comparator-v5-dynamic-amount-value-gate-pdf-native'
+        : 'reference-local-crop-comparator-v5-dynamic-amount-value-gate',
       bank: normalizeBank(bank),
       referenceFile: path.basename(referencePath),
       comparedFieldCount: observations.length,
@@ -21354,9 +21370,14 @@ async function runReferenceLocalCropComparator(
       observations,
       amountComparison: (() => {
         const amount = observations.find(x => x.field === 'amount');
-        return amount ? {
+        if (!amount) return null;
+        const sameNumericValue = amount.sameNumericValue === true;
+        const strongRasterDifference = Number(amount.styleDistance) >= 0.30 && Number(amount.characterDistance) >= 0.36;
+        return {
           targetText: amount.targetText,
           referenceText: amount.referenceText,
+          sameNumericValue,
+          riskEligible: sameNumericValue && strongRasterDifference,
           referenceFile: amount.referenceFile,
           targetBox: amount.targetBox,
           referenceBox: amount.referenceBox,
@@ -21367,10 +21388,15 @@ async function runReferenceLocalCropComparator(
           comparisonMode: relativeBaselineAvailable
             ? 'same-document-multi-field-local-outlier'
             : 'single-field-reference-distance-only',
-          classification: Number(amount.styleDistance) >= 0.30 && Number(amount.characterDistance) >= 0.36
-            ? 'strong-reference-render-difference'
-            : 'measured-below-strong-difference-threshold',
-        } : null;
+          classification: !sameNumericValue
+            ? 'dynamic-amount-value-differs-diagnostic-only'
+            : strongRasterDifference
+              ? 'strong-reference-render-difference'
+              : 'measured-below-strong-difference-threshold',
+          riskNote: sameNumericValue
+            ? null
+            : 'Tutar değeri referanstan farklı; rakam şekli ve metin genişliği risk bulgusu olarak kullanılmadı.',
+        };
       })(),
       findings
     };
@@ -24008,7 +24034,7 @@ const finalAmountReferenceComparison = rawFinalAmountReferenceComparison ? {
   ),
 } : null;
 const amountRenderDifferenceStrong = Boolean(
-  finalAmountReferenceComparison?.available === true && (
+  finalAmountReferenceComparison?.available === true && finalAmountReferenceComparison?.riskEligible === true && (
     finalAmountReferenceComparison.classification === 'strong-reference-render-difference' ||
     (Number(finalAmountReferenceComparison.styleDistance) >= 0.30 &&
       Number(finalAmountReferenceComparison.characterDistance) >= 0.36)
