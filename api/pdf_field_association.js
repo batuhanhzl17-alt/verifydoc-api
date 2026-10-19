@@ -50,6 +50,21 @@ function normalizeIban(value) {
   return String(value || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
 }
 
+function turkishIbanSpan(value) {
+  const source = String(value || '');
+  const startAt = source.search(/TR(?=\s*[0-9])/i);
+  if (startAt < 0) return null;
+  let compact = '';
+  let end = startAt;
+  for (let index = startAt; index < source.length && compact.length < 26; index++) {
+    const char = source[index];
+    if (/[a-z0-9]/i.test(char)) compact += char.toUpperCase();
+    end = index + 1;
+  }
+  if (!validTurkishIban(compact)) return null;
+  return { value: compact, start: startAt, end };
+}
+
 function validTurkishIban(value) {
   const iban = normalizeIban(value);
   if (!/^TR\d{24}$/.test(iban)) return false;
@@ -65,7 +80,7 @@ function validTurkishIban(value) {
 function validValue(field, value) {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   if (!text) return false;
-  if (field === 'recipientIBAN') return validTurkishIban(text);
+  if (field === 'recipientIBAN') return Boolean(turkishIbanSpan(text));
   if (field === 'amount') {
     const normalized = text.replace(/\s+/g, ' ').trim();
     const amountPattern = /^(?:[-+]?\s*)?(?:₺\s*)?(?:(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?|(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:TL|TRY|₺)?$/i;
@@ -217,6 +232,8 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       const inline = label.text.match(/[:：]\s*(.+)$/);
       if (inline?.[1] && !validValue(field, valueText)) valueText = inline[1].trim();
       valueText = cleanAssociatedValue(field, valueText);
+      const recipientIbanSpan = field === 'recipientIBAN' ? turkishIbanSpan(valueText) : null;
+      if (recipientIbanSpan) valueText = recipientIbanSpan.value;
       if (!validValue(field, valueText)) continue;
       if (field === 'recipientIBAN') trace.checksumValidValues++;
 
@@ -240,24 +257,42 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       }
       const labelBox = boxForItems(labelBoxItems, pageWidth, pageHeight);
       let inlineValueItems = null;
-      if (label.inlineValue && validValue(field, cleanAssociatedValue(field, label.inlineValue))) {
+      const rawInlineValue = label.inlineValue ? cleanAssociatedValue(field, label.inlineValue) : '';
+      const inlineIbanSpan = field === 'recipientIBAN' ? turkishIbanSpan(rawInlineValue) : null;
+      if (label.inlineValue && validValue(field, rawInlineValue)) {
         const colonIndex = label.items.findIndex(item => /[:：]/.test(String(item.text || '')));
         if (colonIndex >= 0) {
           const colonItem = label.items[colonIndex];
           const colonText = String(colonItem.text || '');
           const separatorIndex = colonText.search(/[:：]/);
           const suffix = separatorIndex >= 0 ? colonText.slice(separatorIndex + 1).trim() : '';
-          const suffixItems = label.items.slice(colonIndex + 1);
+          const suffixItems = label.items.slice(colonIndex + 1).map(item => {
+            if (field !== 'recipientIBAN') return item;
+            const itemText = String(item.text || '');
+            const itemIbanSpan = turkishIbanSpan(itemText);
+            if (!itemIbanSpan || !itemText.length) return item;
+            const startRatio = itemIbanSpan.start / itemText.length;
+            const widthRatio = (itemIbanSpan.end - itemIbanSpan.start) / itemText.length;
+            return {
+              ...item,
+              text: itemIbanSpan.value,
+              x: item.x + item.width * startRatio,
+              width: item.width * widthRatio,
+            };
+          });
           const suffixValueItems = [];
           if (suffix) {
-            const valueStart = colonText.indexOf(suffix);
+            const suffixSpan = field === 'recipientIBAN' ? turkishIbanSpan(suffix) : null;
+            const visibleValue = suffixSpan ? suffix.slice(suffixSpan.start, suffixSpan.end) : suffix;
+            const valueStart = colonText.indexOf(suffix) + (suffixSpan?.start || 0);
+            const valueLength = visibleValue.length;
             const startRatio = valueStart / Math.max(1, colonText.length);
-            const widthRatio = suffix.length / Math.max(1, colonText.length);
+            const widthRatio = valueLength / Math.max(1, colonText.length);
             suffixValueItems.push({
               ...colonItem,
-              text: suffix,
+              text: visibleValue,
               x: colonItem.x + colonItem.width * startRatio,
-              width: colonItem.width * widthRatio,
+              width: Math.max(0, colonItem.width * widthRatio),
             });
           }
           inlineValueItems = [...suffixValueItems, ...suffixItems];
@@ -266,11 +301,13 @@ function resolveField(field, rows, pageWidth, pageHeight) {
           const fullText = String(item.text || '');
           const valueStart = fullText.indexOf(label.inlineValue);
           if (valueStart >= 0 && fullText.length > 0) {
-            const startRatio = valueStart / fullText.length;
-            const widthRatio = label.inlineValue.length / fullText.length;
+            const start = valueStart + (inlineIbanSpan?.start || 0);
+            const length = inlineIbanSpan ? inlineIbanSpan.end - inlineIbanSpan.start : label.inlineValue.length;
+            const startRatio = start / fullText.length;
+            const widthRatio = length / fullText.length;
             inlineValueItems = [{
               ...item,
-              text: label.inlineValue,
+              text: inlineIbanSpan?.value || label.inlineValue,
               x: item.x + item.width * startRatio,
               width: item.width * widthRatio,
             }];
