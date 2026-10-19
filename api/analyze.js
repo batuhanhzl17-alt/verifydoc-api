@@ -20621,8 +20621,8 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
   const catalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
     .filter(font => font?.fontName || font?.family || font?.pdfFontFamilies?.length)
     .flatMap(font => [font?.family, fontFamily(font?.fontName), ...(font?.pdfFontFamilies || [])])
-    .map(value => fontFamily(value) || clean(value))
-    .map(value => clean(value))
+    .map(value => fontFamily(value) || String(value ?? '').trim())
+    .map(value => String(value ?? '').trim())
     .filter(Boolean))];
   const uniqueCatalogFamily = catalogFamilies.length === 1 ? catalogFamilies[0] : null;
   const matched = [];
@@ -20680,7 +20680,7 @@ if (fontForensics) {
   );
   const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
     const families = [...new Set((profile?.fonts || [])
-      .map(font => clean(font?.family || fontFamily(font?.fontName)))
+      .map(font => fontFamily(font?.family || fontFamily(font?.fontName)) || String(font?.family || font?.fontName || '').trim())
       .filter(Boolean))];
     return {
       referenceFile: profile.fileName,
