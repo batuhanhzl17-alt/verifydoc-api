@@ -6365,8 +6365,6 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     const hits = terms.filter(term => rowText.includes(term)).length;
     const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
     const idMatched = transactionId.length >= 5 && rowText.replace(/\D/g, '').includes(transactionId);
-    if (!descriptionMatched && !idMatched) continue;
-
     let amountCells = cells.filter(cell => statementPdfMoneyTokens(cell.text)
       .some(token => token.cents != null && Math.abs(token.cents) === expectedAmount));
     const balanceCells = expectedBalance == null ? [] : cells.filter(cell =>
@@ -6402,21 +6400,29 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     }
     const balanceBox = balanceCells.length === 1 ? statementPdfAzureBox(balanceCells[0]) : null;
     candidates.push({ tableIndex: tableRow.tableIndex, rowIndex: tableRow.rowIndex, amountCell,
-      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1 });
+      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1,
+      descriptionMatched, idMatched });
   }
 
-  if (candidates.length !== 1) return { status: 'unresolved', source: 'azure-table',
+  // OCR can distort merchant/description text even when the date and exact
+  // cents are clear. Use that row only when date+amount identifies one table
+  // row; repeated same-day/same-amount transactions remain ambiguous.
+  const descriptiveCandidates = candidates.filter(candidate => candidate.descriptionMatched || candidate.idMatched);
+  const selectedCandidates = descriptiveCandidates.length ? descriptiveCandidates : candidates;
+  if (selectedCandidates.length !== 1) return { status: 'unresolved', source: 'azure-table',
     dateAnchorCount: (tableRows || []).filter(item => Number(item.pageNumber) === Number(row.pageNumber) &&
       item.cells?.some(cell => statementPdfDateKey(cell.text) === dateKey)).length,
-    distinctCandidateLineCount: candidates.length,
-    reason: candidates.length ? `${candidates.length} Azure tablo satırı adayı kaldı; güvenli seçim yapılamadı.`
+    distinctCandidateLineCount: selectedCandidates.length,
+    reason: selectedCandidates.length ? `${selectedCandidates.length} Azure tablo satırı adayı kaldı; güvenli seçim yapılamadı.`
       : 'Azure tablo hücrelerinde tarih, açıklama/işlem numarası ve tutar birlikte eşleşmedi.' };
-  const candidate = candidates[0];
+  const candidate = selectedCandidates[0];
   if (!candidate.amountBox) return { status: 'unresolved', source: 'azure-table',
     dateAnchorCount: 1, distinctCandidateLineCount: 1,
     reason: 'Azure tablo satırı bulundu; ancak tutar için dar ve güvenilir hücre/kelime kutusu üretilemedi.' };
   return { status: 'matched', source: 'azure-table', dateAnchorCount: 1,
-    distinctCandidateLineCount: 1, reason: 'Azure tablo satırında tarih, açıklama/işlem numarası ve tutar tekil eşleşti.',
+    distinctCandidateLineCount: 1, reason: descriptiveCandidates.length
+      ? 'Azure tablo satırında tarih, açıklama/işlem numarası ve tutar tekil eşleşti.'
+      : 'OCR açıklaması farklı olsa da tarih ve tam tutar yalnızca bir Azure tablo satırında eşleşti.',
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox,
     amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
 }
@@ -6443,7 +6449,6 @@ function statementPdfResolveAzureRow(row, pageLines, pageWords) {
     const hits = terms.filter(term => text.includes(term)).length;
     const descriptionMatched = !terms.length || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
     const idMatched = transactionId.length >= 5 && text.replace(/\D/g, '').includes(transactionId);
-    if (!descriptionMatched && !idMatched) continue;
     const amountOccurrences = statementPdfMoneyTokens(band.map(line => line.text || '').join(' '))
       .filter(token => token.cents != null && Math.abs(token.cents) === expectedAmount);
     if (amountOccurrences.length !== 1) continue;
@@ -6456,17 +6461,22 @@ function statementPdfResolveAzureRow(row, pageLines, pageWords) {
     const amountBox = amountWords.length === 1 ? statementPdfAzureBox(amountWords[0]) : null;
     const balanceWords = expectedBalance == null ? [] : words.filter(word => statementPdfMoneyCents(word.text) === expectedBalance);
     candidates.push({ anchorY, amountBox, balanceBox: balanceWords.length === 1 ? statementPdfAzureBox(balanceWords[0]) : null,
-      amountText: amountWords.length === 1 ? amountWords[0].text : amountOccurrences[0].text });
+      amountText: amountWords.length === 1 ? amountWords[0].text : amountOccurrences[0].text,
+      descriptionMatched, idMatched });
   }
-  if (candidates.length !== 1) return { status: 'unresolved', dateAnchorCount: anchors.length,
-    distinctCandidateLineCount: candidates.length,
-    reason: candidates.length ? `${candidates.length} Azure satır adayı kaldı; güvenli seçim yapılamadı.`
+  const descriptiveCandidates = candidates.filter(candidate => candidate.descriptionMatched || candidate.idMatched);
+  const selectedCandidates = descriptiveCandidates.length ? descriptiveCandidates : candidates;
+  if (selectedCandidates.length !== 1) return { status: 'unresolved', dateAnchorCount: anchors.length,
+    distinctCandidateLineCount: selectedCandidates.length,
+    reason: selectedCandidates.length ? `${selectedCandidates.length} Azure satır adayı kaldı; güvenli seçim yapılamadı.`
       : 'Azure OCR geometrisinde tarih, açıklama ve tutar aynı satırda doğrulanamadı.' };
-  const candidate = candidates[0];
+  const candidate = selectedCandidates[0];
   if (!candidate.amountBox) return { status: 'unresolved', dateAnchorCount: anchors.length,
     distinctCandidateLineCount: 1, reason: 'Satır bulundu; ancak tutara ait dar OCR kelime kutusu tekil bulunamadı.' };
   return { status: 'matched', source: 'azure-lines', dateAnchorCount: anchors.length, distinctCandidateLineCount: 1,
-    reason: 'Azure OCR satır geometrisinde tarih, açıklama ve tutar tekil eşleşti.',
+    reason: descriptiveCandidates.length
+      ? 'Azure OCR satır geometrisinde tarih, açıklama ve tutar tekil eşleşti.'
+      : 'OCR açıklaması farklı olsa da tarih ve tam tutar yalnızca bir Azure satır bandında eşleşti.',
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox, amountText: candidate.amountText };
 }
 
@@ -6585,7 +6595,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
             ];
             anchorLines.push({ anchorY, tolerance, lineText, descriptionHits, descriptionMatched, matchedAmountItems, matchedBalanceItems });
           }
-          const amountDescriptionCandidates = anchorLines.filter(line => line.descriptionMatched && line.matchedAmountItems.length === 1);
+          const dateAmountCandidates = anchorLines.filter(line => line.matchedAmountItems.length === 1);
+          const descriptiveCandidates = dateAmountCandidates.filter(line => line.descriptionMatched);
+          const amountDescriptionCandidates = descriptiveCandidates.length ? descriptiveCandidates : dateAmountCandidates;
           const balanceDisambiguated = expectedBalanceCents == null ? [] : amountDescriptionCandidates.filter(line => line.matchedBalanceItems.length === 1);
           rowLineCandidates = balanceDisambiguated.length ? balanceDisambiguated : amountDescriptionCandidates;
           if (expectedAmountCents == null) reason = 'Satırda borç/alacak tutarı yapılandırılmış değil.';
@@ -6604,7 +6616,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
             selectedAmountItem = matchedLine.matchedAmountItems[0];
             selectedBalanceItem = matchedLine.matchedBalanceItems.length === 1 ? matchedLine.matchedBalanceItems[0] : null;
             status = 'matched';
-            reason = `Tarih (${dateAnchors.length} metin ankrajı), açıklama ve işlem tutarı aynı görsel satırda tekil eşleşti.`;
+            reason = descriptiveCandidates.length
+              ? `Tarih (${dateAnchors.length} metin ankrajı), açıklama ve işlem tutarı aynı görsel satırda tekil eşleşti.`
+              : `Açıklama OCR'si farklı olsa da tarih (${dateAnchors.length} metin ankrajı) ve tam işlem tutarı tek bir görsel satırda eşleşti.`;
             if (expectedBalanceCents != null && !selectedBalanceItem) reason += ' Bu satırın beklenen bakiyesi aynı satırda tekil bulunamadı.';
             const fieldsToAudit = [{ field: row?.debitAmount != null && row?.debitAmount !== '' ? 'debitAmount' : 'creditAmount', value: rowAmountValue, item: selectedAmountItem }];
             if (selectedBalanceItem) fieldsToAudit.push({ field: 'balanceAfter', value: row.balanceAfter, item: selectedBalanceItem });
