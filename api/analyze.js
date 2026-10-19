@@ -972,20 +972,24 @@ async function forensicWatchlistRequest(method, query = "", body = null) {
 }
 
 
-// Amount risk eligibility requires an actual visual comparison to a matched
-// reference amount field. A position anchor alone only locates the target ROI.
+// Amount risk eligibility requires a visual comparison where the reference and
+// target contain the same amount text. Different legitimate values have
+// different glyphs and crop widths, so their raw crop distance is diagnostic.
 function hasStrongAmountReferenceDifference(amount = {}) {
   const comparison = amount?.referenceComparison || {};
   const styleDistance = Number(comparison.styleDistance);
   const characterDistance = Number(comparison.characterDistance);
+  // Different transaction amounts naturally have different glyph shapes and
+  // crop widths. Their raw pixel distance is diagnostic, not evidence of fraud.
   return comparison.available === true &&
+    comparison.sameText === true &&
     Number.isFinite(styleDistance) && styleDistance >= 0.30 &&
     Number.isFinite(characterDistance) && characterDistance >= 0.36;
 }
 
 // V14: controlled amount promotion. In-target glyph irregularity is only
 // diagnostic; promote only when the same labeled field also differs strongly
-// from the selected reference amount crop.
+// from the selected reference amount crop, with the same visible amount text.
 function getControlledAmountPromotion(result = {}) {
   const amount = result?.amountForensics || {};
   const amountFieldAssociation = result?.semanticEvidenceFusion?.fields?.amount;
@@ -19099,6 +19103,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         referenceText: amountReferenceComparison.referenceText,
         styleDistance: amountReferenceComparison.styleDistance,
         characterDistance: amountReferenceComparison.characterDistance,
+        sameText: amountReferenceComparison.sameText === true,
         fieldAssociationSource: amountReferenceComparison.fieldAssociationSource || null,
         relativeBaselineAvailable: amountReferenceComparison.relativeBaselineAvailable === true,
         comparisonMode: amountReferenceComparison.comparisonMode || null,
@@ -19106,7 +19111,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
           ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
           : 'reference-local-crop-comparator-v3-same-selected-reference',
-        literalAmountEqualityRequired: false,
+        literalAmountEqualityRequired: true,
         };
       }
       console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
@@ -19123,7 +19128,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
           ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
           : 'reference-local-crop-comparator-v3-same-selected-reference',
-        literalAmountEqualityRequired: false,
+        literalAmountEqualityRequired: true,
       }));
     } else {
       console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
@@ -21268,6 +21273,7 @@ async function runReferenceLocalCropComparator(
         field,
         targetText,
         referenceText: refText,
+        sameText: Boolean(sameText),
         referenceFile: path.basename(referencePath),
         styleDistance: Number.isFinite(styleDistance) ? Number(styleDistance.toFixed(4)) : null,
         characterDistance: Number.isFinite(charDistance) ? Number(charDistance.toFixed(4)) : null,
@@ -21359,14 +21365,17 @@ async function runReferenceLocalCropComparator(
           referenceBox: amount.referenceBox,
           styleDistance: amount.styleDistance,
           characterDistance: amount.characterDistance,
+          sameText: amount.sameText === true,
           fieldAssociationSource: amount.fieldAssociationSource || null,
           relativeBaselineAvailable,
           comparisonMode: relativeBaselineAvailable
             ? 'same-document-multi-field-local-outlier'
             : 'single-field-reference-distance-only',
-          classification: Number(amount.styleDistance) >= 0.30 && Number(amount.characterDistance) >= 0.36
+          classification: amount.sameText === true && Number(amount.styleDistance) >= 0.30 && Number(amount.characterDistance) >= 0.36
             ? 'strong-reference-render-difference'
-            : 'measured-below-strong-difference-threshold',
+            : amount.sameText === true
+              ? 'measured-below-strong-difference-threshold'
+              : 'amount-text-differs-render-comparison-diagnostic-only',
         } : null;
       })(),
       findings
@@ -24005,19 +24014,17 @@ const finalAmountReferenceComparison = rawFinalAmountReferenceComparison ? {
   ),
 } : null;
 const amountRenderDifferenceStrong = Boolean(
-  finalAmountReferenceComparison?.available === true && (
-    finalAmountReferenceComparison.classification === 'strong-reference-render-difference' ||
-    (Number(finalAmountReferenceComparison.styleDistance) >= 0.30 &&
-      Number(finalAmountReferenceComparison.characterDistance) >= 0.36)
-  )
+  finalAmountReferenceComparison?.available === true &&
+  finalAmountReferenceComparison.sameText === true &&
+  finalAmountReferenceComparison.classification === 'strong-reference-render-difference'
 );
 const criticalReviewReasons = [];
 if (!criticalIbanEvidence?.associationValidated) criticalReviewReasons.push('recipient-iban-label-association-unverified');
-if (criticalIbanEvidence?.primaryAnalysisAgreement !== 'agreement' || criticalIbanEvidence?.sourceDisagreement) {
+if (criticalIbanEvidence?.primaryAnalysisAgreement === 'disagreement' || criticalIbanEvidence?.sourceDisagreement === true) {
   criticalReviewReasons.push('recipient-iban-source-disagreement');
 }
 if (!criticalAmountEvidence?.associationValidated) criticalReviewReasons.push('amount-label-association-unverified');
-if (criticalAmountEvidence?.primaryAnalysisAgreement !== 'agreement' || criticalAmountEvidence?.sourceDisagreement) {
+if (criticalAmountEvidence?.primaryAnalysisAgreement === 'disagreement' || criticalAmountEvidence?.sourceDisagreement === true) {
   criticalReviewReasons.push('amount-source-disagreement');
 }
 if (finalAmountReferenceComparison?.available !== true) criticalReviewReasons.push('amount-reference-comparison-unavailable');
