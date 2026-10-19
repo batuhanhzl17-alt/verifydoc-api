@@ -12,7 +12,7 @@ import { analyzeFontForensics, fontFamily, normalizeFontName } from "./font_fore
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
-import { extractPdfNativeFieldAssociations, extractPdfOcrFieldAssociations, mergePdfFieldAssociationsWithOcr, matchesPdfFieldLabel } from "./pdf_field_association.js";
+import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { analyzePdfStructure } from "./pdf_structure_forensics.js";
@@ -972,24 +972,20 @@ async function forensicWatchlistRequest(method, query = "", body = null) {
 }
 
 
-// Amount risk eligibility requires a visual comparison where the reference and
-// target contain the same amount text. Different legitimate values have
-// different glyphs and crop widths, so their raw crop distance is diagnostic.
+// Amount risk eligibility requires an actual visual comparison to a matched
+// reference amount field. A position anchor alone only locates the target ROI.
 function hasStrongAmountReferenceDifference(amount = {}) {
   const comparison = amount?.referenceComparison || {};
   const styleDistance = Number(comparison.styleDistance);
   const characterDistance = Number(comparison.characterDistance);
-  // Different transaction amounts naturally have different glyph shapes and
-  // crop widths. Their raw pixel distance is diagnostic, not evidence of fraud.
   return comparison.available === true &&
-    comparison.sameText === true &&
     Number.isFinite(styleDistance) && styleDistance >= 0.30 &&
     Number.isFinite(characterDistance) && characterDistance >= 0.36;
 }
 
 // V14: controlled amount promotion. In-target glyph irregularity is only
 // diagnostic; promote only when the same labeled field also differs strongly
-// from the selected reference amount crop, with the same visible amount text.
+// from the selected reference amount crop.
 function getControlledAmountPromotion(result = {}) {
   const amount = result?.amountForensics || {};
   const amountFieldAssociation = result?.semanticEvidenceFusion?.fields?.amount;
@@ -5970,27 +5966,15 @@ async function auditPdfContentLayer(buffer, fieldAssociation = null, maxPages = 
           const ex = expected.x + expected.width / 2, ey = expected.y + expected.height / 2;
           const distance = Math.hypot(cx-ex, cy-ey);
           const rowValue = fieldKey === 'recipientIBAN' ? row.compactText : row.numberText;
-          // Some PDF producers serialize a whole label/value line (for
-          // example "Alıcı Hesap: TR... Alıcı: name") as one text item.
-          // The native field resolver has already checksum-validated and
-          // narrowed the IBAN substring to field.valueBox. Treat that exact
-          // substring as located even though PDF.js exposes the enclosing
-          // line as a single item.
-          const containsAssociatedValue = fieldKey === 'recipientIBAN' &&
-            Boolean(expectedText && rowValue.includes(expectedText));
-          if (expectedText && (rowValue === expectedText || containsAssociatedValue)) {
+          if (expectedText && rowValue === expectedText) {
             audit.candidates.push({ pageNumber, text: row.text, fontResource: row.fontResource, fontSize: row.fontSize,
-              box: containsAssociatedValue ? expected : row.box,
-              sourceTextBox: containsAssociatedValue ? row.box : undefined,
-              matchedWithinCombinedTextItem: containsAssociatedValue,
-              centerDistanceNorm: Number(distance.toFixed(6)) });
+              box: row.box, centerDistanceNorm: Number(distance.toFixed(6)) });
           }
           const ix = Math.max(0, Math.min(row.box.x+row.box.width, expected.x+expected.width)-Math.max(row.box.x,expected.x));
           const iy = Math.max(0, Math.min(row.box.y+row.box.height, expected.y+expected.height)-Math.max(row.box.y,expected.y));
           const intersection = ix * iy;
           const union = row.box.width*row.box.height + expected.width*expected.height - intersection;
-          if (intersection > 0 && union > 0 && intersection/union >= 0.3 &&
-              rowValue !== expectedText && !containsAssociatedValue) {
+          if (intersection > 0 && union > 0 && intersection/union >= 0.3 && rowValue !== expectedText) {
             audit.overlappingDifferentText.push({ pageNumber, text: row.text, fontResource: row.fontResource,
               overlapRatio: Number((intersection/union).toFixed(3)), box: row.box });
           }
@@ -6363,125 +6347,6 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
 }
 
-function statementPdfResolvePaddleRow(row, pageRegions) {
-  const dateKey = statementPdfDateKey(row?.date);
-  const rawAmount = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
-    : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
-  const parsedAmount = statementPdfMoneyCents(rawAmount);
-  const expectedAmount = parsedAmount == null ? null : Math.abs(parsedAmount);
-  const expectedBalance = statementPdfMoneyCents(row?.balanceAfter);
-  if (!dateKey || expectedAmount == null) return { status: 'unresolved', reason: 'OCR eşleştirmesi için tarih veya tutar eksik.' };
-  const regions = (Array.isArray(pageRegions) ? pageRegions : []).filter(item => {
-    const box = item?.region;
-    return box && [box.x1, box.y1, box.x2, box.y2].map(Number).every(Number.isFinite) &&
-      Number(box.x2) > Number(box.x1) && Number(box.y2) > Number(box.y1) && String(item.text || '').trim();
-  }).map(item => ({ text: String(item.text || '').trim(), score: Number(item.score) || 0,
-    x1: Number(item.region.x1), y1: Number(item.region.y1), x2: Number(item.region.x2), y2: Number(item.region.y2),
-    cy: (Number(item.region.y1) + Number(item.region.y2)) / 2,
-    height: Number(item.region.y2) - Number(item.region.y1),
-    dateKey: statementPdfDateKey(item.text),
-    moneyTokens: statementPdfMoneyTokens(item.text),
-  }));
-  const anchors = regions.filter(item => item.dateKey === dateKey);
-  const medianHeight = [...regions.map(item => item.height).filter(value => value > 0)]
-    .sort((a, b) => a - b)[Math.floor(regions.filter(item => item.height > 0).length / 2)] || 12;
-  const description = statementNormalizeText([row?.description, row?.counterparty].filter(Boolean).join(' '));
-  const terms = description.split(' ').filter(term => term.length >= 4);
-  const transactionId = String(row?.transactionId || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const amountAnchors = regions.filter(item => item.moneyTokens.some(token =>
-    token.cents != null && Math.abs(token.cents) === expectedAmount));
-  if (!amountAnchors.length) return { status: 'unresolved', reason: anchors.length
-    ? 'PaddleOCR tarihleri bulundu; beklenen tutar için OCR bölgesi bulunamadı.'
-    : 'PaddleOCR bölgelerinde tarih ankrajı ve beklenen tutar birlikte doğrulanamadı.' };
-  const candidates = [];
-  for (const anchor of amountAnchors) {
-    // OCR may split one visual table row into separate date, description,
-    // debit/credit and balance boxes. Anchor the search on the exact amount,
-    // then use a wider local band plus the balance/date/description as cross-checks.
-    const tolerance = Math.max(6, Math.min(30, Math.max(anchor.height, medianHeight) * 1.7));
-    const band = regions.filter(item => Math.abs(item.cy - anchor.cy) <= tolerance);
-    const bandText = band.map(item => item.text).join(' ');
-    const normalizedBand = statementNormalizeText(bandText);
-    const hits = terms.filter(term => normalizedBand.includes(term)).length;
-    const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.2));
-    const idMatched = transactionId.length >= 5 && bandText.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(transactionId);
-    const dateMatched = band.some(item => item.dateKey === dateKey) || anchors.some(item => Math.abs(item.cy - anchor.cy) <= tolerance * 1.5);
-    const balanceRegions = expectedBalance == null ? [] : band.filter(item => item.moneyTokens.some(token => token.cents === expectedBalance));
-    const balanceMatched = balanceRegions.length > 0;
-    // A unique exact amount is useful, but repeated fees/amounts require another
-    // independent row cue. A matching balance is especially discriminative.
-    const independentCue = idMatched || (dateMatched && descriptionMatched) ||
-      (balanceMatched && (dateMatched || descriptionMatched));
-    if (!independentCue) continue;
-    const amountRegions = band.filter(item => item.moneyTokens.some(token =>
-      token.cents != null && Math.abs(token.cents) === expectedAmount));
-    const lineY = anchor.cy;
-    const matchedRegions = band.filter(item => Math.abs(item.cy - lineY) <= tolerance &&
-      (item.dateKey === dateKey || item.moneyTokens.length ||
-        terms.some(term => statementNormalizeText(item.text).includes(term)) ||
-        (transactionId.length >= 5 && item.text.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(transactionId))));
-    candidates.push({
-      y: lineY,
-      tolerance,
-      dateMatched,
-      descriptionMatched,
-      idMatched,
-      balanceMatched,
-      balanceBoxPixels: balanceRegions.length ? {
-        x1: Math.min(...balanceRegions.map(item => item.x1)), y1: Math.min(...balanceRegions.map(item => item.y1)),
-        x2: Math.max(...balanceRegions.map(item => item.x2)), y2: Math.max(...balanceRegions.map(item => item.y2)),
-      } : null,
-      amountBoxPixels: amountRegions.length ? {
-        x1: Math.min(...amountRegions.map(item => item.x1)), y1: Math.min(...amountRegions.map(item => item.y1)),
-        x2: Math.max(...amountRegions.map(item => item.x2)), y2: Math.max(...amountRegions.map(item => item.y2)),
-      } : null,
-      boxPixels: matchedRegions.length ? {
-        x1: Math.min(...matchedRegions.map(item => item.x1)), y1: Math.min(...matchedRegions.map(item => item.y1)),
-        x2: Math.max(...matchedRegions.map(item => item.x2)), y2: Math.max(...matchedRegions.map(item => item.y2)),
-      } : null,
-    });
-  }
-  // Multiple OCR regions can represent one amount (currency suffix or split
-  // glyph box). Collapse nearby detections before deciding whether a row is unique.
-  const clustered = [];
-  for (const candidate of candidates.sort((a, b) => a.y - b.y)) {
-    const previous = clustered[clustered.length - 1];
-    if (previous && Math.abs(previous.y - candidate.y) <= Math.min(previous.tolerance, candidate.tolerance) * 0.55) {
-      previous.dateMatched ||= candidate.dateMatched;
-      previous.descriptionMatched ||= candidate.descriptionMatched;
-      previous.idMatched ||= candidate.idMatched;
-      previous.balanceMatched ||= candidate.balanceMatched;
-      previous.boxPixels = previous.boxPixels || candidate.boxPixels;
-      previous.amountBoxPixels = previous.amountBoxPixels || candidate.amountBoxPixels;
-      previous.balanceBoxPixels = previous.balanceBoxPixels || candidate.balanceBoxPixels;
-    } else clustered.push({ ...candidate });
-  }
-  let selected = clustered;
-  if (selected.length > 1) {
-    const strongest = selected.filter(item => item.balanceMatched && (item.dateMatched || item.descriptionMatched));
-    if (strongest.length) selected = strongest;
-  }
-  if (selected.length > 1) {
-    const described = selected.filter(item => item.idMatched || (item.dateMatched && item.descriptionMatched));
-    if (described.length) selected = described;
-  }
-  return selected.length === 1
-    ? { status: 'matched', source: 'paddle-regions', reason: `PaddleOCR satır bandında tutar; ${[
-        selected[0].balanceMatched ? 'bakiye' : null,
-        selected[0].dateMatched ? 'tarih' : null,
-        selected[0].descriptionMatched ? 'açıklama' : null,
-        selected[0].idMatched ? 'işlem numarası' : null,
-      ].filter(Boolean).join(' + ')} ile tekil eşleşti.`,
-      boxPixels: selected[0].boxPixels, amountBoxPixels: selected[0].amountBoxPixels,
-      balanceBoxPixels: selected[0].balanceBoxPixels,
-      matchEvidence: { balanceMatched: selected[0].balanceMatched, dateMatched: selected[0].dateMatched,
-        descriptionMatched: selected[0].descriptionMatched, transactionIdMatched: selected[0].idMatched } }
-    : { status: 'unresolved', reason: selected.length
-      ? `${selected.length} OCR satır adayı kaldı; tarih/açıklama/bakiye ile güvenli tekil seçim yapılamadı.`
-      : 'OCR’de tutar adayı bulundu ancak aynı satır bandında bağımsız tarih, açıklama, işlem numarası veya bakiye doğrulaması yok.',
-      candidateCount: selected.length };
-}
-
 function statementPdfResolveAzureRow(row, pageLines, pageWords) {
   const dateKey = statementPdfDateKey(row?.date);
   const amountValue = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
@@ -6531,7 +6396,7 @@ function statementPdfResolveAzureRow(row, pageLines, pageWords) {
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox, amountText: candidate.amountText };
 }
 
-async function runStatementPdfForensics(filePath, buffer, statementRows = [], azureLayout = null, paddleOCR = null) {
+async function runStatementPdfForensics(filePath, buffer, statementRows = [], azureLayout = null) {
   let pdf = null;
   try {
     pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
@@ -6724,39 +6589,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       ...page.copyMove,
       decisionRole: 'diagnostic-only',
     }));
-    const nativeTextPages = new Set(pageAudits
-      .filter(pageAudit => Number(pageAudit?.textItemCount) > 0)
-      .map(pageAudit => Number(pageAudit.pageNumber)));
-    // Raster-only PDFs have no PDF.js text boxes, and Azure may be unavailable.
-    // Use PaddleOCR's page-indexed regions to associate rows by date, amount,
-    // description/reference and balance on one visual text band.
-    const paddleRegions = Array.isArray(paddleOCR?.regions) ? paddleOCR.regions : [];
-    let paddleMatchedRows = 0;
-    for (const diagnostic of rowAssociationDiagnostics) {
-      if (diagnostic.status === 'matched') continue;
-      const sourceRow = (Array.isArray(statementRows) ? statementRows : []).find(row =>
-        Number(row?.pageNumber) === Number(diagnostic.pageNumber) &&
-        Number(row?.rowNumber) === Number(diagnostic.rowNumber));
-      if (!sourceRow) continue;
-      const pageRegions = paddleRegions.filter(item => Number(item?.pageIndex) + 1 === Number(diagnostic.pageNumber));
-      const resolved = statementPdfResolvePaddleRow(sourceRow, pageRegions);
-      diagnostic.paddleReason = resolved.reason || null;
-      if (resolved.status !== 'matched') continue;
-      diagnostic.status = 'matched';
-      diagnostic.reason = resolved.reason;
-      diagnostic.associationSource = 'paddle-regions';
-      diagnostic.ocrBoxPixels = resolved.boxPixels || null;
-      diagnostic.ocrAmountBoxPixels = resolved.amountBoxPixels || null;
-      diagnostic.ocrBalanceBoxPixels = resolved.balanceBoxPixels || null;
-      diagnostic.paddleMatchEvidence = resolved.matchEvidence || null;
-      diagnostic.amountMatched = true;
-      diagnostic.distinctCandidateLineCount = 1;
-      paddleMatchedRows++;
-    }
-    const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched' &&
-      (azureLayout?.available === true || nativeTextPages.has(Number(item.pageNumber))));
-    const rasterOnlyUnverifiableRows = rowAssociationDiagnostics.filter(item => item.status !== 'matched' &&
-      azureLayout?.available !== true && !nativeTextPages.has(Number(item.pageNumber))).length;
+    const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched');
     const azurePageNumbers = new Set((Array.isArray(azureLayout?.pages) ? azureLayout.pages : [])
       .map(page => Number(page?.pageNumber)).filter(Number.isInteger));
     const unresolvedPagesWithoutAzure = [...new Set(unresolvedRowAssociations
@@ -6790,14 +6623,11 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         inputRows: Array.isArray(statementRows) ? statementRows.length : 0,
         matchedRows: rowAssociationDiagnostics.filter(item => item.status === 'matched').length,
         unresolvedRows: rowAssociationDiagnostics.filter(item => item.status !== 'matched').length,
-        rasterOnlyUnverifiableRows,
         sourceCounts: {
           azureTable: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-table').length,
           azureLines: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-lines' || item.associationSource === 'azure-layout').length,
           pdfNativeText: rowAssociationDiagnostics.filter(item => item.associationSource === 'pdf-native-text').length,
-          paddleRegions: paddleMatchedRows,
         },
-        paddleOCRAvailable: paddleOCR?.success === true,
         azureLayoutAvailable: Boolean(azureLayout?.available),
         azurePageCount: Number(azureLayout?.pageCount) || 0,
         azurePageNumbers: [...azurePageNumbers].sort((a, b) => a - b),
@@ -8194,7 +8024,7 @@ async function getReferenceAmountAnchor(bank) {
     const labelPart = String(text || '').split(/[:：]/, 1)[0];
     const normalized = normalizeFieldTextForMatch(labelPart)
       .replace(/[().]/g, ' ').replace(/\s+/g, ' ').trim();
-    return matchesPdfFieldLabel('amount', normalized);
+    return /^(?:TUTAR|TUTARI|ISLEM TUTAR|ISLEM TUTARI|ISLEM TUTAR TL|ISLEM TUTARI TL|ISLEM TUTAR TRY|ISLEM TUTARI TRY|ANA TUTAR|ANA TUTARI|GIDEN TUTAR|GIDEN TUTARI|GIDEN FAST TUTAR|GIDEN FAST TUTARI|GIDEN FAST EFT TUTAR|GIDEN FAST EFT TUTARI|GONDERILEN TUTAR|GONDERILEN TUTARI|GONDERILEN FAST TUTAR|GONDERILEN FAST TUTARI|TRANSFER TUTAR|TRANSFER TUTARI|ODEME TUTAR|ODEME TUTARI|PARA CINSI TUTAR|B A PARA CINSI TUTAR)$/.test(normalized);
   };
 
   const median = (values) => {
@@ -8347,7 +8177,7 @@ async function getReferenceAmountAnchor(bank) {
         // Halkbank `ISLEM TUTARI (TL)` could produce no reference anchor.
         const strictMoneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)\s*[-+]?\s*\d|[-+]?\d{1,3}(?:[. ]\d{3})*[,.]\d{1,2}\b|[-+]?\d{1,3}(?:[. ]\d{3})+(?:\b|\s)/i;
         const integerMoneyRe = /^[-+]?\d{1,6}$/;
-        const explicitAmountLabelRe = /(?:b\s*\/\s*a\s*para\s*cinsi\s*tutar|işlem\s*tutar(?:ı|i)?(?:\s*\(\s*(?:tl|try)\s*\))?|islem\s*tutar(?:i|ı)?(?:\s*\(\s*(?:tl|try)\s*\))?|(?:fast\s*)?(?:işlem|islem|transfer|gönderim|gonderim|giden|gönderilen)\s*tutar(?:ı|i)?|giden\s*fast(?:\s*eft)?\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|ana\s*tutar|giden\s*tutar)/i;
+        const explicitAmountLabelRe = /(?:b\s*\/\s*a\s*para\s*cinsi\s*tutar|işlem\s*tutar(?:ı|i)?(?:\s*\(\s*(?:tl|try)\s*\))?|islem\s*tutar(?:i|ı)?(?:\s*\(\s*(?:tl|try)\s*\))?|giden\s*fast(?:\s*eft)?\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|ana\s*tutar|giden\s*tutar)/i;
         const moneyCandidates = regions.filter(r =>
           /\d/.test(r.text) && (strictMoneyRe.test(r.text) || integerMoneyRe.test(String(r.text).trim()))
         );
@@ -16922,7 +16752,6 @@ Kesin gerçek veya kesin sahte kararı verme.
 `;
 
 function statementCents(value) {
-  if (value === null || value === undefined || String(value).trim() === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? Math.round(number * 100) : null;
 }
@@ -17004,8 +16833,8 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
       const previous = direction === 'ascending' ? orderedRows[i] : orderedRows[i + 1];
       const currentBalance = statementCents(current.balanceAfter);
       const previousBalance = statementCents(previous.balanceAfter);
-      const debit = Math.abs(statementCents(current.debitAmount) ?? 0);
-      const credit = Math.abs(statementCents(current.creditAmount) ?? 0);
+      const debit = statementCents(current.debitAmount) ?? 0;
+      const credit = statementCents(current.creditAmount) ?? 0;
       const hasMovement = statementCents(current.debitAmount) !== null || statementCents(current.creditAmount) !== null;
       if (currentBalance === null || previousBalance === null || !hasMovement) continue;
       checks++;
@@ -17041,34 +16870,17 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     pdfForensics?.everyPageAnalyzed === true && Number(pdfForensics?.pagesAnalyzed) === Number(pdfPageCount);
 
   let deterministicMismatch = bestOrder.checks > 0 && bestOrder.mismatches > 0;
-  const completeAmounts = !rowsIncomplete && pageCoverageComplete && usableRows.length > 0 && usableRows.every(row =>
-    (statementCents(row.debitAmount) !== null || statementCents(row.creditAmount) !== null) &&
-    statementCents(row.balanceAfter) !== null
+  const completeAmounts = usableRows.length > 0 && usableRows.every(row =>
+    statementCents(row.debitAmount) !== null || statementCents(row.creditAmount) !== null
   );
   const totalIncomingCents = completeAmounts
-    ? usableRows.reduce((sum, row) => sum + Math.abs(statementCents(row.creditAmount) ?? 0), 0)
+    ? usableRows.reduce((sum, row) => sum + (statementCents(row.creditAmount) ?? 0), 0)
     : null;
   const totalOutgoingCents = completeAmounts
-    ? usableRows.reduce((sum, row) => sum + Math.abs(statementCents(row.debitAmount) ?? 0), 0)
+    ? usableRows.reduce((sum, row) => sum + (statementCents(row.debitAmount) ?? 0), 0)
     : null;
-  let openingCents = statementCents(balanceAnalysis.openingBalance);
-  let documentClosingCents = statementCents(balanceAnalysis.documentClosingBalance);
-  if (completeAmounts) {
-    // Statements are commonly printed newest-first. The balance shown on the
-    // oldest transaction is the balance AFTER that transaction, not the
-    // opening balance. Derive the opening value immediately before that row
-    // and the closing value from the newest row, then reconcile all movements.
-    const oldestRow = bestOrder.direction === 'descending' ? usableRows[usableRows.length - 1] : usableRows[0];
-    const newestRow = bestOrder.direction === 'descending' ? usableRows[0] : usableRows[usableRows.length - 1];
-    const oldestBalance = statementCents(oldestRow?.balanceAfter);
-    const oldestDebit = Math.abs(statementCents(oldestRow?.debitAmount) ?? 0);
-    const oldestCredit = Math.abs(statementCents(oldestRow?.creditAmount) ?? 0);
-    if (oldestBalance !== null) openingCents = oldestBalance - oldestCredit + oldestDebit;
-    const newestBalance = statementCents(newestRow?.balanceAfter);
-    if (newestBalance !== null) documentClosingCents = newestBalance;
-    if (openingCents !== null) balanceAnalysis.openingBalance = Number((openingCents / 100).toFixed(2));
-    if (documentClosingCents !== null) balanceAnalysis.documentClosingBalance = Number((documentClosingCents / 100).toFixed(2));
-  }
+  const openingCents = statementCents(balanceAnalysis.openingBalance);
+  const documentClosingCents = statementCents(balanceAnalysis.documentClosingBalance);
   const calculatedClosingCents = completeAmounts && openingCents !== null
     ? openingCents + totalIncomingCents - totalOutgoingCents
     : null;
@@ -17079,12 +16891,6 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   if (completeAmounts) {
     balanceAnalysis.totalIncoming = Number((totalIncomingCents / 100).toFixed(2));
     balanceAnalysis.totalOutgoing = Number((totalOutgoingCents / 100).toFixed(2));
-  } else {
-    // Do not leave model-generated whole-document totals in place when the
-    // extracted ledger is incomplete; represent them as unavailable instead.
-    balanceAnalysis.totalIncoming = null;
-    balanceAnalysis.totalOutgoing = null;
-    balanceAnalysis.calculatedClosingBalance = null;
   }
   if (calculatedClosingCents !== null) balanceAnalysis.calculatedClosingBalance = Number((calculatedClosingCents / 100).toFixed(2));
   if (deterministicMismatch) {
@@ -17099,13 +16905,9 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     // preserve a model-generated false value as if a mismatch was verified.
     balanceAnalysis.calculationConsistent = null;
     balanceAnalysis.evidence = [balanceAnalysis.evidence, 'Satır sayısı doğrulanamadığı için hesap özeti genelinde bakiye tutarlılığı kesinleştirilemedi.'].filter(Boolean).join(' ');
-  } else if (completeAmounts && bestOrder.checks >= 2) {
+  } else if (bestOrder.checks >= 2) {
     balanceAnalysis.calculationConsistent = true;
-    balanceAnalysis.evidence = [
-      `Hareketler satır satır toplandı: toplam alacak ${balanceAnalysis.totalIncoming.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL, toplam borç ${balanceAnalysis.totalOutgoing.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL.`,
-      `İşlem öncesi başlangıç bakiyesi ${balanceAnalysis.openingBalance.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL olarak en eski satırdan türetildi; hesaplanan kapanış ${balanceAnalysis.calculatedClosingBalance.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL ve belgedeki son hareket bakiyesi ${balanceAnalysis.documentClosingBalance.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL.`,
-      `Satır bakiyesi devamlılığı ${bestOrder.checks} ardışık karşılaştırmada tutarlı (${bestOrder.direction === 'ascending' ? 'yukarıdan aşağıya' : 'aşağıdan yukarıya'} sıra).`,
-    ].join(' ');
+    balanceAnalysis.evidence = [balanceAnalysis.evidence, `Satır bakiyesi devamlılığı ${bestOrder.checks} ardışık karşılaştırmada tutarlı (${bestOrder.direction === 'ascending' ? 'yukarıdan aşağıya' : 'aşağıdan yukarıya'} sıra).`].filter(Boolean).join(' ');
   }
 
   // Discard narrative count claims and replace them with the structured row
@@ -17147,46 +16949,6 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   result.transactionAnalysis = transactionAnalysis;
   result.balanceAnalysis = balanceAnalysis;
   result.statementPdfForensics = pdfForensics || { available: false, reason: 'PDF adli katmanı çalıştırılamadı.' };
-
-  // When every extracted row is present and its adjacent balances reconcile,
-  // discard an AI-only aggregate-balance penalty (for example, treating the
-  // oldest transaction's after-balance as the opening balance). Keep other
-  // visual/layout/editing signals intact and retain a diagnostic trail.
-  if (completeAmounts && bestOrder.checks >= 2 && !deterministicMismatch &&
-      calculatedClosingCents !== null && documentClosingCents !== null &&
-      Math.abs(calculatedClosingCents - documentClosingCents) <= 1) {
-    const previousRisk = Number(result.overallRisk);
-    const categories = result.categories && typeof result.categories === 'object' ? result.categories : {};
-    const previousFinancialRisk = Number(categories.financialDataRisk) || 0;
-    categories.financialDataRisk = derivedDuplicates.length ? Math.min(previousFinancialRisk, 30) : Math.min(previousFinancialRisk, 10);
-    result.categories = categories;
-    const categoryScores = ['visualRisk', 'textRisk', 'layoutRisk', 'financialDataRisk', 'editingRisk']
-      .map(key => Number(categories[key]) || 0);
-    result.overallRisk = Math.max(0, Math.min(100, Math.round(Math.max(...categoryScores))));
-    result.riskLabel = result.overallRisk <= 20 ? 'LOW RISK'
-      : result.overallRisk <= 45 ? 'MODERATE RISK'
-        : result.overallRisk <= 70 ? 'HIGH RISK' : 'VERY HIGH RISK';
-    result.balanceRiskReconciliation = {
-      applied: true,
-      previousOverallRisk: Number.isFinite(previousRisk) ? previousRisk : null,
-      updatedOverallRisk: result.overallRisk,
-      previousFinancialDataRisk: previousFinancialRisk,
-      updatedFinancialDataRisk: categories.financialDataRisk,
-      reason: 'Tüm çıkarılan satırlar mevcut; satır bakiyeleri ve başlangıçtan kapanışa deterministik hareket toplamı tutarlı.',
-    };
-    const staleBalanceText = /(?:\d[\d.,]*\s*TL\s*)?(?:bakiye|borç|alacak|hareket|toplam).{0,100}(?:fark|tutarsız|uyuşmuyor|uyumsuz)|(?:fark|tutarsız|uyuşmuyor|uyumsuz).{0,100}(?:bakiye|borç|alacak|hareket|toplam)/i;
-    result.summary = String(result.summary || '').split(/(?<=[.!?])\s+|\n+/)
-      .filter(sentence => !staleBalanceText.test(sentence)).join(' ').trim();
-    result.summary = [result.summary,
-      'Satırların tamamı üzerinden yapılan deterministik bakiye hesabında toplam borç, toplam alacak, başlangıç ve kapanış bakiyeleri tutarlı bulundu.']
-      .filter(Boolean).join(' ');
-    result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : [])
-      .filter(item => !staleBalanceText.test(String(item || ''))),
-      'Deterministik satır hesabında başlangıç bakiyesi, toplam borç/alacak ve kapanış bakiyesi birbiriyle tutarlı bulundu.'])];
-    result.balanceAnalysis.evidence = [result.balanceAnalysis.evidence,
-      'Modelin önceki toplam bakiye yorumu deterministik satır hesabıyla uzlaştırıldı; işlem sonrası en eski bakiye başlangıç bakiyesi olarak kullanılmadı.']
-      .filter(Boolean).join(' ');
-  }
 
   const findings = [];
   if (deterministicMismatch) findings.push('Satır bazlı bakiye hesabında fark bulundu; örnek satırlar ve beklenen bakiyeler rapora eklendi.');
@@ -17391,159 +17153,6 @@ throw new Error(
 }
 
 return result;
-}
-
-// Long, image-only account statements can yield a correct headline transaction
-// count but only a partial row array when all pages are sent in one request.
-// Re-read pages that OCR says contain transaction rows but the first pass
-// omitted, one page per request, so each table gets its own output budget.
-async function completeStatementRowsPageByPage(statementResult, pdfBuffer, pageCount, ocrResult) {
-  const transactionAnalysis = statementResult?.transactionAnalysis;
-  if (!transactionAnalysis || !Buffer.isBuffer(pdfBuffer) || !Number.isInteger(pageCount) || pageCount < 1) {
-    return statementResult;
-  }
-  const currentRows = Array.isArray(transactionAnalysis.rows) ? transactionAnalysis.rows : [];
-  const ocrRegions = Array.isArray(ocrResult?.regions) ? ocrResult.regions : [];
-  if (!ocrRegions.length) return statementResult;
-  const declaredCount = Number(transactionAnalysis.transactionCount) || 0;
-  // A document-level count larger than the extracted row array is direct
-  // evidence that the first vision pass dropped rows. Re-read every OCR-backed
-  // page independently; the date-anchor heuristic alone can undercount when
-  // OCR splits dates into multiple boxes or misses a date glyph.
-  const globalCountMismatch = declaredCount > currentRows.length;
-
-  const needsPagePass = [];
-  for (let pageNumber = 1; pageNumber <= pageCount; pageNumber++) {
-    const pageRegions = ocrRegions.filter(item => Number(item?.pageIndex) + 1 === pageNumber);
-    const pageRows = currentRows.filter(row => Number(row?.pageNumber) === pageNumber);
-    const dateRows = [];
-    for (const item of pageRegions) {
-      if (!/(?:^|\D)\d{1,2}[./-]\d{1,2}[./-]\d{4}(?:\D|$)/.test(String(item?.text || ''))) continue;
-      const y = Number(item?.region?.y1);
-      if (Number.isFinite(y) && dateRows.some(value => Math.abs(value - y) <= 8)) continue;
-      if (Number.isFinite(y)) dateRows.push(y);
-      else dateRows.push(dateRows.length);
-    }
-    const likelyRowCount = dateRows.length;
-    const pageHasTableOCR = pageRegions.length >= 15;
-    if ((globalCountMismatch && (pageHasTableOCR || pageRows.length > 0)) ||
-        (likelyRowCount >= 4 && pageRows.length < likelyRowCount - 2) ||
-        (pageRows.length === 0 && pageHasTableOCR)) {
-      needsPagePass.push({ pageNumber, ocrRegionCount: pageRegions.length, dateAnchorCount: likelyRowCount,
-        existingRowCount: pageRows.length, reason: globalCountMismatch ? 'document-row-count-exceeds-structured-rows' : 'page-row-coverage-gap' });
-    }
-  }
-  if (!needsPagePass.length) return statementResult;
-
-  console.log('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA BAŞLADI:', JSON.stringify({
-    pageCount, missingPages: needsPagePass, existingRows: currentRows.length,
-  }));
-
-  const pageRowsByNumber = new Map();
-  const pagePassResults = new Map();
-  for (const row of currentRows) {
-    const page = Number(row?.pageNumber);
-    if (!pageRowsByNumber.has(page)) pageRowsByNumber.set(page, []);
-    pageRowsByNumber.get(page).push(row);
-  }
-
-  const pageRowItemSchema = {
-    type: 'object',
-    additionalProperties: false,
-    properties: {
-      pageNumber: { type: 'integer', minimum: 1 },
-      rowNumber: { type: 'integer', minimum: 1 },
-      date: { type: ['string', 'null'] },
-      description: { type: 'string' },
-      counterparty: { type: ['string', 'null'] },
-      debitAmount: { type: ['number', 'null'] },
-      creditAmount: { type: ['number', 'null'] },
-      balanceAfter: { type: ['number', 'null'] },
-      transactionId: { type: ['string', 'null'] },
-    },
-    required: ['pageNumber', 'rowNumber', 'date', 'description', 'counterparty', 'debitAmount', 'creditAmount', 'balanceAfter', 'transactionId'],
-  };
-
-  for (const target of needsPagePass) {
-    try {
-      const rendered = await renderPdfPagePng(pdfBuffer, target.pageNumber, 2);
-      if (!rendered?.buffer?.length) {
-        console.warn('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA ATLANDI:', JSON.stringify({ ...target, reason: 'page-render-failed' }));
-        continue;
-      }
-      const response = await openai.responses.create({
-        model: 'gpt-5.6-terra',
-        input: [{
-          role: 'user',
-          content: [
-            { type: 'input_text', text: `Bu, ${pageCount} sayfalı hesap hareketi belgesinin yalnızca ${target.pageNumber}. sayfasıdır. Bu sayfadaki TÜM görünür işlem satırlarını tek tek çıkar; tablo satırlarını atlama veya birleştirme. rowNumber sayfanın üstünden aşağıya işlem satırı sırasıdır, başlık/toplam satırlarını işlem sayma. Borç/Alacak yönünü sütun başlıklarına göre belirle. Okunamayan alanı null yap, rakam uydurma. pageNumber alanını ${target.pageNumber} ver. Bu sayfa için JSON satır sayısı kadar visibleTransactionCount döndür. OCR ön taramasında yaklaşık ${target.dateAnchorCount} tarih ankrajı görüldü; bu sayı yönlendiricidir, belgedeki görünür satırları esas al. Satırdaki bakiye işlemden SONRAKİ bakiyedir. Ters kronolojik tabloda en eski işlemin işlem öncesi açılış bakiyesi = o satırdaki bakiye - alacak + borç; bu alacağı açılış bakiyesine ekleyip toplam alacakta tekrar sayma.` },
-            { type: 'input_image', image_url: `data:image/png;base64,${rendered.buffer.toString('base64')}`, detail: 'high' },
-          ],
-        }],
-        text: {
-          format: {
-            type: 'json_schema',
-            name: 'verifydoc_statement_page_rows',
-            strict: true,
-            schema: {
-              type: 'object', additionalProperties: false,
-              properties: {
-                visibleTransactionCount: { type: 'integer', minimum: 0 },
-                rows: { type: 'array', maxItems: 250, items: pageRowItemSchema },
-              },
-              required: ['visibleTransactionCount', 'rows'],
-            },
-          },
-        },
-        max_output_tokens: 12000,
-      });
-      const pageResult = parseAIResponse(response?.output_text || '');
-      const extractedRows = Array.isArray(pageResult?.rows) ? pageResult.rows
-        .filter(row => Number.isInteger(Number(row?.rowNumber)) && Number(row?.rowNumber) > 0 &&
-          (statementCents(row?.debitAmount) !== null || statementCents(row?.creditAmount) !== null ||
-            String(row?.date || '').trim() || String(row?.description || '').trim()))
-        .map(row => ({ ...row, pageNumber: target.pageNumber }))
-        .sort((a, b) => Number(a.rowNumber) - Number(b.rowNumber)) : [];
-      const visibleCount = Number(pageResult?.visibleTransactionCount);
-      const uniqueRowNumbers = new Set(extractedRows.map(row => Number(row.rowNumber))).size === extractedRows.length;
-      const countConsistent = Number.isInteger(visibleCount) && visibleCount === extractedRows.length && uniqueRowNumbers;
-      const previousRows = pageRowsByNumber.get(target.pageNumber) || [];
-      const accepted = countConsistent && extractedRows.length >= previousRows.length;
-      if (accepted) pageRowsByNumber.set(target.pageNumber, extractedRows);
-      pagePassResults.set(target.pageNumber, { visibleCount, extractedCount: extractedRows.length, countConsistent, accepted });
-      console.log('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA SONUCU:', JSON.stringify({
-        pageNumber: target.pageNumber,
-        reason: target.reason,
-        ocrDateAnchorCount: target.dateAnchorCount,
-        modelVisibleTransactionCount: Number.isFinite(visibleCount) ? visibleCount : null,
-        extractedRowCount: extractedRows.length,
-        previousRowCount: previousRows.length,
-        countConsistent,
-        accepted,
-      }));
-    } catch (error) {
-      console.warn('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA HATASI:', JSON.stringify({
-        pageNumber: target.pageNumber, error: String(error?.message || error).slice(0, 240),
-      }));
-    }
-  }
-
-  const mergedRows = [...pageRowsByNumber.values()].flat()
-    .sort((a, b) => Number(a.pageNumber) - Number(b.pageNumber) || Number(a.rowNumber) - Number(b.rowNumber));
-  if (mergedRows.length > currentRows.length || needsPagePass.length > 0) {
-    transactionAnalysis.rows = mergedRows;
-    const everyPageReRead = pagePassResults.size === pageCount &&
-      [...pagePassResults.values()].every(item => item.countConsistent && item.accepted);
-    if (everyPageReRead) transactionAnalysis.transactionCount = mergedRows.length;
-    console.log('HESAP ÖZETİ SAYFA BAZLI SATIRLAR BİRLEŞTİRİLDİ:', JSON.stringify({
-      before: currentRows.length, after: mergedRows.length,
-      previousDeclaredTransactionCount: declaredCount || null,
-      declaredTransactionCount: Number(transactionAnalysis.transactionCount) || null,
-      pagePasses: Object.fromEntries([...pagePassResults.entries()].map(([page, value]) => [page, value])),
-      countReconciledFromPagePasses: everyPageReRead,
-    }));
-  }
-  return statementResult;
 }
 
 // =====================================================
@@ -18333,8 +17942,6 @@ try {
     available: pdfStructureForensics.available,
     engine: pdfStructureForensics.engine || null,
     fileBytes: pdfStructureForensics.fileBytes || null,
-    pdfVersion: pdfStructureForensics.pdfVersion || null,
-    producer: pdfStructureForensics.metadata?.producer || null,
     pageCount: pdfStructureForensics.pageCount || null,
     normalizedOperatorCounts: pdfStructureForensics.normalizedOperatorCounts || null,
   }));
@@ -18565,33 +18172,6 @@ await runPaddleOCRForJPEG(
 forensicTargetPath
 );
 
-if (type === "pdf" && paddleImageOCR?.success) {
-  try {
-    const rasterMeta = await sharp(forensicTargetPath).metadata();
-    const pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
-    const ocrFields = await extractPdfOcrFieldAssociations(pdf, paddleImageOCR, {
-      imageWidth: Number(rasterMeta.width) || 0,
-      imageHeight: Number(rasterMeta.height) || 0,
-      maxPages: 1,
-    });
-    pdfNativeFieldAssociation = mergePdfFieldAssociationsWithOcr(pdfNativeFieldAssociation, ocrFields);
-    const resolvedAmount = pdfNativeFieldAssociation?.fields?.amount;
-    if (resolvedAmount?.status === "matched" && resolvedAmount?.associationValidated && resolvedAmount?.valueBox) {
-      activeTargetPdfAmountBox = { ...resolvedAmount.valueBox, pageNumber: Number(resolvedAmount.pageNumber) || 1, labelText: resolvedAmount.labelText || null };
-    }
-    console.log("PDF TARGET FIELD ASSOCIATION FUSION:", JSON.stringify({
-      source: pdfNativeFieldAssociation?.sources || [],
-      fields: Object.fromEntries(Object.entries(pdfNativeFieldAssociation?.fields || {}).map(([field, item]) => [field, {
-        status: item?.status, value: item?.value || null, resolver: item?.resolver || null,
-        fallbackUsed: item?.fallbackUsed === true, crossSourceConflict: item?.crossSourceConflict === true,
-        typedLabelCandidates: item?.typedLabelCandidates || 0,
-      }]))
-    }));
-  } catch (error) {
-    console.warn("PDF TARGET OCR FIELD ASSOCIATION ERROR:", error?.message || error);
-  }
-}
-
 if (!paddleImageOCR?.success) {
   paddleCriticalFailure = true;
   console.error("PADDLEOCR CRITICAL FAILURE — ANALYSIS WILL NOT CLAIM CLEAN RESULT");
@@ -18726,82 +18306,29 @@ if ((type === "image" || type === "pdf") && forensicTargetPath) {
 // hatası oluşur.
 let reference = null;
 let pdfReferenceFieldAssociation = null;
-let pdfReferenceFieldComparison = null;
 
 if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR, activeReferenceFormat);
-}
-
-if (type === "pdf" && pdfStructureForensics?.available && reference?.path && path.extname(reference.path).toLowerCase() === ".pdf") {
-  try {
-    const referenceStat = await fs.stat(reference.path);
-    const targetBytes = Number(pdfStructureForensics.fileBytes) || buffer.length;
-    const referenceBytes = Number(referenceStat.size) || 0;
-    pdfStructureForensics.sizeComparison = {
-      referenceFile: path.basename(reference.path),
-      referenceBytes,
-      targetToReferenceRatio: referenceBytes > 0 ? Number((targetBytes / referenceBytes).toFixed(3)) : null,
-      materiallySmaller: referenceBytes > 0 && targetBytes <= referenceBytes * 0.5,
-      comparisonRule: "target-at-or-below-half-of-selected-same-format-reference",
-    };
-    console.log("PDF REFERENCE SIZE COMPARISON:", JSON.stringify(pdfStructureForensics.sizeComparison));
-  } catch (error) {
-    console.warn("PDF REFERENCE SIZE COMPARISON ERROR:", error?.message || error);
-  }
 }
 
 if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCase() === ".pdf") {
   try {
     const referenceBuffer = await fs.readFile(reference.path);
     const referencePdf = await getPdfDocument({ data: new Uint8Array(referenceBuffer) }).promise;
-    const referenceNativeFields = await extractPdfNativeFieldAssociations(referencePdf);
-    let referenceOcrFields = { available: false, fields: {}, status: 'ocr-not-run' };
-    try {
-      const renderedReference = await renderPdfPagePng(referencePdf, 1, 1.6);
-      if (renderedReference?.buffer) {
-        const ocrPath = `/tmp/verifydoc-reference-fields-${createHash('sha256').update(referenceBuffer).digest('hex').slice(0, 16)}.png`;
-        await fs.writeFile(ocrPath, renderedReference.buffer);
-        try {
-          const referenceOCR = await runPaddleOCR(ocrPath);
-          referenceOcrFields = await extractPdfOcrFieldAssociations(referencePdf, referenceOCR, {
-            imageWidth: renderedReference.width,
-            imageHeight: renderedReference.height,
-            maxPages: 1,
-          });
-        } finally {
-          try { await fs.unlink(ocrPath); } catch {}
-        }
-      }
-    } catch (ocrError) {
-      console.warn('PDF REFERENCE OCR FIELD ASSOCIATION ERROR:', ocrError?.message || ocrError);
-    }
-    pdfReferenceFieldAssociation = mergePdfFieldAssociationsWithOcr(referenceNativeFields, referenceOcrFields);
+    pdfReferenceFieldAssociation = await extractPdfNativeFieldAssociations(referencePdf);
     const fieldComparison = {};
     for (const field of ["recipientName", "recipientIBAN", "amount"]) {
       const targetField = pdfNativeFieldAssociation?.fields?.[field];
       const referenceField = pdfReferenceFieldAssociation?.fields?.[field];
       const targetBox = targetField?.valueBox;
       const referenceBox = referenceField?.valueBox;
-      const targetLabelBox = targetField?.labelBox;
-      const referenceLabelBox = referenceField?.labelBox;
-      const labelCenterDelta = targetLabelBox && referenceLabelBox ? {
-        dx: Number(((targetLabelBox.x + targetLabelBox.width / 2) - (referenceLabelBox.x + referenceLabelBox.width / 2)).toFixed(6)),
-        dy: Number(((targetLabelBox.y + targetLabelBox.height / 2) - (referenceLabelBox.y + referenceLabelBox.height / 2)).toFixed(6)),
-      } : null;
       fieldComparison[field] = {
         targetStatus: targetField?.status || "unavailable",
         referenceStatus: referenceField?.status || "unavailable",
         targetLabel: targetField?.labelText || null,
         referenceLabel: referenceField?.labelText || null,
-        referencePresence: referenceField?.referencePresence || 'unknown',
-        targetReferenceValueConflict: targetField?.crossSourceConflict === true,
-        referenceNativeOcrConflict: referenceField?.crossSourceConflict === true,
-        targetResolver: targetField?.resolver || null,
-        referenceResolver: referenceField?.resolver || null,
         targetValueBoxNorm: targetBox || null,
         referenceValueBoxNorm: referenceBox || null,
-        labelCenterDelta,
-        layoutAligned: labelCenterDelta ? Math.abs(labelCenterDelta.dx) <= 0.06 && Math.abs(labelCenterDelta.dy) <= 0.025 : null,
         centerDeltaNorm: targetBox && referenceBox ? {
           dx: Number(((targetBox.x + targetBox.width / 2) - (referenceBox.x + referenceBox.width / 2)).toFixed(6)),
           dy: Number(((targetBox.y + targetBox.height / 2) - (referenceBox.y + referenceBox.height / 2)).toFixed(6)),
@@ -18809,75 +18336,15 @@ if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCas
         comparable: Boolean(targetField?.associationValidated && referenceField?.associationValidated && targetBox && referenceBox),
       };
     }
-    pdfReferenceFieldComparison = fieldComparison;
     console.log("PDF NATIVE TARGET-REFERENCE FIELD COMPARISON:", JSON.stringify({
       referenceFile: path.basename(reference.path),
       targetPageCount: pdfNativeFieldAssociation?.pageCount || 0,
       referencePageCount: pdfReferenceFieldAssociation?.pageCount || 0,
-      targetSources: pdfNativeFieldAssociation?.sources || ['pdf-text-layer'],
-      referenceSources: pdfReferenceFieldAssociation?.sources || ['pdf-text-layer'],
       fields: fieldComparison,
     }));
   } catch (error) {
     console.warn("PDF NATIVE REFERENCE FIELD ASSOCIATION ERROR:", error?.message || error);
     pdfReferenceFieldAssociation = { available: false, status: "error", fields: {}, error: error?.message || String(error) };
-  }
-}
-
-if (type === "pdf" && reference?.path && /\.(?:jpe?g|png|webp)$/i.test(reference.path)) {
-  try {
-    const referenceBuffer = await fs.readFile(reference.path);
-    const imageMeta = await sharp(referenceBuffer).metadata();
-    const imageWidth = Number(imageMeta.width) || 0;
-    const imageHeight = Number(imageMeta.height) || 0;
-    const referenceOCR = await runPaddleOCR(reference.path);
-    const rasterReference = {
-      numPages: 1,
-      getPage: async () => ({ getViewport: () => ({ width: imageWidth, height: imageHeight }) }),
-    };
-    const referenceOcrFields = await extractPdfOcrFieldAssociations(rasterReference, referenceOCR, {
-      imageWidth, imageHeight, maxPages: 1,
-    });
-    const emptyNativeFields = {
-      available: true, status: 'raster-reference-no-text-layer', pageCount: 1,
-      fields: Object.fromEntries(['recipientName', 'recipientIBAN', 'amount'].map(field => [field, {
-        status: 'unavailable', value: null, associationValidated: false, typedLabelCandidates: 0, reason: 'raster-reference-has-no-native-text-layer',
-      }])),
-    };
-    pdfReferenceFieldAssociation = mergePdfFieldAssociationsWithOcr(emptyNativeFields, referenceOcrFields);
-    const fieldComparison = {};
-    for (const field of ['recipientName', 'recipientIBAN', 'amount']) {
-      const targetField = pdfNativeFieldAssociation?.fields?.[field];
-      const referenceField = pdfReferenceFieldAssociation?.fields?.[field];
-      const targetBox = targetField?.valueBox;
-      const referenceBox = referenceField?.valueBox;
-      const targetLabelBox = targetField?.labelBox;
-      const referenceLabelBox = referenceField?.labelBox;
-      const labelCenterDelta = targetLabelBox && referenceLabelBox ? {
-        dx: Number(((targetLabelBox.x + targetLabelBox.width / 2) - (referenceLabelBox.x + referenceLabelBox.width / 2)).toFixed(6)),
-        dy: Number(((targetLabelBox.y + targetLabelBox.height / 2) - (referenceLabelBox.y + referenceLabelBox.height / 2)).toFixed(6)),
-      } : null;
-      fieldComparison[field] = {
-        targetStatus: targetField?.status || 'unavailable', referenceStatus: referenceField?.status || 'unavailable',
-        targetLabel: targetField?.labelText || null, referenceLabel: referenceField?.labelText || null,
-        referencePresence: referenceField?.referencePresence || 'unknown',
-        targetResolver: targetField?.resolver || null, referenceResolver: referenceField?.resolver || null,
-        targetValueBoxNorm: targetBox || null, referenceValueBoxNorm: referenceBox || null,
-        labelCenterDelta,
-        layoutAligned: labelCenterDelta ? Math.abs(labelCenterDelta.dx) <= 0.06 && Math.abs(labelCenterDelta.dy) <= 0.025 : null,
-        targetReferenceValueConflict: targetField?.crossSourceConflict === true,
-        referenceNativeOcrConflict: referenceField?.crossSourceConflict === true,
-        comparable: Boolean(targetField?.associationValidated && referenceField?.associationValidated && targetBox && referenceBox),
-      };
-    }
-    pdfReferenceFieldComparison = fieldComparison;
-    console.log('RASTER REFERENCE TARGET-FIELD COMPARISON:', JSON.stringify({
-      referenceFile: path.basename(reference.path), targetSources: pdfNativeFieldAssociation?.sources || ['pdf-text-layer'],
-      referenceSource: 'paddle-ocr-label-value-geometry', fields: fieldComparison,
-    }));
-  } catch (error) {
-    console.warn('RASTER REFERENCE FIELD ASSOCIATION ERROR:', error?.message || error);
-    pdfReferenceFieldAssociation = { available: false, status: 'error', fields: {}, error: error?.message || String(error) };
   }
 }
 
@@ -19612,7 +19079,6 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         referenceText: amountReferenceComparison.referenceText,
         styleDistance: amountReferenceComparison.styleDistance,
         characterDistance: amountReferenceComparison.characterDistance,
-        sameText: amountReferenceComparison.sameText === true,
         fieldAssociationSource: amountReferenceComparison.fieldAssociationSource || null,
         relativeBaselineAvailable: amountReferenceComparison.relativeBaselineAvailable === true,
         comparisonMode: amountReferenceComparison.comparisonMode || null,
@@ -19620,7 +19086,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
           ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
           : 'reference-local-crop-comparator-v3-same-selected-reference',
-        literalAmountEqualityRequired: true,
+        literalAmountEqualityRequired: false,
         };
       }
       console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
@@ -19637,7 +19103,7 @@ if ((type === "image" || type === "pdf") && bank && reference && paddleImageOCR?
         method: amountReferenceComparison.fieldAssociationSource === 'validated-pdf-text-layer-label-value-boxes'
           ? 'reference-local-crop-comparator-v4-validated-pdf-native-amount-pair'
           : 'reference-local-crop-comparator-v3-same-selected-reference',
-        literalAmountEqualityRequired: true,
+        literalAmountEqualityRequired: false,
       }));
     } else {
       console.log('AMOUNT REFERENCE COMPARISON V1:', JSON.stringify({
@@ -20003,13 +19469,6 @@ let statementModelResult = statementReference
   ? await analyzeStatement(base64, mime, fileName, statementReference)
   : statementIdentityProbe;
 
-statementModelResult = await completeStatementRowsPageByPage(
-  statementModelResult,
-  buffer,
-  Number(pdfStructureForensics?.pageCount) || 0,
-  paddleDocumentOCR
-);
-
 let statementModelBank = normalizeBank(statementModelResult?.documentData?.bank) ||
   detectStatementBankFromText(String(statementModelResult?.summary || "").slice(0, 700), "");
 let statementFinalBankConflict = Boolean(
@@ -20053,8 +19512,7 @@ const statementPdfForensics = await runStatementPdfForensics(
   filePath,
   buffer,
   statementModelResult?.transactionAnalysis?.rows || [],
-  azureLayout,
-  paddleDocumentOCR
+  azureLayout
 );
 const statementPageCount = Number(statementPdfForensics?.pageCount) || 0;
 const statementResult = applyStatementLedgerChecks(
@@ -20121,12 +19579,6 @@ console.log("HESAP ÖZETİ TÜM SAYFA DENETİMİ:", JSON.stringify({
   pdfFindingCount: statementPdfForensics?.findings?.length || 0,
   manualReviewRequired: statementResult?.manualReviewRequired === true,
 }));
-console.log("HESAP ÖZETİ RİSK PUANI UZLAŞTIRMA:", JSON.stringify(statementResult?.balanceRiskReconciliation || {
-  applied: false,
-  reason: statementResult?.transactionAnalysis?.rowByRowAudit?.rowsIncomplete
-    ? 'Eksik satır bulunduğu için model risk puanı deterministik olarak yeniden hesaplanmadı.'
-    : 'Tam ve tutarlı satır hesabı risk düzeltmesi koşullarını karşılamadı.',
-}));
 
 for (const pageAudit of statementPdfForensics?.pages || []) {
   const repeat = pageAudit?.copyMove || {};
@@ -20149,7 +19601,7 @@ for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
   const unresolved = pageRows.filter(item => item.status !== 'matched');
   const reasonCounts = {};
   for (const item of unresolved) {
-    const reason = String(item.paddleReason || item.azureTableReason || item.azureLineReason || item.reason || 'Neden belirtilmedi.').split('.')[0].slice(0, 110);
+    const reason = String(item.reason || 'Neden belirtilmedi.').split('.')[0].slice(0, 110);
     reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
   }
   console.log("HESAP ÖZETİ SATIR ROI EŞLEŞME DETAYI:", JSON.stringify({
@@ -20158,17 +19610,13 @@ for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
     modelRowsOnPage: pageRows.length,
     matched: matched.map(item => ({
       rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
-      source: item.associationSource, amountBox: item.amountBox || item.ocrAmountBoxPixels,
-      amountBoxCoordinates: item.ocrAmountBoxPixels ? 'paddle-ocr-pixels' : 'pdf-normalized',
-      balanceBox: item.balanceBox || item.ocrBalanceBoxPixels,
-      paddleEvidence: item.paddleMatchEvidence || null,
+      source: item.associationSource, amountBox: item.amountBox, balanceBox: item.balanceBox,
     })),
     unresolvedCount: unresolved.length,
     unresolvedReasonCounts: reasonCounts,
     unresolvedExamples: unresolved.slice(0, 5).map(item => ({
       rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
-      reason: item.paddleReason || item.azureTableReason || item.azureLineReason || item.reason,
-      originalReason: item.reason, azureTableReason: item.azureTableReason, azureLineReason: item.azureLineReason,
+      reason: item.reason, azureTableReason: item.azureTableReason, azureLineReason: item.azureLineReason,
     })),
   }));
 }
@@ -21021,12 +20469,22 @@ if (pdfStructureForensics) {
 // between the visual reader, PaddleOCR, and the primary extraction. No value
 // here independently raises risk or declares fraud.
 if (multimodalReceiptEvidence) {
+  // The original PDF OCR pass may return only flat text (or VL candidates)
+  // without region coordinates. Prefer the rendered-page OCR result whenever
+  // it contains labeled regions so the semantic fusion compares the visible
+  // IBAN with the PDF text-layer association instead of treating OCR as absent.
+  const semanticOcrCandidates = [paddleImageOCR, paddleDocumentOCR];
+  const semanticOcrWithRegions = semanticOcrCandidates.find(candidate =>
+    candidate?.success === true && Array.isArray(candidate.regions) &&
+    candidate.regions.some(region => region?.region && String(region.text || '').trim())
+  );
+  const semanticOcr = semanticOcrWithRegions ||
+    semanticOcrCandidates.find(candidate => candidate?.success === true) || null;
   semanticEvidenceFusion = fuseReceiptSemanticEvidence({
     evidenceResult: multimodalReceiptEvidence,
-    paddleOCR: paddleDocumentOCR?.success ? paddleDocumentOCR : paddleImageOCR,
+    paddleOCR: semanticOcr,
     primaryDocumentData: result?.documentData,
     pdfNativeFields: pdfNativeFieldAssociation,
-  referencePdfFields: pdfReferenceFieldAssociation,
   });
   result.semanticEvidenceFusion = semanticEvidenceFusion;
   result.manualReviewRequired = semanticEvidenceFusion.reviewStatus === 'CONTROL_REQUIRED';
@@ -21044,6 +20502,9 @@ if (multimodalReceiptEvidence) {
       pdfNativeLabelText: row?.pdfNativeAssociation?.labelText || null,
       pdfNativeValue: row?.pdfNativeAssociation?.value || null,
       pdfNativeAgreement: row?.pdfNativeAgreement || 'unavailable',
+      independentOcrCorroboration: Boolean(row?.independentOcrCorroboration),
+      visualEvidenceAgreement: row?.visualEvidenceAgreement || 'unavailable',
+      sourceOutlier: row?.sourceOutlier || null,
       primaryAnalysisAgreement: row?.primaryAnalysisAgreement || 'unavailable',
     }]))
   }));
@@ -21152,49 +20613,23 @@ function normalizeAmountForFontMatch(value) {
   return Number.isFinite(number) ? number.toFixed(2) : null;
 }
 
-function summarizeAmountFont(usages, amountValue, fontCatalog = [], fieldAssociation = null) {
+function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
   const normalizedAmount = normalizeAmountForFontMatch(amountValue);
   if (!normalizedAmount || !Array.isArray(usages)) return { status: 'unavailable' };
-  const fieldBox = fieldAssociation?.valueBox || null;
-  const fieldPage = Number(fieldAssociation?.pageNumber) || null;
   // Resolve a PDF.js-generated font alias only when all active fonts in that
   // PDF share one canonical family. Never choose arbitrarily among families.
   const catalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
-    .map(font => font?.family || fontFamily(font?.fontName))
-    .map(value => String(value ?? '').trim())
+    .filter(font => font?.fontName || font?.family || font?.pdfFontFamilies?.length)
+    .flatMap(font => [font?.family, fontFamily(font?.fontName), ...(font?.pdfFontFamilies || [])])
+    .map(value => fontFamily(value) || clean(value))
+    .map(value => clean(value))
     .filter(Boolean))];
-  const activeCatalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
-    .filter(font => Number(font?.itemCount) > 0 || Number(font?.charCount) > 0 ||
-      (Array.isArray(font?.pages) && font.pages.some(page => Number(page) === Number(fieldPage))))
-    .map(font => font?.family || fontFamily(font?.fontName))
-    .map(value => String(value ?? '').trim())
-    .filter(Boolean))];
-  // A field-specific comparison must not borrow the only font declared in a
-  // PDF dictionary when that font has no visible text usage. That fallback
-  // caused a nearby/global family to be assigned to an unrelated amount.
-  const uniqueCatalogFamily = fieldBox
-    ? (activeCatalogFamilies.length === 1 ? activeCatalogFamilies[0] : null)
-    : (catalogFamilies.length === 1 ? catalogFamilies[0] : null);
+  const uniqueCatalogFamily = catalogFamilies.length === 1 ? catalogFamilies[0] : null;
   const matched = [];
   for (const usage of usages) {
     for (const box of usage?.boxes || []) {
       if (normalizeAmountForFontMatch(box?.text) !== normalizedAmount) continue;
-      const boxPage = Number(box?.pageNumber) || null;
-      const normBox = box?.boxNorm;
-      if (fieldBox && (!normBox || (fieldPage && boxPage !== fieldPage))) continue;
-      if (fieldBox) {
-        const targetCenterX = Number(fieldBox.x) + Number(fieldBox.width) / 2;
-        const targetCenterY = Number(fieldBox.y) + Number(fieldBox.height) / 2;
-        const itemCenterX = Number(normBox.x) + Number(normBox.width) / 2;
-        const itemCenterY = Number(normBox.y) + Number(normBox.height) / 2;
-        const centerDistance = Math.hypot(targetCenterX - itemCenterX, targetCenterY - itemCenterY);
-        const ix = Math.max(0, Math.min(Number(fieldBox.x) + Number(fieldBox.width), Number(normBox.x) + Number(normBox.width)) - Math.max(Number(fieldBox.x), Number(normBox.x)));
-        const iy = Math.max(0, Math.min(Number(fieldBox.y) + Number(fieldBox.height), Number(normBox.y) + Number(normBox.height)) - Math.max(Number(fieldBox.y), Number(normBox.y)));
-        const overlap = ix * iy;
-        const itemArea = Number(normBox.width) * Number(normBox.height);
-        const overlapRatio = itemArea > 0 ? overlap / itemArea : 0;
-        if (centerDistance > Math.max(0.012, Number(fieldBox.height) * 1.5) && overlapRatio < 0.25) continue;
-      }
+      const exactAmountText = /^\s*[-+]?\d[\d.,]*\s*(?:TL|TRY|₺)?\s*$/i.test(String(box?.text || ''));
       const candidates = [
         ...(Array.isArray(usage.resolvedFontNames) ? usage.resolvedFontNames : []),
         usage.resolvedFamily,
@@ -21204,22 +20639,29 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = [], fieldAssocia
       const canonicalFamily = candidates.length
         ? (fontFamily(candidates[0]) || candidates[0])
         : uniqueCatalogFamily;
-      const heights = [Number(box.height)].filter(value => Number.isFinite(value) && value > 0);
+      const heights = (usage.boxes || [])
+        .filter(item => normalizeAmountForFontMatch(item?.text) === normalizedAmount)
+        .map(item => Number(item.height)).filter(value => Number.isFinite(value) && value > 0);
       matched.push({
         family: canonicalFamily || null,
         familyResolution: candidates.length ? 'text-font-resource' : (uniqueCatalogFamily ? 'single-active-family-catalog' : 'unresolved'),
         style: usage.resolvedStyle || usage.style || 'unknown',
         fontSizePtEstimate: heights.length ? Number((heights.reduce((sum, value) => sum + value, 0) / heights.length).toFixed(2)) : null,
-        pageNumber: boxPage,
+        pageNumber: Number(box.pageNumber) || null,
         matchedText: String(box.text || '').slice(0, 80),
-        boxNorm: normBox || null,
+        exactAmountText,
       });
     }
   }
-  const unique = [...new Map(matched.map(item => [`${item.family || 'unknown'}|${item.style}|${item.pageNumber}|${item.matchedText}`, item])).values()];
+  // Prefer the exact amount field run over explanatory prose that repeats the
+  // same amount elsewhere on the page. Only use embedded-number matches when
+  // the PDF exposes no standalone amount text run.
+  const exactMatches = matched.filter(item => item.exactAmountText);
+  const selectedMatches = exactMatches.length ? exactMatches : matched;
+  const unique = [...new Map(selectedMatches.map(item => [`${item.family || 'unknown'}|${item.style}|${item.pageNumber}|${item.matchedText}`, item])).values()];
   if (!unique.length) return { status: 'amount-font-not-matched', amount: String(amountValue || '') };
-  if (unique.length > 1) return { status: 'ambiguous', amount: String(amountValue || ''), candidates: unique.slice(0, 6) };
-  return { status: unique[0].family ? 'resolved' : 'family-unresolved', amount: String(amountValue || ''), ...unique[0] };
+  if (unique.length > 1) return { status: 'ambiguous', amount: String(amountValue || ''), matchMethod: exactMatches.length ? 'exact-amount-text-run' : 'amount-token-in-text-run', candidates: unique.slice(0, 6) };
+  return { status: unique[0].family ? 'resolved' : 'family-unresolved', amount: String(amountValue || ''), matchMethod: exactMatches.length ? 'exact-amount-text-run' : 'amount-token-in-text-run', ...unique[0] };
 }
 
 if (fontForensics) {
@@ -21227,7 +20669,6 @@ if (fontForensics) {
     fontForensics.targetActiveFontUsages,
     pdfNativeFieldAssociation?.fields?.amount?.value,
     fontForensics.targetFonts,
-    pdfNativeFieldAssociation?.fields?.amount,
   );
   const selectedReferenceFontProfile = (fontForensics.referenceFontProfiles || []).find(profile =>
     profile.fileName === path.basename(reference?.path || '')
@@ -21236,11 +20677,10 @@ if (fontForensics) {
     selectedReferenceFontProfile?.activeFontUsages,
     pdfReferenceFieldAssociation?.fields?.amount?.value,
     selectedReferenceFontProfile?.fonts,
-    pdfReferenceFieldAssociation?.fields?.amount,
   );
   const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
     const families = [...new Set((profile?.fonts || [])
-      .map(font => String(font?.family || fontFamily(font?.fontName) || '').trim())
+      .map(font => clean(font?.family || fontFamily(font?.fontName)))
       .filter(Boolean))];
     return {
       referenceFile: profile.fileName,
@@ -21831,7 +21271,6 @@ async function runReferenceLocalCropComparator(
         field,
         targetText,
         referenceText: refText,
-        sameText: Boolean(sameText),
         referenceFile: path.basename(referencePath),
         styleDistance: Number.isFinite(styleDistance) ? Number(styleDistance.toFixed(4)) : null,
         characterDistance: Number.isFinite(charDistance) ? Number(charDistance.toFixed(4)) : null,
@@ -21923,17 +21362,14 @@ async function runReferenceLocalCropComparator(
           referenceBox: amount.referenceBox,
           styleDistance: amount.styleDistance,
           characterDistance: amount.characterDistance,
-          sameText: amount.sameText === true,
           fieldAssociationSource: amount.fieldAssociationSource || null,
           relativeBaselineAvailable,
           comparisonMode: relativeBaselineAvailable
             ? 'same-document-multi-field-local-outlier'
             : 'single-field-reference-distance-only',
-          classification: amount.sameText === true && Number(amount.styleDistance) >= 0.30 && Number(amount.characterDistance) >= 0.36
+          classification: Number(amount.styleDistance) >= 0.30 && Number(amount.characterDistance) >= 0.36
             ? 'strong-reference-render-difference'
-            : amount.sameText === true
-              ? 'measured-below-strong-difference-threshold'
-              : 'amount-text-differs-render-comparison-diagnostic-only',
+            : 'measured-below-strong-difference-threshold',
         } : null;
       })(),
       findings
@@ -24572,43 +24008,20 @@ const finalAmountReferenceComparison = rawFinalAmountReferenceComparison ? {
   ),
 } : null;
 const amountRenderDifferenceStrong = Boolean(
-  finalAmountReferenceComparison?.available === true &&
-  finalAmountReferenceComparison.sameText === true &&
-  finalAmountReferenceComparison.classification === 'strong-reference-render-difference'
+  finalAmountReferenceComparison?.available === true && (
+    finalAmountReferenceComparison.classification === 'strong-reference-render-difference' ||
+    (Number(finalAmountReferenceComparison.styleDistance) >= 0.30 &&
+      Number(finalAmountReferenceComparison.characterDistance) >= 0.36)
+  )
 );
 const criticalReviewReasons = [];
-const hasSelectedFieldReference = type === 'pdf' && Boolean(reference?.path && /\.(?:pdf|jpe?g|png|webp)$/i.test(reference.path));
-const referenceIbanPresence = hasSelectedFieldReference
-  ? (pdfReferenceFieldAssociation?.fields?.recipientIBAN?.referencePresence || 'unknown')
-  : 'required';
-const referenceAmountPresence = hasSelectedFieldReference
-  ? (pdfReferenceFieldAssociation?.fields?.amount?.referencePresence || 'unknown')
-  : 'required';
-const recipientIbanApplicable = referenceIbanPresence !== 'absent';
-if (recipientIbanApplicable && !criticalIbanEvidence?.associationValidated) criticalReviewReasons.push('recipient-iban-label-association-unverified');
-if (recipientIbanApplicable && (criticalIbanEvidence?.primaryAnalysisAgreement === 'disagreement' || criticalIbanEvidence?.sourceDisagreement === true)) {
+if (!criticalIbanEvidence?.associationValidated) criticalReviewReasons.push('recipient-iban-label-association-unverified');
+if (criticalIbanEvidence?.primaryAnalysisAgreement !== 'agreement' || criticalIbanEvidence?.sourceDisagreement) {
   criticalReviewReasons.push('recipient-iban-source-disagreement');
 }
 if (!criticalAmountEvidence?.associationValidated) criticalReviewReasons.push('amount-label-association-unverified');
-if (criticalAmountEvidence?.primaryAnalysisAgreement === 'disagreement' || criticalAmountEvidence?.sourceDisagreement === true) {
+if (criticalAmountEvidence?.primaryAnalysisAgreement !== 'agreement' || criticalAmountEvidence?.sourceDisagreement) {
   criticalReviewReasons.push('amount-source-disagreement');
-}
-if (hasSelectedFieldReference) {
-  const amountFieldMatch = pdfReferenceFieldComparison?.amount;
-  if (referenceAmountPresence !== 'present') criticalReviewReasons.push(`trusted-reference-amount-${referenceAmountPresence}`);
-  if (!amountFieldMatch?.comparable) criticalReviewReasons.push('amount-reference-field-association-unavailable');
-  else if (amountFieldMatch.layoutAligned === false) criticalReviewReasons.push('amount-reference-layout-mismatch');
-  if (amountFieldMatch?.targetReferenceValueConflict || amountFieldMatch?.referenceNativeOcrConflict) criticalReviewReasons.push('amount-reference-source-disagreement');
-  if (referenceIbanPresence === 'unknown') criticalReviewReasons.push('trusted-reference-iban-presence-unresolved');
-  if (referenceIbanPresence === 'present' && !pdfReferenceFieldComparison?.recipientIBAN?.comparable) {
-    criticalReviewReasons.push('recipient-iban-reference-field-association-unavailable');
-  }
-  if (referenceIbanPresence === 'present' && pdfReferenceFieldComparison?.recipientIBAN?.layoutAligned === false) {
-    criticalReviewReasons.push('recipient-iban-reference-layout-mismatch');
-  }
-  if (referenceIbanPresence === 'present' && (pdfReferenceFieldComparison?.recipientIBAN?.targetReferenceValueConflict || pdfReferenceFieldComparison?.recipientIBAN?.referenceNativeOcrConflict)) {
-    criticalReviewReasons.push('recipient-iban-reference-source-disagreement');
-  }
 }
 if (finalAmountReferenceComparison?.available !== true) criticalReviewReasons.push('amount-reference-comparison-unavailable');
 if (amountRenderDifferenceStrong) criticalReviewReasons.push('strong-amount-reference-render-difference');
@@ -24619,9 +24032,7 @@ if (semanticEvidenceFusion?.available) {
     ? 'Kontrol gerekli: alıcı IBANı veya tutar alanı doğrulanamadı, kaynaklar uyuşmadı ya da tutar referans karşılaştırması eksik/güçlü fark gösteriyor.'
     : 'Alıcı IBANı ve tutar alanı doğrulandı; tutar referans karşılaştırması güçlü fark göstermedi.';
   semanticEvidenceFusion.criticalFieldReview = {
-    focusFields: recipientIbanApplicable ? ['recipientIBAN', 'amount'] : ['amount'],
-    selectedReferenceFile: hasSelectedFieldReference ? path.basename(reference.path) : null,
-    referenceFieldPresence: { amount: referenceAmountPresence, recipientIBAN: referenceIbanPresence },
+    focusFields: ['recipientIBAN', 'amount'],
     recipientNameUsedAsReviewGate: false,
     amountReferenceComparison: finalAmountReferenceComparison ? {
       available: finalAmountReferenceComparison.available === true,
@@ -24638,9 +24049,7 @@ result.fieldReviewStatus = (type === 'image' || type === 'pdf')
   : (semanticEvidenceFusion?.reviewStatus || null);
 result.manualReviewRequired = result.fieldReviewStatus === 'CONTROL_REQUIRED';
 console.log('FINAL CRITICAL FIELD REVIEW:', JSON.stringify({
-  focusFields: recipientIbanApplicable ? ['recipientIBAN', 'amount'] : ['amount'],
-  selectedReferenceFile: hasSelectedFieldReference ? path.basename(reference.path) : null,
-  referenceFieldPresence: { amount: referenceAmountPresence, recipientIBAN: referenceIbanPresence },
+  focusFields: ['recipientIBAN', 'amount'],
   recipientNameUsedAsReviewGate: false,
   amountReferenceComparisonAvailable: finalAmountReferenceComparison?.available === true,
   amountReferenceComparisonClassification: finalAmountReferenceComparison?.classification || null,
