@@ -17112,7 +17112,7 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     result.summary = [result.summary,
       'Satırların tamamı üzerinden yapılan deterministik bakiye hesabında toplam borç, toplam alacak, başlangıç ve kapanış bakiyeleri tutarlı bulundu.']
       .filter(Boolean).join(' ');
-    result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : [])]
+    result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : [])
       .filter(item => !staleBalanceText.test(String(item || ''))),
       'Deterministik satır hesabında başlangıç bakiyesi, toplam borç/alacak ve kapanış bakiyesi birbiriyle tutarlı bulundu.'])];
     result.balanceAnalysis.evidence = [result.balanceAnalysis.evidence,
