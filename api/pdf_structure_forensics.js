@@ -20,6 +20,10 @@ export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DE
   }
 
   const inspectedCount = Math.min(Number(pdf.numPages) || 0, maxPages);
+  const metadataResult = typeof pdf.getMetadata === 'function'
+    ? await pdf.getMetadata().catch(() => null)
+    : null;
+  const metadataInfo = metadataResult?.info || {};
   const opNameById = new Map(Object.entries(pdfjsLib.OPS).map(([name, id]) => [id, name]));
   const totals = {
     textShow: 0,
@@ -84,6 +88,10 @@ export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DE
     engine: 'pdfjs-dist-4.10.38',
     fileBytes: buffer.length,
     pdfVersion: header.match(/%PDF-(\d\.\d)/)?.[1] || null,
+    metadata: {
+      producer: metadataInfo.Producer ? String(metadataInfo.Producer).trim() : null,
+      creator: metadataInfo.Creator ? String(metadataInfo.Creator).trim() : null,
+    },
     pageCount: pdf.numPages,
     pagesInspected: inspectedCount,
     truncatedPageScan: inspectedCount < pdf.numPages,
