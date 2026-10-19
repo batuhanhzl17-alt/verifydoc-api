@@ -18372,12 +18372,33 @@ if (type === "pdf" && reference?.path) {
     const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
       ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
       : [];
+    const referenceFieldAssociationsByPath = {};
+    if (pdfReferenceFieldAssociation?.available) {
+      referenceFieldAssociationsByPath[path.basename(reference.path)] = pdfReferenceFieldAssociation;
+      referenceFieldAssociationsByPath[reference.path] = pdfReferenceFieldAssociation;
+    }
+    // Font candidates are bank-template PDFs already selected by the local
+    // reference resolver. Extract their typed amount boxes locally as well,
+    // so the amount-font comparison uses the same semantic field on each PDF.
+    for (const candidatePath of candidateReferencePaths.filter(candidate => path.extname(candidate).toLowerCase() === ".pdf")) {
+      if (referenceFieldAssociationsByPath[path.basename(candidatePath)]) continue;
+      try {
+        const candidateBuffer = await fs.readFile(candidatePath);
+        const candidatePdf = await getPdfDocument({ data: new Uint8Array(candidateBuffer) }).promise;
+        referenceFieldAssociationsByPath[path.basename(candidatePath)] = await extractPdfNativeFieldAssociations(candidatePdf);
+        try { if (typeof candidatePdf.destroy === "function") await candidatePdf.destroy(); } catch {}
+      } catch (candidateError) {
+        console.warn("PDF FONT REFERENCE FIELD ASSOCIATION ERROR:", path.basename(candidatePath), candidateError?.message || candidateError);
+      }
+    }
     fontForensics = await analyzeFontForensics({
       targetPath: filePath,
       referencePath: reference.path,
       referencePaths: candidateReferencePaths,
       pdfjsLib,
       maxPages: 5,
+      targetFieldAssociations: pdfNativeFieldAssociation,
+      referenceFieldAssociationsByPath,
     });
     console.log("FONT FORENSICS V35:", JSON.stringify(fontForensics));
   } catch (error) {
@@ -20625,7 +20646,29 @@ function normalizeAmountForFontMatch(value) {
 
 function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
   const normalizedAmount = normalizeAmountForFontMatch(amountValue);
-  if (!normalizedAmount || !Array.isArray(usages)) return { status: 'unavailable' };
+  if (!Array.isArray(usages)) return { status: 'unavailable' };
+  const spatial = usages.filter(usage => usage?.matchMethod === 'pdf-native-value-box-font-geometry');
+  if (spatial.length) {
+    const resolved = spatial.map(item => {
+      const names = [...(Array.isArray(item.resolvedFontNames) ? item.resolvedFontNames : []), item.family, item.fontName]
+        .filter(value => value && !/^g_d\d+_f\d+$/i.test(String(value)));
+      const family = names.length ? (fontFamily(names[0]) || names[0]) : null;
+      return {
+        family,
+        familyResolution: family ? 'pdf-native-value-box-font-resource' : 'unresolved',
+        style: item.style || 'unknown',
+        fontSizePtEstimate: Number(item.fontSizePtEstimate) || null,
+        pageNumber: Number(item.pageNumber) || null,
+        matchedText: String(item.matchedText || '').slice(0, 80),
+        matchMethod: item.matchMethod,
+        evidenceBox: item.boxNorm || null,
+      };
+    });
+    const unique = [...new Map(resolved.map(item => [`${normalizeFontName(item.family || '')}|${item.style}|${item.pageNumber}`, item])).values()];
+    if (unique.length === 1) return { status: unique[0].family ? 'resolved' : 'family-unresolved', amount: String(amountValue || ''), ...unique[0] };
+    if (unique.length > 1) return { status: 'ambiguous', amount: String(amountValue || ''), matchMethod: 'pdf-native-value-box-font-geometry', candidates: unique.slice(0, 6) };
+  }
+  if (!normalizedAmount) return { status: 'unavailable' };
   // Resolve a PDF.js-generated font alias only when all active fonts in that
   // PDF share one canonical family. Never choose arbitrarily among families.
   const catalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
@@ -20676,7 +20719,7 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
 
 if (fontForensics) {
   const targetAmountFont = summarizeAmountFont(
-    fontForensics.targetActiveFontUsages,
+    fontForensics.targetAmountFontUsages?.length ? fontForensics.targetAmountFontUsages : fontForensics.targetActiveFontUsages,
     pdfNativeFieldAssociation?.fields?.amount?.value,
     fontForensics.targetFonts,
   );
@@ -20684,24 +20727,27 @@ if (fontForensics) {
     profile.fileName === path.basename(reference?.path || '')
   ) || null;
   const referenceAmountFont = summarizeAmountFont(
-    selectedReferenceFontProfile?.activeFontUsages,
+    selectedReferenceFontProfile?.amountFontUsages?.length ? selectedReferenceFontProfile.amountFontUsages : selectedReferenceFontProfile?.activeFontUsages,
     pdfReferenceFieldAssociation?.fields?.amount?.value,
     selectedReferenceFontProfile?.fonts,
   );
   const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
-    const families = [...new Set((profile?.fonts || [])
-      .map(font => fontFamily(font?.family || fontFamily(font?.fontName)) || String(font?.family || font?.fontName || '').trim())
-      .filter(Boolean))];
+    const amountProfile = summarizeAmountFont(
+      profile?.amountFontUsages || [],
+      null,
+      profile?.fonts,
+    );
     return {
       referenceFile: profile.fileName,
-      family: families.length === 1 ? families[0] : null,
-      status: families.length === 1 ? 'resolved-from-single-family-pdf' : (families.length ? 'multiple-families' : 'unresolved'),
+      family: amountProfile.status === 'resolved' ? amountProfile.family : null,
+      status: amountProfile.status,
+      matchMethod: amountProfile.matchMethod || null,
     };
   });
   const referenceFontComparisons = targetAmountFont.status === 'resolved'
     ? referenceAmountFonts.map(profile => ({
         ...profile,
-        matchesTargetFamily: profile.status === 'resolved-from-single-family-pdf'
+        matchesTargetFamily: profile.status === 'resolved'
           ? normalizeFontName(profile.family) === normalizeFontName(targetAmountFont.family)
           : null,
       }))
