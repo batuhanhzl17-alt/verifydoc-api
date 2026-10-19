@@ -6,6 +6,7 @@ import {
   hasTurkishIbanShape,
   normalizeTurkishIban,
 } from './semantic_roi.js';
+import { matchesPdfFieldLabel } from './pdf_field_association.js';
 
 const FIELD_SCHEMA = {
   type: 'object',
@@ -111,6 +112,7 @@ function fieldLabel(field, text) {
   const raw = String(text || '').trim();
   const prefix = raw.split(/[:：]/, 1)[0].trim();
   const compact = prefix.toLocaleUpperCase('tr-TR').replace(/[^A-ZÇĞİÖŞÜ]/g, '');
+  if (['recipientName', 'recipientIBAN', 'amount'].includes(field) && matchesPdfFieldLabel(field, prefix)) return true;
   if (field === 'recipientName') return Boolean(recipientNameLabel(prefix));
   if (field === 'recipientIBAN') return Boolean(recipientIbanLabel(prefix));
   if (field === 'amount') {
@@ -242,7 +244,7 @@ export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeTyp
   return { available: true, status: 'ok', model: response.model || model, evidence };
 }
 
-export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primaryDocumentData, pdfNativeFields = null }) {
+export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primaryDocumentData, pdfNativeFields = null, referencePdfFields = null }) {
   if (evidenceResult?.available !== true || !evidenceResult.evidence) {
     return { available: false, status: evidenceResult?.status || 'multimodal-unavailable', fields: {} };
   }
@@ -294,6 +296,9 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
       // association. It does not silently turn a failed OCR/vision check into
       // a fully corroborated field; the final review remains conservative.
       pdfNativeAssociation: pdfNative,
+      referenceFieldStatus: referencePdfFields?.fields?.[field]?.referencePresence || referencePdfFields?.fields?.[field]?.status || null,
+      crossSourceConflict: pdfNative?.crossSourceConflict === true,
+      nativeAssociationAmbiguous: pdfNative?.status === 'ambiguous',
       pdfNativeAgreement: pdfNativeAgreement ? 'agreement' : pdfNative?.status === 'matched' && primaryText ? 'disagreement' : 'unavailable',
       primaryAnalysisAgreement: primaryAgreement ? 'agreement' : comparisonValue && primaryText ? 'disagreement' : 'unavailable',
       sourceDisagreement,
@@ -303,11 +308,16 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
   // The user's fraud checks focus on the beneficiary IBAN and transaction
   // amount. A name-resolution failure is retained as evidence, but it must
   // not block these two critical fields or dominate the review status.
-  const criticalFields = ['recipientIBAN', 'amount'].map(field => fields[field]);
+  const criticalFieldNames = referencePdfFields?.available
+    ? ['amount', ...(referencePdfFields.fields?.recipientIBAN?.referencePresence !== 'absent' ? ['recipientIBAN'] : [])]
+    : ['recipientIBAN', 'amount'];
+  const criticalFields = criticalFieldNames.map(field => fields[field]);
   const requiresControl = criticalFields.some(row =>
     !row?.associationValidated ||
     row.primaryAnalysisAgreement !== 'agreement' ||
     row.sourceDisagreement ||
+    row.crossSourceConflict ||
+    row.nativeAssociationAmbiguous ||
     (row.paddleOCRStatus === 'matched' && row.paddleOCRAgreement !== 'agreement') ||
     (row.visualEvidence?.text && row.pdfNativeAssociation?.status === 'matched' &&
       normalize(row.visualEvidence.text, row === fields.recipientIBAN ? 'recipientIBAN' : 'amount') !==
