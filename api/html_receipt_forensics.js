@@ -125,9 +125,18 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
   const hiddenText = state.hidden.join(' ').slice(0, MAX_TEXT_CHARS);
   const signals = getHtmlSignals(visibleText);
   const hiddenSignals = getHtmlSignals(hiddenText);
-  const externalOrigins = [...new Set([...state.externalScripts, ...state.externalResources].map(url => {
-    try { return new URL(url, 'https://local.invalid').origin; } catch { return 'invalid-url'; }
-  }).filter(origin => origin !== 'https://local.invalid'))];
+  const resourceRefs = [...state.externalScripts, ...state.externalResources];
+  const embeddedDataResourceCount = resourceRefs.filter(url => /^\s*data:/i.test(url)).length;
+  const externalOrigins = [...new Set(resourceRefs.map(url => {
+    try {
+      const parsed = new URL(url);
+      return ['http:', 'https:'].includes(parsed.protocol) ? parsed.origin : null;
+    } catch { return null; }
+  }).filter(Boolean))];
+  const externalResourceCount = resourceRefs.filter(url => {
+    try { return ['http:', 'https:'].includes(new URL(url).protocol); }
+    catch { return false; }
+  }).length;
   const findings = [];
   if (state.hidden.length) findings.push({ code: 'hidden-content-present', severity: 'review', detail: 'HTML içinde gizli olarak işaretlenmiş metin bulundu; bu metin tek başına manipülasyon kanıtı değildir.' });
   if (state.externalScripts.length) findings.push({ code: 'external-script-reference', severity: 'info', detail: 'Belge dış JavaScript kaynakları çağırıyor; bu kaynaklar analiz sırasında çalıştırılmadı ve içerikleri doğrulanmadı.' });
@@ -151,7 +160,8 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
       scriptCount: state.scripts,
       inlineScriptCount: state.inlineScripts,
       externalScriptCount: state.externalScripts.length,
-      externalResourceCount: state.externalResources.length,
+      externalResourceCount,
+      embeddedDataResourceCount,
       externalOrigins,
       formCount: state.forms,
       iframeCount: state.iframes,
