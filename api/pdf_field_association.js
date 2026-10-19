@@ -1,6 +1,6 @@
 const FIELD_LABELS = {
   recipientName: [
-    /^(?:ALICI\s+AD\s+SOYAD(?:\s*\/\s*UNVAN)?|ALICI\s+ADI|ALACAKLI(?:\s+ADI)?|ALICI\s+UNVANI)$/,
+    /^(?:ALICI\s+AD\s+SOYAD(?:\s*\/\s*UNVAN)?|ALICI\s+ADI|ALACAKLI(?:\s+ADI)?|ALICI\s+UNVANI|LEHDAR(?:\s+ADI)?|FAYDALANICI(?:\s+ADI)?)$/,
   ],
   recipientIBAN: [
     /^(?:ALICI|ALACAKLI)\s+(?:HESAP\s+NO\s*\/\s*)?IBAN$/,
@@ -8,6 +8,7 @@ const FIELD_LABELS = {
     // Some banks label the beneficiary account simply "ALICI HESAP".
     // This is safe because the value must still pass the Turkish IBAN checksum.
     /^(?:ALICI|ALACAKLI)\s+HESAP(?:\s+(?:NO|NUMARASI))?$/,
+    /^(?:LEHDAR|FAYDALANICI)\s+(?:HESAP(?:\s*(?:NO|NUMARASI))?\s*)?IBAN$/,
   ],
   amount: [
     /^(?:ISLEM|TRANSFER|GONDERILEN|ODEME|ANA|GIDEN(?:\s+FAST(?:\s+EFT)?)?)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
@@ -19,6 +20,8 @@ const FIELD_LABELS = {
     // Enpara receipts label the amount column "B/A Para Cinsi Tutar".
     // Accept both the slash form and text extraction that separates B and A.
     /^B\s*\/?\s*A\s+PARA\s+CINSI\s+TUTAR$/,
+    /^(?:FAST|FAST\s+ISLEM|FAST\s+TRANSFER|FAST\s+ODEME|FAST\s+GONDERIM|ISLEM|TRANSFER|GONDERIM|GONDERILEN|ALICIYA\s+GIDEN)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
+    /^(?:ISLEM|TRANSFER|FAST|GIDEN\s+FAST)\s+TUTAR(?:I)?\s*\(\s*(?:TL|TRY)\s*\)$/,
   ],
 };
 
@@ -42,8 +45,13 @@ function matchesLabel(field, value) {
     const compact = normalized.replace(/[^A-Z0-9]/g, '');
     if (/^(?:ALICI|ALACAKLI)(?:IBAN|IBANNO|IBANNUMARASI|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN|HESAPNOIBAN|HESAPNUMARASIIBAN)$/.test(compact)) return true;
     if (/^(?:LEHDAR)(?:IBAN|IBANNO|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN|HESAPNOIBAN)$/.test(compact)) return true;
+    if (/^(?:FAYDALANICI)(?:IBAN|IBANNO|HESAP|HESAPNO|HESAPNUMARASI|HESAPIBAN)$/.test(compact)) return true;
   }
   return (FIELD_LABELS[field] || []).some(pattern => pattern.test(normalized));
+}
+
+export function matchesPdfFieldLabel(field, value) {
+  return matchesLabel(field, value);
 }
 
 function normalizeIban(value) {
@@ -347,13 +355,14 @@ function resolveField(field, rows, pageWidth, pageHeight) {
   if (resolved.length === 1) return { status: 'matched', ...resolved[0], candidateCount: 1 };
   if (resolved.length > 1) return { status: 'ambiguous', value: null, associationValidated: false, candidateCount: resolved.length, candidates: resolved,
     ...(field === 'recipientIBAN' ? { associationTrace: trace } : {}) };
-  return { status: 'unavailable', value: null, associationValidated: false, candidateCount: 0, reason: 'typed-label-or-valid-neighbor-not-found',
+  return { status: 'unavailable', value: null, associationValidated: false, candidateCount: 0, typedLabelCandidates: trace.typedLabelCandidates, reason: trace.typedLabelCandidates ? 'typed-label-found-valid-value-not-found' : 'typed-label-not-found',
     ...(field === 'recipientIBAN' ? { associationTrace: trace } : {}) };
 }
 
 export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = {}) {
   if (!pdf || typeof pdf.getPage !== 'function') return { available: false, status: 'pdf-unavailable', fields: {} };
   const collected = { recipientName: [], recipientIBAN: [], amount: [] };
+  const labelTrace = { recipientName: 0, recipientIBAN: 0, amount: 0 };
   const ibanPageTrace = [];
   let pageCount = 0;
   for (let pageNumber = 1; pageNumber <= Math.min(Number(pdf.numPages) || 0, maxPages); pageNumber++) {
@@ -415,6 +424,7 @@ export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = 
     });
     const rows = makeRows(items);
     for (const field of Object.keys(collected)) {
+      labelTrace[field] += rows.reduce((sum, row) => sum + labelSpans(row, field).length, 0);
       const resolved = resolveField(field, rows, pageWidth, pageHeight);
       if (field === 'recipientIBAN') ibanPageTrace.push({
         pageNumber,
@@ -435,7 +445,10 @@ export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = 
     if (keys.size === 1 && rows.length) fields[field] = { ...rows[0], pageMatchCount: rows.length };
     else if (keys.size > 1 || collected[field].some(item => item.status === 'ambiguous')) {
       fields[field] = { status: 'ambiguous', value: null, associationValidated: false, candidateCount: keys.size || collected[field].length, reason: 'multiple-pdf-pages-or-labeled-values' };
-    } else fields[field] = { status: 'unavailable', value: null, associationValidated: false, candidateCount: 0, reason: 'typed-label-or-valid-neighbor-not-found' };
+    } else {
+      const labelCount = labelTrace[field];
+      fields[field] = { status: 'unavailable', value: null, associationValidated: false, candidateCount: 0, typedLabelCandidates: labelCount, reason: labelCount ? 'typed-label-found-valid-value-not-found' : 'typed-label-not-found' };
+    }
     if (field === 'recipientIBAN') fields[field].associationTrace = {
       pages: ibanPageTrace,
       totalTypedLabelCandidates: ibanPageTrace.reduce((sum, item) => sum + (item.typedLabelCandidates || 0), 0),
@@ -451,5 +464,128 @@ export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = 
     matchedFieldCount,
     fields,
     source: 'pdf-text-layer-with-page-normalized-label-value-coordinates',
+  };
+}
+
+// Apply the same typed-label and value validation to positioned OCR regions
+// when a PDF has no usable text layer. OCR coordinates are mapped back into
+// PDF page units, so they can be compared with native reference coordinates.
+export async function extractPdfOcrFieldAssociations(pdf, ocr, { imageWidth, imageHeight, maxPages = 3 } = {}) {
+  if (!pdf || typeof pdf.getPage !== 'function' || !Array.isArray(ocr?.regions) || !ocr.regions.some(region => region?.region && String(region.text || '').trim()) || !(imageWidth > 0 && imageHeight > 0)) {
+    return { available: false, status: 'ocr-geometry-unavailable', fields: {} };
+  }
+  const collected = { recipientName: [], recipientIBAN: [], amount: [] };
+  const labelTrace = { recipientName: 0, recipientIBAN: 0, amount: 0 };
+  let pageCount = 0;
+  for (let pageNumber = 1; pageNumber <= Math.min(Number(pdf.numPages) || 0, maxPages); pageNumber++) {
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale: 1 });
+    const pageWidth = Number(viewport.width) || 0;
+    const pageHeight = Number(viewport.height) || 0;
+    if (!(pageWidth > 0 && pageHeight > 0)) continue;
+    const sx = pageWidth / imageWidth;
+    const sy = pageHeight / imageHeight;
+    const items = ocr.regions.filter(region =>
+      region?.region && String(region.text || '').trim() &&
+      (Number(region.pageIndex) === pageNumber - 1 || region.pageIndex == null)
+    ).map(region => {
+      const r = region.region;
+      const x = Number(r.x1) * sx;
+      const top = Number(r.y1) * sy;
+      const right = Number(r.x2) * sx;
+      const bottom = Number(r.y2) * sy;
+      return {
+        text: String(region.text || '').trim(), x, top,
+        width: Math.max(0, right - x), height: Math.max(1, bottom - top),
+        baseline: bottom, pageNumber,
+      };
+    }).filter(item => Number.isFinite(item.x) && Number.isFinite(item.top) && item.width > 0 && item.height > 0);
+    const rows = makeRows(items);
+    for (const field of Object.keys(collected)) {
+      labelTrace[field] += rows.reduce((sum, row) => sum + labelSpans(row, field).length, 0);
+      const resolved = resolveField(field, rows, pageWidth, pageHeight);
+      if (resolved.status === 'matched' || resolved.status === 'ambiguous') collected[field].push(resolved);
+    }
+    pageCount++;
+  }
+  const fields = {};
+  for (const field of Object.keys(collected)) {
+    const matches = collected[field].filter(item => item.status === 'matched');
+    const typedLabelCandidates = labelTrace[field];
+    const keyOf = item => field === 'recipientIBAN' ? normalizeIban(item.value)
+      : field === 'amount' ? item.value.replace(/[^0-9,.-]/g, '') : normalizeLabel(item.value);
+    const distinct = new Map(matches.map(item => [keyOf(item), item]));
+    if (distinct.size === 1) fields[field] = { ...[...distinct.values()][0], typedLabelCandidates, source: 'paddle-ocr-label-value-geometry', resolver: `paddle-ocr-${[...distinct.values()][0].resolver}`, pageMatchCount: matches.length };
+    else if (distinct.size > 1 || collected[field].some(item => item.status === 'ambiguous')) fields[field] = { status: 'ambiguous', value: null, associationValidated: false, typedLabelCandidates, candidateCount: distinct.size || collected[field].length, reason: 'multiple-ocr-pages-or-labeled-values', source: 'paddle-ocr-label-value-geometry' };
+    else fields[field] = { status: 'unavailable', value: null, associationValidated: false, candidateCount: 0, typedLabelCandidates, reason: typedLabelCandidates ? 'ocr-typed-label-found-valid-value-not-found' : 'ocr-typed-label-not-found', source: 'paddle-ocr-label-value-geometry' };
+  }
+  const matchedFieldCount = Object.values(fields).filter(field => field.status === 'matched').length;
+  const overallConfidence = Number(ocr.confidence) || 0;
+  return {
+    available: true,
+    status: matchedFieldCount ? 'partial-or-full-match' : 'no-fields-matched',
+    pageCount,
+    matchedFieldCount,
+    fields,
+    coverageAdequate: ocr.regions.length >= 5 && String(ocr.text || '').trim().length >= 30 && overallConfidence >= 60,
+    confidence: overallConfidence,
+    source: 'paddle-ocr-label-value-geometry-mapped-to-normalized-pdf-page',
+  };
+}
+
+export function mergePdfFieldAssociationsWithOcr(nativeResult, ocrResult) {
+  if (!nativeResult?.available) return ocrResult || nativeResult || { available: false, fields: {} };
+  if (!ocrResult?.available) {
+    const fields = Object.fromEntries(Object.entries(nativeResult.fields || {}).map(([field, item]) => [field, {
+      ...item,
+      referencePresence: item?.status === 'matched' || item?.status === 'ambiguous' || (item?.typedLabelCandidates || 0) > 0 ? 'present' : 'unknown',
+      ocrAssociation: null,
+      crossSourceConflict: false,
+    }]));
+    return { ...nativeResult, fields, sources: ['pdf-text-layer'] };
+  }
+  const amountKey = value => {
+    let raw = String(value || '').replace(/[^0-9,.-]/g, '');
+    const negative = raw.startsWith('-');
+    raw = raw.replace(/-/g, '');
+    const separator = Math.max(raw.lastIndexOf(','), raw.lastIndexOf('.'));
+    let whole = raw, fraction = '';
+    if (separator >= 0 && raw.length - separator - 1 > 0 && raw.length - separator - 1 <= 2) {
+      whole = raw.slice(0, separator);
+      fraction = raw.slice(separator + 1);
+    }
+    return `${negative ? '-' : ''}${whole.replace(/\D/g, '').replace(/^0+(?=\d)/, '')}.${fraction.padEnd(2, '0') || '00'}`;
+  };
+  const fields = {};
+  for (const field of Object.keys(nativeResult.fields || {})) {
+    const nativeField = nativeResult.fields[field];
+    const ocrField = ocrResult.fields?.[field];
+    const referencePresence = nativeField?.status === 'matched' || nativeField?.status === 'ambiguous' || (nativeField?.typedLabelCandidates || 0) > 0 ||
+      ocrField?.status === 'matched' || ocrField?.status === 'ambiguous' || (ocrField?.typedLabelCandidates || 0) > 0
+      ? 'present'
+      : (nativeResult.available && ocrResult.coverageAdequate === true ? 'absent' : 'unknown');
+    if (nativeField?.status === 'matched') {
+      fields[field] = {
+        ...nativeField,
+        referencePresence,
+        ocrAssociation: ocrField?.status === 'matched' ? ocrField : null,
+        crossSourceConflict: Boolean(ocrField?.status === 'matched' &&
+          (field === 'recipientIBAN' ? normalizeIban(nativeField.value) !== normalizeIban(ocrField.value)
+            : field === 'amount' ? amountKey(nativeField.value) !== amountKey(ocrField.value)
+              : normalizeLabel(nativeField.value) !== normalizeLabel(ocrField.value))),
+      };
+    } else if (nativeField?.status === 'ambiguous') {
+      fields[field] = { ...nativeField, referencePresence, ocrAssociation: ocrField?.status === 'matched' ? ocrField : null, crossSourceConflict: Boolean(ocrField?.status === 'matched') };
+    } else if (ocrField?.status === 'matched') {
+      fields[field] = { ...ocrField, referencePresence, nativeAssociation: nativeField || null, fallbackUsed: true };
+    } else {
+      fields[field] = { ...nativeField, referencePresence, ocrAssociation: ocrField || null };
+    }
+  }
+  return {
+    ...nativeResult,
+    status: Object.values(fields).some(field => field.status === 'matched') ? 'partial-or-full-match' : nativeResult.status,
+    fields,
+    sources: ['pdf-text-layer', 'paddle-ocr-label-value-geometry'],
   };
 }
