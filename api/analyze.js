@@ -12,7 +12,7 @@ import { analyzeFontForensics, fontFamily, normalizeFontName } from "./font_fore
 import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Rois, compareGlobal16x16, inferDocumentFamily } from "./mathematical_forensics_v1.6.3.js";
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
-import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
+import { extractPdfNativeFieldAssociations, extractPdfOcrFieldAssociations, mergePdfFieldAssociationsWithOcr, matchesPdfFieldLabel } from "./pdf_field_association.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { analyzePdfStructure } from "./pdf_structure_forensics.js";
@@ -8126,7 +8126,7 @@ async function getReferenceAmountAnchor(bank) {
     const labelPart = String(text || '').split(/[:：]/, 1)[0];
     const normalized = normalizeFieldTextForMatch(labelPart)
       .replace(/[().]/g, ' ').replace(/\s+/g, ' ').trim();
-    return /^(?:TUTAR|TUTARI|ISLEM TUTAR|ISLEM TUTARI|ISLEM TUTAR TL|ISLEM TUTARI TL|ISLEM TUTAR TRY|ISLEM TUTARI TRY|ANA TUTAR|ANA TUTARI|GIDEN TUTAR|GIDEN TUTARI|GIDEN FAST TUTAR|GIDEN FAST TUTARI|GIDEN FAST EFT TUTAR|GIDEN FAST EFT TUTARI|GONDERILEN TUTAR|GONDERILEN TUTARI|GONDERILEN FAST TUTAR|GONDERILEN FAST TUTARI|TRANSFER TUTAR|TRANSFER TUTARI|ODEME TUTAR|ODEME TUTARI|PARA CINSI TUTAR|B A PARA CINSI TUTAR)$/.test(normalized);
+    return matchesPdfFieldLabel('amount', normalized);
   };
 
   const median = (values) => {
@@ -8279,7 +8279,7 @@ async function getReferenceAmountAnchor(bank) {
         // Halkbank `ISLEM TUTARI (TL)` could produce no reference anchor.
         const strictMoneyRe = /(?:₺|TL|TRY|EUR|USD|GBP)\s*[-+]?\s*\d|[-+]?\d{1,3}(?:[. ]\d{3})*[,.]\d{1,2}\b|[-+]?\d{1,3}(?:[. ]\d{3})+(?:\b|\s)/i;
         const integerMoneyRe = /^[-+]?\d{1,6}$/;
-        const explicitAmountLabelRe = /(?:b\s*\/\s*a\s*para\s*cinsi\s*tutar|işlem\s*tutar(?:ı|i)?(?:\s*\(\s*(?:tl|try)\s*\))?|islem\s*tutar(?:i|ı)?(?:\s*\(\s*(?:tl|try)\s*\))?|giden\s*fast(?:\s*eft)?\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|ana\s*tutar|giden\s*tutar)/i;
+        const explicitAmountLabelRe = /(?:b\s*\/\s*a\s*para\s*cinsi\s*tutar|işlem\s*tutar(?:ı|i)?(?:\s*\(\s*(?:tl|try)\s*\))?|islem\s*tutar(?:i|ı)?(?:\s*\(\s*(?:tl|try)\s*\))?|(?:fast\s*)?(?:işlem|islem|transfer|gönderim|gonderim|giden|gönderilen)\s*tutar(?:ı|i)?|giden\s*fast(?:\s*eft)?\s*tutar|gönderilen\s*(?:fast\s*)?tutar|transfer\s*tutar|ana\s*tutar|giden\s*tutar)/i;
         const moneyCandidates = regions.filter(r =>
           /\d/.test(r.text) && (strictMoneyRe.test(r.text) || integerMoneyRe.test(String(r.text).trim()))
         );
@@ -18497,6 +18497,33 @@ await runPaddleOCRForJPEG(
 forensicTargetPath
 );
 
+if (type === "pdf" && paddleImageOCR?.success) {
+  try {
+    const rasterMeta = await sharp(forensicTargetPath).metadata();
+    const pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
+    const ocrFields = await extractPdfOcrFieldAssociations(pdf, paddleImageOCR, {
+      imageWidth: Number(rasterMeta.width) || 0,
+      imageHeight: Number(rasterMeta.height) || 0,
+      maxPages: 1,
+    });
+    pdfNativeFieldAssociation = mergePdfFieldAssociationsWithOcr(pdfNativeFieldAssociation, ocrFields);
+    const resolvedAmount = pdfNativeFieldAssociation?.fields?.amount;
+    if (resolvedAmount?.status === "matched" && resolvedAmount?.associationValidated && resolvedAmount?.valueBox) {
+      activeTargetPdfAmountBox = { ...resolvedAmount.valueBox, pageNumber: Number(resolvedAmount.pageNumber) || 1, labelText: resolvedAmount.labelText || null };
+    }
+    console.log("PDF TARGET FIELD ASSOCIATION FUSION:", JSON.stringify({
+      source: pdfNativeFieldAssociation?.sources || [],
+      fields: Object.fromEntries(Object.entries(pdfNativeFieldAssociation?.fields || {}).map(([field, item]) => [field, {
+        status: item?.status, value: item?.value || null, resolver: item?.resolver || null,
+        fallbackUsed: item?.fallbackUsed === true, crossSourceConflict: item?.crossSourceConflict === true,
+        typedLabelCandidates: item?.typedLabelCandidates || 0,
+      }]))
+    }));
+  } catch (error) {
+    console.warn("PDF TARGET OCR FIELD ASSOCIATION ERROR:", error?.message || error);
+  }
+}
+
 if (!paddleImageOCR?.success) {
   paddleCriticalFailure = true;
   console.error("PADDLEOCR CRITICAL FAILURE — ANALYSIS WILL NOT CLAIM CLEAN RESULT");
@@ -18631,6 +18658,7 @@ if ((type === "image" || type === "pdf") && forensicTargetPath) {
 // hatası oluşur.
 let reference = null;
 let pdfReferenceFieldAssociation = null;
+let pdfReferenceFieldComparison = null;
 
 if (type !== "video" && type !== "statement") {
   reference = await loadReferenceFile(bank, paddleImageOCR, activeReferenceFormat);
@@ -18658,20 +18686,54 @@ if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCas
   try {
     const referenceBuffer = await fs.readFile(reference.path);
     const referencePdf = await getPdfDocument({ data: new Uint8Array(referenceBuffer) }).promise;
-    pdfReferenceFieldAssociation = await extractPdfNativeFieldAssociations(referencePdf);
+    const referenceNativeFields = await extractPdfNativeFieldAssociations(referencePdf);
+    let referenceOcrFields = { available: false, fields: {}, status: 'ocr-not-run' };
+    try {
+      const renderedReference = await renderPdfPagePng(referencePdf, 1, 1.6);
+      if (renderedReference?.buffer) {
+        const ocrPath = `/tmp/verifydoc-reference-fields-${createHash('sha256').update(referenceBuffer).digest('hex').slice(0, 16)}.png`;
+        await fs.writeFile(ocrPath, renderedReference.buffer);
+        try {
+          const referenceOCR = await runPaddleOCR(ocrPath);
+          referenceOcrFields = await extractPdfOcrFieldAssociations(referencePdf, referenceOCR, {
+            imageWidth: renderedReference.width,
+            imageHeight: renderedReference.height,
+            maxPages: 1,
+          });
+        } finally {
+          try { await fs.unlink(ocrPath); } catch {}
+        }
+      }
+    } catch (ocrError) {
+      console.warn('PDF REFERENCE OCR FIELD ASSOCIATION ERROR:', ocrError?.message || ocrError);
+    }
+    pdfReferenceFieldAssociation = mergePdfFieldAssociationsWithOcr(referenceNativeFields, referenceOcrFields);
     const fieldComparison = {};
     for (const field of ["recipientName", "recipientIBAN", "amount"]) {
       const targetField = pdfNativeFieldAssociation?.fields?.[field];
       const referenceField = pdfReferenceFieldAssociation?.fields?.[field];
       const targetBox = targetField?.valueBox;
       const referenceBox = referenceField?.valueBox;
+      const targetLabelBox = targetField?.labelBox;
+      const referenceLabelBox = referenceField?.labelBox;
+      const labelCenterDelta = targetLabelBox && referenceLabelBox ? {
+        dx: Number(((targetLabelBox.x + targetLabelBox.width / 2) - (referenceLabelBox.x + referenceLabelBox.width / 2)).toFixed(6)),
+        dy: Number(((targetLabelBox.y + targetLabelBox.height / 2) - (referenceLabelBox.y + referenceLabelBox.height / 2)).toFixed(6)),
+      } : null;
       fieldComparison[field] = {
         targetStatus: targetField?.status || "unavailable",
         referenceStatus: referenceField?.status || "unavailable",
         targetLabel: targetField?.labelText || null,
         referenceLabel: referenceField?.labelText || null,
+        referencePresence: referenceField?.referencePresence || 'unknown',
+        targetReferenceValueConflict: targetField?.crossSourceConflict === true,
+        referenceNativeOcrConflict: referenceField?.crossSourceConflict === true,
+        targetResolver: targetField?.resolver || null,
+        referenceResolver: referenceField?.resolver || null,
         targetValueBoxNorm: targetBox || null,
         referenceValueBoxNorm: referenceBox || null,
+        labelCenterDelta,
+        layoutAligned: labelCenterDelta ? Math.abs(labelCenterDelta.dx) <= 0.06 && Math.abs(labelCenterDelta.dy) <= 0.025 : null,
         centerDeltaNorm: targetBox && referenceBox ? {
           dx: Number(((targetBox.x + targetBox.width / 2) - (referenceBox.x + referenceBox.width / 2)).toFixed(6)),
           dy: Number(((targetBox.y + targetBox.height / 2) - (referenceBox.y + referenceBox.height / 2)).toFixed(6)),
@@ -18679,15 +18741,75 @@ if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCas
         comparable: Boolean(targetField?.associationValidated && referenceField?.associationValidated && targetBox && referenceBox),
       };
     }
+    pdfReferenceFieldComparison = fieldComparison;
     console.log("PDF NATIVE TARGET-REFERENCE FIELD COMPARISON:", JSON.stringify({
       referenceFile: path.basename(reference.path),
       targetPageCount: pdfNativeFieldAssociation?.pageCount || 0,
       referencePageCount: pdfReferenceFieldAssociation?.pageCount || 0,
+      targetSources: pdfNativeFieldAssociation?.sources || ['pdf-text-layer'],
+      referenceSources: pdfReferenceFieldAssociation?.sources || ['pdf-text-layer'],
       fields: fieldComparison,
     }));
   } catch (error) {
     console.warn("PDF NATIVE REFERENCE FIELD ASSOCIATION ERROR:", error?.message || error);
     pdfReferenceFieldAssociation = { available: false, status: "error", fields: {}, error: error?.message || String(error) };
+  }
+}
+
+if (type === "pdf" && reference?.path && /\.(?:jpe?g|png|webp)$/i.test(reference.path)) {
+  try {
+    const referenceBuffer = await fs.readFile(reference.path);
+    const imageMeta = await sharp(referenceBuffer).metadata();
+    const imageWidth = Number(imageMeta.width) || 0;
+    const imageHeight = Number(imageMeta.height) || 0;
+    const referenceOCR = await runPaddleOCR(reference.path);
+    const rasterReference = {
+      numPages: 1,
+      getPage: async () => ({ getViewport: () => ({ width: imageWidth, height: imageHeight }) }),
+    };
+    const referenceOcrFields = await extractPdfOcrFieldAssociations(rasterReference, referenceOCR, {
+      imageWidth, imageHeight, maxPages: 1,
+    });
+    const emptyNativeFields = {
+      available: true, status: 'raster-reference-no-text-layer', pageCount: 1,
+      fields: Object.fromEntries(['recipientName', 'recipientIBAN', 'amount'].map(field => [field, {
+        status: 'unavailable', value: null, associationValidated: false, typedLabelCandidates: 0, reason: 'raster-reference-has-no-native-text-layer',
+      }])),
+    };
+    pdfReferenceFieldAssociation = mergePdfFieldAssociationsWithOcr(emptyNativeFields, referenceOcrFields);
+    const fieldComparison = {};
+    for (const field of ['recipientName', 'recipientIBAN', 'amount']) {
+      const targetField = pdfNativeFieldAssociation?.fields?.[field];
+      const referenceField = pdfReferenceFieldAssociation?.fields?.[field];
+      const targetBox = targetField?.valueBox;
+      const referenceBox = referenceField?.valueBox;
+      const targetLabelBox = targetField?.labelBox;
+      const referenceLabelBox = referenceField?.labelBox;
+      const labelCenterDelta = targetLabelBox && referenceLabelBox ? {
+        dx: Number(((targetLabelBox.x + targetLabelBox.width / 2) - (referenceLabelBox.x + referenceLabelBox.width / 2)).toFixed(6)),
+        dy: Number(((targetLabelBox.y + targetLabelBox.height / 2) - (referenceLabelBox.y + referenceLabelBox.height / 2)).toFixed(6)),
+      } : null;
+      fieldComparison[field] = {
+        targetStatus: targetField?.status || 'unavailable', referenceStatus: referenceField?.status || 'unavailable',
+        targetLabel: targetField?.labelText || null, referenceLabel: referenceField?.labelText || null,
+        referencePresence: referenceField?.referencePresence || 'unknown',
+        targetResolver: targetField?.resolver || null, referenceResolver: referenceField?.resolver || null,
+        targetValueBoxNorm: targetBox || null, referenceValueBoxNorm: referenceBox || null,
+        labelCenterDelta,
+        layoutAligned: labelCenterDelta ? Math.abs(labelCenterDelta.dx) <= 0.06 && Math.abs(labelCenterDelta.dy) <= 0.025 : null,
+        targetReferenceValueConflict: targetField?.crossSourceConflict === true,
+        referenceNativeOcrConflict: referenceField?.crossSourceConflict === true,
+        comparable: Boolean(targetField?.associationValidated && referenceField?.associationValidated && targetBox && referenceBox),
+      };
+    }
+    pdfReferenceFieldComparison = fieldComparison;
+    console.log('RASTER REFERENCE TARGET-FIELD COMPARISON:', JSON.stringify({
+      referenceFile: path.basename(reference.path), targetSources: pdfNativeFieldAssociation?.sources || ['pdf-text-layer'],
+      referenceSource: 'paddle-ocr-label-value-geometry', fields: fieldComparison,
+    }));
+  } catch (error) {
+    console.warn('RASTER REFERENCE FIELD ASSOCIATION ERROR:', error?.message || error);
+    pdfReferenceFieldAssociation = { available: false, status: 'error', fields: {}, error: error?.message || String(error) };
   }
 }
 
@@ -20832,6 +20954,7 @@ if (multimodalReceiptEvidence) {
     paddleOCR: paddleDocumentOCR?.success ? paddleDocumentOCR : paddleImageOCR,
     primaryDocumentData: result?.documentData,
     pdfNativeFields: pdfNativeFieldAssociation,
+  referencePdfFields: pdfReferenceFieldAssociation,
   });
   result.semanticEvidenceFusion = semanticEvidenceFusion;
   result.manualReviewRequired = semanticEvidenceFusion.reviewStatus === 'CONTROL_REQUIRED';
@@ -24352,13 +24475,38 @@ const amountRenderDifferenceStrong = Boolean(
   finalAmountReferenceComparison.classification === 'strong-reference-render-difference'
 );
 const criticalReviewReasons = [];
-if (!criticalIbanEvidence?.associationValidated) criticalReviewReasons.push('recipient-iban-label-association-unverified');
-if (criticalIbanEvidence?.primaryAnalysisAgreement === 'disagreement' || criticalIbanEvidence?.sourceDisagreement === true) {
+const hasSelectedFieldReference = type === 'pdf' && Boolean(reference?.path && /\.(?:pdf|jpe?g|png|webp)$/i.test(reference.path));
+const referenceIbanPresence = hasSelectedFieldReference
+  ? (pdfReferenceFieldAssociation?.fields?.recipientIBAN?.referencePresence || 'unknown')
+  : 'required';
+const referenceAmountPresence = hasSelectedFieldReference
+  ? (pdfReferenceFieldAssociation?.fields?.amount?.referencePresence || 'unknown')
+  : 'required';
+const recipientIbanApplicable = referenceIbanPresence !== 'absent';
+if (recipientIbanApplicable && !criticalIbanEvidence?.associationValidated) criticalReviewReasons.push('recipient-iban-label-association-unverified');
+if (recipientIbanApplicable && (criticalIbanEvidence?.primaryAnalysisAgreement === 'disagreement' || criticalIbanEvidence?.sourceDisagreement === true)) {
   criticalReviewReasons.push('recipient-iban-source-disagreement');
 }
 if (!criticalAmountEvidence?.associationValidated) criticalReviewReasons.push('amount-label-association-unverified');
 if (criticalAmountEvidence?.primaryAnalysisAgreement === 'disagreement' || criticalAmountEvidence?.sourceDisagreement === true) {
   criticalReviewReasons.push('amount-source-disagreement');
+}
+if (hasSelectedFieldReference) {
+  const amountFieldMatch = pdfReferenceFieldComparison?.amount;
+  if (referenceAmountPresence !== 'present') criticalReviewReasons.push(`trusted-reference-amount-${referenceAmountPresence}`);
+  if (!amountFieldMatch?.comparable) criticalReviewReasons.push('amount-reference-field-association-unavailable');
+  else if (amountFieldMatch.layoutAligned === false) criticalReviewReasons.push('amount-reference-layout-mismatch');
+  if (amountFieldMatch?.targetReferenceValueConflict || amountFieldMatch?.referenceNativeOcrConflict) criticalReviewReasons.push('amount-reference-source-disagreement');
+  if (referenceIbanPresence === 'unknown') criticalReviewReasons.push('trusted-reference-iban-presence-unresolved');
+  if (referenceIbanPresence === 'present' && !pdfReferenceFieldComparison?.recipientIBAN?.comparable) {
+    criticalReviewReasons.push('recipient-iban-reference-field-association-unavailable');
+  }
+  if (referenceIbanPresence === 'present' && pdfReferenceFieldComparison?.recipientIBAN?.layoutAligned === false) {
+    criticalReviewReasons.push('recipient-iban-reference-layout-mismatch');
+  }
+  if (referenceIbanPresence === 'present' && (pdfReferenceFieldComparison?.recipientIBAN?.targetReferenceValueConflict || pdfReferenceFieldComparison?.recipientIBAN?.referenceNativeOcrConflict)) {
+    criticalReviewReasons.push('recipient-iban-reference-source-disagreement');
+  }
 }
 if (finalAmountReferenceComparison?.available !== true) criticalReviewReasons.push('amount-reference-comparison-unavailable');
 if (amountRenderDifferenceStrong) criticalReviewReasons.push('strong-amount-reference-render-difference');
@@ -24369,7 +24517,9 @@ if (semanticEvidenceFusion?.available) {
     ? 'Kontrol gerekli: alıcı IBANı veya tutar alanı doğrulanamadı, kaynaklar uyuşmadı ya da tutar referans karşılaştırması eksik/güçlü fark gösteriyor.'
     : 'Alıcı IBANı ve tutar alanı doğrulandı; tutar referans karşılaştırması güçlü fark göstermedi.';
   semanticEvidenceFusion.criticalFieldReview = {
-    focusFields: ['recipientIBAN', 'amount'],
+    focusFields: recipientIbanApplicable ? ['recipientIBAN', 'amount'] : ['amount'],
+    selectedReferenceFile: hasSelectedFieldReference ? path.basename(reference.path) : null,
+    referenceFieldPresence: { amount: referenceAmountPresence, recipientIBAN: referenceIbanPresence },
     recipientNameUsedAsReviewGate: false,
     amountReferenceComparison: finalAmountReferenceComparison ? {
       available: finalAmountReferenceComparison.available === true,
@@ -24386,7 +24536,9 @@ result.fieldReviewStatus = (type === 'image' || type === 'pdf')
   : (semanticEvidenceFusion?.reviewStatus || null);
 result.manualReviewRequired = result.fieldReviewStatus === 'CONTROL_REQUIRED';
 console.log('FINAL CRITICAL FIELD REVIEW:', JSON.stringify({
-  focusFields: ['recipientIBAN', 'amount'],
+  focusFields: recipientIbanApplicable ? ['recipientIBAN', 'amount'] : ['amount'],
+  selectedReferenceFile: hasSelectedFieldReference ? path.basename(reference.path) : null,
+  referenceFieldPresence: { amount: referenceAmountPresence, recipientIBAN: referenceIbanPresence },
   recipientNameUsedAsReviewGate: false,
   amountReferenceComparisonAvailable: finalAmountReferenceComparison?.available === true,
   amountReferenceComparisonClassification: finalAmountReferenceComparison?.classification || null,
