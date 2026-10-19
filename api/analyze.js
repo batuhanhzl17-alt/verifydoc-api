@@ -16,6 +16,7 @@ import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { analyzePdfStructure } from "./pdf_structure_forensics.js";
+import { analyzeHtmlReceipt, formatHtmlReceiptSummary } from "./html_receipt_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
 import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs"
@@ -6274,76 +6275,6 @@ function statementPdfMoneyTokens(text) {
   return matches.map(token => ({ text: token.trim(), cents: statementPdfMoneyCents(token) }));
 }
 
-// PDF text layers often split a displayed amount into adjacent spans (for
-// example "1.250," + "00"), even though OCR/model output contains one value.
-// Rebuild only tightly adjacent spans on the same baseline and only accept a
-// complete money literal. This is bank-agnostic and retains the source box for
-// downstream local overlay checks.
-function statementPdfMoneyItemsFromLine(items, expectedCents, absolute = false) {
-  if (!Array.isArray(items) || expectedCents == null) return [];
-  const sorted = items.filter(item => String(item?.str || '').trim())
-    .map(item => ({ item, x: Number(item?.transform?.[4]) || 0,
-      y: Number(item?.transform?.[5]) || 0, width: Math.max(0, Number(item?.width) || 0),
-      height: Math.max(1, Number(item?.height) || 8) }))
-    .sort((a, b) => a.x - b.x);
-  const found = [];
-  const fullMoney = /^[+−-]?(?:(?:\d{1,3}(?:\.\d{3})+)|\d+)(?:,\d{2}|\.\d{2})(?:TL|TRY)?$/i;
-  for (let start = 0; start < sorted.length; start++) {
-    let text = '';
-    let last = null;
-    for (let end = start; end < Math.min(sorted.length, start + 8); end++) {
-      const current = sorted[end];
-      if (last) {
-        const gap = current.x - (last.x + last.width);
-        const maxGap = Math.max(2.5, Math.min(last.height, current.height) * 0.7);
-        if (gap > maxGap || Math.abs(current.y - last.y) > Math.max(2.5, Math.min(last.height, current.height) * 0.45)) break;
-      }
-      text += String(current.item.str || '').replace(/\s+/g, '');
-      last = current;
-      // Whole-span amounts are already represented by the native token pass;
-      // this helper exists specifically for amounts split across spans.
-      if (end === start) continue;
-      if (!fullMoney.test(text)) continue;
-      const cents = statementPdfMoneyCents(text);
-      if ((absolute ? Math.abs(cents) : cents) !== expectedCents) continue;
-      const first = sorted[start];
-      const merged = {
-        str: text,
-        transform: Array.isArray(first.item.transform) ? [...first.item.transform] : [0, 0, 0, 0, first.x, first.y],
-        width: Math.max(0.1, last.x + last.width - first.x),
-        height: Math.max(...sorted.slice(start, end + 1).map(entry => entry.height)),
-        _reconstructedFromTextItems: end > start,
-      };
-      const duplicate = found.some(item => Math.abs((Number(item.transform?.[4]) || 0) - first.x) < 0.5 &&
-        Math.abs((Number(item.transform?.[5]) || 0) - first.y) < 0.5 &&
-        Math.abs((Number(item.width) || 0) - merged.width) < 0.5 && String(item.str) === text);
-      if (!duplicate) found.push(merged);
-    }
-  }
-  return found;
-}
-
-function statementPdfTextLines(items) {
-  const sorted = (Array.isArray(items) ? items : []).filter(item => String(item?.str || '').trim())
-    .map(item => ({ item, y: Number(item?.transform?.[5]) || 0, height: Math.max(1, Number(item?.height) || 8),
-      x: Number(item?.transform?.[4]) || 0 }))
-    .sort((a, b) => b.y - a.y || a.x - b.x);
-  const lines = [];
-  for (const entry of sorted) {
-    let line = lines.find(candidate => Math.abs(candidate.y - entry.y) <= Math.max(2.5, Math.min(candidate.height, entry.height) * 0.4));
-    if (!line) { line = { y: entry.y, height: entry.height, entries: [] }; lines.push(line); }
-    line.entries.push(entry);
-    line.y = line.entries.reduce((sum, value) => sum + value.y, 0) / line.entries.length;
-    line.height = Math.max(line.height, entry.height);
-  }
-  return lines.map(line => {
-    const lineItems = line.entries.sort((a, b) => a.x - b.x).map(entry => entry.item);
-    const text = lineItems.map(item => String(item.str || '')).join(' ');
-    const compactText = lineItems.map(item => String(item.str || '').replace(/\s+/g, '')).join('');
-    return { y: line.y, height: line.height, items: lineItems, text, compactText };
-  });
-}
-
 function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
   const dateKey = statementPdfDateKey(row?.date);
   const rawAmount = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
@@ -6365,6 +6296,8 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     const hits = terms.filter(term => rowText.includes(term)).length;
     const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
     const idMatched = transactionId.length >= 5 && rowText.replace(/\D/g, '').includes(transactionId);
+    if (!descriptionMatched && !idMatched) continue;
+
     let amountCells = cells.filter(cell => statementPdfMoneyTokens(cell.text)
       .some(token => token.cents != null && Math.abs(token.cents) === expectedAmount));
     const balanceCells = expectedBalance == null ? [] : cells.filter(cell =>
@@ -6400,29 +6333,21 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     }
     const balanceBox = balanceCells.length === 1 ? statementPdfAzureBox(balanceCells[0]) : null;
     candidates.push({ tableIndex: tableRow.tableIndex, rowIndex: tableRow.rowIndex, amountCell,
-      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1,
-      descriptionMatched, idMatched });
+      amountBox, amountText, balanceBox, balanceMatched: balanceCells.length === 1 });
   }
 
-  // OCR can distort merchant/description text even when the date and exact
-  // cents are clear. Use that row only when date+amount identifies one table
-  // row; repeated same-day/same-amount transactions remain ambiguous.
-  const descriptiveCandidates = candidates.filter(candidate => candidate.descriptionMatched || candidate.idMatched);
-  const selectedCandidates = descriptiveCandidates.length ? descriptiveCandidates : candidates;
-  if (selectedCandidates.length !== 1) return { status: 'unresolved', source: 'azure-table',
+  if (candidates.length !== 1) return { status: 'unresolved', source: 'azure-table',
     dateAnchorCount: (tableRows || []).filter(item => Number(item.pageNumber) === Number(row.pageNumber) &&
       item.cells?.some(cell => statementPdfDateKey(cell.text) === dateKey)).length,
-    distinctCandidateLineCount: selectedCandidates.length,
-    reason: selectedCandidates.length ? `${selectedCandidates.length} Azure tablo satırı adayı kaldı; güvenli seçim yapılamadı.`
+    distinctCandidateLineCount: candidates.length,
+    reason: candidates.length ? `${candidates.length} Azure tablo satırı adayı kaldı; güvenli seçim yapılamadı.`
       : 'Azure tablo hücrelerinde tarih, açıklama/işlem numarası ve tutar birlikte eşleşmedi.' };
-  const candidate = selectedCandidates[0];
+  const candidate = candidates[0];
   if (!candidate.amountBox) return { status: 'unresolved', source: 'azure-table',
     dateAnchorCount: 1, distinctCandidateLineCount: 1,
     reason: 'Azure tablo satırı bulundu; ancak tutar için dar ve güvenilir hücre/kelime kutusu üretilemedi.' };
   return { status: 'matched', source: 'azure-table', dateAnchorCount: 1,
-    distinctCandidateLineCount: 1, reason: descriptiveCandidates.length
-      ? 'Azure tablo satırında tarih, açıklama/işlem numarası ve tutar tekil eşleşti.'
-      : 'OCR açıklaması farklı olsa da tarih ve tam tutar yalnızca bir Azure tablo satırında eşleşti.',
+    distinctCandidateLineCount: 1, reason: 'Azure tablo satırında tarih, açıklama/işlem numarası ve tutar tekil eşleşti.',
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox,
     amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
 }
@@ -6449,6 +6374,7 @@ function statementPdfResolveAzureRow(row, pageLines, pageWords) {
     const hits = terms.filter(term => text.includes(term)).length;
     const descriptionMatched = !terms.length || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
     const idMatched = transactionId.length >= 5 && text.replace(/\D/g, '').includes(transactionId);
+    if (!descriptionMatched && !idMatched) continue;
     const amountOccurrences = statementPdfMoneyTokens(band.map(line => line.text || '').join(' '))
       .filter(token => token.cents != null && Math.abs(token.cents) === expectedAmount);
     if (amountOccurrences.length !== 1) continue;
@@ -6461,22 +6387,17 @@ function statementPdfResolveAzureRow(row, pageLines, pageWords) {
     const amountBox = amountWords.length === 1 ? statementPdfAzureBox(amountWords[0]) : null;
     const balanceWords = expectedBalance == null ? [] : words.filter(word => statementPdfMoneyCents(word.text) === expectedBalance);
     candidates.push({ anchorY, amountBox, balanceBox: balanceWords.length === 1 ? statementPdfAzureBox(balanceWords[0]) : null,
-      amountText: amountWords.length === 1 ? amountWords[0].text : amountOccurrences[0].text,
-      descriptionMatched, idMatched });
+      amountText: amountWords.length === 1 ? amountWords[0].text : amountOccurrences[0].text });
   }
-  const descriptiveCandidates = candidates.filter(candidate => candidate.descriptionMatched || candidate.idMatched);
-  const selectedCandidates = descriptiveCandidates.length ? descriptiveCandidates : candidates;
-  if (selectedCandidates.length !== 1) return { status: 'unresolved', dateAnchorCount: anchors.length,
-    distinctCandidateLineCount: selectedCandidates.length,
-    reason: selectedCandidates.length ? `${selectedCandidates.length} Azure satır adayı kaldı; güvenli seçim yapılamadı.`
+  if (candidates.length !== 1) return { status: 'unresolved', dateAnchorCount: anchors.length,
+    distinctCandidateLineCount: candidates.length,
+    reason: candidates.length ? `${candidates.length} Azure satır adayı kaldı; güvenli seçim yapılamadı.`
       : 'Azure OCR geometrisinde tarih, açıklama ve tutar aynı satırda doğrulanamadı.' };
-  const candidate = selectedCandidates[0];
+  const candidate = candidates[0];
   if (!candidate.amountBox) return { status: 'unresolved', dateAnchorCount: anchors.length,
     distinctCandidateLineCount: 1, reason: 'Satır bulundu; ancak tutara ait dar OCR kelime kutusu tekil bulunamadı.' };
   return { status: 'matched', source: 'azure-lines', dateAnchorCount: anchors.length, distinctCandidateLineCount: 1,
-    reason: descriptiveCandidates.length
-      ? 'Azure OCR satır geometrisinde tarih, açıklama ve tutar tekil eşleşti.'
-      : 'OCR açıklaması farklı olsa da tarih ve tam tutar yalnızca bir Azure satır bandında eşleşti.',
+    reason: 'Azure OCR satır geometrisinde tarih, açıklama ve tutar tekil eşleşti.',
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox, amountText: candidate.amountText };
 }
 
@@ -6505,18 +6426,12 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       const localizedOverlayCandidates = [];
       const pageRows = (Array.isArray(statementRows) ? statementRows : []).filter(row => Number(row?.pageNumber) === pageNumber);
       const pageItems = content.items || [];
-      const pageTextLines = statementPdfTextLines(pageItems);
       const azurePageLines = Array.isArray(azureLayout?.lines) ? azureLayout.lines.filter(line => Number(line.pageNumber) === pageNumber) : [];
       const azurePageWords = Array.isArray(azureLayout?.words) ? azureLayout.words.filter(word => Number(word.pageNumber) === pageNumber) : [];
       const azurePageTableRows = Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.filter(row => Number(row.pageNumber) === pageNumber) : [];
       for (const [rowIndex, row] of pageRows.entries()) {
         const dateKey = statementPdfDateKey(row?.date);
-        const dateAnchorLines = dateKey ? pageTextLines.filter(line =>
-          statementPdfDateKey(line.text) === dateKey || statementPdfDateKey(line.compactText) === dateKey
-        ) : [];
-        const dateAnchors = dateAnchorLines.map(line => ({
-          transform: [0, 0, 0, line.height, 0, line.y], height: line.height, _line: line,
-        }));
+        const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
         const rowAmountValue = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
           : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
         // Statement rows model debit/credit as positive magnitudes even when
@@ -6573,31 +6488,17 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
             // Collapse anchors on the same baseline, then disambiguate by the
             // row's description and exact transaction amount.
             if (anchorLines.some(line => Math.abs(line.anchorY - anchorY) <= tolerance)) continue;
-            const groupedLine = anchor._line || pageTextLines.find(line => Math.abs(line.y - anchorY) <= tolerance);
-            const lineText = statementNormalizeText(groupedLine?.text || lineItems.map(item => item.str || '').join(' '));
+            const lineText = statementNormalizeText(lineItems.map(item => item.str || '').join(' '));
             const descriptionHits = descriptionTerms.filter(term => lineText.includes(term)).length;
-            const transactionId = String(row?.transactionId || '').replace(/\D/g, '');
-            const idMatched = transactionId.length >= 5 && lineText.replace(/\D/g, '').includes(transactionId);
-            const descriptionMatched = descriptionTerms.length === 0 ||
-              descriptionHits >= Math.max(1, Math.ceil(descriptionTerms.length * 0.35)) || idMatched;
-            const sourceLineItems = groupedLine?.items || lineItems;
-            const reconstructedAmounts = statementPdfMoneyItemsFromLine(sourceLineItems, expectedAmountCents, true);
-            const reconstructedBalances = statementPdfMoneyItemsFromLine(sourceLineItems, expectedBalanceCents, false);
-            const matchedAmountItems = expectedAmountCents == null ? [] : [
-              ...amountItems.filter(item => {
-                const cents = statementPdfMoneyCents(item.str);
-                return cents != null && Math.abs(cents) === expectedAmountCents;
-              }), ...reconstructedAmounts,
-            ];
-            const matchedBalanceItems = expectedBalanceCents == null ? [] : [
-              ...amountItems.filter(item => statementPdfMoneyCents(item.str) === expectedBalanceCents),
-              ...reconstructedBalances,
-            ];
+            const descriptionMatched = descriptionTerms.length === 0 || descriptionHits >= Math.max(1, Math.ceil(descriptionTerms.length * 0.35));
+            const matchedAmountItems = expectedAmountCents == null ? [] : amountItems.filter(item => {
+              const cents = statementPdfMoneyCents(item.str);
+              return cents != null && Math.abs(cents) === expectedAmountCents;
+            });
+            const matchedBalanceItems = expectedBalanceCents == null ? [] : amountItems.filter(item => statementPdfMoneyCents(item.str) === expectedBalanceCents);
             anchorLines.push({ anchorY, tolerance, lineText, descriptionHits, descriptionMatched, matchedAmountItems, matchedBalanceItems });
           }
-          const dateAmountCandidates = anchorLines.filter(line => line.matchedAmountItems.length === 1);
-          const descriptiveCandidates = dateAmountCandidates.filter(line => line.descriptionMatched);
-          const amountDescriptionCandidates = descriptiveCandidates.length ? descriptiveCandidates : dateAmountCandidates;
+          const amountDescriptionCandidates = anchorLines.filter(line => line.descriptionMatched && line.matchedAmountItems.length === 1);
           const balanceDisambiguated = expectedBalanceCents == null ? [] : amountDescriptionCandidates.filter(line => line.matchedBalanceItems.length === 1);
           rowLineCandidates = balanceDisambiguated.length ? balanceDisambiguated : amountDescriptionCandidates;
           if (expectedAmountCents == null) reason = 'Satırda borç/alacak tutarı yapılandırılmış değil.';
@@ -6616,9 +6517,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
             selectedAmountItem = matchedLine.matchedAmountItems[0];
             selectedBalanceItem = matchedLine.matchedBalanceItems.length === 1 ? matchedLine.matchedBalanceItems[0] : null;
             status = 'matched';
-            reason = descriptiveCandidates.length
-              ? `Tarih (${dateAnchors.length} metin ankrajı), açıklama ve işlem tutarı aynı görsel satırda tekil eşleşti.`
-              : `Açıklama OCR'si farklı olsa da tarih (${dateAnchors.length} metin ankrajı) ve tam işlem tutarı tek bir görsel satırda eşleşti.`;
+            reason = `Tarih (${dateAnchors.length} metin ankrajı), açıklama ve işlem tutarı aynı görsel satırda tekil eşleşti.`;
             if (expectedBalanceCents != null && !selectedBalanceItem) reason += ' Bu satırın beklenen bakiyesi aynı satırda tekil bulunamadı.';
             const fieldsToAudit = [{ field: row?.debitAmount != null && row?.debitAmount !== '' ? 'debitAmount' : 'creditAmount', value: rowAmountValue, item: selectedAmountItem }];
             if (selectedBalanceItem) fieldsToAudit.push({ field: 'balanceAfter', value: row.balanceAfter, item: selectedBalanceItem });
@@ -8213,10 +8112,6 @@ async function getReferenceAmountAnchor(bank) {
     let nativePdfReferenceCount = 0;
     for (const referencePath of referencePaths) {
       try {
-        let ocr = null;
-        let rendered = null;
-        let ocrAlreadyLoaded = false;
-        let rasterReferencePageNumber = 1;
         if (/\.pdf$/i.test(String(referencePath || ''))) {
           const pdfBuffer = await fs.readFile(referencePath);
           const pdf = await getPdfDocument({ data: new Uint8Array(pdfBuffer) }).promise;
@@ -8239,7 +8134,6 @@ async function getReferenceAmountAnchor(bank) {
               labelText: amount.labelText || null,
               valueBoxNorm: box,
             }));
-            continue;
           } else {
             console.warn('PDF NATIVE REFERENCE AMOUNT BOX UNAVAILABLE:', JSON.stringify({
               referenceFile: path.basename(referencePath),
@@ -8247,80 +8141,25 @@ async function getReferenceAmountAnchor(bank) {
               reason: amount?.reason || 'typed-amount-label-not-found',
             }));
           }
-
-          // Some bank reference PDFs are vectorized or have labels that the
-          // native text-layer resolver cannot associate. Do not stop here:
-          // render the trusted reference PDF and use the same positioned OCR
-          // anchor path as image references. This is geometry only; it never
-          // supplies transaction data or treats OCR text as verified values.
-          const pageNumber = Number(amount?.pageNumber) || 1;
-          rasterReferencePageNumber = pageNumber;
-          const stat = await fs.stat(referencePath);
-          const renderKey = `ref-pdf-amount-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}:${pageNumber}`;
-          let cached = referenceRasterOcrCache.get(renderKey);
-          ocr = cached?.ocr || cached || null;
-          rendered = cached?.rendered || null;
-          if (!cached) {
-            const pageRender = await renderPdfPagePng(pdf, pageNumber, 2);
-            if (pageRender?.buffer && pageRender.width && pageRender.height) {
-              // Keep the PNG bytes with the cached geometry. The projection
-              // fallback below needs pixels, and the original referencePath is
-              // a PDF (not an image Sharp can decode directly).
-              rendered = { width: pageRender.width, height: pageRender.height, buffer: pageRender.buffer };
-              const tempPath = path.join('/tmp', `verifydoc-anchor-${createHash('sha256').update(renderKey).digest('hex').slice(0,16)}.png`);
-              try {
-                await fs.writeFile(tempPath, pageRender.buffer);
-                ocr = await runPaddleOCR(tempPath);
-              } finally {
-                try { await fs.unlink(tempPath); } catch {}
-              }
-            }
-            referenceRasterOcrCache.set(renderKey, { ocr: ocr || null, rendered });
-          }
-          ocrAlreadyLoaded = true;
-          const width = Number(rendered?.width) || 0;
-          const height = Number(rendered?.height) || 0;
-          const regions = Array.isArray(ocr?.regions)
-            ? ocr.regions.filter(x => x?.region && String(x.text || '').trim()).map(x => ({
-                text: String(x.text || '').trim(),
-                region: {
-                  x1: Number(x.region.x1) || 0, y1: Number(x.region.y1) || 0,
-                  x2: Number(x.region.x2) || 0, y2: Number(x.region.y2) || 0,
-                }
-              }))
-            : [];
-          if (!width || !height || !regions.length) {
-            console.warn('PDF REFERENCE RASTER AMOUNT OCR UNAVAILABLE:', JSON.stringify({
-              referenceFile: path.basename(referencePath), pageNumber,
-              rendered: Boolean(width && height), ocrAvailable: Boolean(ocr?.success),
-              regionCount: regions.length,
-            }));
-            continue;
-          }
-          console.log('PDF REFERENCE RASTER AMOUNT OCR READY:', JSON.stringify({
-            referenceFile: path.basename(referencePath), pageNumber,
-            width, height, regionCount: regions.length,
-          }));
+          continue;
         }
-        if (!ocrAlreadyLoaded) {
-          const stat = await fs.stat(referencePath);
-          const ocrKey = `ref-image-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
-          const cached = referenceRasterOcrCache.get(ocrKey);
-          ocr = cached?.ocr || cached || null;
-          rendered = cached?.rendered || null;
+        const stat = await fs.stat(referencePath);
+        const ocrKey = `ref-image-ocr:${referencePath}:${stat.size}:${stat.mtimeMs}`;
+        let cached = referenceRasterOcrCache.get(ocrKey);
+        let ocr = cached?.ocr || cached || null;
+        let rendered = cached?.rendered || null;
 
-          if (!cached) {
-            const buffer = await fs.readFile(referencePath);
-            const meta = await sharp(buffer).metadata();
-            rendered = { width: Number(meta?.width) || 0, height: Number(meta?.height) || 0 };
-            if (rendered.width && rendered.height) {
-              const tempPath = path.join('/tmp', `verifydoc-anchor-${createHash('sha256').update(ocrKey).digest('hex').slice(0,16)}${path.extname(referencePath).toLowerCase()}`);
-              await fs.writeFile(tempPath, buffer);
-              ocr = await runPaddleOCR(tempPath);
-              try { await fs.unlink(tempPath); } catch {}
-            }
-            referenceRasterOcrCache.set(ocrKey, { ocr: ocr || null, rendered });
+        if (!cached) {
+          const buffer = await fs.readFile(referencePath);
+          const meta = await sharp(buffer).metadata();
+          rendered = { width: Number(meta?.width) || 0, height: Number(meta?.height) || 0 };
+          if (rendered.width && rendered.height) {
+            const tempPath = path.join('/tmp', `verifydoc-anchor-${createHash('sha256').update(ocrKey).digest('hex').slice(0,16)}${path.extname(referencePath).toLowerCase()}`);
+            await fs.writeFile(tempPath, buffer);
+            ocr = await runPaddleOCR(tempPath);
+            try { await fs.unlink(tempPath); } catch {}
           }
+          referenceRasterOcrCache.set(ocrKey, { ocr: ocr || null, rendered });
         }
 
         const width = Number(rendered?.width) || 0;
@@ -8469,9 +8308,7 @@ async function getReferenceAmountAnchor(bank) {
         // projection fallback on the SAME reference image instead.
         if (!best && amountLabels.length) {
           try {
-            const buffer = ocrAlreadyLoaded && rendered?.buffer
-              ? rendered.buffer
-              : await fs.readFile(referencePath);
+            const buffer = await fs.readFile(referencePath);
             const raw = await sharp(buffer).greyscale().raw().toBuffer({ resolveWithObject: true });
             const imgW = Number(raw.info?.width) || width;
             const imgH = Number(raw.info?.height) || height;
@@ -8623,22 +8460,7 @@ async function getReferenceAmountAnchor(bank) {
           widthNorm: Math.max(0.001, (r.x2-r.x1) / width),
           heightNorm: Math.max(0.001, (r.y2-r.y1) / height),
           referenceFile: path.basename(referencePath),
-          pageNumber: rasterReferencePageNumber,
         });
-        if (ocrAlreadyLoaded) {
-          console.log('PDF REFERENCE RASTER AMOUNT BOX:', JSON.stringify({
-            referenceFile: path.basename(referencePath),
-            pageNumber: rasterReferencePageNumber,
-            label: best.candidate.text === '__RASTER_AMOUNT_BOX__' ? best.label || null : null,
-            valueBoxNorm: {
-              x: r.x1 / width,
-              y: r.y1 / height,
-              width: Math.max(0.001, (r.x2-r.x1) / width),
-              height: Math.max(0.001, (r.y2-r.y1) / height),
-            },
-            source: best.source || 'paddle-ocr-label-value-geometry',
-          }));
-        }
       } catch (error) {
         console.warn('REFERENCE AMOUNT ANCHOR DOSYA HATASI:', path.basename(referencePath), error?.message || error);
       }
@@ -18061,13 +17883,47 @@ filePath
 // Telegram filename or client-supplied MIME type.
 const pdfHeader = buffer.subarray(0, Math.min(buffer.length, 1024)).toString('latin1');
 const isPdfUpload = /%PDF-\d\.\d/.test(pdfHeader);
+const htmlText = buffer.subarray(0, Math.min(buffer.length, 8192)).toString('utf8');
+const isHtmlUpload = /\.(?:html?|xhtml)$/i.test(String(fileName || filePath || '')) &&
+  /<\s*(?:!doctype\s+html|html|head|body|table|div|span)\b/i.test(htmlText);
 let pdfStructureForensics = null;
-if (!isPdfUpload && (type !== "video" || !String(mime).toLowerCase().startsWith("video/"))) {
+if (!isPdfUpload && !isHtmlUpload && (type !== "video" || !String(mime).toLowerCase().startsWith("video/"))) {
   console.warn('NON-PDF UPLOAD REJECTED:', JSON.stringify({ fileName, mime: uploadedFile.mimetype || null }));
   return res.status(415).json({
     success: false,
     error: 'PDF_ONLY: Lütfen dekontu veya hesap özetini PDF olarak yükleyin.',
     code: 'PDF_ONLY',
+  });
+}
+if (isHtmlUpload) {
+  mime = 'text/html';
+  type = 'html';
+  activeReferenceFormat = null;
+  const htmlForensics = analyzeHtmlReceipt(buffer, fileName);
+  const hasReviewSignal = htmlForensics.findings.some(item => item.severity === 'review');
+  const summary = formatHtmlReceiptSummary(htmlForensics);
+  console.log('HTML RECEIPT FORENSICS:', JSON.stringify({
+    available: htmlForensics.available,
+    engine: htmlForensics.engine,
+    fileBytes: htmlForensics.fileBytes,
+    structure: htmlForensics.structure,
+    visibleFields: htmlForensics.visibleFields,
+    findingCodes: htmlForensics.findings.map(item => item.code),
+  }));
+  return res.status(200).json({
+    success: true,
+    fileName,
+    type: 'html',
+    bank: bank || null,
+    reference: null,
+    score: 0,
+    riskLabel: 'NOT_ASSESSED',
+    confidence: null,
+    suspicious: false,
+    manualReviewRequired: hasReviewSignal,
+    fieldReviewStatus: hasReviewSignal ? 'CONTROL_REQUIRED' : 'TRIAGE_ONLY',
+    summary,
+    htmlForensics,
   });
 }
 if (isPdfUpload) {
@@ -18551,33 +18407,12 @@ if (type === "pdf" && reference?.path) {
     const candidateReferencePaths = Array.isArray(reference.referenceCandidates)
       ? reference.referenceCandidates.map((name) => path.join(REFERENCE_DIR, String(name)))
       : [];
-    const referenceFieldAssociationsByPath = {};
-    if (pdfReferenceFieldAssociation?.available) {
-      referenceFieldAssociationsByPath[path.basename(reference.path)] = pdfReferenceFieldAssociation;
-      referenceFieldAssociationsByPath[reference.path] = pdfReferenceFieldAssociation;
-    }
-    // Font candidates are bank-template PDFs already selected by the local
-    // reference resolver. Extract their typed amount boxes locally as well,
-    // so the amount-font comparison uses the same semantic field on each PDF.
-    for (const candidatePath of candidateReferencePaths.filter(candidate => path.extname(candidate).toLowerCase() === ".pdf")) {
-      if (referenceFieldAssociationsByPath[path.basename(candidatePath)]) continue;
-      try {
-        const candidateBuffer = await fs.readFile(candidatePath);
-        const candidatePdf = await getPdfDocument({ data: new Uint8Array(candidateBuffer) }).promise;
-        referenceFieldAssociationsByPath[path.basename(candidatePath)] = await extractPdfNativeFieldAssociations(candidatePdf);
-        try { if (typeof candidatePdf.destroy === "function") await candidatePdf.destroy(); } catch {}
-      } catch (candidateError) {
-        console.warn("PDF FONT REFERENCE FIELD ASSOCIATION ERROR:", path.basename(candidatePath), candidateError?.message || candidateError);
-      }
-    }
     fontForensics = await analyzeFontForensics({
       targetPath: filePath,
       referencePath: reference.path,
       referencePaths: candidateReferencePaths,
       pdfjsLib,
       maxPages: 5,
-      targetFieldAssociations: pdfNativeFieldAssociation,
-      referenceFieldAssociationsByPath,
     });
     console.log("FONT FORENSICS V35:", JSON.stringify(fontForensics));
   } catch (error) {
@@ -20825,32 +20660,7 @@ function normalizeAmountForFontMatch(value) {
 
 function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
   const normalizedAmount = normalizeAmountForFontMatch(amountValue);
-  if (!Array.isArray(usages)) return { status: 'unavailable' };
-  const spatial = usages.filter(usage => usage?.matchMethod === 'pdf-native-value-box-font-geometry');
-  if (spatial.length) {
-    const resolved = spatial.map(item => {
-      const names = [...(Array.isArray(item.resolvedFontNames) ? item.resolvedFontNames : []), item.family, item.fontName]
-        .filter(value => value && !/^g_d\d+_f\d+$/i.test(String(value)));
-      const family = names.length ? (fontFamily(names[0]) || names[0]) : null;
-      return {
-        family,
-        familyResolution: family ? 'pdf-native-value-box-font-resource' : 'unresolved',
-        style: item.style || 'unknown',
-        fontSizePtEstimate: Number(item.fontSizePtEstimate) || null,
-        pageNumber: Number(item.pageNumber) || null,
-        matchedText: String(item.matchedText || '').slice(0, 80),
-        matchMethod: item.matchMethod,
-        evidenceBox: item.boxNorm || null,
-      };
-    });
-    const unique = [...new Map(resolved.map(item => [`${normalizeFontName(item.family || '')}|${item.style}|${item.pageNumber}`, item])).values()];
-    // An unresolved spatial hit is not final: the same exact amount text may
-    // be present in the canonical active-usage bridge below. Returning here
-    // caused an alias such as g_d6_f3 to suppress a resolvable PDF font name.
-    if (unique.length === 1 && unique[0].family) return { status: 'resolved', amount: String(amountValue || ''), ...unique[0] };
-    if (unique.length > 1 && unique.some(item => item.family)) return { status: 'ambiguous', amount: String(amountValue || ''), matchMethod: 'pdf-native-value-box-font-geometry', candidates: unique.slice(0, 6) };
-  }
-  if (!normalizedAmount) return { status: 'unavailable' };
+  if (!normalizedAmount || !Array.isArray(usages)) return { status: 'unavailable' };
   // Resolve a PDF.js-generated font alias only when all active fonts in that
   // PDF share one canonical family. Never choose arbitrarily among families.
   const catalogFamilies = [...new Set((Array.isArray(fontCatalog) ? fontCatalog : [])
@@ -20901,7 +20711,7 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
 
 if (fontForensics) {
   const targetAmountFont = summarizeAmountFont(
-    fontForensics.targetAmountFontUsages?.length ? fontForensics.targetAmountFontUsages : fontForensics.targetActiveFontUsages,
+    fontForensics.targetActiveFontUsages,
     pdfNativeFieldAssociation?.fields?.amount?.value,
     fontForensics.targetFonts,
   );
@@ -20909,27 +20719,24 @@ if (fontForensics) {
     profile.fileName === path.basename(reference?.path || '')
   ) || null;
   const referenceAmountFont = summarizeAmountFont(
-    selectedReferenceFontProfile?.amountFontUsages?.length ? selectedReferenceFontProfile.amountFontUsages : selectedReferenceFontProfile?.activeFontUsages,
+    selectedReferenceFontProfile?.activeFontUsages,
     pdfReferenceFieldAssociation?.fields?.amount?.value,
     selectedReferenceFontProfile?.fonts,
   );
   const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
-    const amountProfile = summarizeAmountFont(
-      profile?.amountFontUsages || [],
-      null,
-      profile?.fonts,
-    );
+    const families = [...new Set((profile?.fonts || [])
+      .map(font => fontFamily(font?.family || fontFamily(font?.fontName)) || String(font?.family || font?.fontName || '').trim())
+      .filter(Boolean))];
     return {
       referenceFile: profile.fileName,
-      family: amountProfile.status === 'resolved' ? amountProfile.family : null,
-      status: amountProfile.status,
-      matchMethod: amountProfile.matchMethod || null,
+      family: families.length === 1 ? families[0] : null,
+      status: families.length === 1 ? 'resolved-from-single-family-pdf' : (families.length ? 'multiple-families' : 'unresolved'),
     };
   });
   const referenceFontComparisons = targetAmountFont.status === 'resolved'
     ? referenceAmountFonts.map(profile => ({
         ...profile,
-        matchesTargetFamily: profile.status === 'resolved'
+        matchesTargetFamily: profile.status === 'resolved-from-single-family-pdf'
           ? normalizeFontName(profile.family) === normalizeFontName(targetAmountFont.family)
           : null,
       }))
