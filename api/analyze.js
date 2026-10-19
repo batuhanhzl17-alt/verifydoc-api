@@ -6274,6 +6274,76 @@ function statementPdfMoneyTokens(text) {
   return matches.map(token => ({ text: token.trim(), cents: statementPdfMoneyCents(token) }));
 }
 
+// PDF text layers often split a displayed amount into adjacent spans (for
+// example "1.250," + "00"), even though OCR/model output contains one value.
+// Rebuild only tightly adjacent spans on the same baseline and only accept a
+// complete money literal. This is bank-agnostic and retains the source box for
+// downstream local overlay checks.
+function statementPdfMoneyItemsFromLine(items, expectedCents, absolute = false) {
+  if (!Array.isArray(items) || expectedCents == null) return [];
+  const sorted = items.filter(item => String(item?.str || '').trim())
+    .map(item => ({ item, x: Number(item?.transform?.[4]) || 0,
+      y: Number(item?.transform?.[5]) || 0, width: Math.max(0, Number(item?.width) || 0),
+      height: Math.max(1, Number(item?.height) || 8) }))
+    .sort((a, b) => a.x - b.x);
+  const found = [];
+  const fullMoney = /^[+−-]?(?:(?:\d{1,3}(?:\.\d{3})+)|\d+)(?:,\d{2}|\.\d{2})(?:TL|TRY)?$/i;
+  for (let start = 0; start < sorted.length; start++) {
+    let text = '';
+    let last = null;
+    for (let end = start; end < Math.min(sorted.length, start + 8); end++) {
+      const current = sorted[end];
+      if (last) {
+        const gap = current.x - (last.x + last.width);
+        const maxGap = Math.max(2.5, Math.min(last.height, current.height) * 0.7);
+        if (gap > maxGap || Math.abs(current.y - last.y) > Math.max(2.5, Math.min(last.height, current.height) * 0.45)) break;
+      }
+      text += String(current.item.str || '').replace(/\s+/g, '');
+      last = current;
+      // Whole-span amounts are already represented by the native token pass;
+      // this helper exists specifically for amounts split across spans.
+      if (end === start) continue;
+      if (!fullMoney.test(text)) continue;
+      const cents = statementPdfMoneyCents(text);
+      if ((absolute ? Math.abs(cents) : cents) !== expectedCents) continue;
+      const first = sorted[start];
+      const merged = {
+        str: text,
+        transform: Array.isArray(first.item.transform) ? [...first.item.transform] : [0, 0, 0, 0, first.x, first.y],
+        width: Math.max(0.1, last.x + last.width - first.x),
+        height: Math.max(...sorted.slice(start, end + 1).map(entry => entry.height)),
+        _reconstructedFromTextItems: end > start,
+      };
+      const duplicate = found.some(item => Math.abs((Number(item.transform?.[4]) || 0) - first.x) < 0.5 &&
+        Math.abs((Number(item.transform?.[5]) || 0) - first.y) < 0.5 &&
+        Math.abs((Number(item.width) || 0) - merged.width) < 0.5 && String(item.str) === text);
+      if (!duplicate) found.push(merged);
+    }
+  }
+  return found;
+}
+
+function statementPdfTextLines(items) {
+  const sorted = (Array.isArray(items) ? items : []).filter(item => String(item?.str || '').trim())
+    .map(item => ({ item, y: Number(item?.transform?.[5]) || 0, height: Math.max(1, Number(item?.height) || 8),
+      x: Number(item?.transform?.[4]) || 0 }))
+    .sort((a, b) => b.y - a.y || a.x - b.x);
+  const lines = [];
+  for (const entry of sorted) {
+    let line = lines.find(candidate => Math.abs(candidate.y - entry.y) <= Math.max(2.5, Math.min(candidate.height, entry.height) * 0.4));
+    if (!line) { line = { y: entry.y, height: entry.height, entries: [] }; lines.push(line); }
+    line.entries.push(entry);
+    line.y = line.entries.reduce((sum, value) => sum + value.y, 0) / line.entries.length;
+    line.height = Math.max(line.height, entry.height);
+  }
+  return lines.map(line => {
+    const lineItems = line.entries.sort((a, b) => a.x - b.x).map(entry => entry.item);
+    const text = lineItems.map(item => String(item.str || '')).join(' ');
+    const compactText = lineItems.map(item => String(item.str || '').replace(/\s+/g, '')).join('');
+    return { y: line.y, height: line.height, items: lineItems, text, compactText };
+  });
+}
+
 function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
   const dateKey = statementPdfDateKey(row?.date);
   const rawAmount = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
@@ -6425,12 +6495,18 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       const localizedOverlayCandidates = [];
       const pageRows = (Array.isArray(statementRows) ? statementRows : []).filter(row => Number(row?.pageNumber) === pageNumber);
       const pageItems = content.items || [];
+      const pageTextLines = statementPdfTextLines(pageItems);
       const azurePageLines = Array.isArray(azureLayout?.lines) ? azureLayout.lines.filter(line => Number(line.pageNumber) === pageNumber) : [];
       const azurePageWords = Array.isArray(azureLayout?.words) ? azureLayout.words.filter(word => Number(word.pageNumber) === pageNumber) : [];
       const azurePageTableRows = Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.filter(row => Number(row.pageNumber) === pageNumber) : [];
       for (const [rowIndex, row] of pageRows.entries()) {
         const dateKey = statementPdfDateKey(row?.date);
-        const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
+        const dateAnchorLines = dateKey ? pageTextLines.filter(line =>
+          statementPdfDateKey(line.text) === dateKey || statementPdfDateKey(line.compactText) === dateKey
+        ) : [];
+        const dateAnchors = dateAnchorLines.map(line => ({
+          transform: [0, 0, 0, line.height, 0, line.y], height: line.height, _line: line,
+        }));
         const rowAmountValue = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
           : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
         // Statement rows model debit/credit as positive magnitudes even when
@@ -6487,14 +6563,26 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
             // Collapse anchors on the same baseline, then disambiguate by the
             // row's description and exact transaction amount.
             if (anchorLines.some(line => Math.abs(line.anchorY - anchorY) <= tolerance)) continue;
-            const lineText = statementNormalizeText(lineItems.map(item => item.str || '').join(' '));
+            const groupedLine = anchor._line || pageTextLines.find(line => Math.abs(line.y - anchorY) <= tolerance);
+            const lineText = statementNormalizeText(groupedLine?.text || lineItems.map(item => item.str || '').join(' '));
             const descriptionHits = descriptionTerms.filter(term => lineText.includes(term)).length;
-            const descriptionMatched = descriptionTerms.length === 0 || descriptionHits >= Math.max(1, Math.ceil(descriptionTerms.length * 0.35));
-            const matchedAmountItems = expectedAmountCents == null ? [] : amountItems.filter(item => {
-              const cents = statementPdfMoneyCents(item.str);
-              return cents != null && Math.abs(cents) === expectedAmountCents;
-            });
-            const matchedBalanceItems = expectedBalanceCents == null ? [] : amountItems.filter(item => statementPdfMoneyCents(item.str) === expectedBalanceCents);
+            const transactionId = String(row?.transactionId || '').replace(/\D/g, '');
+            const idMatched = transactionId.length >= 5 && lineText.replace(/\D/g, '').includes(transactionId);
+            const descriptionMatched = descriptionTerms.length === 0 ||
+              descriptionHits >= Math.max(1, Math.ceil(descriptionTerms.length * 0.35)) || idMatched;
+            const sourceLineItems = groupedLine?.items || lineItems;
+            const reconstructedAmounts = statementPdfMoneyItemsFromLine(sourceLineItems, expectedAmountCents, true);
+            const reconstructedBalances = statementPdfMoneyItemsFromLine(sourceLineItems, expectedBalanceCents, false);
+            const matchedAmountItems = expectedAmountCents == null ? [] : [
+              ...amountItems.filter(item => {
+                const cents = statementPdfMoneyCents(item.str);
+                return cents != null && Math.abs(cents) === expectedAmountCents;
+              }), ...reconstructedAmounts,
+            ];
+            const matchedBalanceItems = expectedBalanceCents == null ? [] : [
+              ...amountItems.filter(item => statementPdfMoneyCents(item.str) === expectedBalanceCents),
+              ...reconstructedBalances,
+            ];
             anchorLines.push({ anchorY, tolerance, lineText, descriptionHits, descriptionMatched, matchedAmountItems, matchedBalanceItems });
           }
           const amountDescriptionCandidates = anchorLines.filter(line => line.descriptionMatched && line.matchedAmountItems.length === 1);
@@ -20665,8 +20753,11 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
       };
     });
     const unique = [...new Map(resolved.map(item => [`${normalizeFontName(item.family || '')}|${item.style}|${item.pageNumber}`, item])).values()];
-    if (unique.length === 1) return { status: unique[0].family ? 'resolved' : 'family-unresolved', amount: String(amountValue || ''), ...unique[0] };
-    if (unique.length > 1) return { status: 'ambiguous', amount: String(amountValue || ''), matchMethod: 'pdf-native-value-box-font-geometry', candidates: unique.slice(0, 6) };
+    // An unresolved spatial hit is not final: the same exact amount text may
+    // be present in the canonical active-usage bridge below. Returning here
+    // caused an alias such as g_d6_f3 to suppress a resolvable PDF font name.
+    if (unique.length === 1 && unique[0].family) return { status: 'resolved', amount: String(amountValue || ''), ...unique[0] };
+    if (unique.length > 1 && unique.some(item => item.family)) return { status: 'ambiguous', amount: String(amountValue || ''), matchMethod: 'pdf-native-value-box-font-geometry', candidates: unique.slice(0, 6) };
   }
   if (!normalizedAmount) return { status: 'unavailable' };
   // Resolve a PDF.js-generated font alias only when all active fonts in that
