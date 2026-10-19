@@ -769,10 +769,11 @@ function collectObjectFontNames(obj) {
   return [...names];
 }
 
-function fontDescriptor(item, page, textStyle = null) {
+function fontDescriptor(item, page, textStyle = null, operatorFontNames = []) {
   const raw = clean(item?.fontName);
   const obj = getFontObject(page, raw);
-  const objectNames = collectObjectFontNames(obj);
+  const objectNames = [...new Set([...collectObjectFontNames(obj), ...(operatorFontNames || [])
+    .map(normalizeFontName).filter(Boolean)])];
   const styleFamily = clean(textStyle?.fontFamily);
   const genericStyleFamily = /^(?:sans-serif|serif|monospace|cursive|fantasy|system-ui|math|emoji)$/i.test(styleFamily);
   const usefulStyleFamily = styleFamily && !genericStyleFamily && !/^g_d\d+_f\d+$/i.test(styleFamily)
@@ -829,7 +830,7 @@ function mergeFontRecord(map, rec) {
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v33-active-font-resource-bridge`;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v34-font-object-materialization`;
   if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
 
   const buffer = await fs.readFile(pdfPath);
@@ -850,13 +851,32 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     for (let pageNumber = 1; pageNumber <= maxPages; pageNumber++) {
       const page = await pdf.getPage(pageNumber);
       const viewport = page.getViewport({ scale: 1 });
+      // Materialize page resources before asking for text items. Some PDFs
+      // expose only PDF.js aliases (g_dN_fN) during getTextContent until the
+      // page operator list has loaded the corresponding common font objects.
+      // Reading text first can therefore leave field-level fonts unresolved
+      // even though the PDF dictionary contains the real BaseFont name.
+      let operatorFontNamesByAlias = new Map();
+      try {
+        const operatorList = await page.getOperatorList();
+        const setFontOp = pdfjsLib.OPS?.setFont;
+        if (Number.isInteger(setFontOp) && Array.isArray(operatorList?.fnArray)) {
+          for (let opIndex = 0; opIndex < operatorList.fnArray.length; opIndex++) {
+            if (operatorList.fnArray[opIndex] !== setFontOp) continue;
+            const alias = clean(operatorList.argsArray?.[opIndex]?.[0]);
+            if (!alias) continue;
+            const names = collectObjectFontNames(getFontObject(page, alias));
+            if (names.length) operatorFontNamesByAlias.set(alias, names);
+          }
+        }
+      } catch {}
       const content = await page.getTextContent({ disableCombineTextItems: false });
       const pageItems = [];
 
       for (const item of content.items || []) {
         const text = clean(item?.str);
         if (!text || !item?.fontName) continue;
-        const font = fontDescriptor(item, page, content.styles?.[item.fontName]);
+        const font = fontDescriptor(item, page, content.styles?.[item.fontName], operatorFontNamesByAlias.get(clean(item.fontName)) || []);
         for (const n of font.objectFontNames || []) addName(pdfObjectNames, n);
 
         // If canonical name is unavailable, keep the resource name as an
