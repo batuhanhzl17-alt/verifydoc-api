@@ -763,13 +763,20 @@ function collectObjectFontNames(obj) {
   return [...names];
 }
 
-function fontDescriptor(item, page) {
+function fontDescriptor(item, page, textStyle = null) {
   const raw = clean(item?.fontName);
   const obj = getFontObject(page, raw);
   const objectNames = collectObjectFontNames(obj);
+  const styleFamily = clean(textStyle?.fontFamily);
+  const genericStyleFamily = /^(?:sans-serif|serif|monospace|cursive|fantasy|system-ui|math|emoji)$/i.test(styleFamily);
+  const usefulStyleFamily = styleFamily && !genericStyleFamily && !/^g_d\d+_f\d+$/i.test(styleFamily)
+    ? normalizeFontName(styleFamily)
+    : null;
   // Prefer an actual object/embedded name. Never treat g_d3_f3-style resource
-  // names as the canonical font family.
-  const preferred = objectNames.find(n => !/^g_d\d+_f\d+$/i.test(n)) || null;
+  // names as the canonical font family. PDF.js text styles are a second
+  // authoritative source for the active text item's font family when the
+  // common-object name is only an internal id (common with Type3 fonts).
+  const preferred = objectNames.find(n => !/^g_d\d+_f\d+$/i.test(n)) || usefulStyleFamily || null;
   const canonical = preferred || (isUsefulFontName(raw) ? normalizeFontName(raw) : null);
   return {
     rawFontName: raw || null,
@@ -843,7 +850,7 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
       for (const item of content.items || []) {
         const text = clean(item?.str);
         if (!text || !item?.fontName) continue;
-        const font = fontDescriptor(item, page);
+        const font = fontDescriptor(item, page, content.styles?.[item.fontName]);
         for (const n of font.objectFontNames || []) addName(pdfObjectNames, n);
 
         // If canonical name is unavailable, keep the resource name as an
@@ -863,7 +870,21 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
         const y = Number(tr[5]);
         const width = Number(item.width) || 0;
         const height = Math.abs(Number(tr[3])) || Number(item.height) || 0;
-        const row = { pageNumber, text, x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0, width, height, font };
+        const row = {
+          pageNumber,
+          text,
+          x: Number.isFinite(x) ? x : 0,
+          y: Number.isFinite(y) ? y : 0,
+          width,
+          height,
+          boxNorm: {
+            x: Number((Math.max(0, Number.isFinite(x) ? x : 0) / viewport.width).toFixed(6)),
+            y: Number((Math.max(0, viewport.height - (Number.isFinite(y) ? y : 0) - height) / viewport.height).toFixed(6)),
+            width: Number((Math.max(0.1, width) / viewport.width).toFixed(6)),
+            height: Number((Math.max(1, height) / viewport.height).toFixed(6)),
+          },
+          font,
+        };
         pageItems.push(row);
         items.push(row);
       }
@@ -948,6 +969,7 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
         y: Number(item.y) || 0,
         width: Number(item.width) || 0,
         height: Number(item.height) || 0,
+        boxNorm: item.boxNorm || null,
         text: String(item.text || '').slice(0, 120),
       });
     }
