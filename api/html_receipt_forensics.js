@@ -43,6 +43,62 @@ function getHtmlSignals(text) {
   };
 }
 
+function normalizeLabel(value) {
+  return normalizeText(value).toLocaleLowerCase('tr-TR').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+function amountRoleForText(value) {
+  const text = normalizeLabel(value);
+  if (/\b(?:islem|transaction)\s+tutari?\b/.test(text)) return 'işlem tutarı';
+  if (/\b(?:fast|eft|havale)?\s*(?:ucreti|komisyonu|masrafi)\b/.test(text)) return 'ücret/komisyon';
+  if (/\bbsmv\b/.test(text)) return 'BSMV';
+  if (/\btoplam\b/.test(text)) return 'toplam';
+  return null;
+}
+
+function cssRulesFrom(styleBlocks) {
+  const rules = [];
+  for (const block of styleBlocks) {
+    for (const match of String(block).matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const declarations = {};
+      for (const declaration of match[2].split(';')) {
+        const colon = declaration.indexOf(':');
+        if (colon < 1) continue;
+        declarations[declaration.slice(0, colon).trim().toLowerCase()] = declaration.slice(colon + 1).trim();
+      }
+      const selectors = match[1].split(',').map(x => x.trim()).filter(Boolean);
+      if (Object.keys(declarations).length) rules.push({ selectors, declarations });
+    }
+  }
+  return rules;
+}
+
+function selectorMatchesSimple(selector, node) {
+  const value = String(selector || '').trim();
+  if (!value || /[\s>+~:[\]]/.test(value)) return false;
+  const tag = value.match(/^[a-z][\w-]*/i)?.[0]?.toLowerCase();
+  if (tag && tag !== node.name) return false;
+  const id = value.match(/#([\w-]+)/)?.[1];
+  if (id && id !== node.attrs.id) return false;
+  const classes = [...value.matchAll(/\.([\w-]+)/g)].map(x => x[1]);
+  const nodeClasses = String(node.attrs.class || '').split(/\s+/).filter(Boolean);
+  return classes.every(x => nodeClasses.includes(x)) && Boolean(tag || id || classes.length);
+}
+
+function styleForNode(node, rules) {
+  const computed = {};
+  for (const rule of rules) {
+    if (rule.selectors.some(selector => selectorMatchesSimple(selector, node))) Object.assign(computed, rule.declarations);
+  }
+  const inline = String(node.attrs.style || '');
+  for (const declaration of inline.split(';')) {
+    const colon = declaration.indexOf(':');
+    if (colon > 0) computed[declaration.slice(0, colon).trim().toLowerCase()] = declaration.slice(colon + 1).trim();
+  }
+  for (const key of Object.keys(computed)) computed[key] = String(computed[key]).replace(/\s*!important\s*$/i, '').trim();
+  return computed;
+}
+
 /** Static, non-executing triage for uploaded HTML receipt files. */
 export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) throw new Error('HTML dosyası boş.');
@@ -55,7 +111,7 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
   }
 
   const state = {
-    visible: [], hidden: [], stack: [], tagCounts: {}, scripts: 0, inlineScripts: 0,
+    visible: [], hidden: [], stack: [], nodes: [], tagCounts: {}, scripts: 0, inlineScripts: 0,
     externalScripts: [], externalResources: [], forms: 0, iframes: 0,
     styleBlocks: [], inlineStyles: [], title: '', generator: '', charset: '',
   };
@@ -73,6 +129,7 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
       else if (!inScript) {
         const hidden = state.stack.some(x => x.hidden);
         (hidden ? state.hidden : state.visible).push(text);
+        for (const ancestor of state.stack) ancestor.text += `${ancestor.text ? ' ' : ''}${text}`;
         if (inTitle) state.title += `${state.title ? ' ' : ''}${text}`;
       }
       continue;
@@ -116,7 +173,9 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
     if (['img','iframe','source','video','audio'].includes(name)) {
       for (const key of ['src','poster']) if (attrs[key]) state.externalResources.push(attrs[key]);
     }
-    if (!voidTags.has(name) && !/\/\s*>$/.test(token)) state.stack.push({ name, hidden });
+    const node = { name, attrs, hidden, text: '', parent: state.stack.at(-1) || null };
+    state.nodes.push(node);
+    if (!voidTags.has(name) && !/\/\s*>$/.test(token)) state.stack.push(node);
     // Script contents are deliberately not treated as visible receipt text.
     if (inScript) continue;
   }
@@ -124,7 +183,46 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
   const visibleText = state.visible.join(' ').slice(0, MAX_TEXT_CHARS);
   const hiddenText = state.hidden.join(' ').slice(0, MAX_TEXT_CHARS);
   const signals = getHtmlSignals(visibleText);
-  const hiddenSignals = getHtmlSignals(hiddenText);
+  const rules = cssRulesFrom(state.styleBlocks);
+  const hiddenCssNodes = state.nodes.filter(node => {
+    const style = styleForNode(node, rules);
+    return /^(?:none)$/i.test(style.display || '') || /^(?:hidden|collapse)$/i.test(style.visibility || '') || /^(?:0|0\.0+|0%)$/i.test(style.opacity || '');
+  });
+  const cssHiddenText = hiddenCssNodes.map(node => node.text).filter(Boolean).join(' ').slice(0, MAX_TEXT_CHARS);
+  const hiddenSignals = getHtmlSignals(`${hiddenText} ${cssHiddenText}`);
+  const labeledAmountFields = [];
+  const amountStyleProfiles = [];
+  for (const row of state.nodes.filter(node => node.name === 'tr' && node.text)) {
+    const role = amountRoleForText(row.text);
+    if (!role) continue;
+    const rowSignals = getHtmlSignals(row.text);
+    if (!rowSignals.amountCandidates.length) continue;
+    labeledAmountFields.push({ role, amountCandidates: rowSignals.amountCandidates.slice(0, 5) });
+    const isWithinRow = (node) => {
+      for (let parent = node.parent; parent; parent = parent.parent) if (parent === row) return true;
+      return false;
+    };
+    const valueCells = state.nodes.filter(node => node.name === 'td' && isWithinRow(node) &&
+      rowSignals.amountCandidates.some(value => normalizeLabel(node.text).includes(normalizeLabel(value))));
+    const valueCellProfiles = valueCells.slice(0, 4).map(cell => {
+      const style = styleForNode(cell, rules);
+      return {
+        tag: cell.name,
+        classNames: String(cell.attrs.class || '').split(/\s+/).filter(Boolean).slice(0, 6),
+        styles: Object.fromEntries(['font-family','font-size','font-weight','color','background-color','position','z-index','transform','opacity'].filter(key => style[key]).map(key => [key, String(style[key]).slice(0, 120)])),
+        explicitOverlayStyle: /^(?:absolute|fixed)$/i.test(style.position || '') || Boolean(style.transform) || Boolean(style['z-index']),
+      };
+    });
+    const rowStyle = styleForNode(row, rules);
+    amountStyleProfiles.push({
+      role,
+      tag: row.name,
+      classNames: String(row.attrs.class || '').split(/\s+/).filter(Boolean).slice(0, 6),
+      rowStyles: Object.fromEntries(['font-family','font-size','font-weight','color','background-color','position','z-index','transform','opacity'].filter(key => rowStyle[key]).map(key => [key, String(rowStyle[key]).slice(0, 120)])),
+      valueCells: valueCellProfiles,
+      explicitOverlayStyle: valueCellProfiles.some(x => x.explicitOverlayStyle) || /^(?:absolute|fixed)$/i.test(rowStyle.position || '') || Boolean(rowStyle.transform) || Boolean(rowStyle['z-index']),
+    });
+  }
   const resourceRefs = [...state.externalScripts, ...state.externalResources];
   const embeddedDataResourceCount = resourceRefs.filter(url => /^\s*data:/i.test(url)).length;
   const externalOrigins = [...new Set(resourceRefs.map(url => {
@@ -139,6 +237,10 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
   }).length;
   const findings = [];
   if (state.hidden.length) findings.push({ code: 'hidden-content-present', severity: 'review', detail: 'HTML içinde gizli olarak işaretlenmiş metin bulundu; bu metin tek başına manipülasyon kanıtı değildir.' });
+  if (hiddenCssNodes.length) findings.push({ code: 'css-hidden-elements-present', severity: 'review', detail: 'Basit CSS seçicileriyle gizlenmiş öğe bulundu; şablonun meşru tasarımı da benzer stil kullanabilir.' });
+  if (amountStyleProfiles.some(item => item.explicitOverlayStyle)) findings.push({ code: 'amount-layout-style-candidate', severity: 'review', detail: 'İşlem tutarı satırında absolute/fixed konum, transform veya z-index stili görüldü; bu biçimlendirme tek başına oynama kanıtı değildir.' });
+  const repeatedRoles = [...new Set(labeledAmountFields.filter(item => labeledAmountFields.filter(other => other.role === item.role).length > 1).map(item => item.role))];
+  if (repeatedRoles.length) findings.push({ code: 'repeated-labeled-amount-fields', severity: 'review', detail: `Aynı tutar etiketi birden fazla satırda bulundu: ${repeatedRoles.join(', ')}. Doğru alan manuel olarak doğrulanmalıdır.` });
   if (state.externalScripts.length) findings.push({ code: 'external-script-reference', severity: 'info', detail: 'Belge dış JavaScript kaynakları çağırıyor; bu kaynaklar analiz sırasında çalıştırılmadı ve içerikleri doğrulanmadı.' });
   if (state.iframes) findings.push({ code: 'iframe-present', severity: 'info', detail: 'Belgede iframe bulundu; dış veya gömülü içerik statik incelemede görüntülenmedi.' });
   if (state.forms) findings.push({ code: 'form-present', severity: 'info', detail: 'Belgede form alanları bulundu; bu durum dekont verilerinin doğrulandığı anlamına gelmez.' });
@@ -146,7 +248,7 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
 
   return {
     available: true,
-    engine: 'verifydoc-static-html-forensics-v1',
+    engine: 'verifydoc-static-html-forensics-v2',
     status: 'triage-only',
     fileName,
     fileBytes: buffer.length,
@@ -169,11 +271,16 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
       inlineStyleCount: state.inlineStyles.length,
     },
     visibleFields: signals,
+    labeledAmountFields,
+    amountStyleProfiles,
     hiddenFieldCandidates: hiddenSignals,
+    cssHiddenElementCount: hiddenCssNodes.length,
     findings,
     limitations: [
       'HTML ve JavaScript çalıştırılmadı; harici kaynaklar indirilmedi.',
       'Gizli içerik kontrolü HTML hidden/aria-hidden ve satır içi görünürlük stillerini kapsar; harici CSS seçicileri tam hesaplanmaz.',
+      'CSS hesaplaması yalnızca basit etiket/.class/#id seçicilerini kapsar; medya sorguları, sözde seçiciler ve kalıtım çözülmez.',
+      'Tutar çevresindeki position/transform/z-index bilgileri aday göstergesidir; gerçek piksel örtüşmesi ölçülmez.',
       'Tarayıcıda oluşan son görünüm ekran görüntüsüyle doğrulanmadı.',
       'HTML metin ve yapı incelemesi tek başına belgenin gerçekliğini veya sahteciliği kanıtlamaz.',
     ],
@@ -182,6 +289,11 @@ export function analyzeHtmlReceipt(buffer, fileName = 'document.html') {
 
 export function formatHtmlReceiptSummary(report) {
   const lines = ['HTML dekont için statik metin ve yapı incelemesi tamamlandı.'];
+  if (report?.labeledAmountFields?.length) {
+    lines.push(`Etikete bağlanan tutarlar: ${report.labeledAmountFields.slice(0, 5).map(x => `${x.role}: ${x.amountCandidates.join('/')}`).join('; ')}.`);
+  } else if (report?.visibleFields?.amountCandidates?.length) {
+    lines.push('Tutar adayları bulundu ancak etiketleriyle güvenilir biçimde eşleştirilemedi.');
+  }
   if (report?.hiddenFieldCandidates?.amountCandidates?.length || report?.hiddenFieldCandidates?.ibanCandidates?.length) {
     lines.push('Gizli içerikte finansal alan adayı bulundu; görünür içerikle manuel karşılaştırma önerilir.');
   }
