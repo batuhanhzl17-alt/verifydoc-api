@@ -5970,15 +5970,27 @@ async function auditPdfContentLayer(buffer, fieldAssociation = null, maxPages = 
           const ex = expected.x + expected.width / 2, ey = expected.y + expected.height / 2;
           const distance = Math.hypot(cx-ex, cy-ey);
           const rowValue = fieldKey === 'recipientIBAN' ? row.compactText : row.numberText;
-          if (expectedText && rowValue === expectedText) {
+          // Some PDF producers serialize a whole label/value line (for
+          // example "Alıcı Hesap: TR... Alıcı: name") as one text item.
+          // The native field resolver has already checksum-validated and
+          // narrowed the IBAN substring to field.valueBox. Treat that exact
+          // substring as located even though PDF.js exposes the enclosing
+          // line as a single item.
+          const containsAssociatedValue = fieldKey === 'recipientIBAN' &&
+            Boolean(expectedText && rowValue.includes(expectedText));
+          if (expectedText && (rowValue === expectedText || containsAssociatedValue)) {
             audit.candidates.push({ pageNumber, text: row.text, fontResource: row.fontResource, fontSize: row.fontSize,
-              box: row.box, centerDistanceNorm: Number(distance.toFixed(6)) });
+              box: containsAssociatedValue ? expected : row.box,
+              sourceTextBox: containsAssociatedValue ? row.box : undefined,
+              matchedWithinCombinedTextItem: containsAssociatedValue,
+              centerDistanceNorm: Number(distance.toFixed(6)) });
           }
           const ix = Math.max(0, Math.min(row.box.x+row.box.width, expected.x+expected.width)-Math.max(row.box.x,expected.x));
           const iy = Math.max(0, Math.min(row.box.y+row.box.height, expected.y+expected.height)-Math.max(row.box.y,expected.y));
           const intersection = ix * iy;
           const union = row.box.width*row.box.height + expected.width*expected.height - intersection;
-          if (intersection > 0 && union > 0 && intersection/union >= 0.3 && rowValue !== expectedText) {
+          if (intersection > 0 && union > 0 && intersection/union >= 0.3 &&
+              rowValue !== expectedText && !containsAssociatedValue) {
             audit.overlappingDifferentText.push({ pageNumber, text: row.text, fontResource: row.fontResource,
               overlapRatio: Number((intersection/union).toFixed(3)), box: row.box });
           }
@@ -6351,6 +6363,60 @@ function statementPdfResolveAzureTableRow(row, tableRows, pageWords) {
     amountText: candidate.amountText, tableIndex: candidate.tableIndex, tableRowIndex: candidate.rowIndex };
 }
 
+function statementPdfResolvePaddleRow(row, pageRegions) {
+  const dateKey = statementPdfDateKey(row?.date);
+  const rawAmount = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
+    : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
+  const parsedAmount = statementPdfMoneyCents(rawAmount);
+  const expectedAmount = parsedAmount == null ? null : Math.abs(parsedAmount);
+  const expectedBalance = statementPdfMoneyCents(row?.balanceAfter);
+  if (!dateKey || expectedAmount == null) return { status: 'unresolved', reason: 'OCR eşleştirmesi için tarih veya tutar eksik.' };
+  const regions = (Array.isArray(pageRegions) ? pageRegions : []).filter(item => {
+    const box = item?.region;
+    return box && [box.x1, box.y1, box.x2, box.y2].map(Number).every(Number.isFinite) &&
+      Number(box.x2) > Number(box.x1) && Number(box.y2) > Number(box.y1) && String(item.text || '').trim();
+  }).map(item => ({ text: String(item.text || '').trim(), score: Number(item.score) || 0,
+    x1: Number(item.region.x1), y1: Number(item.region.y1), x2: Number(item.region.x2), y2: Number(item.region.y2),
+    cy: (Number(item.region.y1) + Number(item.region.y2)) / 2,
+    height: Number(item.region.y2) - Number(item.region.y1) }));
+  const anchors = regions.filter(item => statementPdfDateKey(item.text) === dateKey);
+  if (!anchors.length) return { status: 'unresolved', reason: 'PaddleOCR bölgelerinde tarih ankrajı bulunamadı.' };
+  const description = statementNormalizeText([row?.description, row?.counterparty].filter(Boolean).join(' '));
+  const terms = description.split(' ').filter(term => term.length >= 4);
+  const transactionId = String(row?.transactionId || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const candidates = [];
+  for (const anchor of anchors) {
+    const tolerance = Math.max(5, anchor.height * 1.35);
+    const band = regions.filter(item => Math.abs(item.cy - anchor.cy) <= tolerance);
+    const bandText = band.map(item => item.text).join(' ');
+    const normalizedBand = statementNormalizeText(bandText);
+    const hits = terms.filter(term => normalizedBand.includes(term)).length;
+    const descriptionMatched = terms.length === 0 || hits >= Math.max(1, Math.ceil(terms.length * 0.3));
+    const idMatched = transactionId.length >= 5 && bandText.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(transactionId);
+    if (!descriptionMatched && !idMatched) continue;
+    const amountTokens = statementPdfMoneyTokens(bandText).filter(token => token.cents != null && Math.abs(token.cents) === expectedAmount);
+    if (amountTokens.length !== 1) continue;
+    const balanceMatched = expectedBalance == null || statementPdfMoneyTokens(bandText).some(token => token.cents === expectedBalance);
+    const dedupeKey = Math.round(anchor.cy / tolerance);
+    if (candidates.some(candidate => candidate.dedupeKey === dedupeKey)) continue;
+    const matchedRegions = band.filter(item => statementPdfDateKey(item.text) === dateKey ||
+      statementPdfMoneyTokens(item.text).some(token => token.cents != null && Math.abs(token.cents) === expectedAmount) ||
+      (expectedBalance != null && statementPdfMoneyTokens(item.text).some(token => token.cents === expectedBalance)));
+    candidates.push({ dedupeKey, balanceMatched, boxPixels: matchedRegions.length ? {
+      x1: Math.min(...matchedRegions.map(item => item.x1)), y1: Math.min(...matchedRegions.map(item => item.y1)),
+      x2: Math.max(...matchedRegions.map(item => item.x2)), y2: Math.max(...matchedRegions.map(item => item.y2)),
+    } : null });
+  }
+  let selected = candidates;
+  if (selected.length > 1) {
+    const balanceCandidates = selected.filter(item => item.balanceMatched);
+    if (balanceCandidates.length) selected = balanceCandidates;
+  }
+  return selected.length === 1
+    ? { status: 'matched', source: 'paddle-regions', reason: 'PaddleOCR bölgelerinde tarih, açıklama ve tutar aynı satır bandında tekil eşleşti.', boxPixels: selected[0].boxPixels }
+    : { status: 'unresolved', reason: selected.length ? `${selected.length} OCR satır adayı kaldı; tekil eşleşme yok.` : 'OCR bölgelerinde tarih, açıklama ve tutar aynı satır bandında tekil eşleşmedi.', candidateCount: selected.length };
+}
+
 function statementPdfResolveAzureRow(row, pageLines, pageWords) {
   const dateKey = statementPdfDateKey(row?.date);
   const amountValue = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
@@ -6400,7 +6466,7 @@ function statementPdfResolveAzureRow(row, pageLines, pageWords) {
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox, amountText: candidate.amountText };
 }
 
-async function runStatementPdfForensics(filePath, buffer, statementRows = [], azureLayout = null) {
+async function runStatementPdfForensics(filePath, buffer, statementRows = [], azureLayout = null, paddleOCR = null) {
   let pdf = null;
   try {
     pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
@@ -6596,6 +6662,29 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
     const nativeTextPages = new Set(pageAudits
       .filter(pageAudit => Number(pageAudit?.textItemCount) > 0)
       .map(pageAudit => Number(pageAudit.pageNumber)));
+    // Raster-only PDFs have no PDF.js text boxes, and Azure may be unavailable.
+    // Use PaddleOCR's page-indexed regions to associate rows by date, amount,
+    // description/reference and balance on one visual text band.
+    const paddleRegions = Array.isArray(paddleOCR?.regions) ? paddleOCR.regions : [];
+    let paddleMatchedRows = 0;
+    for (const diagnostic of rowAssociationDiagnostics) {
+      if (diagnostic.status === 'matched') continue;
+      const sourceRow = (Array.isArray(statementRows) ? statementRows : []).find(row =>
+        Number(row?.pageNumber) === Number(diagnostic.pageNumber) &&
+        Number(row?.rowNumber) === Number(diagnostic.rowNumber));
+      if (!sourceRow) continue;
+      const pageRegions = paddleRegions.filter(item => Number(item?.pageIndex) + 1 === Number(diagnostic.pageNumber));
+      const resolved = statementPdfResolvePaddleRow(sourceRow, pageRegions);
+      diagnostic.paddleReason = resolved.reason || null;
+      if (resolved.status !== 'matched') continue;
+      diagnostic.status = 'matched';
+      diagnostic.reason = resolved.reason;
+      diagnostic.associationSource = 'paddle-regions';
+      diagnostic.ocrBoxPixels = resolved.boxPixels || null;
+      diagnostic.amountMatched = true;
+      diagnostic.distinctCandidateLineCount = 1;
+      paddleMatchedRows++;
+    }
     const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched' &&
       (azureLayout?.available === true || nativeTextPages.has(Number(item.pageNumber))));
     const rasterOnlyUnverifiableRows = rowAssociationDiagnostics.filter(item => item.status !== 'matched' &&
@@ -6638,7 +6727,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           azureTable: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-table').length,
           azureLines: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-lines' || item.associationSource === 'azure-layout').length,
           pdfNativeText: rowAssociationDiagnostics.filter(item => item.associationSource === 'pdf-native-text').length,
+          paddleRegions: paddleMatchedRows,
         },
+        paddleOCRAvailable: paddleOCR?.success === true,
         azureLayoutAvailable: Boolean(azureLayout?.available),
         azurePageCount: Number(azureLayout?.pageCount) || 0,
         azurePageNumbers: [...azurePageNumbers].sort((a, b) => a - b),
@@ -16845,8 +16936,8 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
       const previous = direction === 'ascending' ? orderedRows[i] : orderedRows[i + 1];
       const currentBalance = statementCents(current.balanceAfter);
       const previousBalance = statementCents(previous.balanceAfter);
-      const debit = statementCents(current.debitAmount) ?? 0;
-      const credit = statementCents(current.creditAmount) ?? 0;
+      const debit = Math.abs(statementCents(current.debitAmount) ?? 0);
+      const credit = Math.abs(statementCents(current.creditAmount) ?? 0);
       const hasMovement = statementCents(current.debitAmount) !== null || statementCents(current.creditAmount) !== null;
       if (currentBalance === null || previousBalance === null || !hasMovement) continue;
       checks++;
@@ -16882,17 +16973,34 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     pdfForensics?.everyPageAnalyzed === true && Number(pdfForensics?.pagesAnalyzed) === Number(pdfPageCount);
 
   let deterministicMismatch = bestOrder.checks > 0 && bestOrder.mismatches > 0;
-  const completeAmounts = usableRows.length > 0 && usableRows.every(row =>
-    statementCents(row.debitAmount) !== null || statementCents(row.creditAmount) !== null
+  const completeAmounts = !rowsIncomplete && pageCoverageComplete && usableRows.length > 0 && usableRows.every(row =>
+    (statementCents(row.debitAmount) !== null || statementCents(row.creditAmount) !== null) &&
+    statementCents(row.balanceAfter) !== null
   );
   const totalIncomingCents = completeAmounts
-    ? usableRows.reduce((sum, row) => sum + (statementCents(row.creditAmount) ?? 0), 0)
+    ? usableRows.reduce((sum, row) => sum + Math.abs(statementCents(row.creditAmount) ?? 0), 0)
     : null;
   const totalOutgoingCents = completeAmounts
-    ? usableRows.reduce((sum, row) => sum + (statementCents(row.debitAmount) ?? 0), 0)
+    ? usableRows.reduce((sum, row) => sum + Math.abs(statementCents(row.debitAmount) ?? 0), 0)
     : null;
-  const openingCents = statementCents(balanceAnalysis.openingBalance);
-  const documentClosingCents = statementCents(balanceAnalysis.documentClosingBalance);
+  let openingCents = statementCents(balanceAnalysis.openingBalance);
+  let documentClosingCents = statementCents(balanceAnalysis.documentClosingBalance);
+  if (completeAmounts) {
+    // Statements are commonly printed newest-first. The balance shown on the
+    // oldest transaction is the balance AFTER that transaction, not the
+    // opening balance. Derive the opening value immediately before that row
+    // and the closing value from the newest row, then reconcile all movements.
+    const oldestRow = bestOrder.direction === 'descending' ? usableRows[usableRows.length - 1] : usableRows[0];
+    const newestRow = bestOrder.direction === 'descending' ? usableRows[0] : usableRows[usableRows.length - 1];
+    const oldestBalance = statementCents(oldestRow?.balanceAfter);
+    const oldestDebit = Math.abs(statementCents(oldestRow?.debitAmount) ?? 0);
+    const oldestCredit = Math.abs(statementCents(oldestRow?.creditAmount) ?? 0);
+    if (oldestBalance !== null) openingCents = oldestBalance - oldestCredit + oldestDebit;
+    const newestBalance = statementCents(newestRow?.balanceAfter);
+    if (newestBalance !== null) documentClosingCents = newestBalance;
+    if (openingCents !== null) balanceAnalysis.openingBalance = Number((openingCents / 100).toFixed(2));
+    if (documentClosingCents !== null) balanceAnalysis.documentClosingBalance = Number((documentClosingCents / 100).toFixed(2));
+  }
   const calculatedClosingCents = completeAmounts && openingCents !== null
     ? openingCents + totalIncomingCents - totalOutgoingCents
     : null;
@@ -16903,6 +17011,12 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   if (completeAmounts) {
     balanceAnalysis.totalIncoming = Number((totalIncomingCents / 100).toFixed(2));
     balanceAnalysis.totalOutgoing = Number((totalOutgoingCents / 100).toFixed(2));
+  } else {
+    // Do not leave model-generated whole-document totals in place when the
+    // extracted ledger is incomplete; represent them as unavailable instead.
+    balanceAnalysis.totalIncoming = null;
+    balanceAnalysis.totalOutgoing = null;
+    balanceAnalysis.calculatedClosingBalance = null;
   }
   if (calculatedClosingCents !== null) balanceAnalysis.calculatedClosingBalance = Number((calculatedClosingCents / 100).toFixed(2));
   if (deterministicMismatch) {
@@ -16917,9 +17031,13 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     // preserve a model-generated false value as if a mismatch was verified.
     balanceAnalysis.calculationConsistent = null;
     balanceAnalysis.evidence = [balanceAnalysis.evidence, 'Satır sayısı doğrulanamadığı için hesap özeti genelinde bakiye tutarlılığı kesinleştirilemedi.'].filter(Boolean).join(' ');
-  } else if (bestOrder.checks >= 2) {
+  } else if (completeAmounts && bestOrder.checks >= 2) {
     balanceAnalysis.calculationConsistent = true;
-    balanceAnalysis.evidence = [balanceAnalysis.evidence, `Satır bakiyesi devamlılığı ${bestOrder.checks} ardışık karşılaştırmada tutarlı (${bestOrder.direction === 'ascending' ? 'yukarıdan aşağıya' : 'aşağıdan yukarıya'} sıra).`].filter(Boolean).join(' ');
+    balanceAnalysis.evidence = [
+      `Hareketler satır satır toplandı: toplam alacak ${balanceAnalysis.totalIncoming.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL, toplam borç ${balanceAnalysis.totalOutgoing.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL.`,
+      `İşlem öncesi başlangıç bakiyesi ${balanceAnalysis.openingBalance.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL olarak en eski satırdan türetildi; hesaplanan kapanış ${balanceAnalysis.calculatedClosingBalance.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL ve belgedeki son hareket bakiyesi ${balanceAnalysis.documentClosingBalance.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL.`,
+      `Satır bakiyesi devamlılığı ${bestOrder.checks} ardışık karşılaştırmada tutarlı (${bestOrder.direction === 'ascending' ? 'yukarıdan aşağıya' : 'aşağıdan yukarıya'} sıra).`,
+    ].join(' ');
   }
 
   // Discard narrative count claims and replace them with the structured row
@@ -16961,6 +17079,46 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   result.transactionAnalysis = transactionAnalysis;
   result.balanceAnalysis = balanceAnalysis;
   result.statementPdfForensics = pdfForensics || { available: false, reason: 'PDF adli katmanı çalıştırılamadı.' };
+
+  // When every extracted row is present and its adjacent balances reconcile,
+  // discard an AI-only aggregate-balance penalty (for example, treating the
+  // oldest transaction's after-balance as the opening balance). Keep other
+  // visual/layout/editing signals intact and retain a diagnostic trail.
+  if (completeAmounts && bestOrder.checks >= 2 && !deterministicMismatch &&
+      calculatedClosingCents !== null && documentClosingCents !== null &&
+      Math.abs(calculatedClosingCents - documentClosingCents) <= 1) {
+    const previousRisk = Number(result.overallRisk);
+    const categories = result.categories && typeof result.categories === 'object' ? result.categories : {};
+    const previousFinancialRisk = Number(categories.financialDataRisk) || 0;
+    categories.financialDataRisk = derivedDuplicates.length ? Math.min(previousFinancialRisk, 30) : Math.min(previousFinancialRisk, 10);
+    result.categories = categories;
+    const categoryScores = ['visualRisk', 'textRisk', 'layoutRisk', 'financialDataRisk', 'editingRisk']
+      .map(key => Number(categories[key]) || 0);
+    result.overallRisk = Math.max(0, Math.min(100, Math.round(Math.max(...categoryScores))));
+    result.riskLabel = result.overallRisk <= 20 ? 'LOW RISK'
+      : result.overallRisk <= 45 ? 'MODERATE RISK'
+        : result.overallRisk <= 70 ? 'HIGH RISK' : 'VERY HIGH RISK';
+    result.balanceRiskReconciliation = {
+      applied: true,
+      previousOverallRisk: Number.isFinite(previousRisk) ? previousRisk : null,
+      updatedOverallRisk: result.overallRisk,
+      previousFinancialDataRisk: previousFinancialRisk,
+      updatedFinancialDataRisk: categories.financialDataRisk,
+      reason: 'Tüm çıkarılan satırlar mevcut; satır bakiyeleri ve başlangıçtan kapanışa deterministik hareket toplamı tutarlı.',
+    };
+    const staleBalanceText = /(?:\d[\d.,]*\s*TL\s*)?(?:bakiye|borç|alacak|hareket|toplam).{0,100}(?:fark|tutarsız|uyuşmuyor|uyumsuz)|(?:fark|tutarsız|uyuşmuyor|uyumsuz).{0,100}(?:bakiye|borç|alacak|hareket|toplam)/i;
+    result.summary = String(result.summary || '').split(/(?<=[.!?])\s+|\n+/)
+      .filter(sentence => !staleBalanceText.test(sentence)).join(' ').trim();
+    result.summary = [result.summary,
+      'Satırların tamamı üzerinden yapılan deterministik bakiye hesabında toplam borç, toplam alacak, başlangıç ve kapanış bakiyeleri tutarlı bulundu.']
+      .filter(Boolean).join(' ');
+    result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : [])]
+      .filter(item => !staleBalanceText.test(String(item || ''))),
+      'Deterministik satır hesabında başlangıç bakiyesi, toplam borç/alacak ve kapanış bakiyesi birbiriyle tutarlı bulundu.'])];
+    result.balanceAnalysis.evidence = [result.balanceAnalysis.evidence,
+      'Modelin önceki toplam bakiye yorumu deterministik satır hesabıyla uzlaştırıldı; işlem sonrası en eski bakiye başlangıç bakiyesi olarak kullanılmadı.']
+      .filter(Boolean).join(' ');
+  }
 
   const findings = [];
   if (deterministicMismatch) findings.push('Satır bazlı bakiye hesabında fark bulundu; örnek satırlar ve beklenen bakiyeler rapora eklendi.');
@@ -17179,6 +17337,12 @@ async function completeStatementRowsPageByPage(statementResult, pdfBuffer, pageC
   const currentRows = Array.isArray(transactionAnalysis.rows) ? transactionAnalysis.rows : [];
   const ocrRegions = Array.isArray(ocrResult?.regions) ? ocrResult.regions : [];
   if (!ocrRegions.length) return statementResult;
+  const declaredCount = Number(transactionAnalysis.transactionCount) || 0;
+  // A document-level count larger than the extracted row array is direct
+  // evidence that the first vision pass dropped rows. Re-read every OCR-backed
+  // page independently; the date-anchor heuristic alone can undercount when
+  // OCR splits dates into multiple boxes or misses a date glyph.
+  const globalCountMismatch = declaredCount > currentRows.length;
 
   const needsPagePass = [];
   for (let pageNumber = 1; pageNumber <= pageCount; pageNumber++) {
@@ -17194,9 +17358,11 @@ async function completeStatementRowsPageByPage(statementResult, pdfBuffer, pageC
     }
     const likelyRowCount = dateRows.length;
     const pageHasTableOCR = pageRegions.length >= 15;
-    if ((likelyRowCount >= 4 && pageRows.length < likelyRowCount - 2) ||
+    if ((globalCountMismatch && (pageHasTableOCR || pageRows.length > 0)) ||
+        (likelyRowCount >= 4 && pageRows.length < likelyRowCount - 2) ||
         (pageRows.length === 0 && pageHasTableOCR)) {
-      needsPagePass.push({ pageNumber, ocrRegionCount: pageRegions.length, dateAnchorCount: likelyRowCount, existingRowCount: pageRows.length });
+      needsPagePass.push({ pageNumber, ocrRegionCount: pageRegions.length, dateAnchorCount: likelyRowCount,
+        existingRowCount: pageRows.length, reason: globalCountMismatch ? 'document-row-count-exceeds-structured-rows' : 'page-row-coverage-gap' });
     }
   }
   if (!needsPagePass.length) return statementResult;
@@ -17206,6 +17372,7 @@ async function completeStatementRowsPageByPage(statementResult, pdfBuffer, pageC
   }));
 
   const pageRowsByNumber = new Map();
+  const pagePassResults = new Map();
   for (const row of currentRows) {
     const page = Number(row?.pageNumber);
     if (!pageRowsByNumber.has(page)) pageRowsByNumber.set(page, []);
@@ -17241,7 +17408,7 @@ async function completeStatementRowsPageByPage(statementResult, pdfBuffer, pageC
         input: [{
           role: 'user',
           content: [
-            { type: 'input_text', text: `Bu, ${pageCount} sayfalı hesap hareketi belgesinin yalnızca ${target.pageNumber}. sayfasıdır. Bu sayfadaki TÜM görünür işlem satırlarını tek tek çıkar; tablo satırlarını atlama veya birleştirme. rowNumber sayfanın üstünden aşağıya işlem satırı sırasıdır, başlık/toplam satırlarını işlem sayma. Borç/Alacak yönünü sütun başlıklarına göre belirle. Okunamayan alanı null yap, rakam uydurma. pageNumber alanını ${target.pageNumber} ver. Bu sayfa için JSON satır sayısı kadar visibleTransactionCount döndür. OCR ön taramasında yaklaşık ${target.dateAnchorCount} tarih ankrajı görüldü; bu sayı yönlendiricidir, belgedeki görünür satırları esas al.` },
+            { type: 'input_text', text: `Bu, ${pageCount} sayfalı hesap hareketi belgesinin yalnızca ${target.pageNumber}. sayfasıdır. Bu sayfadaki TÜM görünür işlem satırlarını tek tek çıkar; tablo satırlarını atlama veya birleştirme. rowNumber sayfanın üstünden aşağıya işlem satırı sırasıdır, başlık/toplam satırlarını işlem sayma. Borç/Alacak yönünü sütun başlıklarına göre belirle. Okunamayan alanı null yap, rakam uydurma. pageNumber alanını ${target.pageNumber} ver. Bu sayfa için JSON satır sayısı kadar visibleTransactionCount döndür. OCR ön taramasında yaklaşık ${target.dateAnchorCount} tarih ankrajı görüldü; bu sayı yönlendiricidir, belgedeki görünür satırları esas al. Satırdaki bakiye işlemden SONRAKİ bakiyedir. Ters kronolojik tabloda en eski işlemin işlem öncesi açılış bakiyesi = o satırdaki bakiye - alacak + borç; bu alacağı açılış bakiyesine ekleyip toplam alacakta tekrar sayma.` },
             { type: 'input_image', image_url: `data:image/png;base64,${rendered.buffer.toString('base64')}`, detail: 'high' },
           ],
         }],
@@ -17265,18 +17432,26 @@ async function completeStatementRowsPageByPage(statementResult, pdfBuffer, pageC
       const pageResult = parseAIResponse(response?.output_text || '');
       const extractedRows = Array.isArray(pageResult?.rows) ? pageResult.rows
         .filter(row => Number.isInteger(Number(row?.rowNumber)) && Number(row?.rowNumber) > 0 &&
-          (statementCents(row?.debitAmount) !== null || statementCents(row?.creditAmount) !== null))
+          (statementCents(row?.debitAmount) !== null || statementCents(row?.creditAmount) !== null ||
+            String(row?.date || '').trim() || String(row?.description || '').trim()))
         .map(row => ({ ...row, pageNumber: target.pageNumber }))
         .sort((a, b) => Number(a.rowNumber) - Number(b.rowNumber)) : [];
+      const visibleCount = Number(pageResult?.visibleTransactionCount);
+      const uniqueRowNumbers = new Set(extractedRows.map(row => Number(row.rowNumber))).size === extractedRows.length;
+      const countConsistent = Number.isInteger(visibleCount) && visibleCount === extractedRows.length && uniqueRowNumbers;
       const previousRows = pageRowsByNumber.get(target.pageNumber) || [];
-      if (extractedRows.length > previousRows.length) pageRowsByNumber.set(target.pageNumber, extractedRows);
+      const accepted = countConsistent && extractedRows.length >= previousRows.length;
+      if (accepted) pageRowsByNumber.set(target.pageNumber, extractedRows);
+      pagePassResults.set(target.pageNumber, { visibleCount, extractedCount: extractedRows.length, countConsistent, accepted });
       console.log('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA SONUCU:', JSON.stringify({
         pageNumber: target.pageNumber,
+        reason: target.reason,
         ocrDateAnchorCount: target.dateAnchorCount,
-        modelVisibleTransactionCount: Number(pageResult?.visibleTransactionCount) || 0,
+        modelVisibleTransactionCount: Number.isFinite(visibleCount) ? visibleCount : null,
         extractedRowCount: extractedRows.length,
         previousRowCount: previousRows.length,
-        accepted: extractedRows.length > previousRows.length,
+        countConsistent,
+        accepted,
       }));
     } catch (error) {
       console.warn('HESAP ÖZETİ SAYFA BAZLI SATIR TAMAMLAMA HATASI:', JSON.stringify({
@@ -17287,11 +17462,17 @@ async function completeStatementRowsPageByPage(statementResult, pdfBuffer, pageC
 
   const mergedRows = [...pageRowsByNumber.values()].flat()
     .sort((a, b) => Number(a.pageNumber) - Number(b.pageNumber) || Number(a.rowNumber) - Number(b.rowNumber));
-  if (mergedRows.length > currentRows.length) {
+  if (mergedRows.length > currentRows.length || needsPagePass.length > 0) {
     transactionAnalysis.rows = mergedRows;
+    const everyPageReRead = pagePassResults.size === pageCount &&
+      [...pagePassResults.values()].every(item => item.countConsistent && item.accepted);
+    if (everyPageReRead) transactionAnalysis.transactionCount = mergedRows.length;
     console.log('HESAP ÖZETİ SAYFA BAZLI SATIRLAR BİRLEŞTİRİLDİ:', JSON.stringify({
       before: currentRows.length, after: mergedRows.length,
+      previousDeclaredTransactionCount: declaredCount || null,
       declaredTransactionCount: Number(transactionAnalysis.transactionCount) || null,
+      pagePasses: Object.fromEntries([...pagePassResults.entries()].map(([page, value]) => [page, value])),
+      countReconciledFromPagePasses: everyPageReRead,
     }));
   }
   return statementResult;
@@ -19682,7 +19863,8 @@ const statementPdfForensics = await runStatementPdfForensics(
   filePath,
   buffer,
   statementModelResult?.transactionAnalysis?.rows || [],
-  azureLayout
+  azureLayout,
+  paddleDocumentOCR
 );
 const statementPageCount = Number(statementPdfForensics?.pageCount) || 0;
 const statementResult = applyStatementLedgerChecks(
@@ -19748,6 +19930,12 @@ console.log("HESAP ÖZETİ TÜM SAYFA DENETİMİ:", JSON.stringify({
   azureTableRowCount: statementPdfForensics?.transactionRowAssociation?.azureTableRowCount || 0,
   pdfFindingCount: statementPdfForensics?.findings?.length || 0,
   manualReviewRequired: statementResult?.manualReviewRequired === true,
+}));
+console.log("HESAP ÖZETİ RİSK PUANI UZLAŞTIRMA:", JSON.stringify(statementResult?.balanceRiskReconciliation || {
+  applied: false,
+  reason: statementResult?.transactionAnalysis?.rowByRowAudit?.rowsIncomplete
+    ? 'Eksik satır bulunduğu için model risk puanı deterministik olarak yeniden hesaplanmadı.'
+    : 'Tam ve tutarlı satır hesabı risk düzeltmesi koşullarını karşılamadı.',
 }));
 
 for (const pageAudit of statementPdfForensics?.pages || []) {
