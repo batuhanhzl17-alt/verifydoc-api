@@ -2181,8 +2181,23 @@ async function sendAnalysisResult(
    `• Dosya: ${html.fileBytes ? `${Number(html.fileBytes).toLocaleString('tr-TR')} bayt` : 'boyut bilgisi yok'}`,
   ];
   if (visible.recognizedFieldLabels?.length) lines.push(`• Tanınan alan etiketleri: ${visible.recognizedFieldLabels.join(', ')}`);
-  if (visible.amountCandidates?.length) lines.push(`• Görünür tutar adayları: ${visible.amountCandidates.slice(0, 5).join(', ')}`);
+  if (html.labeledAmountFields?.length) {
+   lines.push(`• Etiketle eşleşen tutarlar: ${html.labeledAmountFields.slice(0, 6).map(item => `${item.role}: ${item.amountCandidates.join('/')}`).join(' · ')}`);
+  } else if (visible.amountCandidates?.length) lines.push(`• Görünür tutar adayları (etiket eşleşmesi yok): ${visible.amountCandidates.slice(0, 5).join(', ')}`);
   if (visible.ibanCandidates?.length) lines.push(`• IBAN adayları: ${visible.ibanCandidates.slice(0, 3).join(', ')}`);
+  for (const profile of (html.amountStyleProfiles || []).slice(0, 3)) {
+   const styleSummary = (profile.valueCells || []).map(cell => {
+    const styles = cell.styles || {};
+    const relevant = ['font-family','font-size','font-weight','color','position','z-index'].filter(key => styles[key]).map(key => `${key}: ${styles[key]}`);
+    return relevant.join(', ');
+   }).filter(Boolean).join(' · ');
+   if (styleSummary) lines.push(`• ${profile.role} stil bilgisi: ${styleSummary.slice(0, 350)}`);
+  }
+  if (html.amountStyleProfiles?.some(item => item.explicitOverlayStyle)) lines.push('• Tutar satırında konumlandırma/katman stili adayı bulundu; bu tek başına oynama göstergesi değildir.');
+  if (Number(html.cssHiddenElementCount) > 0) lines.push(`• Basit CSS kurallarıyla gizlenmiş öğe adayı: ${html.cssHiddenElementCount}`);
+  const structure = html.structure || {};
+  if (Number(structure.embeddedDataResourceCount) > 0) lines.push(`• HTML’ye gömülü görsel/kaynak: ${structure.embeddedDataResourceCount}`);
+  if (Array.isArray(structure.externalOrigins) && structure.externalOrigins.length) lines.push(`• Harici kaynak alan adları: ${structure.externalOrigins.join(', ')}`);
   for (const item of (html.findings || []).slice(0, 4)) lines.push(`• ${item.detail}`);
   lines.push('', 'Bu statik tarama HTML/JavaScript’i çalıştırmaz ve tarayıcıda oluşan görünümü doğrulamaz. Bulgular tek başına sahtecilik kanıtı değildir.');
   await sendMessage(chatId, lines.join('\n'), replyToMessageId);
