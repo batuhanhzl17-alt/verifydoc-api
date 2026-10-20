@@ -3138,7 +3138,8 @@ fileName
 async function loadReferenceFile(bank, targetOCR = null, targetFormat = null) {
 // V63 ZIRAAT/VARIANT FIX: Her analiz isteği kendi referans varyantını baştan seçsin.
 // Önceki isteğin activeReferenceVariant değeri yeni isteğin adaylarını filtrelemesin.
-activeReferenceVariant = null;
+activeReferenceVariant = detectReferenceVariantFromText(String(targetOCR?.text || ''));
+activeReferenceSpecificTemplate = detectSpecificReferenceTemplate(String(targetOCR?.text || ''));
 activeSelectedReferencePath = null;
 if (targetFormat) activeReferenceFormat = normalizeReferenceFormat(targetFormat);
 const normalizedBank = normalizeBank(bank);
@@ -12168,6 +12169,7 @@ function synchronizeReferenceForensicDecision(forensic) {
 // Aynı banka farklı dekont ailelerine sahipse, hedef belgenin işlem ailesine
 // uygun referansı seçeriz. Tutar/isim/IBAN gibi dinamik değerler seçimde kullanılmaz.
 let activeReferenceVariant = null;
+let activeReferenceSpecificTemplate = null;
 // Anchor extraction follows the exact reference selected for this request.
 // Sibling references can share a transaction family while placing the amount
 // in nearby but distinct boxes, which otherwise creates false ambiguity.
@@ -12211,7 +12213,7 @@ function referenceFormatMatches(filePath, format) {
 function detectReferenceVariantFromText(text) {
   const t = normalizeFieldTextForMatch(text || '');
   if (!t) return null;
-  const hasHvl = /DEKONT\s*\/\s*HVL|\bHVL\b|HAVALE UCRETI|PARA AKTARMA/.test(t);
+  const hasHvl = /DEKONT\s*\/\s*HVL|\bHVL\b|HAVALE UCRETI|HESAPTAN\s+HESABA\s+HAVALE|PARA AKTARMA/.test(t);
   const hasEftFast = /DEKONT\s*\/\s*EFT|\bEFT\b|GIDEN FAST|FAST GIDEN|FAST UCRETI|GIDEN FAST ISLEMI|FAST GIDEN ANLIK ODEME|HESAPTAN FAST|FAST MESAJ KODU|FAST SORGU NO|FAST ISLEMI/.test(t);
   if (hasHvl && !hasEftFast) return 'hvl';
   if (hasEftFast && !hasHvl) return 'eft';
@@ -12238,13 +12240,13 @@ function detectSpecificReferenceTemplate(text) {
 
 function specificReferenceTemplateFromFileName(filePath) {
   const name = normalizeFieldTextForMatch(path.basename(String(filePath || '')));
-  if (/^garanti.*hesaptan.*hesaba.*havale/.test(name)) {
+  if (/^GARANTI.*HESAPTAN.*HESABA.*HAVALE/.test(name)) {
     return 'account-to-account-havale';
   }
-  if (/^teb.*fast.*ucret.*bsmv/.test(name)) {
+  if (/^TEB.*FAST.*UCRET.*BSMV/.test(name)) {
     return 'fast-fee-bsmv';
   }
-  if (/^halkbank.*fast.*no.*bsmv/.test(name)) {
+  if (/^HALKBANK.*FAST.*NO.*BSMV/.test(name)) {
     return 'fast-no-bsmv';
   }
   return null;
@@ -12373,6 +12375,23 @@ async function getReferenceFiles(bank) {
       console.log('REFERENCE TELEGRAM JPG PRIORITY V13:', JSON.stringify({
         selected: uniqueFiles.map(p => path.basename(p)),
         excludedNonTelegramJpg: files.filter(p => !telegramFiles.includes(p) && /\.(?:jpe?g)$/i.test(p)).map(p => path.basename(p))
+      }));
+    }
+  }
+
+  // Keep the reference-template ensemble and amount-anchor pool aligned with
+  // a recognized subtype. Filtering only in loadReferenceFile is too late:
+  // amount anchors are requested earlier during the OCR/forensics pass.
+  if (activeReferenceSpecificTemplate) {
+    const specificFiles = uniqueFiles.filter(filePath =>
+      specificReferenceTemplateFromFileName(filePath) === activeReferenceSpecificTemplate
+    );
+    if (specificFiles.length) {
+      uniqueFiles = specificFiles;
+      console.log('REFERENCE SPECIFIC TEMPLATE CANDIDATE FILTER:', JSON.stringify({
+        bank: normalizedBank,
+        targetTemplate: activeReferenceSpecificTemplate,
+        selected: uniqueFiles.map(p => path.basename(p))
       }));
     }
   }
@@ -18288,7 +18307,8 @@ paddleImageOCR.success
 
 // Make the OCR-derived transaction family available to the module-level
 // reference-anchor resolver before amount forensics requests an anchor.
-activeReferenceVariant = activeReferenceVariant || detectReferenceVariantFromText(paddleImageOCR.text || '');
+activeReferenceVariant = detectReferenceVariantFromText(paddleImageOCR.text || '');
+activeReferenceSpecificTemplate = detectSpecificReferenceTemplate(paddleImageOCR.text || '');
 
 console.log(
 "PADDLEOCR IMAGE OCR BAŞARILI"
