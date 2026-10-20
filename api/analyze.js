@@ -3161,11 +3161,42 @@ if (!candidatePaths.length) {
 
 const targetText = String(targetOCR?.text || '');
 const detectedVariant = detectReferenceVariantFromText(targetText);
+const targetSpecificTemplate = detectSpecificReferenceTemplate(targetText);
 let selectedPath = null;
 let selectedVariant = null;
 let variantMatchedCandidatePaths = [...candidatePaths];
 
-if (detectedVariant && detectedVariant !== 'mixed') {
+// Prefer an explicitly named, bank-scoped template when the target text
+// identifies its fee/tax or account-to-account layout.
+if (targetSpecificTemplate) {
+  const profiledMatches = candidatePaths.filter(p =>
+    specificReferenceTemplateFromFileName(p) === targetSpecificTemplate
+  );
+  if (profiledMatches.length) {
+    const sameVariantMatches = detectedVariant && detectedVariant !== 'mixed'
+      ? profiledMatches.filter(p => referenceVariantFromFileName(p) === detectedVariant)
+      : profiledMatches;
+    const matches = sameVariantMatches.length ? sameVariantMatches : profiledMatches;
+    selectedPath = matches[0];
+    variantMatchedCandidatePaths = matches;
+    console.log('REFERENCE SPECIFIC TEMPLATE MATCH:', JSON.stringify({
+      bank: normalizedBank,
+      targetTemplate: targetSpecificTemplate,
+      detectedTargetVariant: detectedVariant,
+      selectedReference: path.basename(selectedPath),
+      matchedReferences: matches.map(p => path.basename(p))
+    }));
+  } else {
+    console.log('REFERENCE SPECIFIC TEMPLATE NOT FOUND; USING TRANSACTION VARIANT:', JSON.stringify({
+      bank: normalizedBank,
+      targetTemplate: targetSpecificTemplate,
+      detectedTargetVariant: detectedVariant,
+      candidates: candidatePaths.map(p => path.basename(p))
+    }));
+  }
+}
+
+if (!selectedPath && detectedVariant && detectedVariant !== 'mixed') {
   const variants = await Promise.all(candidatePaths.map(async p => ({
     path: p,
     variant: await readReferenceVariant(p)
@@ -3245,7 +3276,7 @@ activeSelectedReferencePath = selectedPath;
 // references, carry only those paths forward. This prevents Yapı Kredi FAST
 // from being compared against the HVL template just because directory order
 // returned `yapikredi-havale.jpg` first.
-if (detectedVariant && detectedVariant !== 'mixed' && variantMatchedCandidatePaths.length) {
+if (((detectedVariant && detectedVariant !== 'mixed') || targetSpecificTemplate) && variantMatchedCandidatePaths.length) {
   candidatePaths.splice(0, candidatePaths.length, ...variantMatchedCandidatePaths);
 }
 
@@ -12185,6 +12216,37 @@ function detectReferenceVariantFromText(text) {
   if (hasHvl && !hasEftFast) return 'hvl';
   if (hasEftFast && !hasHvl) return 'eft';
   if (hasHvl && hasEftFast) return 'mixed';
+  return null;
+}
+
+// Banka/işlem ailesi aynı olsa bile FAST ücret/BSMV ve hesaptan-hesaba
+// havale şablonları farklı alan düzenlerine sahip olabilir. Bu profiller,
+// tutar veya alıcı alanını yanlış şablonla karşılaştırmayı önlemek içindir.
+function detectSpecificReferenceTemplate(text) {
+  const t = normalizeFieldTextForMatch(text || '');
+  if (!t) return null;
+
+  if (/HESAPTAN\s+HESABA/.test(t) && /HAVALE/.test(t)) {
+    return 'account-to-account-havale';
+  }
+
+  const isFast = /\bFAST\b|GIDEN FAST|FAST GIDEN|FAST UCRETI/.test(t);
+  if (!isFast) return null;
+  if (/\bBSMV\b/.test(t)) return 'fast-fee-bsmv';
+  return 'fast-no-bsmv';
+}
+
+function specificReferenceTemplateFromFileName(filePath) {
+  const name = normalizeFieldTextForMatch(path.basename(String(filePath || '')));
+  if (/^garanti.*hesaptan.*hesaba.*havale/.test(name)) {
+    return 'account-to-account-havale';
+  }
+  if (/^teb.*fast.*ucret.*bsmv/.test(name)) {
+    return 'fast-fee-bsmv';
+  }
+  if (/^halkbank.*fast.*no.*bsmv/.test(name)) {
+    return 'fast-no-bsmv';
+  }
   return null;
 }
 
