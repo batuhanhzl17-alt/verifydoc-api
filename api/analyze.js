@@ -24164,6 +24164,17 @@ const amountRenderDifferenceStrong = Boolean(
   )
 );
 const criticalReviewReasons = [];
+// Keep the user-facing review state consistent with the reference-forensics
+// report. Strong, localized field-spacing anomalies must not be presented as
+// a clean/corroborated result just because the critical values (amount/IBAN)
+// themselves were readable. This is a manual-review gate only; it does not
+// assert fraud and does not independently raise the numeric risk score.
+const strongReferenceSpacingAnomalies = Array.isArray(referenceForensics?.spacingAnomalies)
+  ? referenceForensics.spacingAnomalies.filter(x =>
+      (String(x?.severity || '').toLowerCase() === 'strong' || Number(x?.score) >= 80) &&
+      Number(x?.score) >= 80 && x?.beforeField && x?.afterField
+    )
+  : [];
 if (!criticalIbanEvidence?.associationValidated) criticalReviewReasons.push('recipient-iban-label-association-unverified');
 if (criticalIbanEvidence?.primaryAnalysisAgreement !== 'agreement' || criticalIbanEvidence?.sourceDisagreement) {
   criticalReviewReasons.push('recipient-iban-source-disagreement');
@@ -24174,12 +24185,13 @@ if (criticalAmountEvidence?.primaryAnalysisAgreement !== 'agreement' || critical
 }
 if (finalAmountReferenceComparison?.available !== true) criticalReviewReasons.push('amount-reference-comparison-unavailable');
 if (amountRenderDifferenceStrong) criticalReviewReasons.push('strong-amount-reference-render-difference');
+if (strongReferenceSpacingAnomalies.length) criticalReviewReasons.push('strong-reference-field-spacing-anomaly');
 const criticalFieldsRequireControl = criticalReviewReasons.length > 0;
 if (semanticEvidenceFusion?.available) {
   semanticEvidenceFusion.reviewStatus = criticalFieldsRequireControl ? 'CONTROL_REQUIRED' : 'FIELDS_CORROBORATED';
   semanticEvidenceFusion.reviewMessage = criticalFieldsRequireControl
-    ? 'Kontrol gerekli: alıcı IBANı veya tutar alanı doğrulanamadı, kaynaklar uyuşmadı ya da tutar referans karşılaştırması eksik/güçlü fark gösteriyor.'
-    : 'Alıcı IBANı ve tutar alanı doğrulandı; tutar referans karşılaştırması güçlü fark göstermedi.';
+    ? 'Kontrol gerekli: alıcı IBANı veya tutar alanı doğrulanamadı, kaynaklar uyuşmadı, tutar karşılaştırması eksik/güçlü fark gösteriyor ya da referansla güçlü bir alan yerleşimi farkı bulundu.'
+    : 'Alıcı IBANı ve tutar alanı doğrulandı; tutar karşılaştırması ve güçlü yerleşim farkı kontrolleri ek inceleme gerektirmedi.';
   semanticEvidenceFusion.criticalFieldReview = {
     focusFields: ['recipientIBAN', 'amount'],
     recipientNameUsedAsReviewGate: false,
@@ -24191,6 +24203,14 @@ if (semanticEvidenceFusion?.available) {
       characterDistance: finalAmountReferenceComparison.characterDistance != null && Number.isFinite(Number(finalAmountReferenceComparison.characterDistance)) ? Number(finalAmountReferenceComparison.characterDistance) : null,
     } : { available: false, referenceFile: null, classification: null, styleDistance: null, characterDistance: null },
     reasons: criticalReviewReasons,
+    strongReferenceSpacingAnomalyCount: strongReferenceSpacingAnomalies.length,
+    strongReferenceSpacingAnomalies: strongReferenceSpacingAnomalies.slice(0, 5).map(x => ({
+      beforeField: x.beforeField,
+      afterField: x.afterField,
+      score: Number(x.score) || 0,
+      severity: x.severity || null,
+      relativeDelta: Number.isFinite(Number(x.relativeDelta)) ? Number(x.relativeDelta) : null,
+    })),
   };
 }
 result.fieldReviewStatus = (type === 'image' || type === 'pdf')
@@ -24204,6 +24224,14 @@ console.log('FINAL CRITICAL FIELD REVIEW:', JSON.stringify({
   amountReferenceComparisonClassification: finalAmountReferenceComparison?.classification || null,
   amountRenderDifferenceStrong,
   reasons: criticalReviewReasons,
+  strongReferenceSpacingAnomalyCount: strongReferenceSpacingAnomalies.length,
+  strongReferenceSpacingAnomalies: strongReferenceSpacingAnomalies.slice(0, 5).map(x => ({
+    beforeField: x.beforeField,
+    afterField: x.afterField,
+    score: Number(x.score) || 0,
+    severity: x.severity || null,
+    relativeDelta: Number.isFinite(Number(x.relativeDelta)) ? Number(x.relativeDelta) : null,
+  })),
   status: result.fieldReviewStatus,
   manualReviewRequired: result.manualReviewRequired,
 }));
