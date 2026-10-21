@@ -395,8 +395,14 @@ function resolveField(field, rows, pageWidth, pageHeight) {
         const rowText = row.items.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
         const normalizedRowText = normalizeLabel(rowText);
         if (/FAST\s*UCRETI|\bBSMV\b|\bTOPLAM\b|HESAPTAN\s+TOPLAM|KOMISYON|MASRAF/.test(normalizedRowText)) continue;
-        const bankItem = row.items.find(item => /\b[A-Z0-9ÇĞİÖŞÜ .&'-]+(?:BANK|BANKASI|A\.Ş\.?|AS)\b/i.test(item.text));
-        if (!bankItem || !/\bTL\b/i.test(rowText)) continue;
+        // TEB FAST rows often encode the counterparty as `FIBABANKA A.Ş.:`.
+        // The old regex required a trailing word boundary after `A.Ş.` and
+        // therefore rejected the period/colon form. Normalize Turkish letters
+        // first, then look for a bank marker; the row must also contain a value
+        // date, TL currency, and exactly one trailing-minus amount below.
+        const bankItem = row.items.find(item => /BANK|A\.S\.?/i.test(normalizeLabel(item.text)));
+        const hasValueDate = /\bVALOR\s*[:：]?\s*\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(normalizedRowText);
+        if (!bankItem || !hasValueDate || !/\bTL\b/i.test(rowText)) continue;
         const amountItems = row.items.filter(item => /\d[\d.,]*\s*-$/.test(String(item.text || '').trim()) && validValue('amount', item.text));
         const distinct = new Map(amountItems.map(item => [item.text.replace(/[^0-9,.-]/g, ''), item]));
         if (distinct.size !== 1) continue;
