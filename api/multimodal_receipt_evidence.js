@@ -96,6 +96,34 @@ function normalize(value, field) {
   return text.replace(/[çğıöşü]/g, c => ({ ç:'c', ğ:'g', ı:'i', ö:'o', ş:'s', ü:'u' })[c]).replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+function valuesAgree(left, right, field) {
+  const leftKey = normalize(left, field);
+  const rightKey = normalize(right, field);
+  if (!leftKey || !rightKey) return false;
+  if (field !== 'amount') return leftKey === rightKey;
+  if (leftKey === rightKey) return true;
+
+  // Some transaction extractors report only the amount magnitude while the
+  // PDF prints a debit sign (including TEB's trailing-minus notation). A
+  // missing sign is not contradictory evidence. Explicit, opposing signs
+  // remain a real disagreement.
+  const signOf = (value) => {
+    const raw = String(value ?? '').normalize('NFKC').replace(/[^0-9,+.-]/g, '');
+    const leading = raw.match(/^([+-])/u)?.[1] || '';
+    const trailing = raw.match(/([+-])$/u)?.[1] || '';
+    if (leading && trailing) return null;
+    if (leading === '-' || trailing === '-') return -1;
+    if (leading === '+' || trailing === '+') return 1;
+    return null;
+  };
+  const leftMagnitude = leftKey.replace(/^[+-]/u, '');
+  const rightMagnitude = rightKey.replace(/^[+-]/u, '');
+  if (leftMagnitude !== rightMagnitude) return false;
+  const leftSign = signOf(left);
+  const rightSign = signOf(right);
+  return leftSign == null || rightSign == null || leftSign === rightSign;
+}
+
 function boxOf(row) {
   const r = row?.region || row;
   const b = { x1: Number(r?.x1), y1: Number(r?.y1), x2: Number(r?.x2), y2: Number(r?.y2) };
@@ -271,7 +299,7 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
     const nativeMatched = pdfNative?.status === 'matched' && pdfNative?.associationValidated === true;
     const nativeOcrCorroboration = Boolean(
       nativeMatched && ocr.status === 'matched' &&
-      normalize(pdfNative.value, field) === normalize(ocr.text, field)
+      valuesAgree(pdfNative.value, ocr.text, field)
     );
     // A coordinate-associated PDF text value and a separate OCR value from
     // the rendered page form the strongest available visible-field consensus.
@@ -283,24 +311,27 @@ export function fuseReceiptSemanticEvidence({ evidenceResult, paddleOCR, primary
         (nativeMatched ? String(pdfNative.value || '').trim() : '') ||
         (ocr.status === 'matched' ? String(ocr.text || '').trim() : '');
     const comparisonKey = normalize(comparisonValue, field);
-    const ocrAgreement = Boolean(comparisonKey && ocr.status === 'matched' && normalize(ocr.text, field) === comparisonKey);
-    const primaryAgreement = Boolean(comparisonKey && primaryText && normalize(primaryText, field) === comparisonKey);
-    const visualAgreement = Boolean(comparisonKey && value && key === comparisonKey);
+    const ocrAgreement = Boolean(comparisonKey && ocr.status === 'matched' && valuesAgree(ocr.text, comparisonValue, field));
+    const primaryAgreement = Boolean(comparisonKey && primaryText && valuesAgree(primaryText, comparisonValue, field));
+    const visualAgreement = Boolean(comparisonKey && value && valuesAgree(value, comparisonValue, field));
     const pdfNativeAgreement = Boolean(
       pdfNative?.status === 'matched' && pdfNative?.associationValidated === true &&
-      primaryText && normalize(primaryText, field) === normalize(pdfNative.value, field)
+      primaryText && valuesAgree(primaryText, pdfNative.value, field)
     );
     const nonVisualReadings = [
       ocr.status === 'matched' ? ocr.text : '',
       nativeMatched ? pdfNative.value : '',
       primaryText,
-    ].map(item => normalize(item, field)).filter(Boolean);
-    const visualDisagreement = Boolean(value && comparisonKey && key !== comparisonKey);
+    ].filter(item => normalize(item, field));
+    const nonVisualDisagreement = nonVisualReadings.some((item, index) =>
+      nonVisualReadings.slice(index + 1).some(other => !valuesAgree(item, other, field))
+    );
+    const visualDisagreement = Boolean(value && comparisonKey && !valuesAgree(value, comparisonValue, field));
     // Preserve genuine disagreement among the field-associated OCR, PDF text,
     // and primary extraction. Ignore only an isolated secondary visual-reader
     // outlier when both the native label/value association and rendered OCR
     // independently agree.
-    const sourceDisagreement = new Set(nonVisualReadings).size > 1 ||
+    const sourceDisagreement = nonVisualDisagreement ||
       (visualDisagreement && !nativeOcrCorroboration);
     fields[field] = {
       visualEvidence: visual,
