@@ -20662,14 +20662,17 @@ if (layoutForensics) {
   result.layoutForensics = layoutForensics;
 }
 function normalizeAmountForFontMatch(value) {
-  const text = String(value || '').replace(/\b(?:TL|TRY)\b|₺/gi, '').replace(/\s+/g, '');
+  let text = String(value || '').replace(/\b(?:TL|TRY)\b|₺/gi, '').replace(/\s+/g, '');
+  const trailingNegative = /-\s*$/.test(text);
+  if (trailingNegative) text = text.replace(/-\s*$/, '');
   const match = text.match(/[-+]?\d[\d.,]*/);
   if (!match) return null;
   let normalized = match[0];
   if (normalized.includes(',') && normalized.includes('.')) normalized = normalized.replace(/\./g, '').replace(',', '.');
   else if (normalized.includes(',')) normalized = normalized.replace(',', '.');
   else if ((normalized.match(/\./g) || []).length > 1) normalized = normalized.replace(/\./g, '');
-  const number = Number(normalized);
+  let number = Number(normalized);
+  if (trailingNegative) number = -Math.abs(number);
   return Number.isFinite(number) ? number.toFixed(2) : null;
 }
 
