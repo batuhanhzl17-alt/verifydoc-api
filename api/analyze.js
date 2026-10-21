@@ -3138,8 +3138,7 @@ fileName
 async function loadReferenceFile(bank, targetOCR = null, targetFormat = null) {
 // V63 ZIRAAT/VARIANT FIX: Her analiz isteği kendi referans varyantını baştan seçsin.
 // Önceki isteğin activeReferenceVariant değeri yeni isteğin adaylarını filtrelemesin.
-activeReferenceVariant = detectReferenceVariantFromText(String(targetOCR?.text || ''));
-activeReferenceSpecificTemplate = detectSpecificReferenceTemplate(String(targetOCR?.text || ''));
+activeReferenceVariant = null;
 activeSelectedReferencePath = null;
 if (targetFormat) activeReferenceFormat = normalizeReferenceFormat(targetFormat);
 const normalizedBank = normalizeBank(bank);
@@ -3162,42 +3161,11 @@ if (!candidatePaths.length) {
 
 const targetText = String(targetOCR?.text || '');
 const detectedVariant = detectReferenceVariantFromText(targetText);
-const targetSpecificTemplate = detectSpecificReferenceTemplate(targetText);
 let selectedPath = null;
 let selectedVariant = null;
 let variantMatchedCandidatePaths = [...candidatePaths];
 
-// Prefer an explicitly named, bank-scoped template when the target text
-// identifies its fee/tax or account-to-account layout.
-if (targetSpecificTemplate) {
-  const profiledMatches = candidatePaths.filter(p =>
-    specificReferenceTemplateFromFileName(p) === targetSpecificTemplate
-  );
-  if (profiledMatches.length) {
-    const sameVariantMatches = detectedVariant && detectedVariant !== 'mixed'
-      ? profiledMatches.filter(p => referenceVariantFromFileName(p) === detectedVariant)
-      : profiledMatches;
-    const matches = sameVariantMatches.length ? sameVariantMatches : profiledMatches;
-    selectedPath = matches[0];
-    variantMatchedCandidatePaths = matches;
-    console.log('REFERENCE SPECIFIC TEMPLATE MATCH:', JSON.stringify({
-      bank: normalizedBank,
-      targetTemplate: targetSpecificTemplate,
-      detectedTargetVariant: detectedVariant,
-      selectedReference: path.basename(selectedPath),
-      matchedReferences: matches.map(p => path.basename(p))
-    }));
-  } else {
-    console.log('REFERENCE SPECIFIC TEMPLATE NOT FOUND; USING TRANSACTION VARIANT:', JSON.stringify({
-      bank: normalizedBank,
-      targetTemplate: targetSpecificTemplate,
-      detectedTargetVariant: detectedVariant,
-      candidates: candidatePaths.map(p => path.basename(p))
-    }));
-  }
-}
-
-if (!selectedPath && detectedVariant && detectedVariant !== 'mixed') {
+if (detectedVariant && detectedVariant !== 'mixed') {
   const variants = await Promise.all(candidatePaths.map(async p => ({
     path: p,
     variant: await readReferenceVariant(p)
@@ -3277,7 +3245,7 @@ activeSelectedReferencePath = selectedPath;
 // references, carry only those paths forward. This prevents Yapı Kredi FAST
 // from being compared against the HVL template just because directory order
 // returned `yapikredi-havale.jpg` first.
-if (((detectedVariant && detectedVariant !== 'mixed') || targetSpecificTemplate) && variantMatchedCandidatePaths.length) {
+if (detectedVariant && detectedVariant !== 'mixed' && variantMatchedCandidatePaths.length) {
   candidatePaths.splice(0, candidatePaths.length, ...variantMatchedCandidatePaths);
 }
 
@@ -12169,7 +12137,6 @@ function synchronizeReferenceForensicDecision(forensic) {
 // Aynı banka farklı dekont ailelerine sahipse, hedef belgenin işlem ailesine
 // uygun referansı seçeriz. Tutar/isim/IBAN gibi dinamik değerler seçimde kullanılmaz.
 let activeReferenceVariant = null;
-let activeReferenceSpecificTemplate = null;
 // Anchor extraction follows the exact reference selected for this request.
 // Sibling references can share a transaction family while placing the amount
 // in nearby but distinct boxes, which otherwise creates false ambiguity.
@@ -12213,42 +12180,11 @@ function referenceFormatMatches(filePath, format) {
 function detectReferenceVariantFromText(text) {
   const t = normalizeFieldTextForMatch(text || '');
   if (!t) return null;
-  const hasHvl = /DEKONT\s*\/\s*HVL|\bHVL\b|HAVALE UCRETI|HESAPTAN\s+HESABA\s+HAVALE|PARA AKTARMA/.test(t);
+  const hasHvl = /DEKONT\s*\/\s*HVL|\bHVL\b|HAVALE UCRETI|PARA AKTARMA/.test(t);
   const hasEftFast = /DEKONT\s*\/\s*EFT|\bEFT\b|GIDEN FAST|FAST GIDEN|FAST UCRETI|GIDEN FAST ISLEMI|FAST GIDEN ANLIK ODEME|HESAPTAN FAST|FAST MESAJ KODU|FAST SORGU NO|FAST ISLEMI/.test(t);
   if (hasHvl && !hasEftFast) return 'hvl';
   if (hasEftFast && !hasHvl) return 'eft';
   if (hasHvl && hasEftFast) return 'mixed';
-  return null;
-}
-
-// Banka/işlem ailesi aynı olsa bile FAST ücret/BSMV ve hesaptan-hesaba
-// havale şablonları farklı alan düzenlerine sahip olabilir. Bu profiller,
-// tutar veya alıcı alanını yanlış şablonla karşılaştırmayı önlemek içindir.
-function detectSpecificReferenceTemplate(text) {
-  const t = normalizeFieldTextForMatch(text || '');
-  if (!t) return null;
-
-  if (/HESAPTAN\s+HESABA/.test(t) && /HAVALE/.test(t)) {
-    return 'account-to-account-havale';
-  }
-
-  const isFast = /\bFAST\b|GIDEN FAST|FAST GIDEN|FAST UCRETI/.test(t);
-  if (!isFast) return null;
-  if (/\bBSMV\b/.test(t)) return 'fast-fee-bsmv';
-  return 'fast-no-bsmv';
-}
-
-function specificReferenceTemplateFromFileName(filePath) {
-  const name = normalizeFieldTextForMatch(path.basename(String(filePath || '')));
-  if (/^GARANTI.*HESAPTAN.*HESABA.*HAVALE/.test(name)) {
-    return 'account-to-account-havale';
-  }
-  if (/^TEB.*FAST.*UCRET.*BSMV/.test(name)) {
-    return 'fast-fee-bsmv';
-  }
-  if (/^HALKBANK.*FAST.*NO.*BSMV/.test(name)) {
-    return 'fast-no-bsmv';
-  }
   return null;
 }
 
@@ -12375,23 +12311,6 @@ async function getReferenceFiles(bank) {
       console.log('REFERENCE TELEGRAM JPG PRIORITY V13:', JSON.stringify({
         selected: uniqueFiles.map(p => path.basename(p)),
         excludedNonTelegramJpg: files.filter(p => !telegramFiles.includes(p) && /\.(?:jpe?g)$/i.test(p)).map(p => path.basename(p))
-      }));
-    }
-  }
-
-  // Keep the reference-template ensemble and amount-anchor pool aligned with
-  // a recognized subtype. Filtering only in loadReferenceFile is too late:
-  // amount anchors are requested earlier during the OCR/forensics pass.
-  if (activeReferenceSpecificTemplate) {
-    const specificFiles = uniqueFiles.filter(filePath =>
-      specificReferenceTemplateFromFileName(filePath) === activeReferenceSpecificTemplate
-    );
-    if (specificFiles.length) {
-      uniqueFiles = specificFiles;
-      console.log('REFERENCE SPECIFIC TEMPLATE CANDIDATE FILTER:', JSON.stringify({
-        bank: normalizedBank,
-        targetTemplate: activeReferenceSpecificTemplate,
-        selected: uniqueFiles.map(p => path.basename(p))
       }));
     }
   }
@@ -18307,8 +18226,7 @@ paddleImageOCR.success
 
 // Make the OCR-derived transaction family available to the module-level
 // reference-anchor resolver before amount forensics requests an anchor.
-activeReferenceVariant = detectReferenceVariantFromText(paddleImageOCR.text || '');
-activeReferenceSpecificTemplate = detectSpecificReferenceTemplate(paddleImageOCR.text || '');
+activeReferenceVariant = activeReferenceVariant || detectReferenceVariantFromText(paddleImageOCR.text || '');
 
 console.log(
 "PADDLEOCR IMAGE OCR BAŞARILI"
@@ -20743,7 +20661,13 @@ function normalizeAmountForFontMatch(value) {
   return Number.isFinite(number) ? number.toFixed(2) : null;
 }
 
-function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
+function summarizeAmountFont(usages, amountField, fontCatalog = [], pageDimensions = []) {
+  const amountValue = typeof amountField === 'object' && amountField !== null
+    ? amountField.value
+    : amountField;
+  const amountValueBox = typeof amountField === 'object' && amountField !== null
+    ? amountField.valueBox
+    : null;
   const normalizedAmount = normalizeAmountForFontMatch(amountValue);
   if (!normalizedAmount || !Array.isArray(usages)) return { status: 'unavailable' };
   // Resolve a PDF.js-generated font alias only when all active fonts in that
@@ -20789,6 +20713,83 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
   const exactMatches = matched.filter(item => item.exactAmountText);
   const selectedMatches = exactMatches.length ? exactMatches : matched;
   const unique = [...new Map(selectedMatches.map(item => [`${item.family || 'unknown'}|${item.style}|${item.pageNumber}|${item.matchedText}`, item])).values()];
+  if ((!unique.length || unique.every(item => !item.family)) && amountValueBox && Array.isArray(pageDimensions)) {
+    // PDF.js may split the amount into several text items (for example
+    // `1.000`, `,00`, and ` TL`). Associate font usages with the typed-label
+    // amount box in page coordinates instead of requiring one item to contain
+    // the entire formatted amount. Text item y coordinates are bottom-up;
+    // the native association box is normalized top-down.
+    const pageByNumber = new Map(pageDimensions.map(page => [Number(page.pageNumber) || 1, page]));
+    const amountBox = {
+      x: Number(amountValueBox.x), y: Number(amountValueBox.y),
+      width: Number(amountValueBox.width), height: Number(amountValueBox.height),
+    };
+    const hasBox = Object.values(amountBox).every(Number.isFinite) && amountBox.width > 0 && amountBox.height > 0;
+    const spatialMatches = [];
+    if (hasBox) for (const usage of usages) {
+      for (const box of usage?.boxes || []) {
+        const pageNumber = Number(box.pageNumber) || 1;
+        const page = pageByNumber.get(pageNumber);
+        const text = String(box.text || '');
+        if (!page || !/\d/.test(text)) continue;
+        const pageWidth = Number(page.width) || 0;
+        const pageHeight = Number(page.height) || 0;
+        if (!(pageWidth > 0 && pageHeight > 0)) continue;
+        const x = (Number(box.x) || 0) / pageWidth;
+        const y = 1 - ((Number(box.y) || 0) + (Number(box.height) || 0)) / pageHeight;
+        const width = (Number(box.width) || 0) / pageWidth;
+        const height = (Number(box.height) || 0) / pageHeight;
+        const overlapWidth = Math.max(0, Math.min(x + width, amountBox.x + amountBox.width) - Math.max(x, amountBox.x));
+        const overlapHeight = Math.max(0, Math.min(y + height, amountBox.y + amountBox.height) - Math.max(y, amountBox.y));
+        const area = width * height;
+        // A small overlap is enough for thin glyph boxes; reject neighboring
+        // labels unless the item actually occupies a meaningful part of the
+        // associated amount value area.
+        if (!(overlapWidth > 0 && overlapHeight > 0) || (area > 0 && overlapWidth * overlapHeight / area < 0.12)) continue;
+        const candidates = [
+          ...(Array.isArray(usage.resolvedFontNames) ? usage.resolvedFontNames : []),
+          usage.resolvedFamily, usage.family, usage.fontName,
+        ].filter(value => value && !/^g_d\d+_f\d+$/i.test(String(value)));
+        const family = candidates.length ? (fontFamily(candidates[0]) || candidates[0]) : uniqueCatalogFamily;
+        spatialMatches.push({
+          family: family || null,
+          familyResolution: candidates.length ? 'text-font-resource-spatial-field-box' : (uniqueCatalogFamily ? 'single-active-family-catalog-spatial-field-box' : 'unresolved'),
+          style: usage.resolvedStyle || usage.style || 'unknown',
+          fontSizePtEstimate: Number(box.height) > 0 ? Number(Number(box.height).toFixed(2)) : null,
+          pageNumber,
+          matchedText: text.slice(0, 80),
+          exactAmountText: false,
+          overlapRatio: Number((area > 0 ? overlapWidth * overlapHeight / area : 0).toFixed(3)),
+        });
+      }
+    }
+    const byFamily = new Map();
+    for (const item of spatialMatches) {
+      const key = item.family ? normalizeFontName(item.family) : `unresolved:${item.style}`;
+      const current = byFamily.get(key) || { ...item, matchedFragments: [], _heights: [], _weight: 0 };
+      current.matchedFragments.push(item.matchedText);
+      if (item.fontSizePtEstimate) current._heights.push(item.fontSizePtEstimate);
+      current._weight += (item.matchedText.match(/[\d.,+-]/g) || []).length;
+      current.overlapRatio = Math.max(current.overlapRatio, item.overlapRatio);
+      byFamily.set(key, current);
+    }
+    const spatialFamilies = [...byFamily.values()].map(item => ({
+      ...item,
+      fontSizePtEstimate: item._heights.length
+        ? Number((item._heights.reduce((sum, value) => sum + value, 0) / item._heights.length).toFixed(2))
+        : null,
+      matchedText: [...new Set(item.matchedFragments)].join(' ').slice(0, 160),
+      matchedFragments: [...new Set(item.matchedFragments)],
+      _weight: undefined,
+      _heights: undefined,
+    }));
+    if (spatialFamilies.length === 1 && spatialFamilies[0].family) {
+      return { status: 'resolved', amount: String(amountValue || ''), matchMethod: 'amount-field-box-spatial-font-usage', ...spatialFamilies[0] };
+    }
+    if (spatialFamilies.length > 1) {
+      return { status: 'mixed', amount: String(amountValue || ''), matchMethod: 'amount-field-box-spatial-font-usage', candidates: spatialFamilies.slice(0, 6) };
+    }
+  }
   if (!unique.length) return { status: 'amount-font-not-matched', amount: String(amountValue || '') };
   if (unique.length > 1) return { status: 'ambiguous', amount: String(amountValue || ''), matchMethod: exactMatches.length ? 'exact-amount-text-run' : 'amount-token-in-text-run', candidates: unique.slice(0, 6) };
   return { status: unique[0].family ? 'resolved' : 'family-unresolved', amount: String(amountValue || ''), matchMethod: exactMatches.length ? 'exact-amount-text-run' : 'amount-token-in-text-run', ...unique[0] };
@@ -20797,16 +20798,18 @@ function summarizeAmountFont(usages, amountValue, fontCatalog = []) {
 if (fontForensics) {
   const targetAmountFont = summarizeAmountFont(
     fontForensics.targetActiveFontUsages,
-    pdfNativeFieldAssociation?.fields?.amount?.value,
+    pdfNativeFieldAssociation?.fields?.amount,
     fontForensics.targetFonts,
+    fontForensics.targetPages || fontForensics.pages || [],
   );
   const selectedReferenceFontProfile = (fontForensics.referenceFontProfiles || []).find(profile =>
     profile.fileName === path.basename(reference?.path || '')
   ) || null;
   const referenceAmountFont = summarizeAmountFont(
     selectedReferenceFontProfile?.activeFontUsages,
-    pdfReferenceFieldAssociation?.fields?.amount?.value,
+    pdfReferenceFieldAssociation?.fields?.amount,
     selectedReferenceFontProfile?.fonts,
+    selectedReferenceFontProfile?.pages || [],
   );
   const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
     const families = [...new Set((profile?.fonts || [])
