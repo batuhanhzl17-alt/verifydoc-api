@@ -18,6 +18,15 @@ const ANALYZE_URL =
 const processedUpdates =
  new Set();
 
+function compactTelegramText(value, maxChars = 700) {
+ const text = String(value || '').replace(/\s+/g, ' ').trim();
+ if (text.length <= maxChars) return text;
+ const prefix = text.slice(0, maxChars);
+ const sentenceEnd = Math.max(prefix.lastIndexOf('. '), prefix.lastIndexOf('; '));
+ const safeEnd = sentenceEnd >= Math.floor(maxChars * 0.65) ? sentenceEnd + 1 : maxChars - 1;
+ return `${prefix.slice(0, safeEnd).trimEnd()}…`;
+}
+
 
 // =====================================================
 // TELEGRAM API
@@ -2220,11 +2229,6 @@ async function sendAnalysisResult(
    : null;
 
 
- const riskLabel =
- result?.riskLabel ||
- "UNKNOWN";
-
-
  const summary =
  result?.summary ||
  "Analiz tamamlandı.";
@@ -2243,6 +2247,22 @@ async function sendAnalysisResult(
  const confidenceLine = confidence === null
    ? 'Güven: Belirlenemedi'
    : `Güven: ${confidence}/100`;
+ const criticalReviewReasons = Array.isArray(result?.semanticEvidenceFusion?.criticalFieldReview?.reasons)
+   ? result.semanticEvidenceFusion.criticalFieldReview.reasons
+   : [];
+ const reviewReasonLabels = {
+   'recipient-iban-label-association-unverified': 'Alıcı IBAN’ı etiketli alanla doğrulanamadı.',
+   'recipient-iban-source-disagreement': 'Alıcı IBAN’ı çıkarım kaynakları arasında uyuşmuyor.',
+   'amount-label-association-unverified': 'Tutar etiketli alanla doğrulanamadı.',
+   'amount-source-disagreement': 'Tutar çıkarım kaynakları arasında uyuşmuyor.',
+   'amount-reference-comparison-unavailable': 'Tutar referansla karşılaştırılamadı.',
+   'strong-amount-reference-render-difference': 'Tutar alanında referansla belirgin görüntü farkı var.',
+   'strong-reference-field-spacing-anomaly': 'Referans yerleşiminde güçlü alan aralığı farkı var.',
+ };
+ const specificReviewReasonLines = [...new Set(criticalReviewReasons)]
+   .map(reason => reviewReasonLabels[reason])
+   .filter(Boolean)
+   .slice(0, 3);
 
 
  // ===================================================
@@ -2461,26 +2481,7 @@ async function sendAnalysisResult(
      `• ${aiAssessment.replace(/^⚪\s*/u, '')}`,
      '',
    ].join('\n');
-   const detailedVideoText = [
-     String(summary).trim()
-       .replace(/\s*Kareler arasında tutar, tarih, açıklama ve ekran öğelerinde sonradan ekleme[\s\S]*$/iu, '')
-       .slice(0, 1800),
-   ].filter(Boolean).join('\n');
-   const fullVideoText = `${visibleVideoText}\n\n📖 AYRINTILI AÇIKLAMA\n\n${detailedVideoText}`;
-   const chunks = [];
-   let remaining = fullVideoText;
-   while (remaining.length > 3900) {
-     let cutAt = remaining.lastIndexOf('\n', 3900);
-     if (cutAt < 2500) cutAt = 3900;
-     chunks.push(remaining.slice(0, cutAt));
-     remaining = remaining.slice(cutAt).replace(/^\n+/u, '');
-   }
-   if (remaining) chunks.push(remaining);
-   let previousMessageId = replyToMessageId;
-   for (const chunk of chunks) {
-     const sent = await sendMessage(chatId, chunk, previousMessageId);
-     if (sent?.message_id) previousMessageId = sent.message_id;
-   }
+   await sendMessage(chatId, `${visibleVideoText}Not: Zaman adayları tek başına düzenleme kanıtı değildir.`, replyToMessageId);
    return;
  }
 
@@ -2585,11 +2586,31 @@ async function sendAnalysisResult(
  const visualRowMatchLine = rowAssociation.available || unresolvedVisualRows > 0 || matchedVisualRows > 0
    ? `Görsel satır eşleşmesi: ${matchedVisualRows} eşleşti${unresolvedVisualRows ? `, ${unresolvedVisualRows} belirsiz` : ''}.`
    : '';
- const reviewReasonLine = unresolvedVisualRows > 0 && !verifiedStatementIssue
-   ? `${unresolvedVisualRows} satırın tutar/bakiye kutusu PDF’deki görsel konumuyla güvenilir biçimde eşleştirilemedi. Bu belirsizlik tek başına silme veya değiştirme kanıtı değildir; ilgili satırları kontrol etmeniz tavsiye edilir.`
-   : statementNeedsReview && !verifiedStatementIssue
-     ? 'Bazı otomatik kontroller kesin sonuca ulaşamadı. Bu durum tek başına belge düzenlendiğini göstermez; raporlanan belirsiz noktaları kontrol etmeniz tavsiye edilir.'
-     : '';
+ const statementReasonLines = [];
+ if (balanceMismatchCount) statementReasonLines.push(`${balanceMismatchCount} bakiye geçişinde fark bulundu.`);
+ if (rowCountIncomplete) statementReasonLines.push(`Çıkarılan işlem satırı sayısı beklenen sayıyla uyuşmuyor (${extractedRowCount}/${declaredRowCount}).`);
+ if (pageCoverageIncomplete) statementReasonLines.push(`Tüm sayfalar taranamadı (${pagesAnalyzed}/${pageCount}).`);
+ if (bankIdentityConflict) statementReasonLines.push('Belge banka kimliği, seçilen referansla uyuşmuyor.');
+ if (unresolvedVisualRows) statementReasonLines.push(`${unresolvedVisualRows} satırın görsel alan eşleşmesi tamamlanamadı; bu, satırın eksik veya değiştirilmiş olduğunu tek başına göstermez.`);
+ if (statementNeedsReview && !statementReasonLines.length) statementReasonLines.push('Bir veya daha fazla otomatik alan kontrolü kesin sonuca ulaşamadı.');
+ const reviewReasonLine = statementNeedsReview || verifiedStatementIssue
+   ? `Kontrol nedeni:\n${statementReasonLines.slice(0, 3).map(line => `• ${line}`).join('\n')}`
+   : '';
+ const unresolvedRowDetails = (Array.isArray(rowAssociation.rows) ? rowAssociation.rows : [])
+   .filter(row => row?.status !== 'matched')
+   .slice(0, 3)
+   .map(row => {
+     const reason = String(row?.reason || '').toLocaleLowerCase('tr-TR');
+     const shortReason = /tarih.*bulunamadı|tarihi.*okunamadı|ankrajı kurulamadı/.test(reason) ? 'tarih eşleşmedi'
+       : /açıklama eşleşmedi/.test(reason) ? 'açıklama eşleşmedi'
+         : /birden fazla|belirsiz/.test(reason) ? 'birden fazla satır adayı'
+           : /tutar|bakiye/.test(reason) ? 'tutar/bakiye eşleşmedi'
+             : 'alanlar tekil eşleşmedi';
+     return `s.${row?.pageNumber ?? '?'} satır ${row?.rowNumber ?? '?'} (${shortReason})`;
+   });
+ const unresolvedRowDetailLine = unresolvedVisualRows > 0 && unresolvedRowDetails.length
+   ? `Eşleşmeyen satırlar: ${unresolvedRowDetails.join('; ')}${unresolvedVisualRows > unresolvedRowDetails.length ? `; +${unresolvedVisualRows - unresolvedRowDetails.length} satır` : ''}.`
+   : '';
  for (const item of (Array.isArray(transactionAnalysis.suspiciousTransactions) ? transactionAnalysis.suspiciousTransactions : [])) {
    addFinding('Şüpheli işlem', item);
  }
@@ -2607,8 +2628,8 @@ async function sendAnalysisResult(
    .split(/(?<=[.!?])\s+|\n+/)
    .map(x => x.trim())
    .filter(x => x && suspiciousSentence.test(x) && !cleanPhrases.test(x))
-   .slice(0, 8)
-   .forEach(x => addFinding('Belge incelemesi', x));
+   .slice(0, 4)
+   .forEach(x => addFinding('Belge incelemesi', compactTelegramText(x, 280)));
 
  // Referans bulgularını ayrı tut; ana bulgu listesinde tekrar etmeyelim.
  const referenceDetailKeys = new Set(referenceFindings.map(x =>
@@ -2625,26 +2646,24 @@ async function sendAnalysisResult(
    '',
    `${result?.bank ? `Banka: ${getBankDisplayName(result.bank)}\n` : ''}Risk Skoru: ${score}/100`,
    '',
-   'Risk Seviyesi:',
-   riskLabel,
-   '',
    confidenceLine,
    '',
    statementCheckLine,
    ...(visualRowMatchLine ? [visualRowMatchLine] : []),
    ...(reviewReasonLine ? ['', reviewReasonLine] : []),
+   ...(unresolvedRowDetailLine ? [unresolvedRowDetailLine] : []),
    '',
    '━━━━━━━━━━━━━━'
  ];
 
  if (generalFindings.length) {
-   lines.push('', ...generalFindings.slice(0, 8).map((x, i) => `• ${x.detail}`));
+   lines.push('', ...generalFindings.slice(0, 4).map(x => `• ${compactTelegramText(x.detail, 280)}`));
  }
 
  if (referenceFindings.length) {
    lines.push('', '🔎 REFERANS KARŞILAŞTIRMASI', '', '🔴 FARKLAR');
-   referenceFindings.slice(0, 8).forEach(x => {
-     lines.push(`• ${x.title}: ${x.detail}`);
+   referenceFindings.slice(0, 4).forEach(x => {
+     lines.push(`• ${x.title}: ${compactTelegramText(x.detail, 280)}`);
    });
  }
 
@@ -2653,7 +2672,7 @@ async function sendAnalysisResult(
  }
 
  lines.push(formatHistoricalWarning(result?.historicalMatch));
- lines.push('', '━━━━━━━━━━━━━━', '', 'Bu sonuç yalnızca otomatik ön inceleme sonucudur.', 'Güven puanı, bulguların güvenilirliğine dair model tahminidir; belgenin gerçeklik olasılığı değildir.', 'Kesin gerçeklik veya sahtecilik kararı değildir.');
+ lines.push('', '━━━━━━━━━━━━━━', '', 'Otomatik ön incelemedir; kesin sahtecilik kararı değildir.');
 
  const text = lines.join('\n');
 
@@ -2685,6 +2704,7 @@ async function sendAnalysisResult(
  const summaryGeneral = String(summary || '')
    .replace(/🔎\s*REFERANS KARŞILAŞTIRMASI[\s\S]*$/i, '')
    .trim();
+ const conciseSummaryGeneral = compactTelegramText(summaryGeneral, 700);
  const rawReferenceFindings = Array.isArray(result?.primaryForensicFindings)
    ? result.primaryForensicFindings
    : (Array.isArray(result?.referenceForensicReport?.findings)
@@ -2709,27 +2729,27 @@ async function sendAnalysisResult(
        .slice(0, 4);
 
 
+ const specificReviewBlock = manualReviewRequired
+   ? (specificReviewReasonLines.length
+       ? `\nKontrol nedeni:\n${specificReviewReasonLines.map(line => `• ${line}`).join('\n')}\n`
+       : '\nKontrol nedeni: Kritik alanlardan en az biri güvenilir biçimde doğrulanamadı.\n')
+   : '';
  const text =
 
 `${emoji} VERIFYDOC ÖN İNCELEMESİ
 
 ${reviewHeadline}
 
-Risk Seviyesi:
-${riskLabel}
-
 ${confidenceLine}
-${manualReviewRequired ? '\nRisk seviyesi ile kontrol durumu farklı ölçümlerdir. Kritik alanlarda belirsizlik veya karşılaştırma gerektiren bulgu olduğu için manuel kontrol gerekiyor.\n' : ''}
+${specificReviewBlock}
 
 ━━━━━━━━━━━━━━
 
-${summaryGeneral}${criticalReferenceFindings.length || fallbackCriticalReferenceLines.length ? `\n\n🔎 KRİTİK ALAN REFERANS KONTROLÜ\n${criticalReferenceFindings.length ? criticalReferenceFindings.map(item => `• ${item.title}: ${item.detail}`).join('\n') : fallbackCriticalReferenceLines.join('\n')}` : ''}${comparisonWarning}${formatPdfStructureForensics(result?.pdfStructureForensics)}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
+${conciseSummaryGeneral}${criticalReferenceFindings.length || fallbackCriticalReferenceLines.length ? `\n\n🔎 KRİTİK ALAN REFERANS KONTROLÜ\n${criticalReferenceFindings.length ? criticalReferenceFindings.map(item => `• ${item.title}: ${compactTelegramText(item.detail, 280)}`).join('\n') : fallbackCriticalReferenceLines.map(line => compactTelegramText(line, 280)).join('\n')}` : ''}${comparisonWarning}${formatPdfStructureForensics(result?.pdfStructureForensics)}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
 
 ━━━━━━━━━━━━━━
 
-Bu sonuç yalnızca otomatik ön inceleme sonucudur.
-Güven puanı, bulguların güvenilirliğine dair model tahminidir; belgenin gerçeklik olasılığı değildir.
-Kesin gerçeklik veya sahtecilik kararı değildir.`;
+Otomatik ön incelemedir; kesin sahtecilik kararı değildir.`;
 
 
  await sendMessage(
