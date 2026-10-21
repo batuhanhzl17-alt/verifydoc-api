@@ -20,7 +20,7 @@ export function recipientNameLabel(value) {
   if (/^(MUSTERI|GONDEREN|GONDERICI)(?: |$)/.test(label)) return null;
 
   const compact = label.replace(/\s+/g, '');
-  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADIUNVAN|ADISOYAD|ADISOYADI|ADISOYADUNVAN|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISIMUNVAN|ISMI))?$/.test(compact)) return 'recipientName';
+  if (/^(?:ALICI|ALACAKLI)(?:(?:ADI|ADIUNVANI?|ADISOYAD|ADISOYADI|ADISOYADUNVANI?|ADSOYAD|ADSOYADI|UNVAN|UNVANI|ISIM|ISIMUNVANI?|ISMI))?$/.test(compact)) return 'recipientName';
   if (/^(?:BENEFICIARY|BENEFICIARYNAME|PAYEE|PAYEENAME|RECEIVER|RECEIVERNAME|LEHDAR|LEHDARADI|LEHDARUNVANI|FAYDALANICI|FAYDALANICIADI|FAYDALANICIUNVANI)$/.test(compact)) return 'recipientName';
   return null;
 }
