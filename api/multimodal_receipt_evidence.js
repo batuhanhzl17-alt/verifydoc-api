@@ -61,9 +61,17 @@ function normalize(value, field) {
   let text = String(value ?? '').normalize('NFKC').toLocaleLowerCase('tr-TR');
   if (field === 'recipientIBAN') return text.replace(/[^a-z0-9]/g, '').toUpperCase();
   if (field === 'amount') {
-    const raw = text.replace(/[^0-9,.-]/g, '');
-    if (!raw || !/^[-]?[\d.,]+$/.test(raw)) return '';
-    const body = raw.replace(/^-/, '');
+    let raw = text.replace(/[^0-9,+.-]/g, '');
+    if (!raw) return '';
+    // TEB statement rows write debits with a trailing minus (`5.000,00-`),
+    // while other sources and our native-field resolver use a leading minus
+    // (`-5.000,00`). Normalize both to the same signed numeric value.
+    const leadingSign = /^[+-]/.test(raw) ? raw[0] : '';
+    const trailingSign = /[+-]$/.test(raw) ? raw.at(-1) : '';
+    if (leadingSign && trailingSign) return '';
+    const sign = leadingSign === '-' || trailingSign === '-' ? '-' : '';
+    const body = raw.replace(/^[+-]/, '').replace(/[+-]$/, '');
+    if (!body || !/^[\d.,]+$/.test(body)) return '';
     const comma = body.lastIndexOf(',');
     const dot = body.lastIndexOf('.');
     const decimalAt = Math.max(comma, dot);
@@ -83,7 +91,6 @@ function normalize(value, field) {
     }
     const integerDigits = integerPart.replace(/\D/g, '');
     if (!integerDigits) return '';
-    const sign = raw.startsWith('-') ? '-' : '';
     return `${sign}${integerDigits.replace(/^0+(?=\d)/, '')}.${fractionPart.padEnd(2, '0') || '00'}`;
   }
   return text.replace(/[çğıöşü]/g, c => ({ ç:'c', ğ:'g', ı:'i', ö:'o', ş:'s', ü:'u' })[c]).replace(/[^a-z0-9]+/g, ' ').trim();
