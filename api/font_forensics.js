@@ -296,20 +296,64 @@ function pdfIndirectRef(value) {
 function parsePdfIndirectObjects(buffer) {
   const objects = new Map();
   const text = Buffer.from(buffer || []).toString('latin1');
+  // Stream payloads are arbitrary binary data and can contain the byte string
+  // `endobj`. A plain indexOf('endobj') can therefore truncate an object and
+  // hide later font/resource dictionaries. Resolve direct and indirect
+  // /Length values before locating the real endobj token.
+  const directLengths = new Map();
+  const lengthObjectRe = /(?:^|\r?\n|\s)(\d+)\s+(\d+)\s+obj\s*(\d+)\s*endobj\b/g;
+  let lengthMatch;
+  while ((lengthMatch = lengthObjectRe.exec(text))) {
+    const length = Number(lengthMatch[3]);
+    if (Number.isSafeInteger(length) && length >= 0) directLengths.set(`${lengthMatch[1]} ${lengthMatch[2]}`, length);
+  }
   const re = /(?:^|\r?\n|\s)(\d+)\s+(\d+)\s+obj\b/g;
   let m;
   while ((m = re.exec(text))) {
     const key = `${m[1]} ${m[2]}`;
     const bodyStart = re.lastIndex;
-    const end = text.indexOf('endobj', bodyStart);
-    if (end < 0) break;
-    const body = text.slice(bodyStart, end);
-    const streamPos = body.indexOf('stream');
+    const firstEndObj = text.indexOf('endobj', bodyStart);
+    if (firstEndObj < 0) break;
+    const firstBody = text.slice(bodyStart, firstEndObj);
+    const streamMatch = /(?:^|[\r\n])stream(?:\r\n|\n|\r)/.exec(firstBody);
+    let end = firstEndObj;
+    let body = firstBody;
+    let streamPos = -1;
+    if (streamMatch) {
+      streamPos = streamMatch.index + streamMatch[0].lastIndexOf('stream');
+      const dictionaryCandidate = firstBody.slice(0, streamPos);
+      const indirectLengthMatch = dictionaryCandidate.match(/\/Length\s+(\d+)\s+(\d+)\s+R\b/i);
+      const directLengthMatch = dictionaryCandidate.match(/\/Length\s+(\d+)(?!\s+\d+\s+R\b)/i);
+      let dataStart = bodyStart + streamPos + 6;
+      if (text.startsWith('\r\n', dataStart)) dataStart += 2;
+      else if (text.startsWith('\n', dataStart) || text.startsWith('\r', dataStart)) dataStart += 1;
+      let dataLength = directLengthMatch ? Number(directLengthMatch[1]) : null;
+      if (dataLength == null && indirectLengthMatch) {
+        dataLength = directLengths.get(`${indirectLengthMatch[1]} ${indirectLengthMatch[2]}`) ?? null;
+      }
+      let endStream = -1;
+      if (Number.isSafeInteger(dataLength) && dataLength >= 0 && dataStart + dataLength <= buffer.length) {
+        const afterPayload = dataStart + dataLength;
+        const marker = text.indexOf('endstream', afterPayload);
+        // Permit only the PDF-mandated whitespace between payload and marker.
+        if (marker >= afterPayload && marker - afterPayload <= 4 && /^[\r\n\t ]*$/.test(text.slice(afterPayload, marker))) endStream = marker;
+      }
+      if (endStream < 0) endStream = text.indexOf('endstream', dataStart);
+      if (endStream >= 0) {
+        const actualEndObj = text.indexOf('endobj', endStream + 9);
+        if (actualEndObj >= 0) {
+          end = actualEndObj;
+          body = text.slice(bodyStart, end);
+        }
+      }
+    }
+    const streamPosInBody = body.indexOf('stream');
+    const streamPosFinal = streamPosInBody;
     let dictionary = body;
     let stream = null;
-    if (streamPos >= 0) {
-      dictionary = body.slice(0, streamPos);
-      let dataStart = bodyStart + streamPos + 6;
+    if (streamPosFinal >= 0) {
+      dictionary = body.slice(0, streamPosFinal);
+      let dataStart = bodyStart + streamPosFinal + 6;
       if (text.startsWith('\r\n', dataStart)) dataStart += 2;
       else if (text.startsWith('\n', dataStart)) dataStart += 1;
       // /Length may itself be an indirect PDF object (e.g. /Length 65 0 R).
@@ -317,14 +361,17 @@ function parsePdfIndirectObjects(buffer) {
       const indirectLengthMatch = dictionary.match(/\/Length\s+(\d+)\s+(\d+)\s+R\b/i);
       const directLengthMatch = dictionary.match(/\/Length\s+(\d+)(?!\s+\d+\s+R\b)/i);
       let dataEnd = -1;
-      if (!indirectLengthMatch && directLengthMatch) {
-        const n = Number(directLengthMatch[1]);
+      const indirectLength = indirectLengthMatch
+        ? directLengths.get(`${indirectLengthMatch[1]} ${indirectLengthMatch[2]}`)
+        : null;
+      if (directLengthMatch || Number.isSafeInteger(indirectLength)) {
+        const n = directLengthMatch ? Number(directLengthMatch[1]) : indirectLength;
         if (Number.isSafeInteger(n) && n >= 0 && dataStart + n <= buffer.length) {
           dataEnd = dataStart + n;
         }
       }
       if (dataEnd < 0) {
-        const localEnd = body.indexOf('endstream', streamPos + 6);
+        const localEnd = body.indexOf('endstream', streamPosFinal + 6);
         if (localEnd >= 0) dataEnd = bodyStart + localEnd;
       }
       if (dataEnd >= 0) stream = buffer.subarray(dataStart, dataEnd);
@@ -358,7 +405,9 @@ function pdfDictRefsInMap(dictionary) {
 function parsePdfObjectStreams(objects) {
   const embedded = new Map(objects);
   for (const obj of objects.values()) {
-    if (!/\/Type\s+\/ObjStm\b/i.test(obj.dictionary) || !obj.stream) continue;
+    // PDF names are delimited by `/`; whitespace is optional. Many compact
+    // bank PDFs serialize this as `/Type/ObjStm` and `/Type/Font`.
+    if (!/\/Type\s*\/ObjStm\b/i.test(obj.dictionary) || !obj.stream) continue;
     const filters = parsePdfFilterNames(obj.dictionary);
     const decoded = filters.length ? decodePdfStream(obj.stream, filters) : obj.stream;
     if (!decoded) continue;
@@ -446,7 +495,7 @@ function extractPdfObjectGraphFontNamesFromBuffer(buffer) {
         for (const ref of refs.values()) inspectFont(ref);
       }
     }
-    if (/\/Type\s+\/Font\b/i.test(obj.dictionary)) {
+    if (/\/Type\s*\/Font\b/i.test(obj.dictionary)) {
       inspectFont(obj.key);
     }
   }
@@ -816,7 +865,7 @@ function mergeFontRecord(map, rec) {
 async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
   if (!pdfPath || !pdfjsLib) return null;
   const stat = await fs.stat(pdfPath);
-  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v33-active-font-resource-bridge`;
+  const cacheKey = `${pdfPath}:${stat.size}:${stat.mtimeMs}:${Number(options.maxPages) || 5}:v34-resolved-common-fonts`;
   if (fontProfileCache.has(cacheKey)) return fontProfileCache.get(cacheKey);
 
   const buffer = await fs.readFile(pdfPath);
@@ -837,6 +886,13 @@ async function extractPdfFontProfile(pdfPath, pdfjsLib, options = {}) {
     for (let pageNumber = 1; pageNumber <= maxPages; pageNumber++) {
       const page = await pdf.getPage(pageNumber);
       const viewport = page.getViewport({ scale: 1 });
+      // getTextContent exposes PDF.js internal ids such as `g_d19_f5`, but it
+      // does not guarantee that the corresponding shared font object has been
+      // resolved yet. The font object's canonical `name` (for example
+      // `FTIWII+CourierNewPSMT`) becomes available once the operator list has
+      // been evaluated. Resolve it first so fontDescriptor can report the real
+      // embedded/BaseFont name instead of leaking the internal alias.
+      await page.getOperatorList();
       const content = await page.getTextContent({ disableCombineTextItems: false });
       const pageItems = [];
 
