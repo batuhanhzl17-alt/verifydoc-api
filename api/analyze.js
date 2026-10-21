@@ -12180,6 +12180,11 @@ function referenceFormatMatches(filePath, format) {
 function detectReferenceVariantFromText(text) {
   const t = normalizeFieldTextForMatch(text || '');
   if (!t) return null;
+  // Garanti account-to-account transfer slips can also contain FAST-related
+  // text in their transaction details. Prefer the explicit document title
+  // over incidental body labels such as "FAST REF NO".
+  if (/HESAPTAN HESABA HAVALE|HESAPTAN HESABA PARA AKTARMA|DEKONT\s*\/\s*HVL/.test(t)) return 'hvl';
+  if (/HESAPTAN FAST|GIDEN FAST|FAST GIDEN|DEKONT\s*\/\s*EFT/.test(t)) return 'eft';
   const hasHvl = /DEKONT\s*\/\s*HVL|\bHVL\b|HAVALE UCRETI|PARA AKTARMA/.test(t);
   const hasEftFast = /DEKONT\s*\/\s*EFT|\bEFT\b|GIDEN FAST|FAST GIDEN|FAST UCRETI|GIDEN FAST ISLEMI|FAST GIDEN ANLIK ODEME|HESAPTAN FAST|FAST MESAJ KODU|FAST SORGU NO|FAST ISLEMI/.test(t);
   if (hasHvl && !hasEftFast) return 'hvl';
@@ -18018,6 +18023,9 @@ pages.push(pageText);
 }
 
 extractedPdfText = pages.join("\n");
+// Use the PDF text layer as a higher-confidence transaction-family signal
+// than raster OCR. Reset first so a previous request cannot leak its variant.
+activeReferenceVariant = detectReferenceVariantFromText(extractedPdfText);
 console.log(
 "PDF METİN ÇIKARILDI:",
 extractedPdfText.length,
@@ -18350,7 +18358,11 @@ let reference = null;
 let pdfReferenceFieldAssociation = null;
 
 if (type !== "video" && type !== "statement") {
-  reference = await loadReferenceFile(bank, paddleImageOCR, activeReferenceFormat);
+  const referenceSelectionOCR = {
+    ...(paddleImageOCR || {}),
+    text: [extractedPdfText, paddleImageOCR?.text || ''].filter(Boolean).join('\n'),
+  };
+  reference = await loadReferenceFile(bank, referenceSelectionOCR, activeReferenceFormat);
 }
 
 if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCase() === ".pdf") {
@@ -20811,20 +20823,44 @@ if (fontForensics) {
     selectedReferenceFontProfile?.fonts,
     selectedReferenceFontProfile?.pages || [],
   );
-  const referenceAmountFonts = (fontForensics.referenceFontProfiles || []).map(profile => {
-    const families = [...new Set((profile?.fonts || [])
-      .map(font => fontFamily(font?.family || fontFamily(font?.fontName)) || String(font?.family || font?.fontName || '').trim())
-      .filter(Boolean))];
-    return {
-      referenceFile: profile.fileName,
-      family: families.length === 1 ? families[0] : null,
-      status: families.length === 1 ? 'resolved-from-single-family-pdf' : (families.length ? 'multiple-families' : 'unresolved'),
-    };
-  });
+  // Compare the target amount to the font actually used in each reference's
+  // amount field. A bank template commonly uses several families on the page;
+  // its page-wide font catalog cannot answer the amount-font question.
+  const referenceAmountFonts = [];
+  for (const profile of (fontForensics.referenceFontProfiles || [])) {
+    let amountField = null;
+    try {
+      const referencePath = path.join(REFERENCE_DIR, String(profile?.fileName || ''));
+      if (/\.pdf$/i.test(referencePath)) {
+        const referenceBuffer = await fs.readFile(referencePath);
+        const referencePdf = await getPdfDocument({ data: new Uint8Array(referenceBuffer) }).promise;
+        const association = await extractPdfNativeFieldAssociations(referencePdf);
+        amountField = association?.fields?.amount || null;
+      }
+    } catch (error) {
+      console.warn('REFERENCE AMOUNT FONT ASSOCIATION ERROR:', JSON.stringify({
+        referenceFile: profile?.fileName || null,
+        error: error?.message || String(error),
+      }));
+    }
+    const amountFont = summarizeAmountFont(
+      profile?.activeFontUsages,
+      amountField,
+      profile?.fonts,
+      profile?.pages || [],
+    );
+    referenceAmountFonts.push({
+      referenceFile: profile?.fileName || null,
+      family: amountFont.status === 'resolved' ? amountFont.family : null,
+      style: amountFont.status === 'resolved' ? amountFont.style || null : null,
+      status: amountFont.status,
+      matchMethod: amountFont.matchMethod || null,
+    });
+  }
   const referenceFontComparisons = targetAmountFont.status === 'resolved'
     ? referenceAmountFonts.map(profile => ({
         ...profile,
-        matchesTargetFamily: profile.status === 'resolved-from-single-family-pdf'
+        matchesTargetFamily: profile.status === 'resolved'
           ? normalizeFontName(profile.family) === normalizeFontName(targetAmountFont.family)
           : null,
       }))
