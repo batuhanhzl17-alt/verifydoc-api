@@ -13,7 +13,7 @@ const FIELD_LABELS = {
     /^(?:BENEFICIARY|PAYEE|RECEIVER)(?:\s+(?:ACCOUNT|BANK))?\s+(?:IBAN|ACCOUNT(?:\s+NUMBER)?)$/,
   ],
   amount: [
-    /^(?:ISLEM|TRANSFER|HAVALE|EFT|GONDERILEN|ODEME|ANA|GIDEN(?:\s+FAST(?:\s+EFT)?)?)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
+    /^(?:ISLEM|TRANSFER|HAVALE|EFT|GONDERILEN|GONDERILEN\s+ISLEM|AKTARILAN|ODEME|ANA|GIDEN(?:\s+FAST(?:\s+EFT)?)?)\s+TUTAR(?:I)?(?:\s+(?:TL|TRY))?$/,
     // Vakifbank PDFs may omit the first glyph of the embedded-font label
     // during text extraction ("İŞLEM TUTARI" becomes "LEM TUTARI").
     /^LEM\s+TUTAR(?:I)?$/,
@@ -60,6 +60,24 @@ export function matchesPdfFieldLabel(field, value) {
 
 function normalizeIban(value) {
   return String(value || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+}
+
+function normalizePdfAmount(value) {
+  let raw = String(value || '').normalize('NFKC').replace(/[^0-9,.-]/g, '');
+  const leadingSign = /^[+-]/u.test(raw) ? raw[0] : '';
+  const trailingSign = /[+-]$/u.test(raw) ? raw.at(-1) : '';
+  if (leadingSign && trailingSign) return '';
+  const sign = leadingSign === '-' || trailingSign === '-' ? '-' : '';
+  raw = raw.replace(/^[+-]/u, '').replace(/[+-]$/u, '');
+  if (!raw || !/^[0-9.,]+$/u.test(raw)) return '';
+  const lastSeparator = Math.max(raw.lastIndexOf(','), raw.lastIndexOf('.'));
+  const trailingDigits = lastSeparator >= 0 ? raw.length - lastSeparator - 1 : 0;
+  const hasDecimal = trailingDigits >= 1 && trailingDigits <= 2;
+  const whole = hasDecimal ? raw.slice(0, lastSeparator) : raw;
+  const fraction = hasDecimal ? raw.slice(lastSeparator + 1) : '';
+  const integerDigits = whole.replace(/\D/g, '').replace(/^0+(?=\d)/, '');
+  if (!integerDigits) return '';
+  return `${sign}${integerDigits}.${fraction.padEnd(2, '0') || '00'}`;
 }
 
 function turkishIbanSpan(value) {
@@ -190,13 +208,6 @@ function labelSpans(row, field) {
   return spans.sort((a, b) => (a.end - a.start) - (b.end - b.start));
 }
 
-function startsKnownLabel(items, index) {
-  const first = normalizeLabel(items[index]?.text);
-  if (/^(?:MASRAF|KOMISYON|BSMV|VERGI|SORGU NO|FIS NO|ISLEM NO|BAKIYE|TOPLAM)/.test(first)) return true;
-  const tail = { items: items.slice(index, Math.min(items.length, index + 7)) };
-  return Object.keys(FIELD_LABELS).some(field => labelSpans(tail, field).length > 0);
-}
-
 function resolveField(field, rows, pageWidth, pageHeight) {
   const candidates = [];
   const trace = { typedLabelCandidates: 0, multilineJoinAttempts: 0, checksumValidValues: 0 };
@@ -206,7 +217,14 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       trace.typedLabelCandidates++;
       const labelRight = Math.max(...label.items.map(item => item.x + item.width));
       const labelLeft = Math.min(...label.items.map(item => item.x));
-      const nextLabelIndex = row.items.findIndex((_, index) => index > label.end && startsKnownLabel(row.items, index));
+      // Find the next actual typed label, not a punctuation item that happens
+      // to precede one. On rotated bank PDFs, a standalone colon before a
+      // later `Alıcı ...` label used to become the boundary and truncate the
+      // amount value that appeared before that label.
+      const followingLabelIndices = Object.keys(FIELD_LABELS)
+        .flatMap(labelField => labelSpans(row, labelField).map(span => span.start))
+        .filter(index => index > label.end);
+      const nextLabelIndex = followingLabelIndices.length ? Math.min(...followingLabelIndices) : -1;
       const nextLabel = nextLabelIndex >= 0 ? row.items[nextLabelIndex] : null;
       const nextLabelX = nextLabel?.x ?? Infinity;
       const sameRow = row.items.slice(label.end + 1).filter(item =>
@@ -214,6 +232,17 @@ function resolveField(field, rows, pageWidth, pageHeight) {
       );
       let valueItems = sameRow;
       let valueText = sameRow.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
+      if (field === 'amount' && !validValue(field, valueText)) {
+        // Some rotated/column-based slips place the amount, IBAN, and
+        // beneficiary fields on the same PDF.js baseline. Do not concatenate
+        // those distinct cells into one invalid value; bind the nearest
+        // amount-shaped item after the typed amount label.
+        const directAmount = sameRow.find(item => validValue(field, item.text));
+        if (directAmount) {
+          valueItems = [directAmount];
+          valueText = directAmount.text;
+        }
+      }
 
       // Enpara receipts place the "B/A Para Cinsi Tutar" heading on the
       // table-header row, while the transaction amount sits directly below it.
@@ -233,9 +262,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
           const amountCandidates = nextRow.items.filter(item =>
             item.x < columnRight && item.x + item.width > labelLeft && validValue(field, item.text)
           );
-          const distinctAmounts = new Map(amountCandidates.map(item => [
-            String(item.text).replace(/[^0-9,.-]/g, ''), item
-          ]));
+          const distinctAmounts = new Map(amountCandidates.map(item => [normalizePdfAmount(item.text), item]).filter(([key]) => key));
           if (distinctAmounts.size === 1) {
             valueItems = [distinctAmounts.values().next().value];
             valueText = valueItems[0].text;
@@ -404,7 +431,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
         const hasValueDate = /\bVALOR\s*[:：]?\s*\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(normalizedRowText);
         if (!bankItem || !hasValueDate || !/\bTL\b/i.test(rowText)) continue;
         const amountItems = row.items.filter(item => /\d[\d.,]*\s*-$/.test(String(item.text || '').trim()) && validValue('amount', item.text));
-        const distinct = new Map(amountItems.map(item => [item.text.replace(/[^0-9,.-]/g, ''), item]));
+        const distinct = new Map(amountItems.map(item => [normalizePdfAmount(item.text), item]).filter(([key]) => key));
         if (distinct.size !== 1) continue;
         const item = distinct.values().next().value;
         inferred.push({
@@ -418,7 +445,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
           associationValidated: true,
         });
       }
-      const byValue = new Map(inferred.map(item => [item.value.replace(/[^0-9,.-]/g, ''), item]));
+      const byValue = new Map(inferred.map(item => [normalizePdfAmount(item.value), item]).filter(([key]) => key));
       if (byValue.size === 1) return { status: 'matched', ...[...byValue.values()][0], candidateCount: 1 };
       if (byValue.size > 1) return { status: 'ambiguous', value: null, associationValidated: false, candidateCount: byValue.size, reason: 'multiple-teb-fast-principal-rows', candidates: [...byValue.values()] };
     }
@@ -428,7 +455,7 @@ function resolveField(field, rows, pageWidth, pageHeight) {
     const key = field === 'recipientIBAN'
       ? normalizeIban(candidate.value)
       : field === 'amount'
-        ? candidate.value.replace(/[^0-9,.-]/g, '')
+        ? normalizePdfAmount(candidate.value)
         : normalizeLabel(candidate.value);
     if (key && !distinct.has(key)) distinct.set(key, candidate);
   }
@@ -522,7 +549,7 @@ export async function extractPdfNativeFieldAssociations(pdf, { maxPages = 3 } = 
     const rows = collected[field].filter(item => item.status === 'matched');
     const keys = new Set(rows.map(item => field === 'recipientIBAN'
       ? normalizeIban(item.value)
-      : field === 'amount' ? item.value.replace(/[^0-9,.-]/g, '') : normalizeLabel(item.value)));
+      : field === 'amount' ? normalizePdfAmount(item.value) : normalizeLabel(item.value)));
     if (keys.size === 1 && rows.length) fields[field] = { ...rows[0], pageMatchCount: rows.length };
     else if (keys.size > 1 || collected[field].some(item => item.status === 'ambiguous')) {
       fields[field] = { status: 'ambiguous', value: null, associationValidated: false, candidateCount: keys.size || collected[field].length, reason: 'multiple-pdf-pages-or-labeled-values' };
@@ -594,7 +621,7 @@ export async function extractPdfOcrFieldAssociations(pdf, ocr, { imageWidth, ima
     const matches = collected[field].filter(item => item.status === 'matched');
     const typedLabelCandidates = labelTrace[field];
     const keyOf = item => field === 'recipientIBAN' ? normalizeIban(item.value)
-      : field === 'amount' ? item.value.replace(/[^0-9,.-]/g, '') : normalizeLabel(item.value);
+      : field === 'amount' ? normalizePdfAmount(item.value) : normalizeLabel(item.value);
     const distinct = new Map(matches.map(item => [keyOf(item), item]));
     if (distinct.size === 1) fields[field] = { ...[...distinct.values()][0], typedLabelCandidates, source: 'paddle-ocr-label-value-geometry', resolver: `paddle-ocr-${[...distinct.values()][0].resolver}`, pageMatchCount: matches.length };
     else if (distinct.size > 1 || collected[field].some(item => item.status === 'ambiguous')) fields[field] = { status: 'ambiguous', value: null, associationValidated: false, typedLabelCandidates, candidateCount: distinct.size || collected[field].length, reason: 'multiple-ocr-pages-or-labeled-values', source: 'paddle-ocr-label-value-geometry' };
@@ -625,18 +652,6 @@ export function mergePdfFieldAssociationsWithOcr(nativeResult, ocrResult) {
     }]));
     return { ...nativeResult, fields, sources: ['pdf-text-layer'] };
   }
-  const amountKey = value => {
-    let raw = String(value || '').replace(/[^0-9,.-]/g, '');
-    const negative = raw.startsWith('-');
-    raw = raw.replace(/-/g, '');
-    const separator = Math.max(raw.lastIndexOf(','), raw.lastIndexOf('.'));
-    let whole = raw, fraction = '';
-    if (separator >= 0 && raw.length - separator - 1 > 0 && raw.length - separator - 1 <= 2) {
-      whole = raw.slice(0, separator);
-      fraction = raw.slice(separator + 1);
-    }
-    return `${negative ? '-' : ''}${whole.replace(/\D/g, '').replace(/^0+(?=\d)/, '')}.${fraction.padEnd(2, '0') || '00'}`;
-  };
   const fields = {};
   for (const field of Object.keys(nativeResult.fields || {})) {
     const nativeField = nativeResult.fields[field];
@@ -652,7 +667,7 @@ export function mergePdfFieldAssociationsWithOcr(nativeResult, ocrResult) {
         ocrAssociation: ocrField?.status === 'matched' ? ocrField : null,
         crossSourceConflict: Boolean(ocrField?.status === 'matched' &&
           (field === 'recipientIBAN' ? normalizeIban(nativeField.value) !== normalizeIban(ocrField.value)
-            : field === 'amount' ? amountKey(nativeField.value) !== amountKey(ocrField.value)
+            : field === 'amount' ? normalizePdfAmount(nativeField.value) !== normalizePdfAmount(ocrField.value)
               : normalizeLabel(nativeField.value) !== normalizeLabel(ocrField.value))),
       };
     } else if (nativeField?.status === 'ambiguous') {
