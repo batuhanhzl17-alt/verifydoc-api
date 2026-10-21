@@ -95,7 +95,7 @@ function validValue(field, value) {
   if (field === 'recipientIBAN') return Boolean(turkishIbanSpan(text));
   if (field === 'amount') {
     const normalized = text.replace(/\s+/g, ' ').trim();
-    const amountPattern = /^(?:[-+]?\s*)?(?:₺\s*)?(?:(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?|(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:TL|TRY|₺)?$/i;
+    const amountPattern = /^(?:(?:[-+]?\s*)?(?:₺\s*)?(?:(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?|(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:TL|TRY|₺)?|(?:₺\s*)?(?:(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?|(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?)\s*-\s*(?:TL|TRY|₺)?)$/i;
     return amountPattern.test(normalized) && !/\d{1,2}[./-]\d{1,2}[./-]\d{2,4}/.test(normalized);
   }
   const clean = text.replace(/[^\p{L}'’ .-]/gu, ' ').replace(/\s+/g, ' ').trim();
@@ -108,6 +108,9 @@ function cleanAssociatedValue(field, value) {
   // label and value. Do not leak them into the extracted field value.
   // Keep an amount's leading minus sign; it is part of the transaction value.
   text = text.replace(/^[\s:：=]+/, '').trim();
+  // TEB prints debits with a trailing minus (e.g. `5.000,00-`). Preserve
+  // that sign in the conventional leading position for downstream matching.
+  if (field === 'amount' && /\d\s*-$/.test(text)) text = `-${text.replace(/\s*-$/, '').trim()}`;
   return text;
 }
 
@@ -374,6 +377,44 @@ function resolveField(field, rows, pageWidth, pageHeight) {
         associationValidated: true,
         ...(field === 'recipientIBAN' ? { associationTrace: trace } : {}),
       });
+    }
+  }
+  // TEB's FAST receipt places the principal transfer value in a transaction
+  // table row, without a typed "Tutar" label. The FAST fee and BSMV occupy
+  // separately labeled rows, while the total is a separate summary row. Only
+  // infer the amount when the document has a FAST No, fee/BSMV rows, and one
+  // unique debit amount on the bank-counterparty transaction row.
+  if (field === 'amount' && candidates.length === 0) {
+    const documentText = rows.map(row => row.items.map(item => item.text).join(' ')).join(' ');
+    const normalizedDocumentText = normalizeLabel(documentText);
+    const isTebFastLayout = /\bFAST\s*NO\b/.test(normalizedDocumentText) &&
+      /FAST\s*UCRETI/.test(normalizedDocumentText) && /\bBSMV\b/.test(normalizedDocumentText);
+    if (isTebFastLayout) {
+      const inferred = [];
+      for (const row of rows) {
+        const rowText = row.items.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
+        const normalizedRowText = normalizeLabel(rowText);
+        if (/FAST\s*UCRETI|\bBSMV\b|\bTOPLAM\b|HESAPTAN\s+TOPLAM|KOMISYON|MASRAF/.test(normalizedRowText)) continue;
+        const bankItem = row.items.find(item => /\b[A-Z0-9ÇĞİÖŞÜ .&'-]+(?:BANK|BANKASI|A\.Ş\.?|AS)\b/i.test(item.text));
+        if (!bankItem || !/\bTL\b/i.test(rowText)) continue;
+        const amountItems = row.items.filter(item => /\d[\d.,]*\s*-$/.test(String(item.text || '').trim()) && validValue('amount', item.text));
+        const distinct = new Map(amountItems.map(item => [item.text.replace(/[^0-9,.-]/g, ''), item]));
+        if (distinct.size !== 1) continue;
+        const item = distinct.values().next().value;
+        inferred.push({
+          value: cleanAssociatedValue('amount', item.text),
+          labelText: 'FAST işlem tutarı',
+          pageNumber: item.pageNumber || bankItem.pageNumber || 1,
+          labelBox: boxForItems([bankItem], pageWidth, pageHeight),
+          valueBox: boxForItems([item], pageWidth, pageHeight),
+          resolver: 'teb-fast-principal-transaction-row-v1',
+          validation: 'teb-fast-row-with-fee-bsmv-excluded',
+          associationValidated: true,
+        });
+      }
+      const byValue = new Map(inferred.map(item => [item.value.replace(/[^0-9,.-]/g, ''), item]));
+      if (byValue.size === 1) return { status: 'matched', ...[...byValue.values()][0], candidateCount: 1 };
+      if (byValue.size > 1) return { status: 'ambiguous', value: null, associationValidated: false, candidateCount: byValue.size, reason: 'multiple-teb-fast-principal-rows', candidates: [...byValue.values()] };
     }
   }
   const distinct = new Map();
