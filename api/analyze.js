@@ -6530,8 +6530,23 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
             anchorLines.push({ anchorY, tolerance, lineText, descriptionHits, descriptionMatched, matchedAmountItems, matchedBalanceItems });
           }
           const amountDescriptionCandidates = anchorLines.filter(line => line.descriptionMatched && line.matchedAmountItems.length === 1);
-          const balanceDisambiguated = expectedBalanceCents == null ? [] : amountDescriptionCandidates.filter(line => line.matchedBalanceItems.length === 1);
-          rowLineCandidates = balanceDisambiguated.length ? balanceDisambiguated : amountDescriptionCandidates;
+          // In statements with repeated rows (for example recurring FAST fees),
+          // the description can partially match several same-day transactions.
+          // Prefer the exact date + amount + resulting-balance tuple even when
+          // OCR/model wording does not clear the description threshold. This
+          // tuple is a stronger row anchor and avoids leaving every repeated
+          // row unresolved because the right candidate was filtered too early.
+          const exactFinancialCandidates = expectedBalanceCents == null ? [] : anchorLines.filter(line =>
+            line.matchedAmountItems.length === 1 && line.matchedBalanceItems.length === 1
+          );
+          const balanceDisambiguated = expectedBalanceCents == null ? [] : amountDescriptionCandidates.filter(line =>
+            line.matchedBalanceItems.length === 1
+          );
+          rowLineCandidates = exactFinancialCandidates.length === 1 ? exactFinancialCandidates
+            : exactFinancialCandidates.length > 1
+              ? (exactFinancialCandidates.filter(line => line.descriptionMatched).length === 1
+                ? exactFinancialCandidates.filter(line => line.descriptionMatched) : exactFinancialCandidates)
+              : balanceDisambiguated.length ? balanceDisambiguated : amountDescriptionCandidates;
           if (expectedAmountCents == null) reason = 'Satırda borç/alacak tutarı yapılandırılmış değil.';
           else if (rowLineCandidates.length > 1) reason = `Tarih, açıklama ve tutar ölçütlerini karşılayan ${rowLineCandidates.length} ayrı satır bulundu; eşleşme belirsiz bırakıldı.`;
           else if (rowLineCandidates.length === 0) {
