@@ -33,6 +33,31 @@ function moneyTokens(text) {
   return matches.map(text => ({ text: text.trim(), cents: moneyCents(text) }));
 }
 
+export function normalizePaddleOcrBox(value) {
+  if (!value) return null;
+  // Paddle SDK versions may return rec_boxes as [x1,y1,x2,y2], as a polygon
+  // [[x,y], ...], or wrapped one level deeper. Flatten point arrays before
+  // deciding which representation was returned.
+  if (!Array.isArray(value) && typeof value === 'object') {
+    const x1 = Number(value.x1 ?? value.left), y1 = Number(value.y1 ?? value.top);
+    const x2 = Number(value.x2 ?? value.right), y2 = Number(value.y2 ?? value.bottom);
+    if ([x1, y1, x2, y2].every(Number.isFinite) && x2 > x1 && y2 > y1) return { x1, y1, x2, y2 };
+    value = value.points ?? value.polygon ?? value.poly ?? value.box ?? value.bbox ?? null;
+  }
+  if (!Array.isArray(value)) return null;
+  const numbers = value.flat(Infinity).map(Number);
+  if (numbers.length < 4 || numbers.some(number => !Number.isFinite(number))) return null;
+  let xs, ys;
+  if (numbers.length === 4) {
+    [xs, ys] = [[numbers[0], numbers[2]], [numbers[1], numbers[3]]];
+  } else if (numbers.length >= 6 && numbers.length % 2 === 0) {
+    xs = numbers.filter((_, index) => index % 2 === 0);
+    ys = numbers.filter((_, index) => index % 2 === 1);
+  } else return null;
+  const box = { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
+  return box.x2 > box.x1 && box.y2 > box.y1 ? box : null;
+}
+
 function boxOf(region) {
   const box = region?.region;
   if (!box) return null;
