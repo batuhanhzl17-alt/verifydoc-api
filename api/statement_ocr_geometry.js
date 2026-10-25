@@ -58,6 +58,16 @@ export function normalizePaddleOcrBox(value) {
   return box.x2 > box.x1 && box.y2 > box.y1 ? box : null;
 }
 
+// Statement uploads can have their full-document Paddle result in either slot:
+// the text-layer fallback (`paddleDocumentOCR`) or the always-run forensic OCR
+// (`paddleImageOCR`). Prefer whichever actually carries per-page boxes.
+export function selectStatementPaddleOcr(documentOcr, imageOcr) {
+  const hasRegions = value => value?.success === true && Array.isArray(value?.regions) && value.regions.length > 0;
+  if (hasRegions(documentOcr)) return { result: documentOcr, source: 'paddleDocumentOCR' };
+  if (hasRegions(imageOcr)) return { result: imageOcr, source: 'paddleImageOCR' };
+  return { result: documentOcr || imageOcr || null, source: null };
+}
+
 function boxOf(region) {
   const box = region?.region;
   if (!box) return null;
