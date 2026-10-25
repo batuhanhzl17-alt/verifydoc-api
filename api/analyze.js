@@ -20728,7 +20728,7 @@ function summarizeAmountFont(usages, amountField, fontCatalog = [], pageDimensio
   const exactMatches = matched.filter(item => item.exactAmountText);
   const selectedMatches = exactMatches.length ? exactMatches : matched;
   const unique = [...new Map(selectedMatches.map(item => [`${item.family || 'unknown'}|${item.style}|${item.pageNumber}|${item.matchedText}`, item])).values()];
-  if ((!unique.length || unique.every(item => !item.family)) && amountValueBox && Array.isArray(pageDimensions)) {
+  if ((unique.length !== 1 || !unique[0]?.family) && amountValueBox && Array.isArray(pageDimensions)) {
     // PDF.js may split the amount into several text items (for example
     // `1.000`, `,00`, and ` TL`). Associate font usages with the typed-label
     // amount box in page coordinates instead of requiring one item to contain
