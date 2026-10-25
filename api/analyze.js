@@ -13,7 +13,7 @@ import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Roi
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
 import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
-import { resolveStatementPaddleOcrRow, normalizeStatementRowCounts } from "./statement_ocr_geometry.js";
+import { resolveStatementPaddleOcrRow, normalizeStatementRowCounts, normalizePaddleOcrBox } from "./statement_ocr_geometry.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { analyzePdfStructure } from "./pdf_structure_forensics.js";
@@ -2205,97 +2205,9 @@ Number.isFinite(score)
 allScores.push(score);
 }
 
-let region = null;
-
-if (
-Array.isArray(boxes[textIndex]) &&
-boxes[textIndex].length >= 4
-) {
-
-const box =
-boxes[textIndex]
-.map(Number);
-
-if (
-box.every(Number.isFinite)
-) {
-
-region = {
-
-type:
-"box",
-
-x1:
-Math.min(box[0], box[2]),
-
-y1:
-Math.min(box[1], box[3]),
-
-x2:
-Math.max(box[0], box[2]),
-
-y2:
-Math.max(box[1], box[3]),
-};
-
-}
-
-}
-else if (
-Array.isArray(polys[textIndex])
-) {
-
-const points =
-polys[textIndex]
-.flat(Infinity)
-.map(Number)
-.filter(Number.isFinite);
-
-if (
-points.length >= 8
-) {
-
-const xs = [];
-const ys = [];
-
-for (
-let i = 0;
-i + 1 < points.length;
-i += 2
-) {
-
-xs.push(points[i]);
-ys.push(points[i + 1]);
-
-}
-
-if (
-xs.length &&
-ys.length
-) {
-
-region = {
-type:
-"polygon",
-
-x1:
-Math.min(...xs),
-
-y1:
-Math.min(...ys),
-
-x2:
-Math.max(...xs),
-
-y2:
-Math.max(...ys),
-};
-
-}
-
-}
-
-}
+// Handle both axis-aligned rec_boxes and polygon rec_polys across SDK response
+// versions. A malformed rec_boxes entry must not prevent trying rec_polys.
+const region = normalizePaddleOcrBox(boxes[textIndex]) || normalizePaddleOcrBox(polys[textIndex]);
 
 allRegions.push({
 pageIndex,
@@ -2371,10 +2283,15 @@ console.log(
 confidence
 );
 
-console.log(
-"PADDLEOCR REGION SAYISI:",
-allRegions.length
-);
+const validBoxRegions = allRegions.filter(item => item.region);
+console.log("PADDLEOCR REGION SAYISI:", allRegions.length);
+console.log("PADDLEOCR GEOMETRİ KUTU SAYISI:", JSON.stringify({
+  textRegions: allRegions.length,
+  validBoxRegions: validBoxRegions.length,
+  missingBoxRegions: allRegions.length - validBoxRegions.length,
+  validBoxRegionsByPage: pageGeometry.map((_, pageIndex) => validBoxRegions.filter(item => item.pageIndex === pageIndex).length),
+  sample: validBoxRegions.slice(0, 2).map(item => ({ pageIndex: item.pageIndex, text: item.text, region: item.region })),
+}));
 console.log("PADDLEOCR SAYFA GEOMETRİSİ:", JSON.stringify(pageGeometry));
 
 const output = {
@@ -6702,6 +6619,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           azureTableReason: azureTableResolved?.reason || null,
           azureLineReason: azureLineResolved?.reason || null,
           paddleOcrReason: paddleResolved?.reason || null,
+          paddleOcrDateAnchorCount: paddleResolved?.dateAnchorCount ?? null,
+          paddleOcrCandidateLineCount: paddleResolved?.distinctCandidateLineCount ?? null,
+          paddleOcrCandidateLines: paddleResolved?.candidateLines || [],
           paddleOcrConfidence: paddleResolved?.ocrConfidence ?? null,
           paddleGeometryMappedToPdf: selectedAmountItem?.paddle ? Boolean(paddleResolved?.geometryMappedToPdf) : false,
         });
@@ -19838,9 +19758,12 @@ for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
   const matched = pageRows.filter(item => item.status === 'matched');
   const unresolved = pageRows.filter(item => item.status !== 'matched');
   const reasonCounts = {};
+  const paddleReasonCounts = {};
   for (const item of unresolved) {
     const reason = String(item.reason || 'Neden belirtilmedi.').split('.')[0].slice(0, 110);
     reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
+    const paddleReason = String(item.paddleOcrReason || 'PaddleOCR nedeni kaydedilmedi.').split('.')[0].slice(0, 110);
+    paddleReasonCounts[paddleReason] = (paddleReasonCounts[paddleReason] || 0) + 1;
   }
   console.log("HESAP ÖZETİ SATIR ROI EŞLEŞME DETAYI:", JSON.stringify({
     pageNumber,
@@ -19852,9 +19775,13 @@ for (let pageNumber = 1; pageNumber <= statementPageCount; pageNumber++) {
     })),
     unresolvedCount: unresolved.length,
     unresolvedReasonCounts: reasonCounts,
+    paddleOcrUnresolvedReasonCounts: paddleReasonCounts,
     unresolvedExamples: unresolved.slice(0, 5).map(item => ({
       rowNumber: item.rowNumber, date: item.date, amount: item.amountValue,
       reason: item.reason, azureTableReason: item.azureTableReason, azureLineReason: item.azureLineReason,
+      paddleOcrReason: item.paddleOcrReason,
+      paddleOcrDateAnchorCount: item.paddleOcrDateAnchorCount,
+      paddleOcrCandidateLineCount: item.paddleOcrCandidateLineCount,
     })),
   }));
 }
