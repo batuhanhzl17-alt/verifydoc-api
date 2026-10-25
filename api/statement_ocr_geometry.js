@@ -67,6 +67,8 @@ function chooseColumn(items, centerX) {
 function pdfBox(pixelBox, pageGeometry) {
   const width = Number(pageGeometry?.width), height = Number(pageGeometry?.height);
   if (!(width > 0 && height > 0)) return null;
+  // Whole-row OCR regions can associate rows but are too broad for localized ROIs.
+  if (pixelBox.width / width > 0.28 || pixelBox.height / height > 0.08) return null;
   return {
     x: Math.max(0, Math.min(1, pixelBox.x / width)),
     y: Math.max(0, Math.min(1, pixelBox.y / height)),
@@ -75,7 +77,7 @@ function pdfBox(pixelBox, pageGeometry) {
   };
 }
 
-export function resolveStatementPaddleOcrRow(row, regions, pageNumber, pageGeometry = null) {
+export function resolveStatementPaddleOcrRow(row, regions, pageNumber, pageGeometry = null, claimedLines = []) {
   const key = dateKey(row?.date);
   const amountRaw = row?.debitAmount != null && row?.debitAmount !== '' ? row.debitAmount
     : row?.creditAmount != null && row?.creditAmount !== '' ? row.creditAmount : null;
@@ -118,17 +120,43 @@ export function resolveStatementPaddleOcrRow(row, regions, pageNumber, pageGeome
     if (!exactTuple || (!descriptionMatched && !idMatched && expectedBalance == null)) continue;
     if (candidates.some(candidate => Math.abs(candidate.cy - anchor.cy) <= Math.max(candidate.tolerance, anchor.tolerance))) continue;
     candidates.push({ cy: anchor.cy, tolerance: anchor.tolerance, band, amount: amountItems[0], balance: balanceItems.length === 1 ? balanceItems[0] : null,
-      lineText, descriptionMatched, idMatched });
+      lineText, descriptionMatched, descriptionHits, idMatched });
   }
 
-  if (candidates.length !== 1) return {
+  // Nearby date anchors can have overlapping bands and point to the same OCR financial boxes.
+  // Collapse those into one visual row before deciding whether the match is ambiguous.
+  const uniqueCandidates = [];
+  for (const item of candidates) {
+    const same = uniqueCandidates.find(existing => {
+      const amountNear = Math.abs(existing.amount.box.cy - item.amount.box.cy) <= Math.max(3, existing.amount.box.height * 0.5, item.amount.box.height * 0.5);
+      const columnNear = Math.abs(existing.amount.box.cx - item.amount.box.cx) <= Math.max(8, existing.amount.box.width * 0.12, item.amount.box.width * 0.12);
+      const balanceNear = expectedBalance == null || (existing.balance && item.balance && Math.abs(existing.balance.box.cy - item.balance.box.cy) <= Math.max(3, existing.balance.box.height * 0.5, item.balance.box.height * 0.5));
+      return amountNear && columnNear && balanceNear;
+    });
+    if (!same) uniqueCandidates.push(item);
+    else {
+      const oldScore = (same.idMatched ? 1000 : 0) + same.descriptionHits - Math.abs(same.cy - same.amount.box.cy) / 100;
+      const newScore = (item.idMatched ? 1000 : 0) + item.descriptionHits - Math.abs(item.cy - item.amount.box.cy) / 100;
+      if (newScore > oldScore) uniqueCandidates[uniqueCandidates.indexOf(same)] = item;
+    }
+  }
+  const availableCandidates = uniqueCandidates.filter(item => !(Array.isArray(claimedLines) && claimedLines.some(claim =>
+    Math.abs(Number(claim.y) - item.amount.box.cy) <= Math.max(Number(claim.tolerance) || 3, item.amount.box.height, 3)
+  )));
+  let candidate = availableCandidates.length === 1 ? availableCandidates[0] : null;
+  if (!candidate && availableCandidates.length > 1) {
+    const ranked = availableCandidates.map(item => ({ item, score: (item.idMatched ? 1000 : 0) + item.descriptionHits })).sort((a,b) => b.score-a.score);
+    if (ranked[0]?.score > 0 && ranked[0].score > ranked[1]?.score) candidate = ranked[0].item;
+  }
+  if (!candidate) return {
     status: 'unresolved', source: 'paddle-ocr-geometry', dateAnchorCount: dateAnchors.length,
-    distinctCandidateLineCount: candidates.length,
-    reason: candidates.length ? `${candidates.length} PaddleOCR satır adayı kaldı; güvenli seçim yapılamadı.`
-      : 'PaddleOCR geometri satırlarında tarih, tutar ve varsa bakiye tekil olarak eşleşmedi.',
+    distinctCandidateLineCount: availableCandidates.length,
+    candidateLines: availableCandidates.slice(0,8).map(item=>({y:Math.round(item.cy),amount:item.amount?.token?.text||null,balance:item.balance?.token?.text||null,descriptionHits:item.descriptionHits,transactionIdMatched:item.idMatched})),
+    reason: availableCandidates.length ? `${availableCandidates.length} PaddleOCR sat\u0131r aday\u0131 kald\u0131; g\u00fcvenli se\u00e7im yap\u0131lamad\u0131.`
+      : candidates.length ? 'Bu OCR finansal sat\u0131r\u0131 daha \u00f6nce ba\u015fka bir i\u015fleme ba\u011fland\u0131.'
+        : 'PaddleOCR geometri sat\u0131rlar\u0131nda tarih, tutar ve varsa bakiye tekil olarak e\u015fle\u015fmedi.',
   };
 
-  const candidate = candidates[0];
   const amountBox = pdfBox(candidate.amount.box, pageGeometry);
   const balanceBox = candidate.balance ? pdfBox(candidate.balance.box, pageGeometry) : null;
   return {
@@ -138,6 +166,25 @@ export function resolveStatementPaddleOcrRow(row, regions, pageNumber, pageGeome
     geometryMappedToPdf: Boolean(amountBox),
     ocrConfidence: Math.round(Math.min(candidate.amount.score, candidate.balance?.score ?? candidate.amount.score) * 100),
     descriptionMatched: candidate.descriptionMatched, transactionIdMatched: candidate.idMatched,
-    rowBand: { y: candidate.cy, itemCount: candidate.band.length },
+    rowBand: { y: candidate.amount.box.cy, height: candidate.amount.box.height, itemCount: candidate.band.length },
   };
+}
+
+
+export function normalizeStatementRowCounts(transactionAnalysis) {
+  const analysis = transactionAnalysis && typeof transactionAnalysis === 'object' ? transactionAnalysis : {};
+  const rows = Array.isArray(analysis.rows) ? analysis.rows : [];
+  const extractedRowCount = rows.filter(row =>
+    Number.isInteger(Number(row?.pageNumber)) && Number.isInteger(Number(row?.rowNumber)) &&
+    (moneyCents(row?.debitAmount) !== null || moneyCents(row?.creditAmount) !== null)
+  ).length;
+  const priorCount = Number(analysis.modelReportedTransactionCount);
+  const reportedCount = Number.isFinite(priorCount) && priorCount > 0
+    ? priorCount : (Number(analysis.transactionCount) || 0);
+  if (reportedCount > 0 && reportedCount !== extractedRowCount && analysis.modelReportedTransactionCount == null) {
+    analysis.modelReportedTransactionCount = reportedCount;
+  }
+  analysis.extractedRowCount = extractedRowCount;
+  analysis.transactionCount = extractedRowCount;
+  return { reportedCount, extractedRowCount, mismatch: reportedCount > 0 && reportedCount !== extractedRowCount };
 }
