@@ -13,7 +13,7 @@ import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Roi
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
 import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
-import { resolveStatementPaddleOcrRow } from "./statement_ocr_geometry.js";
+import { resolveStatementPaddleOcrRow, normalizeStatementRowCounts } from "./statement_ocr_geometry.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { analyzePdfStructure } from "./pdf_structure_forensics.js";
@@ -6531,7 +6531,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           : azureLineResolved?.status === 'matched' ? azureLineResolved
             : azureTableResolved || azureLineResolved;
         let paddleResolved = dateAnchors.length === 0 && azureResolved?.status !== 'matched'
-          ? resolveStatementPaddleOcrRow(row, paddleOcr?.regions, pageNumber, paddlePageGeometry)
+          ? resolveStatementPaddleOcrRow(row, paddleOcr?.regions, pageNumber, paddlePageGeometry, paddleClaimedLines)
           : { status: 'unresolved', reason: 'PaddleOCR yedeği gerekli değil.' };
         if (paddleResolved.status === 'matched' && paddleClaimedLines.some(claim =>
           Math.abs(claim.y - Number(paddleResolved.rowBand?.y)) <= Math.max(claim.tolerance, 3)
@@ -16926,6 +16926,7 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   const balanceAnalysis = result.balanceAnalysis && typeof result.balanceAnalysis === 'object'
     ? result.balanceAnalysis : {};
   const rows = Array.isArray(transactionAnalysis.rows) ? transactionAnalysis.rows : [];
+  const normalizedCounts = normalizeStatementRowCounts(transactionAnalysis);
   const orderedRows = rows.map((row, index) => ({ ...row, _index: index }))
     .sort((a, b) => (Number(a.pageNumber) - Number(b.pageNumber)) || (Number(a.rowNumber) - Number(b.rowNumber)) || a._index - b._index);
 
@@ -17017,9 +17018,10 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     Number.isInteger(Number(row.pageNumber)) && Number.isInteger(Number(row.rowNumber)) &&
     (statementCents(row.debitAmount) !== null || statementCents(row.creditAmount) !== null)
   );
-  const declaredCount = Number(transactionAnalysis.transactionCount) || 0;
-  const rowCountMismatch = declaredCount > 0 && usableRows.length !== declaredCount;
-  const rowsIncomplete = usableRows.length === 0 || rowCountMismatch;
+  const modelReportedCount = normalizedCounts.reportedCount;
+  // transactionCount and rows are separate model outputs; their difference is
+  // an internal consistency note, not proof that the document has missing rows.
+  const rowsIncomplete = usableRows.length === 0;
   const pageNumbersSeen = new Set(usableRows.map(row => Number(row.pageNumber)));
   const pagesWithRows = pageNumbersSeen.size;
   const pageCoverageComplete = Number(pdfPageCount) > 0 &&
@@ -17035,8 +17037,22 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   const totalOutgoingCents = completeAmounts
     ? usableRows.reduce((sum, row) => sum + (statementCents(row.debitAmount) ?? 0), 0)
     : null;
-  const openingCents = statementCents(balanceAnalysis.openingBalance);
+  let openingCents = statementCents(balanceAnalysis.openingBalance);
   const documentClosingCents = statementCents(balanceAnalysis.documentClosingBalance);
+  // If the opening balance is missing, infer it from a fully continuous,
+  // ordered balance chain and its oldest transaction.
+  if (openingCents === null && !rowsIncomplete && completeAmounts && usableRows.length >= 2 &&
+      bestOrder.checks >= usableRows.length - 1 && bestOrder.mismatches === 0) {
+    const oldest = bestOrder.direction === 'ascending' ? usableRows[0] : usableRows[usableRows.length - 1];
+    const oldestBalance = statementCents(oldest.balanceAfter);
+    const oldestCredit = statementCents(oldest.creditAmount) ?? 0;
+    const oldestDebit = statementCents(oldest.debitAmount) ?? 0;
+    if (oldestBalance !== null) {
+      openingCents = oldestBalance - oldestCredit + oldestDebit;
+      balanceAnalysis.openingBalance = Number((openingCents / 100).toFixed(2));
+      balanceAnalysis.openingBalanceDerivedFromRows = true;
+    }
+  }
   const calculatedClosingCents = completeAmounts && openingCents !== null
     ? openingCents + totalIncomingCents - totalOutgoingCents
     : null;
@@ -17048,7 +17064,7 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     balanceAnalysis.totalIncoming = Number((totalIncomingCents / 100).toFixed(2));
     balanceAnalysis.totalOutgoing = Number((totalOutgoingCents / 100).toFixed(2));
   }
-  if (calculatedClosingCents !== null) balanceAnalysis.calculatedClosingBalance = Number((calculatedClosingCents / 100).toFixed(2));
+  balanceAnalysis.calculatedClosingBalance = calculatedClosingCents === null ? null : Number((calculatedClosingCents / 100).toFixed(2));
   if (deterministicMismatch) {
     balanceAnalysis.calculationConsistent = false;
     const notes = [];
@@ -17066,24 +17082,20 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
     balanceAnalysis.evidence = [balanceAnalysis.evidence, `Satır bakiyesi devamlılığı ${bestOrder.checks} ardışık karşılaştırmada tutarlı (${bestOrder.direction === 'ascending' ? 'yukarıdan aşağıya' : 'aşağıdan yukarıya'} sıra).`].filter(Boolean).join(' ');
   }
 
-  // Discard narrative count claims and replace them with the structured row
-  // count comparison below. The model's prose can disagree with its row array.
+  // Discard narrative count claims; the model count is not a document-declared row total.
   const staleCountClaim = /(bildirilen|beyan edilen|toplam).{0,40}(kayıt|işlem|satır).{0,80}(fark|eksik|arasında)|(?:\d+).{0,30}(işlem|satır).{0,40}(arasında|fark)/i;
   transactionAnalysis.suspiciousTransactions = (Array.isArray(transactionAnalysis.suspiciousTransactions)
     ? transactionAnalysis.suspiciousTransactions : []).filter(item => !staleCountClaim.test(String(item || '')));
-  if (rowCountMismatch) {
-    transactionAnalysis.suspiciousTransactions.push(
-      `Belgede bildirilen ${declaredCount} işlem satırı ile yapılandırılmış olarak çıkarılan ${usableRows.length} satır uyuşmuyor; satır sayımı manuel kontrol edilmeli.`
-    );
-  }
   const existingDuplicates = Array.isArray(transactionAnalysis.duplicateTransactions) ? transactionAnalysis.duplicateTransactions : [];
   transactionAnalysis.duplicateTransactions = [...new Set([...existingDuplicates, ...derivedDuplicates])];
   transactionAnalysis.repeatedTransactionPatterns = repeatedPatterns;
   transactionAnalysis.rows = orderedRows.map(({ _index, ...row }) => row);
   transactionAnalysis.rowByRowAudit = {
+    modelReportedTransactionCount: modelReportedCount || null,
+    modelCountDifference: modelReportedCount > 0 ? modelReportedCount - usableRows.length : null,
     available: usableRows.length > 0,
     extractedRowCount: usableRows.length,
-    declaredTransactionCount: declaredCount || null,
+    declaredTransactionCount: null,
     balanceOrder: bestOrder.direction,
     balanceChecks: bestOrder.checks,
     balanceMismatchCount: bestOrder.mismatches,
@@ -17110,7 +17122,6 @@ function applyStatementLedgerChecks(statementResult, pdfPageCount, pdfForensics)
   if (deterministicMismatch) findings.push('Satır bazlı bakiye hesabında fark bulundu; örnek satırlar ve beklenen bakiyeler rapora eklendi.');
   if (derivedDuplicates.length) findings.push(`${derivedDuplicates.length} olası yinelenen işlem grubu bulundu; tekrarlar ayrı listelendi.`);
   if (usableRows.length === 0) findings.push('Yapılandırılmış işlem satırı çıkarılamadığı için bakiye zinciri doğrulanamadı.');
-  if (rowCountMismatch) findings.push(`Analizin bildirdiği ${declaredCount} işlem ile satır listesinden çıkarılan ${usableRows.length} işlem uyuşmuyor; tüm bakiye zinciri doğrulanmış sayılmamalı.`);
   if (rowsIncomplete) findings.push(`Satır doğrulaması eksik: bakiye matematiği yalnızca çıkarılan ${usableRows.length} satır için geçerlidir; belgenin tamamı doğrulanmış sayılmaz.`);
   if (!pageCoverageComplete) findings.push(`PDF'nin ${pdfForensics?.pagesAnalyzed || 0}/${pdfPageCount || '?'} sayfasındaki yerel PDF denetimi tamamlanamadı.`);
   if (pdfForensics?.findings?.length) findings.push(...pdfForensics.findings.map(item => item.detail));
