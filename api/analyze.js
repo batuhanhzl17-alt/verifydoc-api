@@ -13,7 +13,7 @@ import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Roi
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
 import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
-import { resolveStatementPaddleOcrRow, normalizeStatementRowCounts, normalizePaddleOcrBox } from "./statement_ocr_geometry.js";
+import { resolveStatementPaddleOcrRow, normalizeStatementRowCounts, normalizePaddleOcrBox, selectStatementPaddleOcr } from "./statement_ocr_geometry.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { analyzePdfStructure } from "./pdf_structure_forensics.js";
@@ -19665,12 +19665,19 @@ console.log("HESAP ÖZETİ BANKA KİMLİĞİ ÇAPRAZ KONTROLÜ:", JSON.stringify
     : statementReference?.bank || null,
 }));
 
+const selectedStatementPaddleOcr = selectStatementPaddleOcr(paddleDocumentOCR, paddleImageOCR);
+console.log("HESAP ÖZETİ PADDLE OCR GEOMETRİ KAYNAĞI:", JSON.stringify({
+  selectedSource: selectedStatementPaddleOcr.source,
+  success: selectedStatementPaddleOcr.result?.success === true,
+  pageCount: selectedStatementPaddleOcr.result?.pages || selectedStatementPaddleOcr.result?.pageGeometry?.length || 0,
+  regionCount: selectedStatementPaddleOcr.result?.regions?.length || 0,
+}));
 const statementPdfForensics = await runStatementPdfForensics(
   filePath,
   buffer,
   statementModelResult?.transactionAnalysis?.rows || [],
   azureLayout,
-  paddleDocumentOCR
+  selectedStatementPaddleOcr.result
 );
 const statementPageCount = Number(statementPdfForensics?.pageCount) || 0;
 const statementResult = applyStatementLedgerChecks(
