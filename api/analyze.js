@@ -6530,7 +6530,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         const azureResolved = azureTableResolved?.status === 'matched' ? azureTableResolved
           : azureLineResolved?.status === 'matched' ? azureLineResolved
             : azureTableResolved || azureLineResolved;
-        let paddleResolved = dateAnchors.length === 0 && azureResolved?.status !== 'matched'
+        let paddleResolved = azureResolved?.status !== 'matched' && Array.isArray(paddleOcr?.regions) && paddleOcr.regions.length > 0
           ? resolveStatementPaddleOcrRow(row, paddleOcr?.regions, pageNumber, paddlePageGeometry, paddleClaimedLines)
           : { status: 'unresolved', reason: 'PaddleOCR yedeği gerekli değil.' };
         if (paddleResolved.status === 'matched' && paddleClaimedLines.some(claim =>
@@ -6538,8 +6538,6 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         )) {
           paddleResolved = { ...paddleResolved, status: 'unresolved', amountBox: null, balanceBox: null,
             reason: 'Bu OCR satır bandı başka bir işlem satırına bağlandı; aynı görsel satırın iki kez kullanılmasına izin verilmedi.' };
-        } else if (paddleResolved.status === 'matched') {
-          paddleClaimedLines.push({ y: Number(paddleResolved.rowBand?.y), tolerance: Math.max(3, Number(paddleResolved.rowBand?.height) || 3) });
         }
         if (!Number.isInteger(Number(row?.pageNumber))) reason = 'İşlem satırında sayfa numarası yok.';
         else if (!dateKey) reason = 'Satır tarihi güvenilir biçimde okunamadı; sayfa içi satır ankrajı kurulamadı.';
@@ -6629,16 +6627,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
                 ? exactFinancialCandidates.filter(line => line.descriptionMatched) : exactFinancialCandidates)
               : balanceDisambiguated.length ? balanceDisambiguated : amountDescriptionCandidates;
           if (expectedAmountCents == null) reason = 'Satırda borç/alacak tutarı yapılandırılmış değil.';
-          else if (rowLineCandidates.length > 1) reason = `Tarih, açıklama ve tutar ölçütlerini karşılayan ${rowLineCandidates.length} ayrı satır bulundu; eşleşme belirsiz bırakıldı.`;
-          else if (rowLineCandidates.length === 0) {
-            const hasDescription = anchorLines.some(line => line.descriptionMatched);
-            const hasAmount = anchorLines.some(line => line.matchedAmountItems.length === 1);
-            reason = !hasDescription
-              ? `Aynı tarihli ${anchorLines.length} satır adayında açıklama eşleşmedi.`
-              : !hasAmount
-                ? 'Açıklamayla eşleşen tarih satırında beklenen tutar tekil olarak bulunamadı.'
-                : 'Tarih, açıklama ve tutar aynı görsel satırda tekil eşleşmedi.';
-          } else {
+          else if (rowLineCandidates.length === 1) {
             const matchedLine = rowLineCandidates[0];
             selectedRowLine = matchedLine;
             selectedAmountItem = matchedLine.matchedAmountItems[0];
@@ -6660,7 +6649,38 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
                 });
               }
             }
+          } else if (paddleResolved.status === 'matched') {
+            // PDF.js found a date but could not bind this row to a unique native text line.
+            // Use PaddleOCR's image-space geometry as the row-level fallback.
+            status = 'matched';
+            reason = paddleResolved.reason;
+            rowLineCandidates = [paddleResolved];
+            selectedAmountItem = { paddle: true };
+            selectedBalanceItem = paddleResolved.balanceBox ? { paddle: true } : null;
+            if (paddleResolved.amountBox) {
+              const target = { field: row?.debitAmount != null && row?.debitAmount !== '' ? 'debitAmount' : 'creditAmount',
+                value: rowAmountValue, box: paddleResolved.amountBox, text: paddleResolved.amountText };
+              for (const candidate of pdfAuditWhiteCoverCandidates(operators, viewport, target.box, 'amount', target.text)) {
+                localizedOverlayCandidates.push({ pageNumber, rowNumber: row?.rowNumber ?? rowIndex + 1,
+                  transactionId: row?.transactionId || null, field: target.field, expectedValue: target.value,
+                  valueToken: target.text, associationStatus: 'matched', associationReason: reason,
+                  objectType: candidate.objectType, paintOrder: candidate.imagePaintOrderRelativeToFieldText,
+                  overlap: candidate.targetCoverage, box: candidate.box, evidence: candidate.evidence });
+              }
+            }
+          } else if (rowLineCandidates.length > 1) reason = `Tarih, açıklama ve tutar ölçütlerini karşılayan ${rowLineCandidates.length} ayrı satır bulundu; eşleşme belirsiz bırakıldı.`;
+          else {
+            const hasDescription = anchorLines.some(line => line.descriptionMatched);
+            const hasAmount = anchorLines.some(line => line.matchedAmountItems.length === 1);
+            reason = !hasDescription
+              ? `Aynı tarihli ${anchorLines.length} satır adayında açıklama eşleşmedi.`
+              : !hasAmount
+                ? 'Açıklamayla eşleşen tarih satırında beklenen tutar tekil olarak bulunamadı.'
+                : 'Tarih, açıklama ve tutar aynı görsel satırda tekil eşleşmedi.';
           }
+        }
+        if (status === 'matched' && paddleResolved.status === 'matched') {
+          paddleClaimedLines.push({ y: Number(paddleResolved.rowBand?.y), tolerance: Math.max(3, Number(paddleResolved.rowBand?.height) || 3) });
         }
         rowAssociationDiagnostics.push({
           pageNumber, rowNumber: row?.rowNumber ?? rowIndex + 1, transactionId: row?.transactionId || null,
@@ -6670,20 +6690,20 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           balanceMatched: Boolean(selectedBalanceItem),
           amountValue: rowAmountValue,
           amountBox: azureResolved?.status === 'matched' ? azureResolved.amountBox
-            : paddleResolved?.status === 'matched' ? paddleResolved.amountBox
+            : selectedAmountItem?.paddle ? paddleResolved.amountBox
             : selectedAmountItem ? statementPdfItemBox(selectedAmountItem, viewport) : null,
           balanceBox: azureResolved?.status === 'matched' ? azureResolved.balanceBox
-            : paddleResolved?.status === 'matched' ? paddleResolved.balanceBox
+            : selectedAmountItem?.paddle ? paddleResolved.balanceBox
             : selectedBalanceItem && !selectedBalanceItem.azure ? statementPdfItemBox(selectedBalanceItem, viewport) : null,
           associationSource: azureResolved?.status === 'matched' ? azureResolved.source || 'azure-layout'
-            : paddleResolved?.status === 'matched' ? 'paddle-ocr-geometry'
+            : selectedAmountItem?.paddle ? 'paddle-ocr-geometry'
               : status === 'matched' ? 'pdf-native-text' : 'unresolved',
           azureAssociationReason: azureResolved?.reason || null,
           azureTableReason: azureTableResolved?.reason || null,
           azureLineReason: azureLineResolved?.reason || null,
           paddleOcrReason: paddleResolved?.reason || null,
           paddleOcrConfidence: paddleResolved?.ocrConfidence ?? null,
-          paddleGeometryMappedToPdf: paddleResolved?.geometryMappedToPdf ?? false,
+          paddleGeometryMappedToPdf: selectedAmountItem?.paddle ? Boolean(paddleResolved?.geometryMappedToPdf) : false,
         });
       }
       for (const item of numericTokens) {
