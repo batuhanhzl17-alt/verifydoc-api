@@ -27,6 +27,31 @@ function compactTelegramText(value, maxChars = 700) {
  return `${prefix.slice(0, safeEnd).trimEnd()}…`;
 }
 
+function formatAutomatedCheckSummary(checks) {
+ if (!checks || typeof checks !== 'object' || Array.isArray(checks)) return '';
+ const entries = Object.values(checks).filter(item =>
+   item && typeof item === 'object' && ['pass', 'fail', 'unknown'].includes(String(item.status || '').toLowerCase())
+ );
+ if (!entries.length) return '';
+ const counts = entries.reduce((total, item) => {
+   total[String(item.status).toLowerCase()] += 1;
+   return total;
+ }, { pass: 0, fail: 0, unknown: 0 });
+ return [
+   '🔎 KONTROL ÖZETİ',
+   `İşlenen otomatik kontrol: ${entries.length}`,
+   `✅ Uyumlu kontroller: ${counts.pass}`,
+   `⚠️ İnceleme sinyali: ${counts.fail}`,
+   `☁️ Doğrulanamayan kontroller: ${counts.unknown}`,
+   'Bu sayılar kontrol durumlarını gösterir; tek başına sahtecilik kararı değildir.',
+ ].join('\n');
+}
+
+function getTextIntegrityNotice(summary) {
+ const issuePattern = /(?:türkçe karakter.{0,80}(?:eksik|görünm|bozuk|kaybol|atlan|okunam|boşluklu)|(?:eksik|görünmeyen|bozuk|kaybolan|okunamayan).{0,80}türkçe karakter|metin bütünlüğü.{0,80}(?:sınırlı|bozuk|eksik|sorun))/i;
+ return String(summary || '').split(/(?<=[.!?])\s+|\n+/).map(line => line.trim()).find(line => issuePattern.test(line)) || '';
+}
+
 
 // =====================================================
 // TELEGRAM API
@@ -2090,6 +2115,22 @@ function formatHistoricalWarning(historicalMatch) {
 // =====================================================
 // PDF STRUCTURE TRIAGE — EVIDENCE ONLY
 // =====================================================
+function amountFontMatchesReference(fontForensics) {
+ const typography = fontForensics?.amountTypography || {};
+ return typography.target?.status === 'resolved' &&
+   Array.isArray(typography.referenceFontComparisons) &&
+   typography.referenceFontComparisons.some(item => item.matchesTargetFamily === true);
+}
+
+function shouldShowPdfStructureForensics(triage, fontForensics) {
+ if (triage?.available !== true) return false;
+ const counts = triage.normalizedOperatorCounts || {};
+ const standardTjOnly = Number(counts.textTj) > 0 && Number(counts.textTJ) === 0;
+ // Hide routine PDF inventory when Tj is used without TJ and the amount font
+ // is confirmed against a reference. Keep the block for other profiles.
+ return !(standardTjOnly && amountFontMatchesReference(fontForensics));
+}
+
 function formatPdfStructureForensics(triage) {
   if (triage?.available !== true) return '';
   const counts = triage.normalizedOperatorCounts || {};
@@ -2098,6 +2139,9 @@ function formatPdfStructureForensics(triage) {
     lines.push(`• PDF boyutu: ${Number(triage.fileBytes).toLocaleString('tr-TR')} bayt · ${triage.pageCount || '?'} sayfa`);
   }
   lines.push(`• Metin komutları: Tj ${counts.textTj ?? 0} · TJ ${counts.textTJ ?? 0} · toplam ${counts.textShow ?? 0}`);
+  if (Number(counts.textTj) === 0 && Number(counts.textTJ) > 0) {
+    lines.push('• Bu PDF’de metin TJ komutlarıyla çizilmiş; bu teknik yapı tek başına düzenleme göstergesi değildir.');
+  }
   const quoteOps = (counts.nextLineShowText ?? 0) + (counts.nextLineSetSpacingShowText ?? 0);
   if (quoteOps) lines.push(`• Kısaltılmış satır/metin komutları: ${quoteOps} (Tj/TJ sayımına dahil değil)`);
   lines.push(`• Görsel işlemleri: ${counts.imagePaint ?? 0} · vektör yolları: ${counts.vectorPath ?? 0}`);
@@ -2129,6 +2173,8 @@ function formatFontForensicsWarning(fontForensics) {
  const referenceFontComparisons = Array.isArray(amountTypography.referenceFontComparisons)
    ? amountTypography.referenceFontComparisons
    : [];
+ const score = Number(f.score) || 0;
+ if (score < 18 && amountFontMatchesReference(f)) return '';
  if (referenceFontComparisons.length) {
    const comparisons = referenceFontComparisons.map(item => {
      const family = item.family || 'font ailesi belirlenemedi';
@@ -2144,7 +2190,6 @@ function formatFontForensicsWarning(fontForensics) {
  if (targetAmountFont.status === 'resolved' && hasResolvedReference && !hasFamilyMatch) {
    lines.push('• Tutar font ailesi mevcut referans şablonlarla eşleşmedi; bu tek başına düzenleme veya sahtecilik kanıtı değildir.');
  }
- const score = Number(f.score) || 0;
  if (score < 18) return amountTypography.target ? lines.join('\n') : '';
  const targetOnly = Array.isArray(f.targetOnlyFamiliesAcrossReferences)
    ? f.targetOnlyFamiliesAcrossReferences.filter(Boolean).slice(0, 5)
@@ -2233,9 +2278,15 @@ async function sendAnalysisResult(
  result?.summary ||
  "Analiz tamamlandı.";
 
+ const textIntegrityNotice = getTextIntegrityNotice(summary);
+ const textIntegrityReview = result?.checks?.ocrConsistency?.status === 'fail' || Boolean(textIntegrityNotice);
+ const textIntegrityReviewLine = textIntegrityNotice ||
+   'Metin tutarlılığı kontrolünde sorun sinyali var; ilgili alanlar manuel doğrulanmalı.';
+
  const manualReviewRequired = result?.manualReviewRequired === true ||
    result?.fieldReviewStatus === 'CONTROL_REQUIRED' ||
-   result?.semanticEvidenceFusion?.reviewStatus === 'CONTROL_REQUIRED';
+   result?.semanticEvidenceFusion?.reviewStatus === 'CONTROL_REQUIRED' ||
+   textIntegrityReview;
  const suspiciousFinding = result?.suspicious === true;
  const reviewHeadline = manualReviewRequired
    ? '🟠 KONTROL GEREKLİ'
@@ -2259,10 +2310,17 @@ async function sendAnalysisResult(
    'strong-amount-reference-render-difference': 'Tutar alanında referansla belirgin görüntü farkı var.',
    'strong-reference-field-spacing-anomaly': 'Referans yerleşiminde güçlü alan aralığı farkı var.',
  };
- const specificReviewReasonLines = [...new Set(criticalReviewReasons)]
+ const specificReviewReasonLines = [...new Set([
+   ...criticalReviewReasons,
+   ...(textIntegrityReview ? ['turkish-character-integrity-limitation'] : []),
+ ])]
    .map(reason => reviewReasonLabels[reason])
    .filter(Boolean)
    .slice(0, 3);
+ if (textIntegrityReview && !specificReviewReasonLines.includes(textIntegrityReviewLine)) {
+   specificReviewReasonLines.unshift(textIntegrityReviewLine);
+ }
+ specificReviewReasonLines.splice(3);
 
 
  // ===================================================
@@ -2575,6 +2633,8 @@ async function sendAnalysisResult(
    statementPdfAudit.reviewRequired === true;
  const statementReviewHeadline = verifiedStatementIssue
    ? '🟠 KONTROL GEREKLİ'
+   : textIntegrityReview
+     ? '🟠 KONTROL GEREKLİ'
    : statementNeedsReview
      ? '🟡 KONTROL TAVSİYE EDİLİR'
      : suspiciousFinding || score >= 21
@@ -2587,6 +2647,7 @@ async function sendAnalysisResult(
    ? `Görsel satır eşleşmesi: ${matchedVisualRows} eşleşti${unresolvedVisualRows ? `, ${unresolvedVisualRows} belirsiz` : ''}.`
    : '';
  const statementReasonLines = [];
+ if (textIntegrityReview) statementReasonLines.push(textIntegrityReviewLine);
  if (balanceMismatchCount) statementReasonLines.push(`${balanceMismatchCount} bakiye geçişinde fark bulundu.`);
  if (rowCountIncomplete) statementReasonLines.push(`Çıkarılan işlem satırı sayısı beklenen sayıyla uyuşmuyor (${extractedRowCount}/${declaredRowCount}).`);
  if (pageCoverageIncomplete) statementReasonLines.push(`Tüm sayfalar taranamadı (${pagesAnalyzed}/${pageCount}).`);
@@ -2647,6 +2708,7 @@ async function sendAnalysisResult(
    `${result?.bank ? `Banka: ${getBankDisplayName(result.bank)}\n` : ''}Risk Skoru: ${score}/100`,
    '',
    confidenceLine,
+   ...(formatAutomatedCheckSummary(result?.checks) ? ['', formatAutomatedCheckSummary(result?.checks)] : []),
    '',
    statementCheckLine,
    ...(visualRowMatchLine ? [visualRowMatchLine] : []),
@@ -2701,9 +2763,12 @@ async function sendAnalysisResult(
  result?.bank ||
  null;
 
- const summaryGeneral = String(summary || '')
+ const summaryGeneralRaw = String(summary || '')
    .replace(/🔎\s*REFERANS KARŞILAŞTIRMASI[\s\S]*$/i, '')
    .trim();
+ const summaryGeneral = textIntegrityNotice
+   ? summaryGeneralRaw.split(/(?<=[.!?])\s+|\n+/).filter(line => line.trim() !== textIntegrityNotice).join(' ').trim()
+   : summaryGeneralRaw;
  const conciseSummaryGeneral = compactTelegramText(summaryGeneral, 700);
  const rawReferenceFindings = Array.isArray(result?.primaryForensicFindings)
    ? result.primaryForensicFindings
@@ -2741,11 +2806,12 @@ async function sendAnalysisResult(
 ${reviewHeadline}
 
 ${confidenceLine}
+${formatAutomatedCheckSummary(result?.checks) ? `\n${formatAutomatedCheckSummary(result?.checks)}\n` : ''}
 ${specificReviewBlock}
 
 ━━━━━━━━━━━━━━
 
-${conciseSummaryGeneral}${criticalReferenceFindings.length || fallbackCriticalReferenceLines.length ? `\n\n🔎 KRİTİK ALAN REFERANS KONTROLÜ\n${criticalReferenceFindings.length ? criticalReferenceFindings.map(item => `• ${item.title}: ${compactTelegramText(item.detail, 280)}`).join('\n') : fallbackCriticalReferenceLines.map(line => compactTelegramText(line, 280)).join('\n')}` : ''}${comparisonWarning}${formatPdfStructureForensics(result?.pdfStructureForensics)}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
+${conciseSummaryGeneral}${criticalReferenceFindings.length || fallbackCriticalReferenceLines.length ? `\n\n🔎 KRİTİK ALAN REFERANS KONTROLÜ\n${criticalReferenceFindings.length ? criticalReferenceFindings.map(item => `• ${item.title}: ${compactTelegramText(item.detail, 280)}`).join('\n') : fallbackCriticalReferenceLines.map(line => compactTelegramText(line, 280)).join('\n')}` : ''}${comparisonWarning}${shouldShowPdfStructureForensics(result?.pdfStructureForensics, result?.fontForensics) ? formatPdfStructureForensics(result?.pdfStructureForensics) : ''}${formatFontForensicsWarning(result?.fontForensics)}${formatHistoricalWarning(result?.historicalMatch)}
 
 ━━━━━━━━━━━━━━
 
