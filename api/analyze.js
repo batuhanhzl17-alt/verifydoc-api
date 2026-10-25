@@ -6263,6 +6263,30 @@ function statementPdfItemBox(item, viewport) {
   };
 }
 
+function statementPdfHeaderColumnX(pageItems, labels) {
+  const accepted = new Set((Array.isArray(labels) ? labels : []).map(statementNormalizeText));
+  const matches = (Array.isArray(pageItems) ? pageItems : []).filter(item => {
+    const text = statementNormalizeText(item?.str || '');
+    return text && [...accepted].some(label => text === label || text.startsWith(`${label} `));
+  });
+  if (!matches.length) return null;
+  const centers = matches.map(item => (Number(item?.transform?.[4]) || 0) + (Number(item?.width) || 0) / 2)
+    .filter(Number.isFinite).sort((a, b) => a - b);
+  if (!centers.length) return null;
+  return centers[Math.floor(centers.length / 2)];
+}
+
+function statementPdfSelectColumnCandidate(candidates, headerCenterX) {
+  if (!Array.isArray(candidates) || candidates.length <= 1 || !Number.isFinite(Number(headerCenterX))) return candidates || [];
+  const ranked = candidates.map(item => ({
+    item,
+    distance: Math.abs(((Number(item?.transform?.[4]) || 0) + (Number(item?.width) || 0) / 2) - Number(headerCenterX)),
+  })).sort((a, b) => a.distance - b.distance);
+  // Only break a same-value tie when the column header gives a clear spatial winner.
+  if (ranked.length > 1 && ranked[1].distance - ranked[0].distance >= 8) return [ranked[0].item];
+  return candidates;
+}
+
 function statementPdfAzureBox(lineOrWord) {
   const values = [lineOrWord?.xNorm, lineOrWord?.yNorm, lineOrWord?.widthNorm, lineOrWord?.heightNorm].map(Number);
   if (!values.every(Number.isFinite) || values[2] <= 0 || values[3] <= 0) return null;
@@ -6426,6 +6450,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       const localizedOverlayCandidates = [];
       const pageRows = (Array.isArray(statementRows) ? statementRows : []).filter(row => Number(row?.pageNumber) === pageNumber);
       const pageItems = content.items || [];
+      const balanceColumnX = statementPdfHeaderColumnX(pageItems, ['bakiye', 'balance']);
       const azurePageLines = Array.isArray(azureLayout?.lines) ? azureLayout.lines.filter(line => Number(line.pageNumber) === pageNumber) : [];
       const azurePageWords = Array.isArray(azureLayout?.words) ? azureLayout.words.filter(word => Number(word.pageNumber) === pageNumber) : [];
       const azurePageTableRows = Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.filter(row => Number(row.pageNumber) === pageNumber) : [];
@@ -6491,11 +6516,17 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
             const lineText = statementNormalizeText(lineItems.map(item => item.str || '').join(' '));
             const descriptionHits = descriptionTerms.filter(term => lineText.includes(term)).length;
             const descriptionMatched = descriptionTerms.length === 0 || descriptionHits >= Math.max(1, Math.ceil(descriptionTerms.length * 0.35));
-            const matchedAmountItems = expectedAmountCents == null ? [] : amountItems.filter(item => {
+            let matchedAmountItems = expectedAmountCents == null ? [] : amountItems.filter(item => {
               const cents = statementPdfMoneyCents(item.str);
               return cents != null && Math.abs(cents) === expectedAmountCents;
             });
-            const matchedBalanceItems = expectedBalanceCents == null ? [] : amountItems.filter(item => statementPdfMoneyCents(item.str) === expectedBalanceCents);
+            let matchedBalanceItems = expectedBalanceCents == null ? [] : amountItems.filter(item => statementPdfMoneyCents(item.str) === expectedBalanceCents);
+            const isDebitRow = row?.debitAmount != null && row?.debitAmount !== '';
+            const amountColumnX = statementPdfHeaderColumnX(pageItems, isDebitRow
+              ? ['tutar', 'tutar tl', 'tutar try', 'debit', 'borc']
+              : ['tutar', 'tutar tl', 'tutar try', 'credit', 'alacak']);
+            matchedAmountItems = statementPdfSelectColumnCandidate(matchedAmountItems, amountColumnX);
+            matchedBalanceItems = statementPdfSelectColumnCandidate(matchedBalanceItems, balanceColumnX);
             anchorLines.push({ anchorY, tolerance, lineText, descriptionHits, descriptionMatched, matchedAmountItems, matchedBalanceItems });
           }
           const amountDescriptionCandidates = anchorLines.filter(line => line.descriptionMatched && line.matchedAmountItems.length === 1);
