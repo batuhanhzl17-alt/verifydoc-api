@@ -13,6 +13,7 @@ import { extractMathematicalFingerprint, compareAgainstBaseline, compare16x16Roi
 import { recipientNameLabel, recipientIbanLabel, senderIbanLabel, sameTurkishIban, shouldSuppressIbanLayoutMismatch, resolveSplitTurkishIban, resolveRecipientInlineSegments } from "./semantic_roi.js";
 import { analyzeReceiptImageEvidence, fuseReceiptSemanticEvidence } from "./multimodal_receipt_evidence.js";
 import { extractPdfNativeFieldAssociations } from "./pdf_field_association.js";
+import { resolveStatementPaddleOcrRow } from "./statement_ocr_geometry.js";
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { analyzePdfStructure } from "./pdf_structure_forensics.js";
@@ -2088,6 +2089,30 @@ result.pages
 const allTexts = [];
 const allScores = [];
 const allRegions = [];
+const pageGeometry = [];
+
+const readDimensionPair = (sources) => {
+  const queue = (Array.isArray(sources) ? sources : [sources]).filter(Boolean).map(value => ({ value, depth: 0, allowGeneric: true }));
+  const seen = new Set();
+  while (queue.length) {
+    const { value, depth, allowGeneric: queueItemAllowGeneric } = queue.shift();
+    if (!value || typeof value !== 'object' || seen.has(value) || depth > 4) continue;
+    seen.add(value);
+    const width = Number(value.imageWidth ?? value.image_width ?? value.pageWidth ?? value.page_width ?? value.originalWidth ?? value.original_width ?? value.inputWidth ?? value.input_width ?? (queueItemAllowGeneric ? value.width : undefined));
+    const height = Number(value.imageHeight ?? value.image_height ?? value.pageHeight ?? value.page_height ?? value.originalHeight ?? value.original_height ?? value.inputHeight ?? value.input_height ?? (queueItemAllowGeneric ? value.height : undefined));
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0 && width <= 100000 && height <= 100000) {
+      return { width, height, source: 'paddle-response-metadata' };
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (/image|page|data|info|size|dimension|source|input|preprocess/i.test(key) && child && typeof child === 'object') {
+        const allowGeneric = /image|input|dataInfo|page/i.test(key);
+        if (Array.isArray(child)) child.forEach(item => queue.push({ value: item, depth: depth + 1, allowGeneric }));
+        else queue.push({ value: child, depth: depth + 1, allowGeneric });
+      }
+    }
+  }
+  return null;
+};
 
 for (
 let pageIndex = 0;
@@ -2100,6 +2125,18 @@ const pruned =
 page?.prunedResult ||
 page?.pruned_result ||
 {};
+
+const responsePageInfo = Array.isArray(result?.dataInfo?.pages) ? result.dataInfo.pages[pageIndex]
+  : Array.isArray(result?.dataInfo) ? result.dataInfo[pageIndex] : result?.dataInfo;
+let dimensions = readDimensionPair([page?.image, page?.inputImage, pruned, responsePageInfo, result?.dataInfo]);
+if (!dimensions && page?.inputImage && typeof page.inputImage === 'string') {
+  try {
+    const encoded = page.inputImage.replace(/^data:image\/[^;]+;base64,/i, '');
+    const metadata = await sharp(Buffer.from(encoded, 'base64')).metadata();
+    if (metadata.width > 0 && metadata.height > 0) dimensions = { width: metadata.width, height: metadata.height, source: 'paddle-input-image' };
+  } catch {}
+}
+pageGeometry[pageIndex] = dimensions;
 
 const texts =
 Array.isArray(
@@ -2279,6 +2316,17 @@ region,
 
 }
 
+for (let pageIndex = 0; pageIndex < pageGeometry.length; pageIndex++) {
+  const dimensions = pageGeometry[pageIndex];
+  if (!dimensions) continue;
+  const boxes = allRegions.filter(region => region.pageIndex === pageIndex).map(region => region.region).filter(Boolean);
+  const maxX = boxes.reduce((max, box) => Math.max(max, Number(box.x2) || 0), 0);
+  const maxY = boxes.reduce((max, box) => Math.max(max, Number(box.y2) || 0), 0);
+  // Reject PDF-point dimensions or stale metadata that cannot contain Paddle's
+  // pixel boxes. A bad scale would put the audit ROI over the wrong PDF area.
+  if (maxX > dimensions.width * 1.02 || maxY > dimensions.height * 1.02) pageGeometry[pageIndex] = null;
+}
+
 const text =
 allTexts.join(
 "\n"
@@ -2327,6 +2375,7 @@ console.log(
 "PADDLEOCR REGION SAYISI:",
 allRegions.length
 );
+console.log("PADDLEOCR SAYFA GEOMETRİSİ:", JSON.stringify(pageGeometry));
 
 const output = {
 text,
@@ -2337,6 +2386,7 @@ pages:
 pages.length,
 regions:
 allRegions,
+pageGeometry,
 };
 
 if (paddleCacheKey) {
@@ -6425,7 +6475,7 @@ function statementPdfResolveAzureRow(row, pageLines, pageWords) {
     amountBox: candidate.amountBox, balanceBox: candidate.balanceBox, amountText: candidate.amountText };
 }
 
-async function runStatementPdfForensics(filePath, buffer, statementRows = [], azureLayout = null) {
+async function runStatementPdfForensics(filePath, buffer, statementRows = [], azureLayout = null, paddleOcr = null) {
   let pdf = null;
   try {
     pdf = await getPdfDocument({ data: new Uint8Array(buffer) }).promise;
@@ -6454,6 +6504,8 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       const azurePageLines = Array.isArray(azureLayout?.lines) ? azureLayout.lines.filter(line => Number(line.pageNumber) === pageNumber) : [];
       const azurePageWords = Array.isArray(azureLayout?.words) ? azureLayout.words.filter(word => Number(word.pageNumber) === pageNumber) : [];
       const azurePageTableRows = Array.isArray(azureLayout?.tableRows) ? azureLayout.tableRows.filter(row => Number(row.pageNumber) === pageNumber) : [];
+      const paddlePageGeometry = Array.isArray(paddleOcr?.pageGeometry) ? paddleOcr.pageGeometry[pageNumber - 1] : null;
+      const paddleClaimedLines = [];
       for (const [rowIndex, row] of pageRows.entries()) {
         const dateKey = statementPdfDateKey(row?.date);
         const dateAnchors = dateKey ? pageItems.filter(item => statementPdfDateKey(item.str) === dateKey) : [];
@@ -6478,6 +6530,17 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         const azureResolved = azureTableResolved?.status === 'matched' ? azureTableResolved
           : azureLineResolved?.status === 'matched' ? azureLineResolved
             : azureTableResolved || azureLineResolved;
+        let paddleResolved = dateAnchors.length === 0 && azureResolved?.status !== 'matched'
+          ? resolveStatementPaddleOcrRow(row, paddleOcr?.regions, pageNumber, paddlePageGeometry)
+          : { status: 'unresolved', reason: 'PaddleOCR yedeği gerekli değil.' };
+        if (paddleResolved.status === 'matched' && paddleClaimedLines.some(claim =>
+          Math.abs(claim.y - Number(paddleResolved.rowBand?.y)) <= Math.max(claim.tolerance, 3)
+        )) {
+          paddleResolved = { ...paddleResolved, status: 'unresolved', amountBox: null, balanceBox: null,
+            reason: 'Bu OCR satır bandı başka bir işlem satırına bağlandı; aynı görsel satırın iki kez kullanılmasına izin verilmedi.' };
+        } else if (paddleResolved.status === 'matched') {
+          paddleClaimedLines.push({ y: Number(paddleResolved.rowBand?.y), tolerance: Math.max(3, Number(paddleResolved.rowBand?.height) || 3) });
+        }
         if (!Number.isInteger(Number(row?.pageNumber))) reason = 'İşlem satırında sayfa numarası yok.';
         else if (!dateKey) reason = 'Satır tarihi güvenilir biçimde okunamadı; sayfa içi satır ankrajı kurulamadı.';
         else if (azureResolved?.status === 'matched') {
@@ -6499,7 +6562,25 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           }
           selectedBalanceItem = azureResolved.balanceBox ? { azure: true } : null;
         }
-        else if (dateAnchors.length === 0) reason = 'PDF metin katmanında bu satırın tarihi bulunamadı.';
+        else if (dateAnchors.length === 0 && paddleResolved?.status === 'matched') {
+          status = 'matched';
+          reason = paddleResolved.reason;
+          rowLineCandidates = [paddleResolved];
+          selectedAmountItem = { paddle: true };
+          selectedBalanceItem = paddleResolved.balanceBox ? { paddle: true } : null;
+          if (paddleResolved.amountBox) {
+            const target = { field: row?.debitAmount != null && row?.debitAmount !== '' ? 'debitAmount' : 'creditAmount',
+              value: rowAmountValue, box: paddleResolved.amountBox, text: paddleResolved.amountText };
+            for (const candidate of pdfAuditWhiteCoverCandidates(operators, viewport, target.box, 'amount', target.text)) {
+              localizedOverlayCandidates.push({ pageNumber, rowNumber: row?.rowNumber ?? rowIndex + 1,
+                transactionId: row?.transactionId || null, field: target.field, expectedValue: target.value,
+                valueToken: target.text, associationStatus: 'matched', associationReason: reason,
+                objectType: candidate.objectType, paintOrder: candidate.imagePaintOrderRelativeToFieldText,
+                overlap: candidate.targetCoverage, box: candidate.box, evidence: candidate.evidence });
+            }
+          }
+        }
+        else if (dateAnchors.length === 0) reason = paddleResolved?.reason || 'PDF metin katmanında bu satırın tarihi bulunamadı.';
         else {
           const description = statementNormalizeText(row?.description);
           const descriptionTerms = description.split(' ').filter(term => term.length >= 4);
@@ -6589,14 +6670,20 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           balanceMatched: Boolean(selectedBalanceItem),
           amountValue: rowAmountValue,
           amountBox: azureResolved?.status === 'matched' ? azureResolved.amountBox
+            : paddleResolved?.status === 'matched' ? paddleResolved.amountBox
             : selectedAmountItem ? statementPdfItemBox(selectedAmountItem, viewport) : null,
           balanceBox: azureResolved?.status === 'matched' ? azureResolved.balanceBox
+            : paddleResolved?.status === 'matched' ? paddleResolved.balanceBox
             : selectedBalanceItem && !selectedBalanceItem.azure ? statementPdfItemBox(selectedBalanceItem, viewport) : null,
           associationSource: azureResolved?.status === 'matched' ? azureResolved.source || 'azure-layout'
-            : status === 'matched' ? 'pdf-native-text' : 'unresolved',
+            : paddleResolved?.status === 'matched' ? 'paddle-ocr-geometry'
+              : status === 'matched' ? 'pdf-native-text' : 'unresolved',
           azureAssociationReason: azureResolved?.reason || null,
           azureTableReason: azureTableResolved?.reason || null,
           azureLineReason: azureLineResolved?.reason || null,
+          paddleOcrReason: paddleResolved?.reason || null,
+          paddleOcrConfidence: paddleResolved?.ocrConfidence ?? null,
+          paddleGeometryMappedToPdf: paddleResolved?.geometryMappedToPdf ?? false,
         });
       }
       for (const item of numericTokens) {
@@ -6641,6 +6728,9 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       decisionRole: 'diagnostic-only',
     }));
     const unresolvedRowAssociations = rowAssociationDiagnostics.filter(item => item.status !== 'matched');
+    const paddleRowsWithoutMappedBoxes = rowAssociationDiagnostics.filter(item =>
+      item.associationSource === 'paddle-ocr-geometry' && item.status === 'matched' && !item.paddleGeometryMappedToPdf
+    );
     const azurePageNumbers = new Set((Array.isArray(azureLayout?.pages) ? azureLayout.pages : [])
       .map(page => Number(page?.pageNumber)).filter(Number.isInteger));
     const unresolvedPagesWithoutAzure = [...new Set(unresolvedRowAssociations
@@ -6651,7 +6741,11 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
       ...overlayFindings,
       ...(unresolvedRowAssociations.length ? [{
         severity: 'review',
-        detail: `${unresolvedRowAssociations.length}/${rowAssociationDiagnostics.length} işlem satırında tutar/bakiye PDF metin kutusu satıra güvenle bağlanamadı. Bu satırlarda lokal örtme denetimi sonuçsuzdur; örnekler: ${unresolvedRowAssociations.slice(0, 5).map(item => `s.${item.pageNumber ?? '?'} satır ${item.rowNumber}: ${item.reason}`).join('; ')}.`,
+        detail: `${unresolvedRowAssociations.length}/${rowAssociationDiagnostics.length} işlem satırında tarih, tutar ve bakiye kaynak kutuları tekil satıra bağlanamadı. Bu satırlarda lokal örtme denetimi sonuçsuzdur; örnekler: ${unresolvedRowAssociations.slice(0, 5).map(item => `s.${item.pageNumber ?? '?'} satır ${item.rowNumber}: ${item.reason}`).join('; ')}.`,
+      }] : []),
+      ...(paddleRowsWithoutMappedBoxes.length ? [{
+        severity: 'review',
+        detail: `${paddleRowsWithoutMappedBoxes.length} işlem satırı PaddleOCR metni ve satır geometrisiyle eşleşti; ancak OCR görüntü boyutları PDF sayfasına eşlenemediği için bu satırlarda yerel örtme alanı denetlenemedi.`,
       }] : []),
       ...(unresolvedPagesWithoutAzure.length ? [{
         severity: 'review',
@@ -6661,6 +6755,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
     const reviewRequired = Boolean(
       overlayFindings.length ||
       unresolvedRowAssociations.length > 0 ||
+      paddleRowsWithoutMappedBoxes.length > 0 ||
       unresolvedPagesWithoutAzure.length > 0 ||
       structural?.findings?.some(item => item.severity === 'medium' || item.severity === 'strong')
     );
@@ -6678,7 +6773,12 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           azureTable: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-table').length,
           azureLines: rowAssociationDiagnostics.filter(item => item.associationSource === 'azure-lines' || item.associationSource === 'azure-layout').length,
           pdfNativeText: rowAssociationDiagnostics.filter(item => item.associationSource === 'pdf-native-text').length,
+          paddleOcrGeometry: rowAssociationDiagnostics.filter(item => item.associationSource === 'paddle-ocr-geometry').length,
         },
+        paddleOcrAvailable: Boolean(paddleOcr?.success && Array.isArray(paddleOcr?.regions)),
+        paddleOcrRegionCount: Array.isArray(paddleOcr?.regions) ? paddleOcr.regions.length : 0,
+        paddleOcrPageGeometry: Array.isArray(paddleOcr?.pageGeometry) ? paddleOcr.pageGeometry : [],
+        paddleRowsWithoutMappedBoxes: paddleRowsWithoutMappedBoxes.length,
         azureLayoutAvailable: Boolean(azureLayout?.available),
         azurePageCount: Number(azureLayout?.pageCount) || 0,
         azurePageNumbers: [...azurePageNumbers].sort((a, b) => a - b),
@@ -19618,7 +19718,8 @@ const statementPdfForensics = await runStatementPdfForensics(
   filePath,
   buffer,
   statementModelResult?.transactionAnalysis?.rows || [],
-  azureLayout
+  azureLayout,
+  paddleDocumentOCR
 );
 const statementPageCount = Number(statementPdfForensics?.pageCount) || 0;
 const statementResult = applyStatementLedgerChecks(
