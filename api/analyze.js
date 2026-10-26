@@ -6450,12 +6450,6 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
         let paddleResolved = azureResolved?.status !== 'matched' && Array.isArray(paddleOcr?.regions) && paddleOcr.regions.length > 0
           ? resolveStatementPaddleOcrRow(row, paddleOcr?.regions, pageNumber, paddlePageGeometry, paddleClaimedLines)
           : { status: 'unresolved', reason: 'PaddleOCR yedeği gerekli değil.' };
-        if (paddleResolved.status === 'matched' && paddleClaimedLines.some(claim =>
-          Math.abs(claim.y - Number(paddleResolved.rowBand?.y)) <= Math.max(claim.tolerance, 3)
-        )) {
-          paddleResolved = { ...paddleResolved, status: 'unresolved', amountBox: null, balanceBox: null,
-            reason: 'Bu OCR satır bandı başka bir işlem satırına bağlandı; aynı görsel satırın iki kez kullanılmasına izin verilmedi.' };
-        }
         if (!Number.isInteger(Number(row?.pageNumber))) reason = 'İşlem satırında sayfa numarası yok.';
         else if (!dateKey) reason = 'Satır tarihi güvenilir biçimde okunamadı; sayfa içi satır ankrajı kurulamadı.';
         else if (azureResolved?.status === 'matched') {
@@ -6597,7 +6591,7 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           }
         }
         if (status === 'matched' && paddleResolved.status === 'matched') {
-          paddleClaimedLines.push({ y: Number(paddleResolved.rowBand?.y), tolerance: Math.max(3, Number(paddleResolved.rowBand?.height) || 3) });
+          if (paddleResolved.claimedGeometry) paddleClaimedLines.push(paddleResolved.claimedGeometry);
         }
         rowAssociationDiagnostics.push({
           pageNumber, rowNumber: row?.rowNumber ?? rowIndex + 1, transactionId: row?.transactionId || null,
@@ -6622,6 +6616,8 @@ async function runStatementPdfForensics(filePath, buffer, statementRows = [], az
           paddleOcrDateAnchorCount: paddleResolved?.dateAnchorCount ?? null,
           paddleOcrCandidateLineCount: paddleResolved?.distinctCandidateLineCount ?? null,
           paddleOcrCandidateLines: paddleResolved?.candidateLines || [],
+          paddleOcrClaimedCandidateLineCount: paddleResolved?.claimedCandidateLineCount ?? null,
+          paddleOcrFieldDiagnostics: paddleResolved?.fieldDiagnostics || null,
           paddleOcrConfidence: paddleResolved?.ocrConfidence ?? null,
           paddleGeometryMappedToPdf: selectedAmountItem?.paddle ? Boolean(paddleResolved?.geometryMappedToPdf) : false,
         });
