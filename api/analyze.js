@@ -2686,7 +2686,7 @@ async function runNegativeSampleComparison({ targetPath, negativeSamples = [], b
       const sampleImage = `data:image/jpeg;base64,${sampleJpeg.toString("base64")}`;
 
       const response = await openai.responses.create({
-        model: "gpt-6-luna",
+        model: "gpt-6.1-terra",
         input: [{ role: "user", content: [
           { type: "input_text", text: `VerifyDoc icin yardimci adli goruntusal karsilastirma katmanisin.
 
@@ -7814,7 +7814,7 @@ console.log(
 const response =
 await openai.responses.create({
 model:
-"gpt-6-luna",
+"gpt-6.1-terra",
 
 reasoning: {
 effort: "medium",
@@ -17189,7 +17189,7 @@ const response =
 await openai.responses.create({
 
 model:
-"gpt-6-luna",
+"gpt-6.1-terra",
 input: [
 {
 role:
@@ -18915,7 +18915,7 @@ Koordinatlar bu zone görüntüsüne göre 0..1 arasındadır.`
         ];
 
         const response = await openai.responses.create({
-          model:"gpt-6-luna",
+          model:"gpt-6.1-terra",
           reasoning:{ effort:"low" },
           input:[{role:"user",content}],
           text:{
@@ -19012,7 +19012,7 @@ Koordinatlar bu zone görüntüsüne göre 0..1 arasındadır.`
     if (!uniqueCandidates.length) {
       return {
         available:true,
-        engine:"gpt-6-luna-focused-zones-v43",
+        engine:"gpt-6.1-terra-focused-zones-v43",
         referenceFile:path.basename(referenceInfo.path),
         findingCount:0,
         findings:[],
@@ -19126,7 +19126,7 @@ Sonuçları aday numarasıyla döndür.`
 
       try {
         const vr=await openai.responses.create({
-          model:"gpt-6-luna",
+          model:"gpt-6.1-terra",
           reasoning:{ effort:"low" },
           input:[{role:"user",content}],
           text:{
@@ -19184,7 +19184,7 @@ Sonuçları aday numarasıyla döndür.`
 
     return {
       available:true,
-      engine:"gpt-6-luna-focused-zones-v43",
+      engine:"gpt-6.1-terra-focused-zones-v43",
       referenceFile:path.basename(referenceInfo.path),
       findingCount:finalFindings.length,
       findings:finalFindings.slice(0,12),
@@ -19362,7 +19362,7 @@ if ((type === 'image' || type === 'pdf') && bank && reference && shouldRunRefere
   referenceVisualAdjudication = {
     available:true,
     skipped:true,
-    engine:"gpt-6-luna-focused-zones-v43",
+    engine:"gpt-6.1-terra-focused-zones-v43",
     referenceFile:(() => {
       const visualReference = getVisualReferencePath(reference);
       const firstVisualReference = Array.isArray(visualReference) ? visualReference[0] : visualReference;
@@ -20567,7 +20567,7 @@ console.log(
 const response =
 await openai.responses.create({
 model:
-"gpt-6-luna",
+"gpt-6.1-terra",
 
 // V63 SPEED: Ana belge çıkarımı için derin reasoning gerekmiyor.
 // Asıl forensic karar deterministic/reference katmanlarından geliyor.
@@ -21892,7 +21892,7 @@ Ama bunu yaparken aşağıdaki kurallar MUTLAKTIR.
 `;
 
     const response = await openai.responses.create({
-      model: 'gpt-6-luna',
+      model: 'gpt-6.1-terra',
       input: [{
         role: 'user',
         content: [
@@ -21933,7 +21933,7 @@ Ama bunu yaparken aşağıdaki kurallar MUTLAKTIR.
 
     return {
       available: true,
-      engine: 'gpt-6-luna-reference-visual-adjudicator-v28-targeted-zones',
+      engine: 'gpt-6.1-terra-reference-visual-adjudicator-v28-targeted-zones',
       overallConfidence: Number(parsed.overallConfidence) || 0,
       findingCount: merged.length,
       findings: merged,
@@ -22047,7 +22047,7 @@ REFERENCE sadece stil/şablon davranışını anlamak içindir; literal içerik 
 `;
 
       const response = await openai.responses.create({
-        model: 'gpt-6-luna',
+        model: 'gpt-6.1-terra',
         input: [{ role: 'user', content: [
           { type: 'input_text', text: prompt },
           { type: 'input_text', text: '=== TARGET ZONE ===' },
@@ -22324,7 +22324,7 @@ anlamak içindir. Hedefte lokal ve gerçekten şüpheli bir üretim farkı yoksa
 `;
     try {
       const response = await openai.responses.create({
-        model:'gpt-6-luna',
+        model:'gpt-6.1-terra',
         input:[{role:'user',content:[
           {type:'input_text',text:prompt},
           {type:'input_text',text:'=== TARGET FIELD CROP ==='},
@@ -22368,7 +22368,7 @@ anlamak içindir. Hedefte lokal ve gerçekten şüpheli bir üretim farkı yoksa
   const finalFindings=[...best.values()].sort((a,b)=>Number(b.confidence)-Number(a.confidence)).slice(0,8);
   return {
     available:true,
-    engine:'gpt-6-luna-evidence-linked-v29',
+    engine:'gpt-6.1-terra-evidence-linked-v29',
     overallConfidence:finalFindings.length?Math.round(finalFindings.reduce((s,x)=>s+Number(x.confidence||0),0)/finalFindings.length):0,
     findingCount:finalFindings.length,
     candidateCount:candidates.length,
