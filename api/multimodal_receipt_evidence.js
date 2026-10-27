@@ -235,7 +235,7 @@ function containsDateOrTime(value) {
   return /\b(?:date|time|tarih|saat)\b|\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b|\b\d{1,2}:\d{2}\b/i.test(text);
 }
 
-export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeType = 'image/jpeg', model = 'gpt-6-luna' }) {
+export async function analyzeReceiptImageEvidence({ openai, imageBuffer, mimeType = 'image/jpeg', model = 'gpt-6.1-terra' }) {
   if (!openai || !Buffer.isBuffer(imageBuffer) || !imageBuffer.length) {
     return { available: false, status: 'missing-client-or-image' };
   }
