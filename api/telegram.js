@@ -2122,30 +2122,44 @@ function amountFontMatchesReference(fontForensics) {
    typography.referenceFontComparisons.some(item => item.matchesTargetFamily === true);
 }
 
-function shouldShowPdfStructureForensics(triage, fontForensics) {
- if (triage?.available !== true) return false;
- const counts = triage.normalizedOperatorCounts || {};
- const standardTjOnly = Number(counts.textTj) > 0 && Number(counts.textTJ) === 0;
- // Hide routine PDF inventory when Tj is used without TJ and the amount font
- // is confirmed against a reference. Keep the block for other profiles.
- return !(standardTjOnly && amountFontMatchesReference(fontForensics));
+function hasReliableAmountFontMismatch(fontForensics) {
+ const typography = fontForensics?.amountTypography || {};
+ const comparisons = Array.isArray(typography.referenceFontComparisons) ? typography.referenceFontComparisons : [];
+ return typography.target?.status === 'resolved' &&
+   comparisons.some(item => typeof item?.matchesTargetFamily === 'boolean' && item?.family) &&
+   !comparisons.some(item => item?.matchesTargetFamily === true);
+}
+
+function hasReliableFontMismatch(fontForensics) {
+ const f = fontForensics || {};
+ if (hasReliableAmountFontMismatch(f)) return true;
+ const fieldMismatches = f.comparisons?.[0]?.comparison?.fieldMismatches;
+ return Array.isArray(fieldMismatches) && fieldMismatches.some(item =>
+   Array.isArray(item?.referenceFonts) && Array.isArray(item?.targetFonts) &&
+   item.referenceFonts.length > 0 && item.targetFonts.length > 0 &&
+   item.referenceFonts.join('|') !== item.targetFonts.join('|')
+ );
+}
+
+ function shouldShowPdfStructureForensics(triage) {
+ return triage?.available === true && triage?.referenceComparison?.materialDifferences === true;
 }
 
 function formatPdfStructureForensics(triage) {
   if (triage?.available !== true) return '';
-  const counts = triage.normalizedOperatorCounts || {};
-  const lines = ['\n🧪 PDF YAPISAL TARAMA (Node.js)'];
-  if (Number.isFinite(Number(triage.fileBytes))) {
-    lines.push(`• PDF boyutu: ${Number(triage.fileBytes).toLocaleString('tr-TR')} bayt · ${triage.pageCount || '?'} sayfa`);
+  const comparison = triage.referenceComparison || {};
+  const lines = ['\n🧪 PDF YAPISAL KARŞILAŞTIRMA'];
+  if (comparison.sizeMaterialDifference) {
+    const percent = Math.abs(Number(comparison.byteDeltaPercent) || 0).toLocaleString('tr-TR');
+    const direction = Number(comparison.byteDelta) < 0 ? 'daha küçük' : 'daha büyük';
+    lines.push(`• PDF boyutu seçilen ${comparison.referenceFile || 'referansa'} göre belirgin ölçüde ${direction} (%${percent}).`);
   }
-  lines.push(`• Metin komutları: Tj ${counts.textTj ?? 0} · TJ ${counts.textTJ ?? 0} · toplam ${counts.textShow ?? 0}`);
-  if (Number(counts.textTj) === 0 && Number(counts.textTJ) > 0) {
-    lines.push('• Bu PDF’de metin TJ komutlarıyla çizilmiş; bu teknik yapı tek başına düzenleme göstergesi değildir.');
+  if (comparison.operatorMaterialDifference) {
+    const target = comparison.targetTextOperators || {};
+    const reference = comparison.referenceTextOperators || {};
+    lines.push(`• Metin komutları hedefte Tj ${target.Tj ?? 0}/TJ ${target.TJ ?? 0}, referansta Tj ${reference.Tj ?? 0}/TJ ${reference.TJ ?? 0}.`);
   }
-  const quoteOps = (counts.nextLineShowText ?? 0) + (counts.nextLineSetSpacingShowText ?? 0);
-  if (quoteOps) lines.push(`• Kısaltılmış satır/metin komutları: ${quoteOps} (Tj/TJ sayımına dahil değil)`);
-  lines.push(`• Görsel işlemleri: ${counts.imagePaint ?? 0} · vektör yolları: ${counts.vectorPath ?? 0}`);
-  lines.push('• Sayımlar PDF.js’in ayrıştırdığı sayfa işlemleridir; tek başına düzenleme veya sahtecilik kanıtı olmaz.');
+  lines.push('• Bu yapısal farklar farklı dışa aktarma veya sıkıştırma biçimlerinden kaynaklanabilir; tek başına düzenleme kanıtı değildir.');
   return lines.join('\n');
 }
 
@@ -2157,7 +2171,15 @@ function formatFontForensicsWarning(fontForensics) {
  if (f.available !== true) return '';
  const amountTypography = f.amountTypography || {};
  const targetAmountFont = amountTypography.target || {};
- const referenceAmountFont = amountTypography.reference || {};
+ const referenceFontComparisons = Array.isArray(amountTypography.referenceFontComparisons)
+   ? amountTypography.referenceFontComparisons : [];
+ const amountFamilyMismatch = hasReliableAmountFontMismatch(f);
+ const fieldMismatches = Array.isArray(f.comparisons?.[0]?.comparison?.fieldMismatches)
+   ? f.comparisons[0].comparison.fieldMismatches.filter(item =>
+       Array.isArray(item?.referenceFonts) && Array.isArray(item?.targetFonts) &&
+       item.referenceFonts.join('|') !== item.targetFonts.join('|'))
+   : [];
+ if (!amountFamilyMismatch && !fieldMismatches.length) return '';
  const lines = ['\n🅰️ TUTAR FONT BİLGİSİ'];
  const formatAmountFont = (item) => {
    if (item.status === 'resolved') {
@@ -2170,11 +2192,6 @@ function formatFontForensicsWarning(fontForensics) {
    return 'belirlenemedi';
  };
  lines.push(`• Hedef (${targetAmountFont.amount || 'tutar'}): ${formatAmountFont(targetAmountFont)}`);
- const referenceFontComparisons = Array.isArray(amountTypography.referenceFontComparisons)
-   ? amountTypography.referenceFontComparisons
-   : [];
- const score = Number(f.score) || 0;
- if (score < 18 && amountFontMatchesReference(f)) return '';
  if (referenceFontComparisons.length) {
    const comparisons = referenceFontComparisons.map(item => {
      const family = item.family || 'font ailesi belirlenemedi';
@@ -2183,21 +2200,15 @@ function formatFontForensicsWarning(fontForensics) {
    });
    lines.push(`• Referans şablonları: ${comparisons.join('; ')}`);
  } else if (amountTypography.referenceFile) {
-   lines.push(`• Referans (${amountTypography.referenceFile}): ${formatAmountFont(referenceAmountFont)}`);
+   lines.push(`• Referans (${amountTypography.referenceFile}): ${formatAmountFont(amountTypography.reference || {})}`);
  }
- const hasResolvedReference = referenceFontComparisons.some(item => item.status === 'resolved-from-single-family-pdf');
- const hasFamilyMatch = referenceFontComparisons.some(item => item.matchesTargetFamily === true);
- if (targetAmountFont.status === 'resolved' && hasResolvedReference && !hasFamilyMatch) {
-   lines.push('• Tutar font ailesi mevcut referans şablonlarla eşleşmedi; bu tek başına düzenleme veya sahtecilik kanıtı değildir.');
- }
- if (score < 18) return amountTypography.target ? lines.join('\n') : '';
  const targetOnly = Array.isArray(f.targetOnlyFamiliesAcrossReferences)
    ? f.targetOnlyFamiliesAcrossReferences.filter(Boolean).slice(0, 5)
    : [];
- const fieldMismatches = Array.isArray(f.comparisons?.[0]?.comparison?.fieldMismatches)
-   ? f.comparisons[0].comparison.fieldMismatches.slice(0, 4)
-   : [];
- lines.push('\n🅰️ GENEL FONT KARŞILAŞTIRMASI');
+ if (amountFamilyMismatch) {
+   lines.push('• Tutar font ailesi seçilen referansla eşleşmiyor; inceleme gerekir. Font farkı tek başına sahtecilik kanıtı değildir.');
+ }
+ if (fieldMismatches.length || targetOnly.length) lines.push('\n🅰️ GENEL FONT KARŞILAŞTIRMASI');
  if (targetOnly.length) {
    lines.push(`• Referanslarda bulunmayan hedef font: ${targetOnly.join(', ')}`);
  }
@@ -2206,10 +2217,6 @@ function formatFontForensicsWarning(fontForensics) {
    const tar = Array.isArray(item.targetFonts) ? item.targetFonts.join(', ') : '';
    lines.push(`• ${item.labelText || item.field}: referans [${ref}] → hedef [${tar}]`);
  }
- if (lines.length === 1) {
-   lines.push(`• Referans/hedef PDF font profili arasında farklılık sinyali bulundu (skor ${score}/100).`);
- }
- lines.push('• Font farkı tek başına sahtecilik kanıtı değildir; diğer forensic bulgularla birlikte değerlendirilir.');
  return lines.join('\n');
 }
 
@@ -2283,18 +2290,20 @@ async function sendAnalysisResult(
  const textIntegrityReviewLine = textIntegrityNotice ||
    'Metin tutarlılığı kontrolünde sorun sinyali var; ilgili alanlar manuel doğrulanmalı.';
 
+ const amountFontMismatchReview = hasReliableAmountFontMismatch(result?.fontForensics);
+ const fontMismatchReview = hasReliableFontMismatch(result?.fontForensics);
+ const pdfStructureComparison = result?.pdfStructureForensics?.referenceComparison || {};
+ const pdfStructureReview = pdfStructureComparison.materialDifferences === true;
  const manualReviewRequired = result?.manualReviewRequired === true ||
    result?.fieldReviewStatus === 'CONTROL_REQUIRED' ||
    result?.semanticEvidenceFusion?.reviewStatus === 'CONTROL_REQUIRED' ||
-   textIntegrityReview;
+   textIntegrityReview || fontMismatchReview || pdfStructureReview;
  const suspiciousFinding = result?.suspicious === true;
  const reviewHeadline = manualReviewRequired
    ? '🟠 KONTROL GEREKLİ'
    : suspiciousFinding
      ? '🔴 ŞÜPHELİ BULGU VAR'
-     : score >= 21
-       ? '🟡 BULGULARI İNCELEYİN'
-       : '🟢 BELİRGİN ŞÜPHELİ BULGU YOK';
+     : '🟢 BELİRGİN ŞÜPHELİ BULGU YOK';
  const confidenceLine = confidence === null
    ? 'Güven: Belirlenemedi'
    : `Güven: ${confidence}/100`;
@@ -2307,11 +2316,17 @@ async function sendAnalysisResult(
    'amount-label-association-unverified': 'Tutar etiketli alanla doğrulanamadı.',
    'amount-source-disagreement': 'Tutar çıkarım kaynakları arasında uyuşmuyor.',
    'amount-reference-comparison-unavailable': 'Tutar referansla karşılaştırılamadı.',
+   'amount-font-reference-mismatch': 'Tutar font ailesi seçilen referansla uyuşmuyor.',
+   'font-reference-mismatch': 'Belgedeki font ailesi referans şablonla uyuşmuyor.',
+   'pdf-structure-reference-difference': 'PDF boyutu veya metin çizim komutları seçilen referanstan belirgin farklı.',
    'strong-amount-reference-render-difference': 'Tutar alanında referansla belirgin görüntü farkı var.',
    'strong-reference-field-spacing-anomaly': 'Referans yerleşiminde güçlü alan aralığı farkı var.',
  };
  const specificReviewReasonLines = [...new Set([
    ...criticalReviewReasons,
+   ...(amountFontMismatchReview ? ['amount-font-reference-mismatch'] : []),
+   ...(fontMismatchReview && !amountFontMismatchReview ? ['font-reference-mismatch'] : []),
+   ...(pdfStructureReview ? ['pdf-structure-reference-difference'] : []),
    ...(textIntegrityReview ? ['turkish-character-integrity-limitation'] : []),
  ])]
    .map(reason => reviewReasonLabels[reason])
@@ -2321,6 +2336,14 @@ async function sendAnalysisResult(
    specificReviewReasonLines.unshift(textIntegrityReviewLine);
  }
  specificReviewReasonLines.splice(3);
+
+ const confidenceCap = criticalReviewReasons.some(reason =>
+   /amount|iban/.test(String(reason)) && /unverified|unavailable|disagreement|difference/.test(String(reason))
+ ) ? 74 : fontMismatchReview ? 76 : pdfStructureReview ? 80 : textIntegrityReview ? 80 : manualReviewRequired ? 80 : null;
+ const reportConfidence = confidence !== null && confidenceCap !== null
+   ? Math.min(confidence, confidenceCap) : confidence;
+ const reportConfidenceLine = reportConfidence === null
+   ? 'Güven: Belirlenemedi' : `Güven: ${reportConfidence}/100`;
 
 
  // ===================================================
@@ -2572,9 +2595,8 @@ async function sendAnalysisResult(
  statementMode
  ) {
 
- // V25: Hesap özeti çıktısı normal dekont ile aynı kullanıcı
- // mantığında olsun: yalnızca somut bulgular gösterilir.
- // Risk skoru / seviye / güven korunur; uzun AI paragrafı gösterilmez.
+ // Hesap özeti çıktısında risk puanı gösterilmez. Kontrol durumu;
+ // bakiye, kapsam, satır eşleşmesi ve doğrulanmış bulgularla belirlenir.
  const uniqueFindings = [];
  const seenFindingKeys = new Set();
 
@@ -2637,9 +2659,15 @@ async function sendAnalysisResult(
      ? '🟠 KONTROL GEREKLİ'
    : statementNeedsReview
      ? '🟡 KONTROL TAVSİYE EDİLİR'
-     : suspiciousFinding || score >= 21
+     : suspiciousFinding
        ? '🟡 BULGULARI İNCELEYİN'
        : '🟢 BELİRGİN ŞÜPHELİ BULGU YOK';
+ const statementConfidenceCap = balanceMismatchCount || rowCountIncomplete || pageCoverageIncomplete
+   ? 65 : unresolvedVisualRows > 0 ? 75 : null;
+ const statementConfidence = confidence !== null && statementConfidenceCap !== null
+   ? Math.min(confidence, statementConfidenceCap) : confidence;
+ const statementConfidenceLine = statementConfidence === null
+   ? 'Güven: Belirlenemedi' : `Güven: ${statementConfidence}/100`;
  const statementCheckLine = rowByRowAudit.available
    ? `Satır kontrolü: ${extractedRowCount} işlem satırı, ${rowByRowAudit.balanceChecks || 0} bakiye geçişi; ${balanceMismatchCount ? `${balanceMismatchCount} fark` : 'bakiye farkı yok'}. PDF sayfaları: ${pagesAnalyzed}/${pageCount}.`
    : `Satır kontrolü: işlem satırları güvenilir biçimde çıkarılamadı. PDF sayfaları: ${pagesAnalyzed}/${pageCount}.`;
@@ -2662,15 +2690,27 @@ async function sendAnalysisResult(
    .slice(0, 3)
    .map(row => {
      const reason = String(row?.reason || '').toLocaleLowerCase('tr-TR');
-     const shortReason = /tarih.*bulunamadı|tarihi.*okunamadı|ankrajı kurulamadı/.test(reason) ? 'tarih eşleşmedi'
-       : /açıklama eşleşmedi/.test(reason) ? 'açıklama eşleşmedi'
-         : /birden fazla|belirsiz/.test(reason) ? 'birden fazla satır adayı'
-           : /tutar|bakiye/.test(reason) ? 'tutar/bakiye eşleşmedi'
-             : 'alanlar tekil eşleşmedi';
+     const paddleReason = String(row?.paddleOcrReason || '').toLocaleLowerCase('tr-TR');
+     const fields = row?.paddleOcrFieldDiagnostics || {};
+     const missingDate = fields.date?.matched === false ||
+       /beklenen tarih bulunamadı|tarih.*bulunamadı|tarihi.*okunamadı|ankrajı kurulamadı/.test(`${paddleReason} ${reason}`);
+     const missingDescription = fields.description?.matched === false || /açıklama.*eşleşmedi/.test(`${paddleReason} ${reason}`);
+     const missingAmount = fields.amount?.matched === false || /beklenen tutar.*eşleşmedi|tutar.*tekil olarak bulunamadı/.test(`${paddleReason} ${reason}`);
+     const missingBalance = fields.balance?.matched === false || /beklenen bakiye.*eşleşmedi|bakiye.*tekil olarak bulunamadı/.test(`${paddleReason} ${reason}`);
+     const shortReason = missingDate
+       ? `${row?.date ? `${row.date} ` : ''}tarihi OCR satır kutusuna bağlanamadı`
+       : missingDescription ? 'açıklama OCR satırında doğrulanamadı'
+         : missingAmount ? 'beklenen tutar OCR satırında eşleşmedi'
+           : missingBalance ? 'beklenen bakiye OCR satırında eşleşmedi'
+             : /birden fazla|belirsiz/.test(`${paddleReason} ${reason}`) ? 'birden fazla satır adayı'
+               : 'tarih/tutar/bakiye kutuları tekil satıra bağlanamadı';
      return `s.${row?.pageNumber ?? '?'} satır ${row?.rowNumber ?? '?'} (${shortReason})`;
    });
  const unresolvedRowDetailLine = unresolvedVisualRows > 0 && unresolvedRowDetails.length
    ? `Eşleşmeyen satırlar: ${unresolvedRowDetails.join('; ')}${unresolvedVisualRows > unresolvedRowDetails.length ? `; +${unresolvedVisualRows - unresolvedRowDetails.length} satır` : ''}.`
+   : '';
+ const unresolvedRowLegend = unresolvedVisualRows > 0
+   ? 'Satırlar her sayfada üstten alta doğru numaralandırılır. “Tarih eşleşmedi”, çıkarılan işlem tarihiyle OCR’nin aynı satır bölgesinde okuduğu tarihin güvenilir biçimde bağlanamadığı anlamına gelir; tarih değerinin yanlış olduğu sonucunu vermez.'
    : '';
  for (const item of (Array.isArray(transactionAnalysis.suspiciousTransactions) ? transactionAnalysis.suspiciousTransactions : [])) {
    addFinding('Şüpheli işlem', item);
@@ -2705,15 +2745,15 @@ async function sendAnalysisResult(
    '',
    statementReviewHeadline,
    '',
-   `${result?.bank ? `Banka: ${getBankDisplayName(result.bank)}\n` : ''}Risk Skoru: ${score}/100`,
-   '',
-   confidenceLine,
+   ...(result?.bank ? [`Banka: ${getBankDisplayName(result.bank)}`] : []),
+   statementConfidenceLine,
    ...(formatAutomatedCheckSummary(result?.checks) ? ['', formatAutomatedCheckSummary(result?.checks)] : []),
    '',
    statementCheckLine,
    ...(visualRowMatchLine ? [visualRowMatchLine] : []),
    ...(reviewReasonLine ? ['', reviewReasonLine] : []),
    ...(unresolvedRowDetailLine ? [unresolvedRowDetailLine] : []),
+   ...(unresolvedRowLegend ? [unresolvedRowLegend] : []),
    '',
    '━━━━━━━━━━━━━━'
  ];
@@ -2805,7 +2845,7 @@ async function sendAnalysisResult(
 
 ${reviewHeadline}
 
-${confidenceLine}
+${reportConfidenceLine}
 ${formatAutomatedCheckSummary(result?.checks) ? `\n${formatAutomatedCheckSummary(result?.checks)}\n` : ''}
 ${specificReviewBlock}
 
