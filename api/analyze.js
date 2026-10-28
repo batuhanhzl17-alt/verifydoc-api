@@ -18462,6 +18462,49 @@ if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCas
   try {
     const referenceBuffer = await fs.readFile(reference.path);
     const referencePdf = await getPdfDocument({ data: new Uint8Array(referenceBuffer) }).promise;
+    if (pdfStructureForensics?.available === true) {
+      try {
+        const referenceStructure = await analyzePdfStructure({ pdf: referencePdf, buffer: referenceBuffer, pdfjsLib });
+        const targetCounts = pdfStructureForensics.normalizedOperatorCounts || {};
+        const referenceCounts = referenceStructure.normalizedOperatorCounts || {};
+        const samePageCount = Number(pdfStructureForensics.pageCount) === Number(referenceStructure.pageCount);
+        const byteDelta = Number(pdfStructureForensics.fileBytes) - Number(referenceStructure.fileBytes);
+        const byteDeltaPercent = referenceStructure.fileBytes
+          ? (byteDelta / Number(referenceStructure.fileBytes)) * 100 : null;
+        const targetTextCount = Number(targetCounts.textShow) || 0;
+        const referenceTextCount = Number(referenceCounts.textShow) || 0;
+        const targetOperatorMode = Number(targetCounts.textTJ) > 0
+          ? (Number(targetCounts.textTj) > 0 ? 'Tj+TJ' : 'TJ')
+          : (Number(targetCounts.textTj) > 0 ? 'Tj' : 'none');
+        const referenceOperatorMode = Number(referenceCounts.textTJ) > 0
+          ? (Number(referenceCounts.textTj) > 0 ? 'Tj+TJ' : 'TJ')
+          : (Number(referenceCounts.textTj) > 0 ? 'Tj' : 'none');
+        const sizeMaterialDifference = samePageCount && Math.abs(byteDelta) >= 10000 &&
+          Math.abs(Number(byteDeltaPercent) || 0) >= 50;
+        const operatorCountDelta = Math.abs((Number(targetCounts.textTj) || 0) - (Number(referenceCounts.textTj) || 0)) +
+          Math.abs((Number(targetCounts.textTJ) || 0) - (Number(referenceCounts.textTJ) || 0));
+        const operatorMaterialDifference = samePageCount && targetTextCount >= 20 && referenceTextCount >= 20 &&
+          (targetOperatorMode !== referenceOperatorMode || operatorCountDelta >= Math.max(20, Math.round(referenceTextCount * 0.35)));
+        pdfStructureForensics.referenceComparison = {
+          available: true,
+          referenceFile: path.basename(reference.path),
+          samePageCount,
+          byteDelta,
+          byteDeltaPercent: Number.isFinite(byteDeltaPercent) ? Number(byteDeltaPercent.toFixed(1)) : null,
+          sizeMaterialDifference,
+          targetOperatorMode,
+          referenceOperatorMode,
+          targetTextOperators: { Tj: Number(targetCounts.textTj) || 0, TJ: Number(targetCounts.textTJ) || 0 },
+          referenceTextOperators: { Tj: Number(referenceCounts.textTj) || 0, TJ: Number(referenceCounts.textTJ) || 0 },
+          operatorMaterialDifference,
+          materialDifferences: sizeMaterialDifference || operatorMaterialDifference,
+          note: 'Boyut ve metin komutu farkları dışa aktarma/sıkıştırma biçiminden kaynaklanabilir; tek başına düzenleme kanıtı değildir.',
+        };
+        console.log('PDF STRUCTURE REFERENCE COMPARISON:', JSON.stringify(pdfStructureForensics.referenceComparison));
+      } catch (structureError) {
+        console.warn('PDF STRUCTURE REFERENCE COMPARISON ERROR:', structureError?.message || String(structureError));
+      }
+    }
     pdfReferenceFieldAssociation = await extractPdfNativeFieldAssociations(referencePdf);
     const fieldComparison = {};
     for (const field of ["recipientName", "recipientIBAN", "amount"]) {
