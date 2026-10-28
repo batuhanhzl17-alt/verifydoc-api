@@ -27,26 +27,6 @@ function compactTelegramText(value, maxChars = 700) {
  return `${prefix.slice(0, safeEnd).trimEnd()}…`;
 }
 
-function formatAutomatedCheckSummary(checks) {
- if (!checks || typeof checks !== 'object' || Array.isArray(checks)) return '';
- const entries = Object.values(checks).filter(item =>
-   item && typeof item === 'object' && ['pass', 'fail', 'unknown'].includes(String(item.status || '').toLowerCase())
- );
- if (!entries.length) return '';
- const counts = entries.reduce((total, item) => {
-   total[String(item.status).toLowerCase()] += 1;
-   return total;
- }, { pass: 0, fail: 0, unknown: 0 });
- return [
-   '🔎 KONTROL ÖZETİ',
-   `İşlenen otomatik kontrol: ${entries.length}`,
-   `✅ Uyumlu kontroller: ${counts.pass}`,
-   `⚠️ İnceleme sinyali: ${counts.fail}`,
-   `☁️ Doğrulanamayan kontroller: ${counts.unknown}`,
-   'Bu sayılar kontrol durumlarını gösterir; tek başına sahtecilik kararı değildir.',
- ].join('\n');
-}
-
 function getTextIntegrityNotice(summary) {
  const issuePattern = /(?:türkçe karakter.{0,80}(?:eksik|görünm|bozuk|kaybol|atlan|okunam|boşluklu)|(?:eksik|görünmeyen|bozuk|kaybolan|okunamayan).{0,80}türkçe karakter|metin bütünlüğü.{0,80}(?:sınırlı|bozuk|eksik|sorun))/i;
  return String(summary || '').split(/(?<=[.!?])\s+|\n+/).map(line => line.trim()).find(line => issuePattern.test(line)) || '';
@@ -2747,7 +2727,6 @@ async function sendAnalysisResult(
    '',
    ...(result?.bank ? [`Banka: ${getBankDisplayName(result.bank)}`] : []),
    statementConfidenceLine,
-   ...(formatAutomatedCheckSummary(result?.checks) ? ['', formatAutomatedCheckSummary(result?.checks)] : []),
    '',
    statementCheckLine,
    ...(visualRowMatchLine ? [visualRowMatchLine] : []),
@@ -2846,7 +2825,6 @@ async function sendAnalysisResult(
 ${reviewHeadline}
 
 ${reportConfidenceLine}
-${formatAutomatedCheckSummary(result?.checks) ? `\n${formatAutomatedCheckSummary(result?.checks)}\n` : ''}
 ${specificReviewBlock}
 
 ━━━━━━━━━━━━━━
