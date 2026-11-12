@@ -7110,18 +7110,30 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
     const formatTags = {};
     const streamLines = [];
     let readingInputMetadata = false;
+    let insideInputSection = false;
+    let inputFormatMetadataOpen = false;
     for (const line of ffmpegInputLog.split(/\r?\n/)) {
-      if (/^\s*Input #0,/i.test(line)) readingInputMetadata = false;
+      if (/^\s*Input #0,/i.test(line)) {
+        insideInputSection = true;
+        inputFormatMetadataOpen = true;
+        readingInputMetadata = false;
+      }
+      if (/^\s*Output #/i.test(line)) {
+        insideInputSection = false;
+        inputFormatMetadataOpen = false;
+        readingInputMetadata = false;
+      }
+      if (/^\s*Duration:/i.test(line)) inputFormatMetadataOpen = false;
       if (/^\s*Metadata:/i.test(line)) {
-        readingInputMetadata = true;
+        readingInputMetadata = insideInputSection && inputFormatMetadataOpen;
         continue;
       }
       if (/^\s*Stream #0:/i.test(line)) {
         readingInputMetadata = false;
-        streamLines.push(line.trim());
+        inputFormatMetadataOpen = false;
+        if (insideInputSection) streamLines.push(line.trim());
         continue;
       }
-      if (/^\s*Stream #0:/i.test(line)) streamLines.push(line.trim());
       if (readingInputMetadata) {
         const tagMatch = line.match(/^\s{4,}([A-Za-z0-9_.-]+)\s*:\s*(.*?)\s*$/);
         if (tagMatch && Object.keys(formatTags).length < 40) formatTags[tagMatch[1]] = tagMatch[2].slice(0, 300);
@@ -7133,7 +7145,7 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       if (!line) return null;
       const codecMatch = line.match(new RegExp(`${kind}:\\s*([^,(]+)(?:\\s*\\(([^)]*)\\))?`, "i"));
       const resolutionMatch = line.match(/(\d{2,5})x(\d{2,5})/);
-      const pixelFormatMatch = kind === "Video" ? line.match(/,\s*([a-zA-Z0-9_]+),\s*\d{2,5}x\d{2,5}/) : null;
+      const pixelFormatMatch = kind === "Video" ? line.match(/,\s*([a-zA-Z0-9_]+)(?:\([^)]*\))?,\s*\d{2,5}x\d{2,5}/) : null;
       const rateMatch = kind === "Video" ? line.match(/,\s*([0-9.]+)\s*(?:fps|tbr)/i) : null;
       const sampleRateMatch = kind === "Audio" ? line.match(/(\d{4,6})\s*Hz/i) : null;
       const channelMatch = kind === "Audio" ? line.match(/,\s*(mono|stereo|[0-9.]+\s*channels?)/i) : null;
