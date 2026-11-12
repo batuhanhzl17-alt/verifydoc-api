@@ -7095,10 +7095,108 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       }
     }
     const framePts = [];
+    const ffmpegInputLog = String(videoPass?.stderr || "");
     for (const line of String(videoPass?.stderr || "").split(/\r?\n/)) {
       const match = line.match(/\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:\s*(-?\d+(?:\.\d+)?)/);
       if (match) framePts.push({ frame: Number(match[1]), pts: Number(match[2]), timestampSeconds: Number(match[3]) });
     }
+    // Diagnostic-only source/container inventory. FFmpeg reports what it can
+    // parse from the uploaded file; tags can be absent, rewritten, or spoofed.
+    const inputHeader = ffmpegInputLog.match(/Input #0,\s*([^,\r\n]+)/i);
+    const durationHeader = ffmpegInputLog.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/i);
+    const parsedDuration = durationHeader
+      ? Number(durationHeader[1]) * 3600 + Number(durationHeader[2]) * 60 + Number(durationHeader[3])
+      : null;
+    const formatTags = {};
+    const streamLines = [];
+    let readingInputMetadata = false;
+    for (const line of ffmpegInputLog.split(/\r?\n/)) {
+      if (/^\s*Input #0,/i.test(line)) readingInputMetadata = false;
+      if (/^\s*Metadata:/i.test(line)) {
+        readingInputMetadata = true;
+        continue;
+      }
+      if (/^\s*Stream #0:/i.test(line)) {
+        readingInputMetadata = false;
+        streamLines.push(line.trim());
+        continue;
+      }
+      if (/^\s*Stream #0:/i.test(line)) streamLines.push(line.trim());
+      if (readingInputMetadata) {
+        const tagMatch = line.match(/^\s{4,}([A-Za-z0-9_.-]+)\s*:\s*(.*?)\s*$/);
+        if (tagMatch && Object.keys(formatTags).length < 40) formatTags[tagMatch[1]] = tagMatch[2].slice(0, 300);
+      }
+    }
+    const videoStreamLine = streamLines.find((line) => /Video:/i.test(line)) || "";
+    const audioStreamLine = streamLines.find((line) => /Audio:/i.test(line)) || "";
+    const parseStream = (line, kind) => {
+      if (!line) return null;
+      const codecMatch = line.match(new RegExp(`${kind}:\\s*([^,(]+)(?:\\s*\\(([^)]*)\\))?`, "i"));
+      const resolutionMatch = line.match(/(\d{2,5})x(\d{2,5})/);
+      const pixelFormatMatch = kind === "Video" ? line.match(/,\s*([a-zA-Z0-9_]+),\s*\d{2,5}x\d{2,5}/) : null;
+      const rateMatch = kind === "Video" ? line.match(/,\s*([0-9.]+)\s*(?:fps|tbr)/i) : null;
+      const sampleRateMatch = kind === "Audio" ? line.match(/(\d{4,6})\s*Hz/i) : null;
+      const channelMatch = kind === "Audio" ? line.match(/,\s*(mono|stereo|[0-9.]+\s*channels?)/i) : null;
+      return {
+        codec: codecMatch?.[1]?.trim() || null,
+        codecDetails: codecMatch?.[2]?.trim() || null,
+        ...(kind === "Video" ? {
+          width: resolutionMatch ? Number(resolutionMatch[1]) : null,
+          height: resolutionMatch ? Number(resolutionMatch[2]) : null,
+          pixelFormat: pixelFormatMatch?.[1] || null,
+          frameRateFps: rateMatch ? Number(rateMatch[1]) : null,
+        } : {
+          sampleRateHz: sampleRateMatch ? Number(sampleRateMatch[1]) : null,
+          channels: channelMatch?.[1]?.trim() || null,
+        }),
+        streamDescription: line.slice(0, 600),
+      };
+    };
+    const encoderTag = Object.entries(formatTags).find(([key]) => /^(encoder|writing_library|writing_application|software)$/i.test(key));
+    const containerAudit = {
+      available: Boolean(inputHeader || videoStreamLine || Object.keys(formatTags).length),
+      engine: "ffmpeg-input-metadata-audit-v1",
+      format: inputHeader?.[1]?.trim() || null,
+      durationSeconds: Number.isFinite(parsedDuration) ? Number(parsedDuration.toFixed(3)) : null,
+      formatTags,
+      encoderHint: encoderTag ? { field: encoderTag[0], value: encoderTag[1] } : null,
+      videoStream: parseStream(videoStreamLine, "Video"),
+      audioStream: parseStream(audioStreamLine, "Audio"),
+      affectsRiskScore: false,
+      note: "Konteyner ve codec etiketleri kaynak dosyanın beyan ettiği bilgilerdir; eksik veya değiştirilebilir, tek başına düzenleme kanıtı değildir.",
+    };
+    // FFmpeg showinfo exposes decoded picture type/keyframe flags on builds
+    // that support them. Report GOP spacing as a descriptive signal only.
+    const keyframes = [];
+    for (const line of ffmpegInputLog.split(/\r?\n/)) {
+      if (!/showinfo/i.test(line) || !(/\btype:I\b/.test(line) || /\biskey:1\b/.test(line))) continue;
+      const match = line.match(/\bn:\s*(\d+).*?pts_time:\s*(-?\d+(?:\.\d+)?)/);
+      if (match) keyframes.push({ frame: Number(match[1]), timestampSeconds: Number(match[2]) });
+    }
+    const keyframeIntervals = keyframes.slice(1).map((item, index) => ({
+      fromFrame: keyframes[index].frame,
+      toFrame: item.frame,
+      fromSeconds: Number(keyframes[index].timestampSeconds.toFixed(3)),
+      toSeconds: Number(item.timestampSeconds.toFixed(3)),
+      frameInterval: item.frame - keyframes[index].frame,
+      seconds: Number((item.timestampSeconds - keyframes[index].timestampSeconds).toFixed(3)),
+    }));
+    const sortedGopFrames = keyframeIntervals.map((item) => item.frameInterval).filter((value) => value > 0).sort((a, b) => a - b);
+    const medianGopFrames = sortedGopFrames.length
+      ? sortedGopFrames[Math.floor(sortedGopFrames.length / 2)]
+      : null;
+    const keyframeAudit = {
+      available: keyframes.length > 0,
+      engine: "ffmpeg-showinfo-keyframe-gop-audit-v1",
+      keyframeCount: keyframes.length,
+      keyframes: keyframes.slice(0, 200),
+      intervalCount: keyframeIntervals.length,
+      medianGopFrames,
+      intervals: keyframeIntervals.slice(0, 200),
+      affectsRiskScore: false,
+      reason: keyframes.length ? undefined : "Bu FFmpeg çıktısında keyframe türü alanı bulunamadı.",
+      note: "I-frame/GOP düzeni codec ve yeniden kodlama ayarlarına göre değişir; düzensizlik veya düzenlilik tek başına kurgu/sahtecilik kanıtı değildir.",
+    };
     const videoDeltas = framePts.slice(1).map((item, index) => ({
       fromSeconds: framePts[index].timestampSeconds,
       toSeconds: item.timestampSeconds,
@@ -7353,6 +7451,8 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
           anomalyCount: videoTimestampAnomalies.length,
           anomalies: videoTimestampAnomalies,
         },
+        containerAudit,
+        keyframeAudit,
         audioTimestampAudit: audioTimeline,
         audioContentAudit,
         secondDetector: {
@@ -7400,6 +7500,8 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
         anomalies: videoTimestampAnomalies,
         note: "Decoded frame PTS continuity only; a re-encoded edit may have a clean timeline.",
       },
+      containerAudit,
+      keyframeAudit,
       audioTimestampAudit: audioTimeline,
       audioContentAudit,
       secondDetector: {
@@ -7443,6 +7545,8 @@ async function analyzeVideoTemporalContinuity(videoPath, durationSeconds = null)
       fullDurationScanned: false,
       candidateCount: null,
       sceneChangeCandidates: [],
+      containerAudit: { available: false, engine: "ffmpeg-input-metadata-audit-v1", affectsRiskScore: false, reason: error?.message || String(error) },
+      keyframeAudit: { available: false, engine: "ffmpeg-showinfo-keyframe-gop-audit-v1", affectsRiskScore: false, reason: error?.message || String(error) },
       reason: error?.message || String(error)
     };
   }
