@@ -2301,6 +2301,7 @@ async function sendAnalysisResult(
    'pdf-structure-reference-difference': 'PDF boyutu veya metin çizim komutları seçilen referanstan belirgin farklı.',
    'strong-amount-reference-render-difference': 'Tutar alanında referansla belirgin görüntü farkı var.',
    'strong-reference-field-spacing-anomaly': 'Referans yerleşiminde güçlü alan aralığı farkı var.',
+   'pdf-provenance-image-only-missing-metadata': 'PDF’de üretici/oluşturan bilgisi ve değiştirilme tarihi yok; sayfalar metin katmanı olmadan görüntü çizimleri içeriyor. Bu birleşik sinyal manuel inceleme gerektirir, tek başına düzenleme kanıtı değildir.',
  };
  const specificReviewReasonLines = [...new Set([
    ...criticalReviewReasons,
@@ -2656,6 +2657,13 @@ async function sendAnalysisResult(
    : '';
  const statementReasonLines = [];
  if (textIntegrityReview) statementReasonLines.push(textIntegrityReviewLine);
+ const statementTemplateCheck = result?.statementReferenceTemplateCompatibility;
+ if (statementTemplateCheck && statementTemplateCheck.status !== 'compatible') {
+   statementReasonLines.push(statementTemplateCheck.message || 'Banka adıyla referans seçildi; hesap özeti şablon uyumu doğrulanamadı.');
+ }
+ if (result?.pdfProvenanceReview?.triggered === true && result?.pdfProvenanceReview?.message) {
+   statementReasonLines.push(result.pdfProvenanceReview.message);
+ }
  if (balanceMismatchCount) statementReasonLines.push(`${balanceMismatchCount} bakiye geçişinde fark bulundu.`);
  if (rowCountIncomplete) statementReasonLines.push(`Çıkarılan işlem satırı sayısı beklenen sayıyla uyuşmuyor (${extractedRowCount}/${declaredRowCount}).`);
  if (pageCoverageIncomplete) statementReasonLines.push(`Tüm sayfalar taranamadı (${pagesAnalyzed}/${pageCount}).`);
