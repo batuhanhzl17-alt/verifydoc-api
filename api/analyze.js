@@ -2751,6 +2751,30 @@ const STATEMENT_REFERENCE_MAP = {
   yapikredi: ["yapikredi-hesap-hareketi1.pdf", "yapikredi-hesap-hareketi2.pdf"],
 };
 
+function evaluatePdfProvenanceReview(pdfStructure) {
+  const metadata = pdfStructure?.metadata || {};
+  const pages = Array.isArray(pdfStructure?.pageDetails) ? pdfStructure.pageDetails : [];
+  const completePageScan = pdfStructure?.truncatedPageScan !== true &&
+    pages.length > 0 && pages.length === Number(pdfStructure?.pageCount);
+  const imageOnlyCandidate = completePageScan && pages.every(page =>
+    Number(page?.textItemCount) === 0 && Number(page?.imagePaint) > 0
+  );
+  const missingSourceMetadata = !metadata.producer && !metadata.creator && !metadata.modificationDate;
+  const triggered = pdfStructure?.available === true && missingSourceMetadata && imageOnlyCandidate;
+  return {
+    triggered,
+    status: triggered ? 'review' : 'not-triggered',
+    producerMissing: !metadata.producer,
+    creatorMissing: !metadata.creator,
+    modificationDateMissing: !metadata.modificationDate,
+    imageOnlyCandidatePageCount: imageOnlyCandidate ? pages.length : Number(pdfStructure?.imageOnlyCandidatePageCount) || 0,
+    pageCount: Number(pdfStructure?.pageCount) || 0,
+    message: triggered
+      ? 'PDF’de üretici/oluşturan bilgisi ve değiştirilme tarihi kaydı yok; incelenen tüm sayfalarda çıkarılabilir metin bulunmuyor ve görüntü çizimleri var. Bu birleşik köken sinyali manuel kontrol gerektirir; tek başına düzenleme kanıtı değildir.'
+      : null,
+  };
+}
+
 function detectStatementBankFromText(text, fileName = "") {
   const normalizeBankText = (value) => String(value || "")
     .toLocaleLowerCase("tr-TR")
@@ -2955,6 +2979,157 @@ async function loadStatementReferenceFile(bank, statementText = "", fileName = "
 
   if (!references.length) return null;
   return references.length === 1 ? references[0] : references;
+}
+
+// The issuer identity pass authorizes which bank's reference is loaded; it does
+// NOT establish that the uploaded statement uses that reference's template.
+// Compare first-page geometry independently so a bank-name match is never
+// reported as a template match by implication.
+async function getStatementTemplateSignature(pdfBuffer) {
+  if (!Buffer.isBuffer(pdfBuffer) || !pdfBuffer.length) return null;
+  let pdf = null;
+  try {
+    pdf = await getPdfDocument({ data: new Uint8Array(pdfBuffer) }).promise;
+    if (!pdf?.numPages) return null;
+    const page = await pdf.getPage(1);
+    const textContent = await page.getTextContent().catch(() => ({ items: [] }));
+    const rendered = await renderPdfPagePng(pdf, 1, 1.35);
+    if (!rendered?.buffer) return null;
+    const fingerprint = await extractLongLineFingerprint(rendered.buffer);
+    const structure = await extractWholePageStructureSignature(rendered.buffer);
+    if (!fingerprint || !structure) return null;
+    const text = (textContent.items || []).map(item => String(item?.str || '')).join(' ')
+      .toLocaleLowerCase('tr-TR').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/ı/g, 'i').replace(/ş/g, 's').replace(/ğ/g, 'g').replace(/ü/g, 'u')
+      .replace(/ö/g, 'o').replace(/ç/g, 'c').replace(/\s+/g, ' ');
+    const anchorRules = {
+      accountHeading: /hesap\s+(?:hareket|ozet)/,
+      transactionDate: /islem\s+tarihi|tarih\s+aciklama/,
+      description: /aciklama|islem\s+detayi/,
+      amount: /islem\s+tutari|borc|alacak|tutar/,
+      balance: /hesap\s+bakiyesi|bakiye/,
+      accountNumber: /hesap\s+no|iban/,
+    };
+    const anchors = Object.entries(anchorRules).filter(([, pattern]) => pattern.test(text)).map(([key]) => key);
+    return {
+      pageCount: Number(pdf.numPages) || 0,
+      width: rendered.width,
+      height: rendered.height,
+      lines: fingerprint.horizontal.filter(line => Number(line.lengthNorm) >= 0.50),
+      structureLineCount: Number(structure.lineCount) || 0,
+      anchors,
+    };
+  } catch (error) {
+    console.warn('HESAP ÖZETİ ŞABLON İMZASI HATASI:', error?.message || error);
+    return null;
+  } finally {
+    try { await pdf?.destroy?.(); } catch {}
+  }
+}
+
+async function compareStatementReferenceTemplate(targetBuffer, statementReference, bank) {
+  const referenceItems = (Array.isArray(statementReference) ? statementReference : [statementReference])
+    .filter(item => item?.base64);
+  const target = await getStatementTemplateSignature(targetBuffer);
+  if (!target || !referenceItems.length) {
+    return {
+      available: false,
+      status: 'indeterminate',
+      bank: bank || null,
+      message: 'Banka adı belirlenmiş olsa da kayıtlı hesap özeti referansıyla görsel şablon karşılaştırması tamamlanamadı; referans uyumu doğrulanamadı.',
+    };
+  }
+
+  const comparisons = [];
+  for (const item of referenceItems) {
+    try {
+      const refBuffer = Buffer.from(item.base64, 'base64');
+      const reference = await getStatementTemplateSignature(refBuffer);
+      if (!reference) continue;
+      const refLines = [...reference.lines].sort((a, b) => a.yNorm - b.yNorm);
+      const targetLines = [...target.lines].sort((a, b) => a.yNorm - b.yNorm);
+      const used = new Set();
+      let matchedLines = 0;
+      let lineCost = 0;
+      for (const targetLine of targetLines) {
+        let bestIndex = -1;
+        let bestCost = Infinity;
+        for (let index = 0; index < refLines.length; index++) {
+          if (used.has(index)) continue;
+          const refLine = refLines[index];
+          const dy = Math.abs(Number(targetLine.yNorm) - Number(refLine.yNorm));
+          const dl = Math.abs(Number(targetLine.lengthNorm) - Number(refLine.lengthNorm));
+          const cost = dy / 0.035 + dl / 0.18;
+          if (cost < bestCost) { bestCost = cost; bestIndex = index; }
+        }
+        if (bestIndex >= 0 && bestCost <= 2.0) {
+          used.add(bestIndex);
+          matchedLines++;
+          lineCost += bestCost;
+        }
+      }
+      const lineSimilarity = matchedLines / Math.max(1, refLines.length, targetLines.length);
+      const refAnchors = new Set(reference.anchors);
+      const targetAnchors = new Set(target.anchors);
+      const sharedAnchors = [...refAnchors].filter(anchor => targetAnchors.has(anchor));
+      const anchorUnion = new Set([...refAnchors, ...targetAnchors]);
+      const anchorSimilarity = anchorUnion.size ? sharedAnchors.length / anchorUnion.size : null;
+      const enoughGeometry = refLines.length >= 4 && targetLines.length >= 3;
+      const status = enoughGeometry && lineSimilarity >= 0.68
+        ? 'compatible'
+        : enoughGeometry && lineSimilarity < 0.32
+          ? 'mismatch'
+          : 'indeterminate';
+      comparisons.push({
+        referenceFile: item.fileName || null,
+        lineSimilarity: Number(lineSimilarity.toFixed(3)),
+        matchedLongLines: matchedLines,
+        referenceLongLines: refLines.length,
+        targetLongLines: targetLines.length,
+        meanMatchedLineCost: matchedLines ? Number((lineCost / matchedLines).toFixed(3)) : null,
+        anchorSimilarity: anchorSimilarity === null ? null : Number(anchorSimilarity.toFixed(3)),
+        sharedAnchors,
+        status,
+      });
+    } catch (error) {
+      console.warn('HESAP ÖZETİ REFERANS ŞABLONU ATLANDI:', item?.fileName || 'bilinmeyen', error?.message || error);
+    }
+  }
+
+  comparisons.sort((a, b) => (b.lineSimilarity || 0) - (a.lineSimilarity || 0));
+  const best = comparisons[0];
+  const bankLabel = ({ ziraat: 'Ziraat', garanti: 'Garanti BBVA', vakifbank: 'VakıfBank', akbank: 'Akbank', isbankasi: 'İş Bankası', halkbank: 'Halkbank', enpara: 'Enpara', qnb: 'QNB', ing: 'ING', yapikredi: 'Yapı Kredi', kuveytturk: 'Kuveyt Türk' })[bank] || bank || 'Banka';
+  if (!best) {
+    return {
+      available: false,
+      status: 'indeterminate',
+      bank: bank || null,
+      message: `${bankLabel} adıyla referans seçildi; ancak PDF sayfa yapısı karşılaştırılamadığı için şablon uyumu doğrulanamadı.`,
+      comparisons,
+    };
+  }
+  const status = best.status;
+  const message = status === 'compatible'
+    ? `${bankLabel} hesap özeti referansıyla ilk sayfa yerleşimi uyumlu görünüyor; bu sonuç banka kaynağını veya belge özgünlüğünü tek başına doğrulamaz.`
+    : status === 'mismatch'
+      ? `${bankLabel} olarak tanınan belgede, kayıtlı hesap özeti referansıyla belirgin ilk sayfa şablon farkı var (uzun çizgi/geometri benzerliği %${Math.round(best.lineSimilarity * 100)}). Banka kimliği belirlenmiş olsa da şablon uyumu doğrulanamadı; manuel kontrol gerekli.`
+      : `${bankLabel} adıyla referans seçildi; ancak ilk sayfa geometrisi şablon uyumunu güvenilir biçimde doğrulamak için yeterli değil. Banka kimliği, şablon eşleşmesi anlamına gelmez; manuel kontrol önerilir.`;
+  return {
+    available: true,
+    engine: 'statement-reference-page-geometry-v1',
+    bank: bank || null,
+    status,
+    selectedReference: best.referenceFile,
+    lineSimilarity: best.lineSimilarity,
+    matchedLongLines: best.matchedLongLines,
+    referenceLongLines: best.referenceLongLines,
+    targetLongLines: best.targetLongLines,
+    anchorSimilarity: best.anchorSimilarity,
+    sharedAnchors: best.sharedAnchors,
+    comparisons,
+    comparedPage: 1,
+    message,
+  };
 }
 
 // =====================================================
@@ -18199,6 +18374,9 @@ try {
     engine: pdfStructureForensics.engine || null,
     fileBytes: pdfStructureForensics.fileBytes || null,
     pageCount: pdfStructureForensics.pageCount || null,
+    metadata: pdfStructureForensics.metadata || null,
+    imageOnlyCandidatePageCount: pdfStructureForensics.imageOnlyCandidatePageCount || 0,
+    hasExtractableTextLayer: pdfStructureForensics.hasExtractableTextLayer === true,
     normalizedOperatorCounts: pdfStructureForensics.normalizedOperatorCounts || null,
   }));
 } catch (error) {
@@ -19840,6 +20018,45 @@ const statementResult = applyStatementLedgerChecks(
   statementPageCount,
   statementPdfForensics
 );
+statementResult.pdfStructureForensics = pdfStructureForensics;
+const statementTemplateCompatibility = await compareStatementReferenceTemplate(
+  buffer,
+  statementReference,
+  statementBank
+);
+statementResult.statementReferenceTemplateCompatibility = statementTemplateCompatibility;
+console.log('HESAP ÖZETİ REFERANS ŞABLON UYUMU:', JSON.stringify({
+  bank: statementTemplateCompatibility?.bank || statementBank || null,
+  status: statementTemplateCompatibility?.status || 'indeterminate',
+  selectedReference: statementTemplateCompatibility?.selectedReference || null,
+  lineSimilarity: statementTemplateCompatibility?.lineSimilarity ?? null,
+  comparisons: statementTemplateCompatibility?.comparisons || [],
+}));
+if (statementReference && statementTemplateCompatibility?.status !== 'compatible') {
+  const templateFinding = statementTemplateCompatibility?.message ||
+    'Banka adına göre referans seçildi; hesap özeti şablon uyumu doğrulanamadı. Manuel kontrol önerilir.';
+  statementResult.manualReviewRequired = true;
+  statementResult.statementReferenceTemplateValidated = false;
+  statementResult.statementAuditFindings = [
+    ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
+    templateFinding,
+  ];
+  statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), templateFinding])];
+  statementResult.summary = [String(statementResult.summary || '').trim(), `• ${templateFinding}`].filter(Boolean).join('\n');
+} else {
+  statementResult.statementReferenceTemplateValidated = statementTemplateCompatibility?.status === 'compatible';
+}
+const statementProvenanceReview = evaluatePdfProvenanceReview(pdfStructureForensics);
+statementResult.pdfProvenanceReview = statementProvenanceReview;
+if (statementProvenanceReview.triggered) {
+  statementResult.manualReviewRequired = true;
+  statementResult.statementAuditFindings = [
+    ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
+    statementProvenanceReview.message,
+  ];
+  statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), statementProvenanceReview.message])];
+  statementResult.summary = [String(statementResult.summary || '').trim(), `• ${statementProvenanceReview.message}`].filter(Boolean).join('\n');
+}
 if (statementBankIdentityConflict) {
   const bankConflictReasons = [];
   if (statementTextBankConflict) bankConflictReasons.push(`üst bilgi metin tespiti ${detectedStatementBank}, görsel ön tarama ${statementBank} dedi`);
@@ -20009,12 +20226,16 @@ statementReference
       ? {
           fileName: statementReference.map((r) => r.fileName),
           type: "statement-reference",
-          bank: statementReference[0]?.bank || statementBank
+          bank: statementReference[0]?.bank || statementBank,
+          selectionBasis: "bank-identity; template-compatibility-checked-separately",
+          templateCompatibility: statementTemplateCompatibility?.status || "indeterminate"
         }
       : {
           fileName: statementReference.fileName,
           type: "statement-reference",
-          bank: statementReference.bank
+          bank: statementReference.bank,
+          selectionBasis: "bank-identity; template-compatibility-checked-separately",
+          templateCompatibility: statementTemplateCompatibility?.status || "indeterminate"
         })
   : null,
 ...statementResult,
@@ -24532,6 +24753,12 @@ const amountRenderDifferenceStrong = Boolean(
   )
 );
 const criticalReviewReasons = [];
+const pdfProvenanceReview = evaluatePdfProvenanceReview(pdfStructureForensics);
+result.pdfProvenanceReview = pdfProvenanceReview;
+if (pdfProvenanceReview.triggered) {
+  criticalReviewReasons.push('pdf-provenance-image-only-missing-metadata');
+  result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : []), pdfProvenanceReview.message])];
+}
 // Keep the user-facing review state consistent with the reference-forensics
 // report. Strong, localized field-spacing anomalies must not be presented as
 // a clean/corroborated result just because the critical values (amount/IBAN)
@@ -24558,7 +24785,7 @@ const criticalFieldsRequireControl = criticalReviewReasons.length > 0;
 if (semanticEvidenceFusion?.available) {
   semanticEvidenceFusion.reviewStatus = criticalFieldsRequireControl ? 'CONTROL_REQUIRED' : 'FIELDS_CORROBORATED';
   semanticEvidenceFusion.reviewMessage = criticalFieldsRequireControl
-    ? 'Kontrol gerekli: alıcı IBANı veya tutar alanı doğrulanamadı, kaynaklar uyuşmadı, tutar karşılaştırması eksik/güçlü fark gösteriyor ya da referansla güçlü bir alan yerleşimi farkı bulundu.'
+    ? 'Kontrol gerekli: kritik alan doğrulanamadı, kaynaklar uyuşmadı, referans karşılaştırması tamamlanmadı veya PDF köken/yapı sinyali manuel inceleme gerektiriyor.'
     : 'Alıcı IBANı ve tutar alanı doğrulandı; tutar karşılaştırması ve güçlü yerleşim farkı kontrolleri ek inceleme gerektirmedi.';
   semanticEvidenceFusion.criticalFieldReview = {
     focusFields: ['recipientIBAN', 'amount'],
