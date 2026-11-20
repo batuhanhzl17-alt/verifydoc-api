@@ -3046,151 +3046,164 @@ async function loadStatementReferenceFile(bank, statementText = "", fileName = "
   return references.length === 1 ? references[0] : references;
 }
 
-// The issuer identity pass authorizes which bank's reference is loaded; it does
-// NOT establish that the uploaded statement uses that reference's template.
-// Compare first-page geometry independently so a bank-name match is never
-// reported as a template match by implication.
+// Compare the rendered first page using the upper layout and transaction
+// column positions. Variable transaction text is pooled into broad regions.
+const STATEMENT_LAYOUT_GRID = { width: 240, height: 336, upperColumns: 30, upperRows: 16, tableColumns: 60 };
+
+async function describeStatementPageImage(imageBuffer) {
+  const { width, height, upperColumns, upperRows, tableColumns } = STATEMENT_LAYOUT_GRID;
+  const pixels = await sharp(imageBuffer)
+    .flatten({ background: '#fff' })
+    .resize(width, height, { fit: 'fill' })
+    .toColourspace('srgb')
+    .removeAlpha()
+    .raw()
+    .toBuffer();
+  const upper = new Float64Array(upperColumns * upperRows);
+  const table = new Float64Array(tableColumns);
+  const row = new Uint8Array(width);
+  const top = 7, upperEnd = 92, tableEnd = 230, margin = 5;
+  let upperInk = 0, tableInk = 0;
+  let coloredRun = 0, longestColoredRun = 0;
+
+  for (let y = top; y < tableEnd; y++) {
+    let background = 0, coloredPixels = 0;
+    for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * 3;
+      const r = pixels[offset], g = pixels[offset + 1], b = pixels[offset + 2];
+      row[x] = (77 * r + 150 * g + 29 * b) >> 8;
+      background = Math.max(background, row[x]);
+      if (x >= margin && x < width - margin && Math.max(r, g, b) - Math.min(r, g, b) >= 55) {
+        coloredPixels++;
+      }
+    }
+    coloredRun = coloredPixels >= (width - 2 * margin) * 0.5 ? coloredRun + 1 : 0;
+    longestColoredRun = Math.max(longestColoredRun, coloredRun);
+    const upperRow = Math.floor((y - top) * upperRows / (upperEnd - top));
+    for (let x = margin; x < width - margin; x++) {
+      const ink = Math.min(1, Math.max(0, (background - row[x] - 22) / 165));
+      if (y < upperEnd) {
+        upper[upperRow * upperColumns + Math.floor(x * upperColumns / width)] += ink;
+        upperInk += ink;
+      } else {
+        table[Math.floor(x * tableColumns / width)] += ink;
+        tableInk += ink;
+      }
+    }
+  }
+
+  return {
+    upper: upper.map(value => Math.sqrt(value)),
+    table: table.map((value, i) => (2 * value + (table[i - 1] || 0) + (table[i + 1] || 0)) / 4),
+    hasEnoughContent: upperInk >= 50 && tableInk >= 80,
+    hasWideColoredBand: longestColoredRun >= 5,
+  };
+}
+
+function statementLayoutSimilarity(a, b, columns, maxShiftX, maxShiftY) {
+  const energy = values => values.reduce((sum, value) => sum + value ** 2, 0);
+  const norm = Math.sqrt(energy(a) * energy(b));
+  if (!norm) return null;
+
+  const rows = a.length / columns;
+  let best = 0;
+  for (let dy = -maxShiftY; dy <= maxShiftY; dy++) {
+    for (let dx = -maxShiftX; dx <= maxShiftX; dx++) {
+      let overlap = 0;
+      for (let y = Math.max(0, -dy); y < Math.min(rows, rows - dy); y++) {
+        for (let x = Math.max(0, -dx); x < Math.min(columns, columns - dx); x++) {
+          overlap += a[y * columns + x] * b[(y + dy) * columns + x + dx];
+        }
+      }
+      best = Math.max(best, overlap / norm);
+    }
+  }
+  return Math.min(1, best);
+}
+
+function compareStatementPageImages(target, reference) {
+  const { upperColumns, tableColumns } = STATEMENT_LAYOUT_GRID;
+  const headerSimilarity = statementLayoutSimilarity(target.upper, reference.upper, upperColumns, 1, 1);
+  const columnSimilarity = statementLayoutSimilarity(target.table, reference.table, tableColumns, 2, 0);
+  const coloredBandDifference = target.hasWideColoredBand !== reference.hasWideColoredBand;
+  const enoughContent = target.hasEnoughContent && reference.hasEnoughContent &&
+    headerSimilarity !== null && columnSimilarity !== null;
+  let status = 'indeterminate';
+  if (enoughContent && headerSimilarity >= 0.78 && columnSimilarity >= 0.80) {
+    status = 'compatible';
+  } else if (enoughContent && headerSimilarity < 0.62 && (columnSimilarity < 0.79 || coloredBandDifference)) {
+    status = 'mismatch';
+  }
+
+  const round = score => score === null ? null : Number(score.toFixed(3));
+  return {
+    status,
+    visualSimilarity: enoughContent ? round(0.65 * headerSimilarity + 0.35 * columnSimilarity) : null,
+    headerSimilarity: round(headerSimilarity),
+    columnSimilarity: round(columnSimilarity),
+    coloredBandDifference,
+  };
+}
+
 async function getStatementTemplateSignature(pdfBuffer) {
   if (!Buffer.isBuffer(pdfBuffer) || !pdfBuffer.length) return null;
-  let pdf = null;
+  let pdf;
   try {
     pdf = await getPdfDocument({ data: new Uint8Array(pdfBuffer) }).promise;
     if (!pdf?.numPages) return null;
-    const page = await pdf.getPage(1);
-    const textContent = await page.getTextContent().catch(() => ({ items: [] }));
-    const rendered = await renderPdfPagePng(pdf, 1, 1.35);
-    if (!rendered?.buffer) return null;
-    const fingerprint = await extractLongLineFingerprint(rendered.buffer);
-    const structure = await extractWholePageStructureSignature(rendered.buffer);
-    if (!fingerprint || !structure) return null;
-    const text = (textContent.items || []).map(item => String(item?.str || '')).join(' ')
-      .toLocaleLowerCase('tr-TR').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
-      .replace(/ı/g, 'i').replace(/ş/g, 's').replace(/ğ/g, 'g').replace(/ü/g, 'u')
-      .replace(/ö/g, 'o').replace(/ç/g, 'c').replace(/\s+/g, ' ');
-    const anchorRules = {
-      accountHeading: /hesap\s+(?:hareket|ozet)/,
-      transactionDate: /islem\s+tarihi|tarih\s+aciklama/,
-      description: /aciklama|islem\s+detayi/,
-      amount: /islem\s+tutari|borc|alacak|tutar/,
-      balance: /hesap\s+bakiyesi|bakiye/,
-      accountNumber: /hesap\s+no|iban/,
-    };
-    const anchors = Object.entries(anchorRules).filter(([, pattern]) => pattern.test(text)).map(([key]) => key);
-    return {
-      pageCount: Number(pdf.numPages) || 0,
-      width: rendered.width,
-      height: rendered.height,
-      lines: fingerprint.horizontal.filter(line => Number(line.lengthNorm) >= 0.50),
-      structureLineCount: Number(structure.lineCount) || 0,
-      anchors,
-    };
+    const rendered = await renderPdfPagePng(pdf, 1, 1.1);
+    return rendered?.buffer ? await describeStatementPageImage(rendered.buffer) : null;
   } catch (error) {
-    console.warn('HESAP ÖZETİ ŞABLON İMZASI HATASI:', error?.message || error);
+    console.warn('HESAP ÖZETİ GÖRSEL ŞABLON OKUMA HATASI:', error?.message || error);
     return null;
   } finally {
-    try { await pdf?.destroy?.(); } catch {}
+    try { await pdf?.destroy(); } catch {}
   }
 }
 
 async function compareStatementReferenceTemplate(targetBuffer, statementReference, bank) {
   const referenceItems = (Array.isArray(statementReference) ? statementReference : [statementReference])
     .filter(item => item?.base64);
-  const target = await getStatementTemplateSignature(targetBuffer);
-  if (!target || !referenceItems.length) {
-    return {
-      available: false,
-      status: 'indeterminate',
-      bank: bank || null,
-      message: 'Banka adı belirlenmiş olsa da kayıtlı hesap özeti referansıyla görsel şablon karşılaştırması tamamlanamadı; referans uyumu doğrulanamadı.',
-    };
-  }
-
+  const target = referenceItems.length ? await getStatementTemplateSignature(targetBuffer) : null;
   const comparisons = [];
-  for (const item of referenceItems) {
-    try {
-      const refBuffer = Buffer.from(item.base64, 'base64');
-      const reference = await getStatementTemplateSignature(refBuffer);
-      if (!reference) continue;
-      const refLines = [...reference.lines].sort((a, b) => a.yNorm - b.yNorm);
-      const targetLines = [...target.lines].sort((a, b) => a.yNorm - b.yNorm);
-      const used = new Set();
-      let matchedLines = 0;
-      let lineCost = 0;
-      for (const targetLine of targetLines) {
-        let bestIndex = -1;
-        let bestCost = Infinity;
-        for (let index = 0; index < refLines.length; index++) {
-          if (used.has(index)) continue;
-          const refLine = refLines[index];
-          const dy = Math.abs(Number(targetLine.yNorm) - Number(refLine.yNorm));
-          const dl = Math.abs(Number(targetLine.lengthNorm) - Number(refLine.lengthNorm));
-          const cost = dy / 0.035 + dl / 0.18;
-          if (cost < bestCost) { bestCost = cost; bestIndex = index; }
-        }
-        if (bestIndex >= 0 && bestCost <= 2.0) {
-          used.add(bestIndex);
-          matchedLines++;
-          lineCost += bestCost;
-        }
+  if (target) {
+    for (const item of referenceItems) {
+      const reference = await getStatementTemplateSignature(Buffer.from(item.base64, 'base64'));
+      if (reference) {
+        comparisons.push({
+          referenceFile: item.fileName || null,
+          ...compareStatementPageImages(target, reference),
+        });
       }
-      const lineSimilarity = matchedLines / Math.max(1, refLines.length, targetLines.length);
-      const refAnchors = new Set(reference.anchors);
-      const targetAnchors = new Set(target.anchors);
-      const sharedAnchors = [...refAnchors].filter(anchor => targetAnchors.has(anchor));
-      const anchorUnion = new Set([...refAnchors, ...targetAnchors]);
-      const anchorSimilarity = anchorUnion.size ? sharedAnchors.length / anchorUnion.size : null;
-      const enoughGeometry = refLines.length >= 4 && targetLines.length >= 3;
-      const status = enoughGeometry && lineSimilarity >= 0.68
-        ? 'compatible'
-        : enoughGeometry && lineSimilarity < 0.32
-          ? 'mismatch'
-          : 'indeterminate';
-      comparisons.push({
-        referenceFile: item.fileName || null,
-        lineSimilarity: Number(lineSimilarity.toFixed(3)),
-        matchedLongLines: matchedLines,
-        referenceLongLines: refLines.length,
-        targetLongLines: targetLines.length,
-        meanMatchedLineCost: matchedLines ? Number((lineCost / matchedLines).toFixed(3)) : null,
-        anchorSimilarity: anchorSimilarity === null ? null : Number(anchorSimilarity.toFixed(3)),
-        sharedAnchors,
-        status,
-      });
-    } catch (error) {
-      console.warn('HESAP ÖZETİ REFERANS ŞABLONU ATLANDI:', item?.fileName || 'bilinmeyen', error?.message || error);
     }
   }
 
-  comparisons.sort((a, b) => (b.lineSimilarity || 0) - (a.lineSimilarity || 0));
+  const statusPriority = { compatible: 2, indeterminate: 1, mismatch: 0 };
+  comparisons.sort((a, b) => statusPriority[b.status] - statusPriority[a.status] ||
+    (b.visualSimilarity ?? -1) - (a.visualSimilarity ?? -1));
   const best = comparisons[0];
+  const allCompared = comparisons.length === referenceItems.length;
+  const status = best && (best.status !== 'mismatch' || allCompared) ? best.status : 'indeterminate';
   const bankLabel = ({ ziraat: 'Ziraat', garanti: 'Garanti BBVA', vakifbank: 'VakıfBank', akbank: 'Akbank', isbankasi: 'İş Bankası', halkbank: 'Halkbank', enpara: 'Enpara', qnb: 'QNB', ing: 'ING', yapikredi: 'Yapı Kredi', kuveytturk: 'Kuveyt Türk' })[bank] || bank || 'Banka';
-  if (!best) {
-    return {
-      available: false,
-      status: 'indeterminate',
-      bank: bank || null,
-      message: `${bankLabel} adıyla referans seçildi; ancak PDF sayfa yapısı karşılaştırılamadığı için şablon uyumu doğrulanamadı.`,
-      comparisons,
-    };
+  let message = null;
+  if (status === 'mismatch') {
+    const differences = ['üst bölümün yerleşimi'];
+    if (best.columnSimilarity < 0.79) differences.push('işlem tablosunda sütunların yerleşimi');
+    if (best.coloredBandDifference) differences.push('geniş renkli bant');
+    message = bankLabel + ' hesap özeti referansı “' + best.referenceFile +
+      '” ile ilk sayfanın görsel düzeni farklı (' + differences.join(', ') + ').';
   }
-  const status = best.status;
-  const message = status === 'compatible'
-    ? `${bankLabel} hesap özeti referansıyla ilk sayfa yerleşimi uyumlu görünüyor; bu sonuç banka kaynağını veya belge özgünlüğünü tek başına doğrulamaz.`
-    : status === 'mismatch'
-      ? `${bankLabel} olarak tanınan belgede, kayıtlı hesap özeti referansıyla belirgin ilk sayfa şablon farkı var (uzun çizgi/geometri benzerliği %${Math.round(best.lineSimilarity * 100)}). Banka kimliği belirlenmiş olsa da şablon uyumu doğrulanamadı; manuel kontrol gerekli.`
-      : `${bankLabel} adıyla referans seçildi; ancak ilk sayfa geometrisi şablon uyumunu güvenilir biçimde doğrulamak için yeterli değil. Banka kimliği, şablon eşleşmesi anlamına gelmez; manuel kontrol önerilir.`;
+
   return {
-    available: true,
-    engine: 'statement-reference-page-geometry-v1',
+    available: Boolean(best),
+    engine: 'statement-reference-visual-layout-v2',
     bank: bank || null,
     status,
-    selectedReference: best.referenceFile,
-    lineSimilarity: best.lineSimilarity,
-    matchedLongLines: best.matchedLongLines,
-    referenceLongLines: best.referenceLongLines,
-    targetLongLines: best.targetLongLines,
-    anchorSimilarity: best.anchorSimilarity,
-    sharedAnchors: best.sharedAnchors,
+    selectedReference: best?.referenceFile || null,
+    visualSimilarity: best?.visualSimilarity ?? null,
+    headerSimilarity: best?.headerSimilarity ?? null,
+    columnSimilarity: best?.columnSimilarity ?? null,
+    coloredBandDifference: best?.coloredBandDifference ?? null,
     comparisons,
     comparedPage: 1,
     message,
@@ -20098,12 +20111,12 @@ console.log('HESAP ÖZETİ REFERANS ŞABLON UYUMU:', JSON.stringify({
   bank: statementTemplateCompatibility?.bank || statementBank || null,
   status: statementTemplateCompatibility?.status || 'indeterminate',
   selectedReference: statementTemplateCompatibility?.selectedReference || null,
-  lineSimilarity: statementTemplateCompatibility?.lineSimilarity ?? null,
+  visualSimilarity: statementTemplateCompatibility?.visualSimilarity ?? null,
   comparisons: statementTemplateCompatibility?.comparisons || [],
 }));
-if (statementReference && statementTemplateCompatibility?.status !== 'compatible') {
+if (statementReference && statementTemplateCompatibility?.status === 'mismatch') {
   const templateFinding = statementTemplateCompatibility?.message ||
-    'Banka adına göre referans seçildi; hesap özeti şablon uyumu doğrulanamadı. Manuel kontrol önerilir.';
+    'Hesap özetinin ilk sayfası kayıtlı referanstan görsel olarak farklı.';
   statementResult.manualReviewRequired = true;
   statementResult.statementReferenceTemplateValidated = false;
   statementResult.statementAuditFindings = [
