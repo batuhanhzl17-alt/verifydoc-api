@@ -55,7 +55,6 @@ export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DE
       imagePaint: 0,
       vectorPath: 0,
       operatorCount: operators.fnArray.length,
-      textItemCount: (text.items || []).filter(item => String(item?.str || '').trim()).length,
     };
     for (const item of text.items || []) {
       if (item.fontName) fontNames.add(String(item.fontName));
@@ -90,10 +89,9 @@ export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DE
     fileBytes: buffer.length,
     pdfVersion: header.match(/%PDF-(\d\.\d)/)?.[1] || null,
     metadata: {
-      producer: metadataInfo.Producer ? String(metadataInfo.Producer).trim() : null,
-      creator: metadataInfo.Creator ? String(metadataInfo.Creator).trim() : null,
-      creationDate: metadataInfo.CreationDate ? String(metadataInfo.CreationDate).trim() : null,
-      modificationDate: metadataInfo.ModDate ? String(metadataInfo.ModDate).trim() : null,
+      producer: metadataInfo.Producer ? String(metadataInfo.Producer).trim() : metadataResult?.metadata?.get('pdf:producer') || null,
+      creator: metadataInfo.Creator ? String(metadataInfo.Creator).trim() : metadataResult?.metadata?.get('xmp:creatortool') || null,
+      modificationDate: metadataInfo.ModDate ? String(metadataInfo.ModDate).trim() : metadataResult?.metadata?.get('xmp:modifydate') || null,
     },
     pageCount: pdf.numPages,
     pagesInspected: inspectedCount,
@@ -101,14 +99,11 @@ export async function analyzePdfStructure({ pdf, buffer, pdfjsLib, maxPages = DE
     normalizedOperatorCounts: totals,
     pdfJsFontResourceNames: [...fontNames].slice(0, 80),
     pageDetails: pages,
-    imageOnlyCandidatePageCount: pages.filter(page => page.textItemCount === 0 && page.imagePaint > 0).length,
-    hasExtractableTextLayer: pages.some(page => page.textItemCount > 0),
     notes: [
       'PDF.js maps Tj to showText and TJ to showSpacedText; counts are reported separately.',
       'The single-quote and double-quote text-show shorthand operators are counted separately and are not included in Tj/TJ.',
       'Counts are from PDF.js parsed page operator lists, not a byte-level search of compressed content streams.',
       'Counts describe PDF structure; different export software can produce different structures without tampering.',
-      'An image-only candidate page has no extractable text items and at least one image-paint operation; this does not by itself prove that the whole page is a raster image.',
       'This inventory is a review aid and does not decide authenticity or affect risk scoring.',
     ],
   };
