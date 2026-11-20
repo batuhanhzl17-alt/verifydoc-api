@@ -225,63 +225,6 @@ export function resolveStatementPaddleOcrRow(row, regions, pageNumber, pageGeome
     const ranked = availableCandidates.map(item => ({ item, score: (item.idMatched ? 1000 : 0) + item.descriptionHits })).sort((a,b) => b.score-a.score);
     if (ranked[0]?.score > 0 && ranked[0].score > ranked[1]?.score) candidate = ranked[0].item;
   }
-
-  // Fallback for statements where line clustering misses a wrapped or
-  // fragmented description. A unique date + amount + balance tuple is still
-  // a strong row anchor: locate the exact amount and balance OCR boxes in the
-  // expected columns, pair them by vertical proximity, then attach the nearest
-  // OCR date box. Description text is used only to break ties, never required.
-  // Keep this fallback behind the existing resolver and refuse ambiguous or
-  // already-claimed physical amount boxes.
-  if (!candidate && availableCandidates.length === 0 && expectedBalance != null) {
-    const all = items;
-    const amountMatches = chooseColumn(all.flatMap(item => moneyTokens(item.text)
-      .filter(token => token.cents != null && Math.abs(token.cents) === expectedAmount)
-      .map(token => ({ ...item, token }))), amountX);
-    const balanceMatches = chooseColumn(all.flatMap(item => moneyTokens(item.text)
-      .filter(token => token.cents === expectedBalance)
-      .map(token => ({ ...item, token }))), balanceX);
-    const dateMatches = all.filter(item => dateKey(item.text) === key);
-    const spatial = [];
-    for (const amount of amountMatches) {
-      for (const balance of balanceMatches) {
-        const pairTolerance = Math.max(7, Math.min(22, Math.max(amount.box.height, balance.box.height) * 0.95));
-        if (Math.abs(amount.box.cy - balance.box.cy) > pairTolerance) continue;
-        const rowY = (amount.box.cy + balance.box.cy) / 2;
-        const dated = dateMatches.map(date => ({ date, distance: Math.abs(date.box.cy - rowY) }))
-          .sort((a, b) => a.distance - b.distance);
-        const nearest = dated[0];
-        const dateTolerance = Math.max(12, Math.min(30,
-          Math.max(amount.box.height, balance.box.height, nearest?.date?.box?.height || 0) * 1.25));
-        if (!nearest || nearest.distance > dateTolerance) continue;
-        // If two date boxes are effectively equally close, do not guess which
-        // transaction the numeric pair belongs to.
-        if (dated[1] && Math.abs(dated[1].distance - nearest.distance) <= 2) continue;
-        const band = all.filter(item => Math.abs(item.box.cy - rowY) <= dateTolerance);
-        const lineText = normalizeText(band.map(item => item.text).join(' '));
-        const descriptionHits = terms.filter(term => lineText.includes(term)).length;
-        spatial.push({ cy: rowY, tolerance: pairTolerance, band, amount, balance,
-          lineText, descriptionMatched: terms.length === 0 || descriptionHits >= Math.max(1, Math.ceil(terms.length * 0.3)),
-          descriptionHits, idMatched: id.length >= 5 && lineText.replace(/\D/g, '').includes(id) });
-      }
-    }
-    const distinctSpatial = [];
-    for (const item of spatial) {
-      const duplicate = distinctSpatial.some(existing =>
-        Math.abs(existing.amount.box.cx - item.amount.box.cx) <= Math.max(5, Math.min(existing.amount.box.width, item.amount.box.width) * 0.25)
-        && Math.abs(existing.amount.box.cy - item.amount.box.cy) <= Math.max(3, Math.min(existing.amount.box.height, item.amount.box.height) * 0.4)
-        && Math.abs(existing.balance.box.cy - item.balance.box.cy) <= Math.max(3, Math.min(existing.balance.box.height, item.balance.box.height) * 0.4));
-      if (!duplicate) distinctSpatial.push(item);
-    }
-    const unclaimedSpatial = distinctSpatial.filter(item => !matchesClaimedAmount(item, claimedLines));
-    if (unclaimedSpatial.length === 1) candidate = unclaimedSpatial[0];
-    else if (unclaimedSpatial.length > 1) {
-      const ranked = unclaimedSpatial.map(item => ({ item,
-        score: (item.idMatched ? 1000 : 0) + item.descriptionHits - Math.abs(item.cy - item.amount.box.cy) / 100 }))
-        .sort((a, b) => b.score - a.score);
-      if (ranked[0].score > ranked[1].score) candidate = ranked[0].item;
-    }
-  }
   if (!candidate) return {
     status: 'unresolved', source: 'paddle-ocr-geometry', dateAnchorCount: dateAnchors.length,
     distinctCandidateLineCount: availableCandidates.length,
