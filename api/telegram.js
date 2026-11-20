@@ -2274,14 +2274,12 @@ async function sendAnalysisResult(
  const fontMismatchReview = hasReliableFontMismatch(result?.fontForensics);
  const pdfStructureComparison = result?.pdfStructureForensics?.referenceComparison || {};
  const pdfStructureReview = pdfStructureComparison.materialDifferences === true;
- const pdfSourceMetadataReview = result?.pdfSourceMetadataReview;
- const pdfSourceMetadataReviewLine = pdfSourceMetadataReview?.triggered
-   ? pdfSourceMetadataReview.message
-   : null;
+ const pdfProvenanceReviewLine = result?.pdfProvenanceReview?.triggered ? result.pdfProvenanceReview.message : null;
+ const pdfSourceMetadataReviewLine = result?.pdfSourceMetadataReview?.triggered ? result.pdfSourceMetadataReview.message : null;
  const manualReviewRequired = result?.manualReviewRequired === true ||
    result?.fieldReviewStatus === 'CONTROL_REQUIRED' ||
    result?.semanticEvidenceFusion?.reviewStatus === 'CONTROL_REQUIRED' ||
-   textIntegrityReview || fontMismatchReview || pdfStructureReview || Boolean(pdfSourceMetadataReviewLine);
+   textIntegrityReview || fontMismatchReview || pdfStructureReview || Boolean(pdfProvenanceReviewLine) || Boolean(pdfSourceMetadataReviewLine);
  const suspiciousFinding = result?.suspicious === true;
  const reviewHeadline = manualReviewRequired
    ? '🟠 KONTROL GEREKLİ'
@@ -2305,13 +2303,16 @@ async function sendAnalysisResult(
    'pdf-structure-reference-difference': 'PDF boyutu veya metin çizim komutları seçilen referanstan belirgin farklı.',
    'strong-amount-reference-render-difference': 'Tutar alanında referansla belirgin görüntü farkı var.',
    'strong-reference-field-spacing-anomaly': 'Referans yerleşiminde güçlü alan aralığı farkı var.',
-   'pdf-provenance-image-only-missing-metadata': 'PDF’de üretici/oluşturan bilgisi ve değiştirilme tarihi yok; sayfalar metin katmanı olmadan görüntü çizimleri içeriyor. Bu birleşik sinyal manuel inceleme gerektirir, tek başına düzenleme kanıtı değildir.',
+   'pdf-provenance-image-only-missing-metadata': pdfProvenanceReviewLine,
+   'pdf-source-metadata-review': pdfSourceMetadataReviewLine,
  };
  const specificReviewReasonLines = [...new Set([
    ...criticalReviewReasons,
    ...(amountFontMismatchReview ? ['amount-font-reference-mismatch'] : []),
    ...(fontMismatchReview && !amountFontMismatchReview ? ['font-reference-mismatch'] : []),
    ...(pdfStructureReview ? ['pdf-structure-reference-difference'] : []),
+   ...(pdfProvenanceReviewLine ? ['pdf-provenance-image-only-missing-metadata'] : []),
+   ...(pdfSourceMetadataReviewLine ? ['pdf-source-metadata-review'] : []),
    ...(textIntegrityReview ? ['turkish-character-integrity-limitation'] : []),
  ])]
    .map(reason => reviewReasonLabels[reason])
@@ -2320,8 +2321,12 @@ async function sendAnalysisResult(
  if (textIntegrityReview && !specificReviewReasonLines.includes(textIntegrityReviewLine)) {
    specificReviewReasonLines.unshift(textIntegrityReviewLine);
  }
- specificReviewReasonLines.splice(3);
- if (pdfSourceMetadataReviewLine) specificReviewReasonLines.push(pdfSourceMetadataReviewLine);
+ for (const line of [pdfProvenanceReviewLine, pdfSourceMetadataReviewLine]) {
+   if (line && !specificReviewReasonLines.includes(line)) {
+     if (specificReviewReasonLines.length >= 3) specificReviewReasonLines.pop();
+     specificReviewReasonLines.push(line);
+   }
+ }
 
  const confidenceCap = criticalReviewReasons.some(reason =>
    /amount|iban/.test(String(reason)) && /unverified|unavailable|disagreement|difference/.test(String(reason))
@@ -2641,7 +2646,8 @@ async function sendAnalysisResult(
    statementPdfAudit.reviewRequired === true;
  const statementReviewHeadline = verifiedStatementIssue
    ? '🟠 KONTROL GEREKLİ'
-   : textIntegrityReview || pdfSourceMetadataReviewLine
+   : textIntegrityReview || (result?.statementReferenceTemplateCompatibility?.status && result.statementReferenceTemplateCompatibility.status !== 'compatible') ||
+     result?.pdfProvenanceReview?.triggered || result?.pdfSourceMetadataReview?.triggered
      ? '🟠 KONTROL GEREKLİ'
    : statementNeedsReview
      ? '🟡 KONTROL TAVSİYE EDİLİR'
@@ -2662,29 +2668,19 @@ async function sendAnalysisResult(
    : '';
  const statementReasonLines = [];
  if (textIntegrityReview) statementReasonLines.push(textIntegrityReviewLine);
- const statementTemplateCheck = result?.statementReferenceTemplateCompatibility;
- if (statementTemplateCheck?.status === 'mismatch') {
-   statementReasonLines.push(statementTemplateCheck.message || 'Hesap özetinin ilk sayfası kayıtlı referanstan görsel olarak farklı.');
+ if (result?.statementReferenceTemplateCompatibility?.status !== 'compatible' && result?.statementReferenceTemplateCompatibility?.message) {
+   statementReasonLines.push(result.statementReferenceTemplateCompatibility.message);
  }
- if (result?.pdfProvenanceReview?.triggered === true && result?.pdfProvenanceReview?.message) {
-   statementReasonLines.push(result.pdfProvenanceReview.message);
- }
+ if (result?.pdfProvenanceReview?.triggered && result.pdfProvenanceReview.message) statementReasonLines.push(result.pdfProvenanceReview.message);
+ if (result?.pdfSourceMetadataReview?.triggered && result.pdfSourceMetadataReview.message) statementReasonLines.push(result.pdfSourceMetadataReview.message);
  if (balanceMismatchCount) statementReasonLines.push(`${balanceMismatchCount} bakiye geçişinde fark bulundu.`);
  if (rowCountIncomplete) statementReasonLines.push(`Çıkarılan işlem satırı sayısı beklenen sayıyla uyuşmuyor (${extractedRowCount}/${declaredRowCount}).`);
  if (pageCoverageIncomplete) statementReasonLines.push(`Tüm sayfalar taranamadı (${pagesAnalyzed}/${pageCount}).`);
  if (bankIdentityConflict) statementReasonLines.push('Belge banka kimliği, seçilen referansla uyuşmuyor.');
  if (unresolvedVisualRows) statementReasonLines.push(`${unresolvedVisualRows} satırın görsel alan eşleşmesi tamamlanamadı; bu, satırın eksik veya değiştirilmiş olduğunu tek başına göstermez.`);
- const transactionReviewReasons = Array.isArray(transactionAnalysis.suspiciousTransactions)
-   ? transactionAnalysis.suspiciousTransactions.map(item => String(item || '').trim()).filter(Boolean)
-   : [];
- for (const reason of transactionReviewReasons.slice(0, 2)) {
-   statementReasonLines.push(`İşlem incelemesi: ${compactTelegramText(reason, 280)}`);
- }
- if (statementNeedsReview && !statementReasonLines.length && !pdfSourceMetadataReviewLine) statementReasonLines.push('Bir veya daha fazla otomatik alan kontrolü kesin sonuca ulaşamadı.');
- const visibleStatementReasons = statementReasonLines.slice(0, 3);
- if (pdfSourceMetadataReviewLine) visibleStatementReasons.push(pdfSourceMetadataReviewLine);
+ if (statementNeedsReview && !statementReasonLines.length) statementReasonLines.push('Bir veya daha fazla otomatik alan kontrolü kesin sonuca ulaşamadı.');
  const reviewReasonLine = statementNeedsReview || verifiedStatementIssue
-   ? `Kontrol nedeni:\n${visibleStatementReasons.map(line => `• ${line}`).join('\n')}`
+   ? `Kontrol nedeni:\n${statementReasonLines.slice(0, 3).map(line => `• ${line}`).join('\n')}`
    : '';
  const unresolvedRowDetails = (Array.isArray(rowAssociation.rows) ? rowAssociation.rows : [])
    .filter(row => row?.status !== 'matched')
@@ -2738,8 +2734,7 @@ async function sendAnalysisResult(
    String(x?.detail || '').trim().toLocaleLowerCase('tr-TR')
  ));
  const generalFindings = uniqueFindings.filter(x =>
-   !referenceDetailKeys.has(String(x.detail || '').trim().toLocaleLowerCase('tr-TR')) &&
-   !transactionReviewReasons.some(reason => reason === String(x.detail || '').trim())
+   !referenceDetailKeys.has(String(x.detail || '').trim().toLocaleLowerCase('tr-TR'))
  );
 
  const lines = [
@@ -2770,7 +2765,7 @@ async function sendAnalysisResult(
    });
  }
 
- if (!generalFindings.length && !referenceFindings.length && !pdfSourceMetadataReviewLine) {
+ if (!generalFindings.length && !referenceFindings.length) {
    lines.push('', 'Hatalı veya şüpheli bir kısım tespit edilmedi.');
  }
 
