@@ -2674,6 +2674,12 @@ async function sendAnalysisResult(
  if (pageCoverageIncomplete) statementReasonLines.push(`Tüm sayfalar taranamadı (${pagesAnalyzed}/${pageCount}).`);
  if (bankIdentityConflict) statementReasonLines.push('Belge banka kimliği, seçilen referansla uyuşmuyor.');
  if (unresolvedVisualRows) statementReasonLines.push(`${unresolvedVisualRows} satırın görsel alan eşleşmesi tamamlanamadı; bu, satırın eksik veya değiştirilmiş olduğunu tek başına göstermez.`);
+ const transactionReviewReasons = Array.isArray(transactionAnalysis.suspiciousTransactions)
+   ? transactionAnalysis.suspiciousTransactions.map(item => String(item || '').trim()).filter(Boolean)
+   : [];
+ for (const reason of transactionReviewReasons.slice(0, 2)) {
+   statementReasonLines.push(`İşlem incelemesi: ${compactTelegramText(reason, 280)}`);
+ }
  if (statementNeedsReview && !statementReasonLines.length && !pdfSourceMetadataReviewLine) statementReasonLines.push('Bir veya daha fazla otomatik alan kontrolü kesin sonuca ulaşamadı.');
  const visibleStatementReasons = statementReasonLines.slice(0, 3);
  if (pdfSourceMetadataReviewLine) visibleStatementReasons.push(pdfSourceMetadataReviewLine);
@@ -2732,7 +2738,8 @@ async function sendAnalysisResult(
    String(x?.detail || '').trim().toLocaleLowerCase('tr-TR')
  ));
  const generalFindings = uniqueFindings.filter(x =>
-   !referenceDetailKeys.has(String(x.detail || '').trim().toLocaleLowerCase('tr-TR'))
+   !referenceDetailKeys.has(String(x.detail || '').trim().toLocaleLowerCase('tr-TR')) &&
+   !transactionReviewReasons.some(reason => reason === String(x.detail || '').trim())
  );
 
  const lines = [
