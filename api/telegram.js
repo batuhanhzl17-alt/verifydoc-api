@@ -2663,8 +2663,8 @@ async function sendAnalysisResult(
  const statementReasonLines = [];
  if (textIntegrityReview) statementReasonLines.push(textIntegrityReviewLine);
  const statementTemplateCheck = result?.statementReferenceTemplateCompatibility;
- if (statementTemplateCheck && statementTemplateCheck.status !== 'compatible') {
-   statementReasonLines.push(statementTemplateCheck.message || 'Banka adıyla referans seçildi; hesap özeti şablon uyumu doğrulanamadı.');
+ if (statementTemplateCheck?.status === 'mismatch') {
+   statementReasonLines.push(statementTemplateCheck.message || 'Hesap özetinin ilk sayfası kayıtlı referanstan görsel olarak farklı.');
  }
  if (result?.pdfProvenanceReview?.triggered === true && result?.pdfProvenanceReview?.message) {
    statementReasonLines.push(result.pdfProvenanceReview.message);
