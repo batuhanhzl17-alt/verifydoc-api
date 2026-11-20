@@ -2751,95 +2751,6 @@ const STATEMENT_REFERENCE_MAP = {
   yapikredi: ["yapikredi-hesap-hareketi1.pdf", "yapikredi-hesap-hareketi2.pdf"],
 };
 
-function evaluatePdfProvenanceReview(pdfStructure) {
-  const metadata = pdfStructure?.metadata || {};
-  const pages = Array.isArray(pdfStructure?.pageDetails) ? pdfStructure.pageDetails : [];
-  const completePageScan = pdfStructure?.truncatedPageScan !== true &&
-    pages.length > 0 && pages.length === Number(pdfStructure?.pageCount);
-  const imageOnlyCandidate = completePageScan && pages.every(page =>
-    Number(page?.textItemCount) === 0 && Number(page?.imagePaint) > 0
-  );
-  const missingSourceMetadata = !metadata.producer && !metadata.creator && !metadata.modificationDate;
-  const triggered = pdfStructure?.available === true && missingSourceMetadata && imageOnlyCandidate;
-  return {
-    triggered,
-    status: triggered ? 'review' : 'not-triggered',
-    producerMissing: !metadata.producer,
-    creatorMissing: !metadata.creator,
-    modificationDateMissing: !metadata.modificationDate,
-    imageOnlyCandidatePageCount: imageOnlyCandidate ? pages.length : Number(pdfStructure?.imageOnlyCandidatePageCount) || 0,
-    pageCount: Number(pdfStructure?.pageCount) || 0,
-    message: triggered
-      ? 'PDF’de üretici/oluşturan bilgisi ve değiştirilme tarihi kaydı yok; incelenen tüm sayfalarda çıkarılabilir metin bulunmuyor ve görüntü çizimleri var. Bu birleşik köken sinyali manuel kontrol gerektirir; tek başına düzenleme kanıtı değildir.'
-      : null,
-  };
-}
-
-function cleanPdfSourceMetadata(value) {
-  return typeof value === 'string' ? value.normalize('NFC').replace(/\s+/g, ' ').trim() || null : null;
-}
-
-async function readPdfSourceMetadata(pdf) {
-  try {
-    const { info, metadata } = await pdf.getMetadata();
-    return {
-      producer: cleanPdfSourceMetadata(info?.Producer) || cleanPdfSourceMetadata(metadata?.get('pdf:producer')),
-      creator: cleanPdfSourceMetadata(info?.Creator) || cleanPdfSourceMetadata(metadata?.get('xmp:creatortool')),
-    };
-  } catch (error) {
-    console.warn('PDF SOURCE METADATA READ ERROR:', error?.message || String(error));
-    return null;
-  }
-}
-
-async function readStatementReferenceSourceMetadata(reference) {
-  if (!reference?.base64) return null;
-  let pdf;
-  try {
-    pdf = await getPdfDocument({ data: new Uint8Array(Buffer.from(reference.base64, 'base64')) }).promise;
-    return await readPdfSourceMetadata(pdf);
-  } catch (error) {
-    console.warn('STATEMENT REFERENCE METADATA READ ERROR:', error?.message || String(error));
-    return null;
-  } finally {
-    try { await pdf?.destroy(); } catch {}
-  }
-}
-
-function evaluatePdfSourceMetadataReview(target, reference, referenceFile = null) {
-  if (!target) return { status: 'target-metadata-unavailable', triggered: false, referenceFile, message: null };
-
-  const labels = { producer: 'Üretici', creator: 'Oluşturucu' };
-  const fields = Object.keys(labels);
-  const missingFields = fields.filter(field => !target[field]);
-  const comparableFields = fields.filter(field => target[field] && reference?.[field]);
-  const differentFields = comparableFields.filter(field =>
-    target[field].toLowerCase() !== reference[field].toLowerCase()
-  );
-  const reasons = [];
-  if (missingFields.length) {
-    const missingLabels = missingFields.map(field => labels[field].toLocaleLowerCase('tr-TR')).join(' ve ');
-    reasons.push(`PDF’de ${missingLabels} ${missingFields.length === 1 ? 'bilgisi' : 'bilgileri'} bulunamadı.`);
-  }
-  if (differentFields.length) {
-    const brief = value => value.length > 80 ? `${value.slice(0, 79)}…` : value;
-    const differences = differentFields.map(field =>
-      `${labels[field]} (belge “${brief(target[field])}”, referans “${brief(reference[field])}”)`
-    );
-    reasons.push(`PDF metadata’sı ${referenceFile || 'seçilen referans'} ile uyuşmuyor. ${differences.join(' · ')}.`);
-  }
-  const triggered = reasons.length > 0;
-  return {
-    status: triggered ? 'review' : comparableFields.length === fields.length ? 'matched' : 'reference-metadata-incomplete',
-    triggered,
-    referenceFile,
-    missingFields,
-    differentFields,
-    comparableFields,
-    message: triggered ? reasons.join(' ') : null,
-  };
-}
-
 function detectStatementBankFromText(text, fileName = "") {
   const normalizeBankText = (value) => String(value || "")
     .toLocaleLowerCase("tr-TR")
@@ -3044,170 +2955,6 @@ async function loadStatementReferenceFile(bank, statementText = "", fileName = "
 
   if (!references.length) return null;
   return references.length === 1 ? references[0] : references;
-}
-
-// Compare the rendered first page using the upper layout and transaction
-// column positions. Variable transaction text is pooled into broad regions.
-const STATEMENT_LAYOUT_GRID = { width: 240, height: 336, upperColumns: 30, upperRows: 16, tableColumns: 60 };
-
-async function describeStatementPageImage(imageBuffer) {
-  const { width, height, upperColumns, upperRows, tableColumns } = STATEMENT_LAYOUT_GRID;
-  const pixels = await sharp(imageBuffer)
-    .flatten({ background: '#fff' })
-    .resize(width, height, { fit: 'fill' })
-    .toColourspace('srgb')
-    .removeAlpha()
-    .raw()
-    .toBuffer();
-  const upper = new Float64Array(upperColumns * upperRows);
-  const table = new Float64Array(tableColumns);
-  const row = new Uint8Array(width);
-  const top = 7, upperEnd = 92, tableEnd = 230, margin = 5;
-  let upperInk = 0, tableInk = 0;
-  let coloredRun = 0, longestColoredRun = 0;
-
-  for (let y = top; y < tableEnd; y++) {
-    let background = 0, coloredPixels = 0;
-    for (let x = 0; x < width; x++) {
-      const offset = (y * width + x) * 3;
-      const r = pixels[offset], g = pixels[offset + 1], b = pixels[offset + 2];
-      row[x] = (77 * r + 150 * g + 29 * b) >> 8;
-      background = Math.max(background, row[x]);
-      if (x >= margin && x < width - margin && Math.max(r, g, b) - Math.min(r, g, b) >= 55) {
-        coloredPixels++;
-      }
-    }
-    coloredRun = coloredPixels >= (width - 2 * margin) * 0.5 ? coloredRun + 1 : 0;
-    longestColoredRun = Math.max(longestColoredRun, coloredRun);
-    const upperRow = Math.floor((y - top) * upperRows / (upperEnd - top));
-    for (let x = margin; x < width - margin; x++) {
-      const ink = Math.min(1, Math.max(0, (background - row[x] - 22) / 165));
-      if (y < upperEnd) {
-        upper[upperRow * upperColumns + Math.floor(x * upperColumns / width)] += ink;
-        upperInk += ink;
-      } else {
-        table[Math.floor(x * tableColumns / width)] += ink;
-        tableInk += ink;
-      }
-    }
-  }
-
-  return {
-    upper: upper.map(value => Math.sqrt(value)),
-    table: table.map((value, i) => (2 * value + (table[i - 1] || 0) + (table[i + 1] || 0)) / 4),
-    hasEnoughContent: upperInk >= 50 && tableInk >= 80,
-    hasWideColoredBand: longestColoredRun >= 5,
-  };
-}
-
-function statementLayoutSimilarity(a, b, columns, maxShiftX, maxShiftY) {
-  const energy = values => values.reduce((sum, value) => sum + value ** 2, 0);
-  const norm = Math.sqrt(energy(a) * energy(b));
-  if (!norm) return null;
-
-  const rows = a.length / columns;
-  let best = 0;
-  for (let dy = -maxShiftY; dy <= maxShiftY; dy++) {
-    for (let dx = -maxShiftX; dx <= maxShiftX; dx++) {
-      let overlap = 0;
-      for (let y = Math.max(0, -dy); y < Math.min(rows, rows - dy); y++) {
-        for (let x = Math.max(0, -dx); x < Math.min(columns, columns - dx); x++) {
-          overlap += a[y * columns + x] * b[(y + dy) * columns + x + dx];
-        }
-      }
-      best = Math.max(best, overlap / norm);
-    }
-  }
-  return Math.min(1, best);
-}
-
-function compareStatementPageImages(target, reference) {
-  const { upperColumns, tableColumns } = STATEMENT_LAYOUT_GRID;
-  const headerSimilarity = statementLayoutSimilarity(target.upper, reference.upper, upperColumns, 1, 1);
-  const columnSimilarity = statementLayoutSimilarity(target.table, reference.table, tableColumns, 2, 0);
-  const coloredBandDifference = target.hasWideColoredBand !== reference.hasWideColoredBand;
-  const enoughContent = target.hasEnoughContent && reference.hasEnoughContent &&
-    headerSimilarity !== null && columnSimilarity !== null;
-  let status = 'indeterminate';
-  if (enoughContent && headerSimilarity >= 0.78 && columnSimilarity >= 0.80) {
-    status = 'compatible';
-  } else if (enoughContent && headerSimilarity < 0.62 && (columnSimilarity < 0.79 || coloredBandDifference)) {
-    status = 'mismatch';
-  }
-
-  const round = score => score === null ? null : Number(score.toFixed(3));
-  return {
-    status,
-    visualSimilarity: enoughContent ? round(0.65 * headerSimilarity + 0.35 * columnSimilarity) : null,
-    headerSimilarity: round(headerSimilarity),
-    columnSimilarity: round(columnSimilarity),
-    coloredBandDifference,
-  };
-}
-
-async function getStatementTemplateSignature(pdfBuffer) {
-  if (!Buffer.isBuffer(pdfBuffer) || !pdfBuffer.length) return null;
-  let pdf;
-  try {
-    pdf = await getPdfDocument({ data: new Uint8Array(pdfBuffer) }).promise;
-    if (!pdf?.numPages) return null;
-    const rendered = await renderPdfPagePng(pdf, 1, 1.1);
-    return rendered?.buffer ? await describeStatementPageImage(rendered.buffer) : null;
-  } catch (error) {
-    console.warn('HESAP ÖZETİ GÖRSEL ŞABLON OKUMA HATASI:', error?.message || error);
-    return null;
-  } finally {
-    try { await pdf?.destroy(); } catch {}
-  }
-}
-
-async function compareStatementReferenceTemplate(targetBuffer, statementReference, bank) {
-  const referenceItems = (Array.isArray(statementReference) ? statementReference : [statementReference])
-    .filter(item => item?.base64);
-  const target = referenceItems.length ? await getStatementTemplateSignature(targetBuffer) : null;
-  const comparisons = [];
-  if (target) {
-    for (const item of referenceItems) {
-      const reference = await getStatementTemplateSignature(Buffer.from(item.base64, 'base64'));
-      if (reference) {
-        comparisons.push({
-          referenceFile: item.fileName || null,
-          ...compareStatementPageImages(target, reference),
-        });
-      }
-    }
-  }
-
-  const statusPriority = { compatible: 2, indeterminate: 1, mismatch: 0 };
-  comparisons.sort((a, b) => statusPriority[b.status] - statusPriority[a.status] ||
-    (b.visualSimilarity ?? -1) - (a.visualSimilarity ?? -1));
-  const best = comparisons[0];
-  const allCompared = comparisons.length === referenceItems.length;
-  const status = best && (best.status !== 'mismatch' || allCompared) ? best.status : 'indeterminate';
-  const bankLabel = ({ ziraat: 'Ziraat', garanti: 'Garanti BBVA', vakifbank: 'VakıfBank', akbank: 'Akbank', isbankasi: 'İş Bankası', halkbank: 'Halkbank', enpara: 'Enpara', qnb: 'QNB', ing: 'ING', yapikredi: 'Yapı Kredi', kuveytturk: 'Kuveyt Türk' })[bank] || bank || 'Banka';
-  let message = null;
-  if (status === 'mismatch') {
-    const differences = ['üst bölümün yerleşimi'];
-    if (best.columnSimilarity < 0.79) differences.push('işlem tablosunda sütunların yerleşimi');
-    if (best.coloredBandDifference) differences.push('geniş renkli bant');
-    message = bankLabel + ' hesap özeti referansı “' + best.referenceFile +
-      '” ile ilk sayfanın görsel düzeni farklı (' + differences.join(', ') + ').';
-  }
-
-  return {
-    available: Boolean(best),
-    engine: 'statement-reference-visual-layout-v2',
-    bank: bank || null,
-    status,
-    selectedReference: best?.referenceFile || null,
-    visualSimilarity: best?.visualSimilarity ?? null,
-    headerSimilarity: best?.headerSimilarity ?? null,
-    columnSimilarity: best?.columnSimilarity ?? null,
-    coloredBandDifference: best?.coloredBandDifference ?? null,
-    comparisons,
-    comparedPage: 1,
-    message,
-  };
 }
 
 // =====================================================
@@ -3531,6 +3278,157 @@ false,
 
 },
 };
+
+function cleanPdfSourceMetadata(value) {
+  return typeof value === 'string' ? value.normalize('NFC').replace(/\\s+/g, ' ').trim() || null : null;
+}
+
+async function readPdfSourceMetadata(pdf) {
+  try {
+    const { info, metadata } = await pdf.getMetadata();
+    return {
+      producer: cleanPdfSourceMetadata(info?.Producer) || cleanPdfSourceMetadata(metadata?.get('pdf:producer')),
+      creator: cleanPdfSourceMetadata(info?.Creator) || cleanPdfSourceMetadata(metadata?.get('xmp:creatortool')),
+      modificationDate: cleanPdfSourceMetadata(info?.ModDate) || cleanPdfSourceMetadata(metadata?.get('xmp:modifydate')),
+    };
+  } catch (error) {
+    console.warn('PDF SOURCE METADATA READ ERROR:', error?.message || String(error));
+    return null;
+  }
+}
+
+async function readStatementReferenceSourceMetadata(reference) {
+  if (!reference?.base64) return null;
+  let pdf;
+  try {
+    pdf = await getPdfDocument({ data: new Uint8Array(Buffer.from(reference.base64, 'base64')) }).promise;
+    return await readPdfSourceMetadata(pdf);
+  } catch (error) {
+    console.warn('STATEMENT REFERENCE METADATA READ ERROR:', error?.message || String(error));
+    return null;
+  } finally {
+    try { await pdf?.destroy(); } catch {}
+  }
+}
+
+function evaluatePdfSourceMetadataReview(target, reference, referenceFile = null) {
+  if (!target) return { status: 'target-metadata-unavailable', triggered: true, referenceFile,
+    message: 'PDF metadata bilgileri okunamadı; üretici ve oluşturan bilgileri referansla karşılaştırılamadı.' };
+  const labels = { producer: 'Üretici', creator: 'Oluşturucu' };
+  const missingFields = Object.keys(labels).filter(field => !target[field]);
+  const referenceMissingFields = Object.keys(labels).filter(field => target[field] && !reference?.[field]);
+  const differentFields = Object.keys(labels).filter(field => target[field] && reference?.[field] &&
+    target[field].toLocaleLowerCase('en-US') !== reference[field].toLocaleLowerCase('en-US'));
+  const reasons = [];
+  if (missingFields.length) reasons.push(`PDF’de ${missingFields.map(field => labels[field].toLocaleLowerCase('tr-TR')).join(' ve ')} bilgisi bulunamadı.`);
+  if (!reference) reasons.push('Seçilen referansın PDF metadata bilgileri okunamadı; üretici/oluşturucu karşılaştırması yapılamadı.');
+  else if (referenceMissingFields.length) reasons.push(`Referansta ${referenceMissingFields.map(field => labels[field].toLocaleLowerCase('tr-TR')).join(' ve ')} alanı bulunmadığından bu metadata karşılaştırması tamamlanamadı.`);
+  if (differentFields.length) {
+    const short = value => value.length > 72 ? `${value.slice(0, 71)}…` : value;
+    reasons.push(`PDF metadata’sı ${referenceFile || 'seçilen referans'} ile uyuşmuyor: ${differentFields.map(field => `${labels[field]} belge “${short(target[field])}”, referans “${short(reference[field])}”`).join('; ')}.`);
+  }
+  return {
+    status: reasons.length ? 'review' : 'matched', triggered: reasons.length > 0,
+    referenceFile, missingFields, referenceMissingFields, differentFields,
+    message: reasons.length ? reasons.join(' ') : null,
+  };
+}
+
+function evaluatePdfProvenanceReview(pdfStructure, sourceMetadata) {
+  const metadata = sourceMetadata || pdfStructure?.metadata || {};
+  const pages = Array.isArray(pdfStructure?.pageDetails) ? pdfStructure.pageDetails : [];
+  const complete = pdfStructure?.available === true && pdfStructure?.truncatedPageScan !== true &&
+    pages.length > 0 && pages.length === Number(pdfStructure?.pageCount);
+  const imageOnly = complete && pages.every(page => Number(page?.textItemCount) === 0 && Number(page?.imagePaint) > 0);
+  const missing = !metadata.producer && !metadata.creator && !metadata.modificationDate;
+  const triggered = imageOnly && missing;
+  return {
+    triggered, status: triggered ? 'review' : 'not-triggered',
+    imageOnlyCandidatePageCount: imageOnly ? pages.length : 0,
+    producerMissing: !metadata.producer, creatorMissing: !metadata.creator,
+    modificationDateMissing: !metadata.modificationDate,
+    message: triggered
+      ? 'PDF’de üretici/oluşturan bilgisi ve değiştirilme tarihi yok; tüm sayfalarda metin katmanı bulunmuyor ve görüntü çizimleri var. Bu birleşik sinyal manuel inceleme gerektirir; tek başına düzenleme kanıtı değildir.'
+      : null,
+  };
+}
+
+// Compare stable page structure, not transaction values, so normal statement
+// data changes do not dominate the template comparison.
+const STATEMENT_LAYOUT_GRID = { width: 240, height: 336, upperColumns: 30, upperRows: 16, tableColumns: 60 };
+async function describeStatementPageImage(imageBuffer) {
+  const { width, height, upperColumns, upperRows, tableColumns } = STATEMENT_LAYOUT_GRID;
+  const pixels = await sharp(imageBuffer).flatten({ background: '#fff' }).resize(width, height, { fit: 'fill' })
+    .toColourspace('srgb').removeAlpha().raw().toBuffer();
+  const upper = new Float64Array(upperColumns * upperRows), table = new Float64Array(tableColumns);
+  const row = new Uint8Array(width); const top = 7, upperEnd = 92, tableEnd = 230, margin = 5;
+  let upperInk = 0, tableInk = 0, coloredRun = 0, longestColoredRun = 0;
+  for (let y = top; y < tableEnd; y++) {
+    let background = 0, coloredPixels = 0;
+    for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * 3, r = pixels[offset], g = pixels[offset + 1], b = pixels[offset + 2];
+      row[x] = (77 * r + 150 * g + 29 * b) >> 8; background = Math.max(background, row[x]);
+      if (x >= margin && x < width - margin && Math.max(r, g, b) - Math.min(r, g, b) >= 55) coloredPixels++;
+    }
+    coloredRun = coloredPixels >= (width - 2 * margin) * 0.5 ? coloredRun + 1 : 0;
+    longestColoredRun = Math.max(longestColoredRun, coloredRun);
+    const upperRow = Math.floor((y - top) * upperRows / (upperEnd - top));
+    for (let x = margin; x < width - margin; x++) {
+      const ink = Math.min(1, Math.max(0, (background - row[x] - 22) / 165));
+      if (y < upperEnd) { upper[upperRow * upperColumns + Math.floor(x * upperColumns / width)] += ink; upperInk += ink; }
+      else { table[Math.floor(x * tableColumns / width)] += ink; tableInk += ink; }
+    }
+  }
+  return { upper: upper.map(Math.sqrt), table: table.map((v, i) => (2*v + (table[i-1]||0) + (table[i+1]||0))/4),
+    hasEnoughContent: upperInk >= 50 && tableInk >= 80, hasWideColoredBand: longestColoredRun >= 5 };
+}
+function statementLayoutSimilarity(a, b, columns, maxShiftX, maxShiftY) {
+  const energy = values => values.reduce((sum, value) => sum + value ** 2, 0), norm = Math.sqrt(energy(a) * energy(b));
+  if (!norm) return null;
+  const rows = a.length / columns; let best = 0;
+  for (let dy=-maxShiftY; dy<=maxShiftY; dy++) for (let dx=-maxShiftX; dx<=maxShiftX; dx++) {
+    let overlap=0;
+    for (let y=Math.max(0,-dy); y<Math.min(rows,rows-dy); y++) for (let x=Math.max(0,-dx); x<Math.min(columns,columns-dx); x++) overlap += a[y*columns+x] * b[(y+dy)*columns+x+dx];
+    best=Math.max(best,overlap/norm);
+  }
+  return Math.min(1,best);
+}
+function compareStatementPageImages(target, reference) {
+  const { upperColumns, tableColumns } = STATEMENT_LAYOUT_GRID;
+  const headerSimilarity=statementLayoutSimilarity(target.upper,reference.upper,upperColumns,1,1);
+  const columnSimilarity=statementLayoutSimilarity(target.table,reference.table,tableColumns,2,0);
+  const coloredBandDifference=target.hasWideColoredBand!==reference.hasWideColoredBand;
+  const enough=target.hasEnoughContent&&reference.hasEnoughContent&&headerSimilarity!==null&&columnSimilarity!==null;
+  const status=enough&&headerSimilarity>=0.78&&columnSimilarity>=0.80?'compatible'
+    :enough&&headerSimilarity<0.62&&(columnSimilarity<0.79||coloredBandDifference)?'mismatch':'indeterminate';
+  const round=x=>x===null?null:Number(x.toFixed(3));
+  return {status,visualSimilarity:enough?round(0.65*headerSimilarity+0.35*columnSimilarity):null,
+    headerSimilarity:round(headerSimilarity),columnSimilarity:round(columnSimilarity),coloredBandDifference};
+}
+async function getStatementTemplateSignature(pdfBuffer) {
+  if (!Buffer.isBuffer(pdfBuffer)||!pdfBuffer.length) return null;
+  let pdf;
+  try { pdf=await getPdfDocument({data:new Uint8Array(pdfBuffer)}).promise; if(!pdf?.numPages)return null;
+    const rendered=await renderPdfPagePng(pdf,1,1.1); return rendered?.buffer?await describeStatementPageImage(rendered.buffer):null;
+  } catch(error) { console.warn('HESAP ÖZETİ GÖRSEL ŞABLON OKUMA HATASI:',error?.message||error);return null; }
+  finally { try{await pdf?.destroy();}catch{} }
+}
+async function compareStatementReferenceTemplate(targetBuffer, references, bank) {
+  const items=(Array.isArray(references)?references:[references]).filter(item=>item?.base64);
+  const target=items.length?await getStatementTemplateSignature(targetBuffer):null, comparisons=[];
+  if(target) for(const item of items) { const ref=await getStatementTemplateSignature(Buffer.from(item.base64,'base64'));
+    if(ref) comparisons.push({referenceFile:item.fileName||null,...compareStatementPageImages(target,ref)}); }
+  const priority={compatible:2,indeterminate:1,mismatch:0};
+  const best=[...comparisons].sort((a,b)=>(priority[b.status]||0)-(priority[a.status]||0) || (b.visualSimilarity??-1)-(a.visualSimilarity??-1))[0];
+  const complete=comparisons.length===items.length;
+  const status=best&&(best.status!=='mismatch'||complete)?best.status:'indeterminate';
+  const message=status==='mismatch'
+    ? `Ziraat hesap özetinin ilk sayfa düzeni kayıtlı Ziraat referansı “${best.referenceFile}” ile belirgin biçimde farklı; banka şablonu uyumu doğrulanamadı.`
+    : status==='indeterminate' ? 'Ziraat hesap özetinin sayfa düzeni mevcut referanslarla güvenilir biçimde karşılaştırılamadı; şablon uyumu doğrulanamadı.' : null;
+  return {available:Boolean(best),engine:'statement-reference-visual-layout-v1',bank,status,selectedReference:best?.referenceFile||null,
+    visualSimilarity:best?.visualSimilarity??null,headerSimilarity:best?.headerSimilarity??null,columnSimilarity:best?.columnSimilarity??null,
+    coloredBandDifference:best?.coloredBandDifference??null,comparisons,comparedPage:1,message};
+}
 
 // =====================================================
 // OPENAI
@@ -18354,7 +18252,6 @@ const htmlText = buffer.subarray(0, Math.min(buffer.length, 8192)).toString('utf
 const isHtmlUpload = /\.(?:html?|xhtml)$/i.test(String(fileName || filePath || '')) &&
   /<\s*(?:!doctype\s+html|html|head|body|table|div|span)\b/i.test(htmlText);
 let pdfStructureForensics = null;
-let targetPdfSourceMetadata = null;
 if (!isPdfUpload && !isHtmlUpload && (type !== "video" || !String(mime).toLowerCase().startsWith("video/"))) {
   console.warn('NON-PDF UPLOAD REJECTED:', JSON.stringify({ fileName, mime: uploadedFile.mimetype || null }));
   return res.status(415).json({
@@ -18445,7 +18342,6 @@ const pdf = await getPdfDocument({
 data: new Uint8Array(buffer),
 }).promise;
 
-if (isPdfUpload) targetPdfSourceMetadata = await readPdfSourceMetadata(pdf);
 pdfNativeFieldAssociation = await extractPdfNativeFieldAssociations(pdf);
 try {
   pdfStructureForensics = await analyzePdfStructure({ pdf, buffer, pdfjsLib });
@@ -18454,9 +18350,6 @@ try {
     engine: pdfStructureForensics.engine || null,
     fileBytes: pdfStructureForensics.fileBytes || null,
     pageCount: pdfStructureForensics.pageCount || null,
-    metadata: pdfStructureForensics.metadata || null,
-    imageOnlyCandidatePageCount: pdfStructureForensics.imageOnlyCandidatePageCount || 0,
-    hasExtractableTextLayer: pdfStructureForensics.hasExtractableTextLayer === true,
     normalizedOperatorCounts: pdfStructureForensics.normalizedOperatorCounts || null,
   }));
 } catch (error) {
@@ -18823,7 +18716,6 @@ if ((type === "image" || type === "pdf") && forensicTargetPath) {
 // hatası oluşur.
 let reference = null;
 let pdfReferenceFieldAssociation = null;
-let receiptReferencePdfSourceMetadata = null;
 
 if (type !== "video" && type !== "statement") {
   const referenceSelectionOCR = {
@@ -18837,7 +18729,6 @@ if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCas
   try {
     const referenceBuffer = await fs.readFile(reference.path);
     const referencePdf = await getPdfDocument({ data: new Uint8Array(referenceBuffer) }).promise;
-    receiptReferencePdfSourceMetadata = await readPdfSourceMetadata(referencePdf);
     if (pdfStructureForensics?.available === true) {
       try {
         const referenceStructure = await analyzePdfStructure({ pdf: referencePdf, buffer: referenceBuffer, pdfjsLib });
@@ -20101,61 +19992,41 @@ const statementResult = applyStatementLedgerChecks(
   statementPdfForensics
 );
 statementResult.pdfStructureForensics = pdfStructureForensics;
-const statementTemplateCompatibility = await compareStatementReferenceTemplate(
-  buffer,
-  statementReference,
-  statementBank
-);
-statementResult.statementReferenceTemplateCompatibility = statementTemplateCompatibility;
-console.log('HESAP ÖZETİ REFERANS ŞABLON UYUMU:', JSON.stringify({
-  bank: statementTemplateCompatibility?.bank || statementBank || null,
-  status: statementTemplateCompatibility?.status || 'indeterminate',
-  selectedReference: statementTemplateCompatibility?.selectedReference || null,
-  visualSimilarity: statementTemplateCompatibility?.visualSimilarity ?? null,
-  comparisons: statementTemplateCompatibility?.comparisons || [],
-}));
-if (statementReference && statementTemplateCompatibility?.status === 'mismatch') {
-  const templateFinding = statementTemplateCompatibility?.message ||
-    'Hesap özetinin ilk sayfası kayıtlı referanstan görsel olarak farklı.';
+statementResult.pdfProvenanceReview = evaluatePdfProvenanceReview(pdfStructureForensics, pdfStructureForensics?.metadata);
+if (statementResult.pdfProvenanceReview.triggered) {
   statementResult.manualReviewRequired = true;
-  statementResult.statementReferenceTemplateValidated = false;
-  statementResult.statementAuditFindings = [
-    ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
-    templateFinding,
-  ];
-  statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), templateFinding])];
-  statementResult.summary = [String(statementResult.summary || '').trim(), `• ${templateFinding}`].filter(Boolean).join('\n');
-} else {
-  statementResult.statementReferenceTemplateValidated = statementTemplateCompatibility?.status === 'compatible';
+  statementResult.statementAuditFindings = [...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []), statementResult.pdfProvenanceReview.message];
+  statementResult.evidence = [...new Set([...(statementResult.evidence || []), statementResult.pdfProvenanceReview.message])];
 }
-const statementProvenanceReview = evaluatePdfProvenanceReview(pdfStructureForensics);
-statementResult.pdfProvenanceReview = statementProvenanceReview;
-if (statementProvenanceReview.triggered) {
-  statementResult.manualReviewRequired = true;
-  statementResult.statementAuditFindings = [
-    ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
-    statementProvenanceReview.message,
-  ];
-  statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), statementProvenanceReview.message])];
-  statementResult.summary = [String(statementResult.summary || '').trim(), `• ${statementProvenanceReview.message}`].filter(Boolean).join('\n');
+const statementTemplateCompatibility = statementBank === 'ziraat'
+  ? await compareStatementReferenceTemplate(buffer, statementReference, statementBank)
+  : null;
+if (statementTemplateCompatibility) {
+  statementResult.statementReferenceTemplateCompatibility = statementTemplateCompatibility;
+  console.log('HESAP ÖZETİ REFERANS ŞABLON UYUMU:', JSON.stringify(statementTemplateCompatibility));
+  if (statementTemplateCompatibility.status !== 'compatible') {
+    statementResult.manualReviewRequired = true;
+    statementResult.statementReferenceTemplateValidated = false;
+    const templateFinding = statementTemplateCompatibility.message || 'Ziraat hesap özeti şablon uyumu doğrulanamadı.';
+    statementResult.statementAuditFindings = [...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []), templateFinding];
+    statementResult.evidence = [...new Set([...(statementResult.evidence || []), templateFinding])];
+    statementResult.summary = [String(statementResult.summary || '').trim(), `• ${templateFinding}`].filter(Boolean).join('\n');
+  } else statementResult.statementReferenceTemplateValidated = true;
 }
-if (isPdfUpload && (statementBank || normalizeBank(bank)) !== 'ziraat') {
-  const metadataReference = Array.isArray(statementReference)
-    ? statementReference.find(item => item.fileName === statementTemplateCompatibility?.selectedReference)
+if (isPdfUpload && statementBank && statementBank !== 'ziraat' && statementReference) {
+  const selectedRef = Array.isArray(statementReference)
+    ? statementReference.find(item => item.fileName === statementTemplateCompatibility?.selectedReference) || statementReference[0]
     : statementReference;
   const metadataReview = evaluatePdfSourceMetadataReview(
-    targetPdfSourceMetadata,
-    await readStatementReferenceSourceMetadata(metadataReference),
-    metadataReference?.fileName || null
+    pdfStructureForensics?.metadata || null,
+    await readStatementReferenceSourceMetadata(selectedRef),
+    selectedRef?.fileName || null
   );
   statementResult.pdfSourceMetadataReview = metadataReview;
   if (metadataReview.triggered) {
     statementResult.manualReviewRequired = true;
-    statementResult.statementAuditFindings = [
-      ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
-      metadataReview.message,
-    ];
-    statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), metadataReview.message])];
+    statementResult.statementAuditFindings = [...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []), metadataReview.message];
+    statementResult.evidence = [...new Set([...(statementResult.evidence || []), metadataReview.message])];
   }
 }
 if (statementBankIdentityConflict) {
@@ -20327,16 +20198,12 @@ statementReference
       ? {
           fileName: statementReference.map((r) => r.fileName),
           type: "statement-reference",
-          bank: statementReference[0]?.bank || statementBank,
-          selectionBasis: "bank-identity; template-compatibility-checked-separately",
-          templateCompatibility: statementTemplateCompatibility?.status || "indeterminate"
+          bank: statementReference[0]?.bank || statementBank
         }
       : {
           fileName: statementReference.fileName,
           type: "statement-reference",
-          bank: statementReference.bank,
-          selectionBasis: "bank-identity; template-compatibility-checked-separately",
-          templateCompatibility: statementTemplateCompatibility?.status || "indeterminate"
+          bank: statementReference.bank
         })
   : null,
 ...statementResult,
@@ -24854,21 +24721,24 @@ const amountRenderDifferenceStrong = Boolean(
   )
 );
 const criticalReviewReasons = [];
-const pdfProvenanceReview = evaluatePdfProvenanceReview(pdfStructureForensics);
-result.pdfProvenanceReview = pdfProvenanceReview;
-if (pdfProvenanceReview.triggered) {
-  criticalReviewReasons.push('pdf-provenance-image-only-missing-metadata');
-  result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : []), pdfProvenanceReview.message])];
-}
+let pdfProvenanceReview = { triggered: false, message: null };
+let pdfSourceMetadataReview = { triggered: false, message: null };
 if (type === 'pdf') {
-  const metadataReview = evaluatePdfSourceMetadataReview(
-    targetPdfSourceMetadata,
-    receiptReferencePdfSourceMetadata,
+  pdfProvenanceReview = evaluatePdfProvenanceReview(pdfStructureForensics, pdfStructureForensics?.metadata);
+  result.pdfProvenanceReview = pdfProvenanceReview;
+  if (pdfProvenanceReview.triggered) {
+    criticalReviewReasons.push('pdf-provenance-image-only-missing-metadata');
+    result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : []), pdfProvenanceReview.message])];
+  }
+  pdfSourceMetadataReview = evaluatePdfSourceMetadataReview(
+    pdfStructureForensics?.metadata || null,
+    await readStatementReferenceSourceMetadata(reference),
     reference?.fileName || null
   );
-  result.pdfSourceMetadataReview = metadataReview;
-  if (metadataReview.triggered) {
+  result.pdfSourceMetadataReview = pdfSourceMetadataReview;
+  if (pdfSourceMetadataReview.triggered) {
     criticalReviewReasons.push('pdf-source-metadata-review');
+    result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : []), pdfSourceMetadataReview.message])];
   }
 }
 // Keep the user-facing review state consistent with the reference-forensics
@@ -24897,7 +24767,7 @@ const criticalFieldsRequireControl = criticalReviewReasons.length > 0;
 if (semanticEvidenceFusion?.available) {
   semanticEvidenceFusion.reviewStatus = criticalFieldsRequireControl ? 'CONTROL_REQUIRED' : 'FIELDS_CORROBORATED';
   semanticEvidenceFusion.reviewMessage = criticalFieldsRequireControl
-    ? 'Kontrol gerekli: kritik alan doğrulanamadı, kaynaklar uyuşmadı, referans karşılaştırması tamamlanmadı veya PDF köken/yapı sinyali manuel inceleme gerektiriyor.'
+    ? 'Kontrol gerekli: alıcı IBANı veya tutar alanı doğrulanamadı, kaynaklar uyuşmadı, tutar karşılaştırması eksik/güçlü fark gösteriyor ya da referansla güçlü bir alan yerleşimi farkı bulundu.'
     : 'Alıcı IBANı ve tutar alanı doğrulandı; tutar karşılaştırması ve güçlü yerleşim farkı kontrolleri ek inceleme gerektirmedi.';
   semanticEvidenceFusion.criticalFieldReview = {
     focusFields: ['recipientIBAN', 'amount'],
@@ -24925,7 +24795,8 @@ result.fieldReviewStatus = (type === 'image' || type === 'pdf')
   : (semanticEvidenceFusion?.reviewStatus || null);
 result.manualReviewRequired = Boolean(
   result.fieldReviewStatus === 'CONTROL_REQUIRED' ||
-  result.aiAnalysisStatus === 'unavailable'
+  result.aiAnalysisStatus === 'unavailable' ||
+  pdfProvenanceReview.triggered || pdfSourceMetadataReview.triggered
 );
 console.log('FINAL CRITICAL FIELD REVIEW:', JSON.stringify({
   focusFields: ['recipientIBAN', 'amount'],
@@ -24946,9 +24817,7 @@ console.log('FINAL CRITICAL FIELD REVIEW:', JSON.stringify({
   manualReviewRequired: result.manualReviewRequired,
 }));
 
-const finalEvidence = result.pdfSourceMetadataReview?.triggered
-  ? `${canonicalReferenceText}\n\n• ${result.pdfSourceMetadataReview.message}`
-  : canonicalReferenceText;
+const finalEvidence = canonicalReferenceText;
 
 console.log(
 "FINAL SCORE:",
