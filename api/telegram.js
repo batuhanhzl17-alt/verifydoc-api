@@ -2274,10 +2274,14 @@ async function sendAnalysisResult(
  const fontMismatchReview = hasReliableFontMismatch(result?.fontForensics);
  const pdfStructureComparison = result?.pdfStructureForensics?.referenceComparison || {};
  const pdfStructureReview = pdfStructureComparison.materialDifferences === true;
+ const pdfSourceMetadataReview = result?.pdfSourceMetadataReview;
+ const pdfSourceMetadataReviewLine = pdfSourceMetadataReview?.triggered
+   ? pdfSourceMetadataReview.message
+   : null;
  const manualReviewRequired = result?.manualReviewRequired === true ||
    result?.fieldReviewStatus === 'CONTROL_REQUIRED' ||
    result?.semanticEvidenceFusion?.reviewStatus === 'CONTROL_REQUIRED' ||
-   textIntegrityReview || fontMismatchReview || pdfStructureReview;
+   textIntegrityReview || fontMismatchReview || pdfStructureReview || Boolean(pdfSourceMetadataReviewLine);
  const suspiciousFinding = result?.suspicious === true;
  const reviewHeadline = manualReviewRequired
    ? '🟠 KONTROL GEREKLİ'
@@ -2317,6 +2321,7 @@ async function sendAnalysisResult(
    specificReviewReasonLines.unshift(textIntegrityReviewLine);
  }
  specificReviewReasonLines.splice(3);
+ if (pdfSourceMetadataReviewLine) specificReviewReasonLines.push(pdfSourceMetadataReviewLine);
 
  const confidenceCap = criticalReviewReasons.some(reason =>
    /amount|iban/.test(String(reason)) && /unverified|unavailable|disagreement|difference/.test(String(reason))
@@ -2636,7 +2641,7 @@ async function sendAnalysisResult(
    statementPdfAudit.reviewRequired === true;
  const statementReviewHeadline = verifiedStatementIssue
    ? '🟠 KONTROL GEREKLİ'
-   : textIntegrityReview
+   : textIntegrityReview || pdfSourceMetadataReviewLine
      ? '🟠 KONTROL GEREKLİ'
    : statementNeedsReview
      ? '🟡 KONTROL TAVSİYE EDİLİR'
@@ -2669,9 +2674,11 @@ async function sendAnalysisResult(
  if (pageCoverageIncomplete) statementReasonLines.push(`Tüm sayfalar taranamadı (${pagesAnalyzed}/${pageCount}).`);
  if (bankIdentityConflict) statementReasonLines.push('Belge banka kimliği, seçilen referansla uyuşmuyor.');
  if (unresolvedVisualRows) statementReasonLines.push(`${unresolvedVisualRows} satırın görsel alan eşleşmesi tamamlanamadı; bu, satırın eksik veya değiştirilmiş olduğunu tek başına göstermez.`);
- if (statementNeedsReview && !statementReasonLines.length) statementReasonLines.push('Bir veya daha fazla otomatik alan kontrolü kesin sonuca ulaşamadı.');
+ if (statementNeedsReview && !statementReasonLines.length && !pdfSourceMetadataReviewLine) statementReasonLines.push('Bir veya daha fazla otomatik alan kontrolü kesin sonuca ulaşamadı.');
+ const visibleStatementReasons = statementReasonLines.slice(0, 3);
+ if (pdfSourceMetadataReviewLine) visibleStatementReasons.push(pdfSourceMetadataReviewLine);
  const reviewReasonLine = statementNeedsReview || verifiedStatementIssue
-   ? `Kontrol nedeni:\n${statementReasonLines.slice(0, 3).map(line => `• ${line}`).join('\n')}`
+   ? `Kontrol nedeni:\n${visibleStatementReasons.map(line => `• ${line}`).join('\n')}`
    : '';
  const unresolvedRowDetails = (Array.isArray(rowAssociation.rows) ? rowAssociation.rows : [])
    .filter(row => row?.status !== 'matched')
@@ -2756,7 +2763,7 @@ async function sendAnalysisResult(
    });
  }
 
- if (!generalFindings.length && !referenceFindings.length) {
+ if (!generalFindings.length && !referenceFindings.length && !pdfSourceMetadataReviewLine) {
    lines.push('', 'Hatalı veya şüpheli bir kısım tespit edilmedi.');
  }
 
