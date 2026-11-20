@@ -2775,6 +2775,71 @@ function evaluatePdfProvenanceReview(pdfStructure) {
   };
 }
 
+function cleanPdfSourceMetadata(value) {
+  return typeof value === 'string' ? value.normalize('NFC').replace(/\s+/g, ' ').trim() || null : null;
+}
+
+async function readPdfSourceMetadata(pdf) {
+  try {
+    const { info, metadata } = await pdf.getMetadata();
+    return {
+      producer: cleanPdfSourceMetadata(info?.Producer) || cleanPdfSourceMetadata(metadata?.get('pdf:producer')),
+      creator: cleanPdfSourceMetadata(info?.Creator) || cleanPdfSourceMetadata(metadata?.get('xmp:creatortool')),
+    };
+  } catch (error) {
+    console.warn('PDF SOURCE METADATA READ ERROR:', error?.message || String(error));
+    return null;
+  }
+}
+
+async function readStatementReferenceSourceMetadata(reference) {
+  if (!reference?.base64) return null;
+  let pdf;
+  try {
+    pdf = await getPdfDocument({ data: new Uint8Array(Buffer.from(reference.base64, 'base64')) }).promise;
+    return await readPdfSourceMetadata(pdf);
+  } catch (error) {
+    console.warn('STATEMENT REFERENCE METADATA READ ERROR:', error?.message || String(error));
+    return null;
+  } finally {
+    try { await pdf?.destroy(); } catch {}
+  }
+}
+
+function evaluatePdfSourceMetadataReview(target, reference, referenceFile = null) {
+  if (!target) return { status: 'target-metadata-unavailable', triggered: false, referenceFile, message: null };
+
+  const labels = { producer: 'Üretici', creator: 'Oluşturucu' };
+  const fields = Object.keys(labels);
+  const missingFields = fields.filter(field => !target[field]);
+  const comparableFields = fields.filter(field => target[field] && reference?.[field]);
+  const differentFields = comparableFields.filter(field =>
+    target[field].toLowerCase() !== reference[field].toLowerCase()
+  );
+  const reasons = [];
+  if (missingFields.length) {
+    const missingLabels = missingFields.map(field => labels[field].toLocaleLowerCase('tr-TR')).join(' ve ');
+    reasons.push(`PDF’de ${missingLabels} ${missingFields.length === 1 ? 'bilgisi' : 'bilgileri'} bulunamadı.`);
+  }
+  if (differentFields.length) {
+    const brief = value => value.length > 80 ? `${value.slice(0, 79)}…` : value;
+    const differences = differentFields.map(field =>
+      `${labels[field]} (belge “${brief(target[field])}”, referans “${brief(reference[field])}”)`
+    );
+    reasons.push(`PDF metadata’sı ${referenceFile || 'seçilen referans'} ile uyuşmuyor. ${differences.join(' · ')}.`);
+  }
+  const triggered = reasons.length > 0;
+  return {
+    status: triggered ? 'review' : comparableFields.length === fields.length ? 'matched' : 'reference-metadata-incomplete',
+    triggered,
+    referenceFile,
+    missingFields,
+    differentFields,
+    comparableFields,
+    message: triggered ? reasons.join(' ') : null,
+  };
+}
+
 function detectStatementBankFromText(text, fileName = "") {
   const normalizeBankText = (value) => String(value || "")
     .toLocaleLowerCase("tr-TR")
@@ -18276,6 +18341,7 @@ const htmlText = buffer.subarray(0, Math.min(buffer.length, 8192)).toString('utf
 const isHtmlUpload = /\.(?:html?|xhtml)$/i.test(String(fileName || filePath || '')) &&
   /<\s*(?:!doctype\s+html|html|head|body|table|div|span)\b/i.test(htmlText);
 let pdfStructureForensics = null;
+let targetPdfSourceMetadata = null;
 if (!isPdfUpload && !isHtmlUpload && (type !== "video" || !String(mime).toLowerCase().startsWith("video/"))) {
   console.warn('NON-PDF UPLOAD REJECTED:', JSON.stringify({ fileName, mime: uploadedFile.mimetype || null }));
   return res.status(415).json({
@@ -18366,6 +18432,7 @@ const pdf = await getPdfDocument({
 data: new Uint8Array(buffer),
 }).promise;
 
+if (isPdfUpload) targetPdfSourceMetadata = await readPdfSourceMetadata(pdf);
 pdfNativeFieldAssociation = await extractPdfNativeFieldAssociations(pdf);
 try {
   pdfStructureForensics = await analyzePdfStructure({ pdf, buffer, pdfjsLib });
@@ -18743,6 +18810,7 @@ if ((type === "image" || type === "pdf") && forensicTargetPath) {
 // hatası oluşur.
 let reference = null;
 let pdfReferenceFieldAssociation = null;
+let receiptReferencePdfSourceMetadata = null;
 
 if (type !== "video" && type !== "statement") {
   const referenceSelectionOCR = {
@@ -18756,6 +18824,7 @@ if (type === "pdf" && reference?.path && path.extname(reference.path).toLowerCas
   try {
     const referenceBuffer = await fs.readFile(reference.path);
     const referencePdf = await getPdfDocument({ data: new Uint8Array(referenceBuffer) }).promise;
+    receiptReferencePdfSourceMetadata = await readPdfSourceMetadata(referencePdf);
     if (pdfStructureForensics?.available === true) {
       try {
         const referenceStructure = await analyzePdfStructure({ pdf: referencePdf, buffer: referenceBuffer, pdfjsLib });
@@ -20056,6 +20125,25 @@ if (statementProvenanceReview.triggered) {
   ];
   statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), statementProvenanceReview.message])];
   statementResult.summary = [String(statementResult.summary || '').trim(), `• ${statementProvenanceReview.message}`].filter(Boolean).join('\n');
+}
+if (isPdfUpload && (statementBank || normalizeBank(bank)) !== 'ziraat') {
+  const metadataReference = Array.isArray(statementReference)
+    ? statementReference.find(item => item.fileName === statementTemplateCompatibility?.selectedReference)
+    : statementReference;
+  const metadataReview = evaluatePdfSourceMetadataReview(
+    targetPdfSourceMetadata,
+    await readStatementReferenceSourceMetadata(metadataReference),
+    metadataReference?.fileName || null
+  );
+  statementResult.pdfSourceMetadataReview = metadataReview;
+  if (metadataReview.triggered) {
+    statementResult.manualReviewRequired = true;
+    statementResult.statementAuditFindings = [
+      ...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []),
+      metadataReview.message,
+    ];
+    statementResult.evidence = [...new Set([...(Array.isArray(statementResult.evidence) ? statementResult.evidence : []), metadataReview.message])];
+  }
 }
 if (statementBankIdentityConflict) {
   const bankConflictReasons = [];
@@ -24759,6 +24847,17 @@ if (pdfProvenanceReview.triggered) {
   criticalReviewReasons.push('pdf-provenance-image-only-missing-metadata');
   result.evidence = [...new Set([...(Array.isArray(result.evidence) ? result.evidence : []), pdfProvenanceReview.message])];
 }
+if (type === 'pdf') {
+  const metadataReview = evaluatePdfSourceMetadataReview(
+    targetPdfSourceMetadata,
+    receiptReferencePdfSourceMetadata,
+    reference?.fileName || null
+  );
+  result.pdfSourceMetadataReview = metadataReview;
+  if (metadataReview.triggered) {
+    criticalReviewReasons.push('pdf-source-metadata-review');
+  }
+}
 // Keep the user-facing review state consistent with the reference-forensics
 // report. Strong, localized field-spacing anomalies must not be presented as
 // a clean/corroborated result just because the critical values (amount/IBAN)
@@ -24834,7 +24933,9 @@ console.log('FINAL CRITICAL FIELD REVIEW:', JSON.stringify({
   manualReviewRequired: result.manualReviewRequired,
 }));
 
-const finalEvidence = canonicalReferenceText;
+const finalEvidence = result.pdfSourceMetadataReview?.triggered
+  ? `${canonicalReferenceText}\n\n• ${result.pdfSourceMetadataReview.message}`
+  : canonicalReferenceText;
 
 console.log(
 "FINAL SCORE:",
