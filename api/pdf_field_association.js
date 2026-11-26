@@ -145,6 +145,45 @@ function boxForItems(items, pageWidth, pageHeight) {
   };
 }
 
+function resolveAkbankStructuredAmount(rows, pageWidth, pageHeight) {
+  const orderedRows = [...rows].sort((a, b) => a.baseline - b.baseline);
+  const rowText = row => row.items.map(item => item.text).join(' ').replace(/\s+/g, ' ').trim();
+  const normalize = value => normalizeLabel(value).replace(/[.]/g, ' ').replace(/\s+/g, ' ').trim();
+  const headingIndex = orderedRows.findIndex(row => /\bTUTAR\s+BILGILERI\b/.test(normalize(rowText(row))));
+  if (headingIndex < 0) return null;
+
+  const endIndex = orderedRows.findIndex((row, index) => index > headingIndex && /\bTOPLAM\b/.test(normalize(rowText(row))));
+  const sectionEnd = endIndex >= 0 ? endIndex : Math.min(orderedRows.length, headingIndex + 16);
+  const principalRows = orderedRows.slice(headingIndex + 1, sectionEnd).filter(row =>
+    row.items.some(item => /^(?:S?CH|SÇH)$/i.test(normalize(item.text)))
+  );
+  if (principalRows.length !== 1) return null;
+
+  const principalRow = principalRows[0];
+  const labelItems = principalRow.items.filter(item => /^(?:S?CH|SÇH)$/i.test(normalize(item.text)));
+  const amountItems = principalRow.items.filter(item => validValue('amount', item.text));
+  const nonZero = amountItems.filter(item => {
+    const normalized = normalizePdfAmount(item.text);
+    return normalized && Number(normalized) !== 0;
+  });
+  const distinct = new Map(nonZero.map(item => [normalizePdfAmount(item.text), item]).filter(([key]) => key));
+  if (distinct.size !== 1 || !labelItems.length) return null;
+
+  const amountItem = distinct.values().next().value;
+  return {
+    status: 'matched',
+    value: cleanAssociatedValue('amount', amountItem.text),
+    labelText: labelItems.map(item => item.text).join(' '),
+    pageNumber: amountItem.pageNumber || labelItems[0].pageNumber || 1,
+    labelBox: boxForItems(labelItems, pageWidth, pageHeight),
+    valueBox: boxForItems([amountItem], pageWidth, pageHeight),
+    resolver: 'akbank-tutar-bilgileri-sch-principal-row-v1',
+    validation: 'unique-nonzero-amount-in-sch-row-excludes-fees-and-total',
+    associationValidated: true,
+    candidateCount: 1,
+  };
+}
+
 function makeRows(items) {
   const rows = [];
   for (const item of [...items].sort((a, b) => b.baseline - a.baseline || a.x - b.x)) {
@@ -405,6 +444,10 @@ function resolveField(field, rows, pageWidth, pageHeight) {
         ...(field === 'recipientIBAN' ? { associationTrace: trace } : {}),
       });
     }
+  }
+  if (field === 'amount' && candidates.length === 0) {
+    const structuredAmount = resolveAkbankStructuredAmount(rows, pageWidth, pageHeight);
+    if (structuredAmount) return structuredAmount;
   }
   // TEB's FAST receipt places the principal transfer value in a transaction
   // table row, without a typed "Tutar" label. The FAST fee and BSMV occupy
