@@ -2204,6 +2204,88 @@ function formatFontForensicsWarning(fontForensics) {
 // ANALİZ SONUCUNU GÖNDER
 // =====================================================
 
+function formatPdfRevisionReview(review) {
+ if (!review) return '';
+ const heading = '📄 PDF İMZA VE SÜRÜM KONTROLÜ';
+ if (!review.available) {
+  const reasons = {
+   'not-configured': 'PDF servisi yapılandırılmamış.',
+   'size-limit': 'Dosya PDF inceleme boyut sınırını aşıyor.',
+   'encrypted': 'Şifreli PDF açılamadı.',
+   'repaired-pdf': 'PDF yapısı güvenilir biçimde okunamadı.',
+  };
+  return [heading, reasons[review.status] || 'PDF servisinden inceleme sonucu alınamadı.'].join('\n');
+ }
+
+ const lines = [heading];
+ const signatureReport = review.signatures || {};
+ const signatures = Array.isArray(signatureReport.entries) ? signatureReport.entries : [];
+ const documentSignatures = signatures.filter(entry =>
+  entry.format && !/^(unknown|ETSI\.RFC3161)$/i.test(entry.format));
+ const validSignatures = documentSignatures.filter(entry => /^Signature is Valid\.$/i.test(entry.integrity || ''));
+ const finalCovered = validSignatures.some(entry => entry.coversFinalFile === true);
+
+ if (documentSignatures.length) {
+  lines.push(`• Dijital imza: ${validSignatures.length}/${documentSignatures.length} imza bütünlük kontrolünden geçti.`);
+  if (validSignatures.length) {
+   lines.push(finalCovered
+    ? '• Bütünlük kontrolünden geçen bir imza son sürümü kapsıyor.'
+    : '• Bütünlük kontrolünden geçen imzalar önceki sürümleri kapsıyor.');
+  }
+  const trusted = documentSignatures.filter(entry => /^Certificate is Trusted\.$/i.test(entry.certificateTrust || '')).length;
+  lines.push(trusted
+   ? `• Sertifika güveni: ${trusted}/${documentSignatures.length} için doğrulandı.`
+   : '• Sertifika güveni: Doğrulanamadı.');
+ } else {
+  lines.push(signatureReport.status === 'absent'
+   ? '• Dijital imza: Gömülü imza bulunamadı.'
+   : '• Dijital imza: Doğrulanmış belge imzası sonucu yok.');
+ }
+
+ const timestampReport = review.timestamps || {};
+ const timestamps = Array.isArray(timestampReport.entries) ? timestampReport.entries : [];
+ if (timestamps.length) {
+  const matched = timestamps.filter(entry => entry.status === 'integrity-matched').length;
+  lines.push(`• RFC 3161: ${matched}/${timestamps.length} belge zaman damgası bütünlük kontrolünden geçti. Sağlayıcı sertifikası ayrıca doğrulanmadı.`);
+ } else {
+  lines.push(timestampReport.scanLimited === false
+   ? '• RFC 3161: Belge zaman damgası tespit edilmedi.'
+   : '• RFC 3161: Belge zaman damgası incelemesi tamamlanamadı.');
+ }
+
+ const revisions = Array.isArray(review.revisions) ? review.revisions : [];
+ const changed = revisions.some(entry => entry.pageCountChanged || entry.changedPages?.length);
+ const changedPages = [...new Set(revisions.flatMap(entry => (entry.changedPages || []).map(page => page.page)))].sort((a, b) => a - b);
+ if (revisions.length) {
+  const pageDetails = changedPages.length
+   ? ` Değişen sayfalar: ${changedPages.slice(0, 10).join(', ')}${changedPages.length > 10 ? '…' : ''}.`
+   : '';
+  lines.push(`• Önceki sürümler: ${revisions.length} karşılaştırma. ${changed ? 'Sayfa içeriği, görünümü veya sayısı farklı.' : 'Karşılaştırılan sayfalarda fark bulunmadı.'}${pageDetails}`);
+ } else if (review.revisionStatus === 'complete') {
+  lines.push('• Önceki sürüm: Karşılaştırılabilecek sürüm bulunamadı.');
+ }
+ if (review.revisionStatus !== 'complete' || revisions.some(entry =>
+  entry.comparedPages < Math.min(entry.pageCount, review.pageCount))) {
+  lines.push('• Sürüm veya sayfa karşılaştırması kısmi.');
+ }
+ const overlayPages = (review.pages || []).filter(page => page.possibleAmountOverlays?.length).map(page => page.page);
+ if (overlayPages.length) {
+  lines.push(`• Olası tutar örtüşmesi: Sayfa ${overlayPages.slice(0, 10).join(', ')}${overlayPages.length > 10 ? '…' : ''}.`);
+ }
+ return lines.join('\n');
+}
+
+async function sendPdfAwareAnalysisMessage(chatId, text, replyToMessageId, result) {
+ const reviewText = formatPdfRevisionReview(result?.pdfStructureForensics?.revisionAndSignatureReview);
+ const combined = reviewText ? `${text}\n\n${reviewText}` : text;
+ if (reviewText && combined.length > 4096) {
+  await sendMessage(chatId, text, replyToMessageId);
+  await sendMessage(chatId, reviewText, replyToMessageId);
+ } else {
+  await sendMessage(chatId, combined, replyToMessageId);
+ }
+}
+
 async function sendAnalysisResult(
  chatId,
  result,
@@ -2774,11 +2856,7 @@ async function sendAnalysisResult(
 
  const text = lines.join('\n');
 
- await sendMessage(
- chatId,
- text,
- replyToMessageId
- );
+ await sendPdfAwareAnalysisMessage(chatId, text, replyToMessageId, result);
 
  await sendAnnotatedDifferenceIfAvailable(
  chatId,
@@ -2853,11 +2931,7 @@ ${conciseSummaryGeneral}${criticalReferenceFindings.length || fallbackCriticalRe
 Otomatik ön incelemedir; kesin sahtecilik kararı değildir.`;
 
 
- await sendMessage(
- chatId,
- text,
- replyToMessageId
- );
+ await sendPdfAwareAnalysisMessage(chatId, text, replyToMessageId, result);
 
  await sendAnnotatedDifferenceIfAvailable(
  chatId,
