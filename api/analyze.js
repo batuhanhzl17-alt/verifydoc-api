@@ -17,6 +17,7 @@ import { resolveStatementPaddleOcrRow, normalizeStatementRowCounts, normalizePad
 import { analyzeAudioBoundaryChanges } from "./audio_edit_forensics.js";
 import { analyzeSpeechActivity } from "./speech_activity_vad.js";
 import { analyzePdfStructure } from "./pdf_structure_forensics.js";
+import { inspectPdfRevisions } from "./pdf_forensics_client.js";
 import { analyzeHtmlReceipt, formatHtmlReceiptSummary } from "./html_receipt_forensics.js";
 import { createWorker } from "tesseract.js"
 import { Model, PaddleOCRClient } from "@paddleocr/api-sdk"
@@ -18345,6 +18346,7 @@ data: new Uint8Array(buffer),
 pdfNativeFieldAssociation = await extractPdfNativeFieldAssociations(pdf);
 try {
   pdfStructureForensics = await analyzePdfStructure({ pdf, buffer, pdfjsLib });
+  pdfStructureForensics.revisionAndSignatureReview = await inspectPdfRevisions(buffer);
   console.log('PDF STRUCTURE FORENSICS NODE:', JSON.stringify({
     available: pdfStructureForensics.available,
     engine: pdfStructureForensics.engine || null,
