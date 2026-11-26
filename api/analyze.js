@@ -2760,26 +2760,29 @@ function detectStatementBankFromText(text, fileName = "") {
     .replace(/ü/g, "u")
     .replace(/ö/g, "o")
     .replace(/ç/g, "c");
-  const rawLines = normalizeBankText(text).split(/\r?\n/)
-    .map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
-  const tableHeaderIndex = rawLines.findIndex(line =>
-    /islem tarihi/.test(line) && /tutar/.test(line) && /bakiye/.test(line)
-  );
-  const firstTransactionIndex = rawLines.findIndex(line =>
-    /^\d{1,2}[./-]\d{1,2}[./-]\d{4}\s+(?:mb|atm|fast|eft|havale)\b/.test(line)
-  );
+  // PDF.js/PDF text extraction commonly returns the whole page as one long
+  // string, without line breaks. Do not require a table header or a transaction
+  // date to be the start of a line: that made text-based issuer detection fail
+  // for otherwise readable statements (including İş Bankası PDFs).
+  const normalizedText = normalizeBankText(text).replace(/\s+/g, " ").trim();
+  const tableHeaderMatch = normalizedText.match(/\b(?:islem\s+)?tarihi\b[\s\S]{0,600}?\btutar(?:i)?\b[\s\S]{0,600}?\bbakiye\b/i);
+  const tableHeaderIndex = tableHeaderMatch ? tableHeaderMatch.index : -1;
+  const firstTransactionMatch = normalizedText.match(/\b\d{1,2}[./-]\d{1,2}[./-]\d{4}\s+(?:mb|atm|fast|eft|havale)\b/i);
+  const firstTransactionIndex = firstTransactionMatch ? firstTransactionMatch.index : -1;
   const cutoffCandidates = [tableHeaderIndex, firstTransactionIndex].filter(index => index >= 0);
-  const tableCutoff = cutoffCandidates.length ? Math.min(...cutoffCandidates) : rawLines.length;
-  const headerLines = cutoffCandidates.length
-    ? rawLines.slice(0, tableCutoff).join(" ").slice(0, 1800)
-    : "";
+  const tableCutoff = cutoffCandidates.length ? Math.min(...cutoffCandidates) : -1;
+  // With no recognizable table boundary, inspect only the bounded document
+  // header. Issuer names in transaction descriptions must not authorize a
+  // bank reference.
+  const headerLimit = tableCutoff >= 0 ? 1800 : 900;
+  const headerLines = (tableCutoff >= 0 ? normalizedText.slice(0, tableCutoff) : normalizedText)
+    .slice(0, headerLimit);
 
   // Issuer evidence may appear in a labeled legal-identity footer, but bank
   // names inside transaction rows are counterparties and must never identify
   // the statement issuer. Keep only short snippets tied to issuer labels.
   const issuerFooterSnippets = [];
-  const joinedText = rawLines.join(" ");
-  for (const match of joinedText.matchAll(/(?:ticaret unvani|banka unvani|duzenleyen banka)\s*[:：]?\s*([^.;]{1,140})/g)) {
+  for (const match of normalizedText.matchAll(/(?:ticaret unvani|banka unvani|duzenleyen banka)\s*[:：]?\s*([^.;]{1,140})/g)) {
     issuerFooterSnippets.push(match[1]);
   }
   const issuerEvidence = `${headerLines} ${issuerFooterSnippets.join(" ")}`.trim();
@@ -2912,6 +2915,8 @@ function detectStatementBankFromText(text, fileName = "") {
     tableHeaderFound: tableHeaderIndex >= 0,
     firstTransactionFound: firstTransactionIndex >= 0,
     transactionBodyExcluded: cutoffCandidates.length > 0,
+    headerFallbackUsed: cutoffCandidates.length === 0,
+    headerLimit,
   }));
   console.log("HESAP ÖZETİ BANKA SKORLARI:", JSON.stringify(scores));
   // A weak or near-tied result must not silently choose the wrong bank's
@@ -3422,9 +3427,14 @@ async function compareStatementReferenceTemplate(targetBuffer, references, bank)
   const best=[...comparisons].sort((a,b)=>(priority[b.status]||0)-(priority[a.status]||0) || (b.visualSimilarity??-1)-(a.visualSimilarity??-1))[0];
   const complete=comparisons.length===items.length;
   const status=best&&(best.status!=='mismatch'||complete)?best.status:'indeterminate';
+  const bankName = ({
+    akbank: 'Akbank', enpara: 'Enpara', garanti: 'Garanti BBVA', halkbank: 'Halkbank',
+    ing: 'ING', isbankasi: 'İş Bankası', kuveytturk: 'Kuveyt Türk', qnb: 'QNB',
+    teb: 'TEB', vakifbank: 'VakıfBank', yapikredi: 'Yapı Kredi', ziraat: 'Ziraat Bankası',
+  })[normalizeBank(bank)] || String(bank || 'Banka');
   const message=status==='mismatch'
-    ? `Ziraat hesap özetinin ilk sayfa düzeni kayıtlı Ziraat referansı “${best.referenceFile}” ile belirgin biçimde farklı; banka şablonu uyumu doğrulanamadı.`
-    : status==='indeterminate' ? 'Ziraat hesap özetinin sayfa düzeni mevcut referanslarla güvenilir biçimde karşılaştırılamadı; şablon uyumu doğrulanamadı.' : null;
+    ? `${bankName} hesap özetinin ilk sayfa düzeni kayıtlı referans “${best.referenceFile}” ile belirgin biçimde farklı; banka şablonu uyumu doğrulanamadı.`
+    : status==='indeterminate' ? `${bankName} hesap özetinin sayfa düzeni kayıtlı referanslarla güvenilir biçimde karşılaştırılamadı; şablon uyumu doğrulanamadı.` : null;
   return {available:Boolean(best),engine:'statement-reference-visual-layout-v1',bank,status,selectedReference:best?.referenceFile||null,
     visualSimilarity:best?.visualSimilarity??null,headerSimilarity:best?.headerSimilarity??null,columnSimilarity:best?.columnSimilarity??null,
     coloredBandDifference:best?.coloredBandDifference??null,comparisons,comparedPage:1,message};
@@ -8459,6 +8469,7 @@ async function getReferenceAmountAnchor(bank) {
 
     const entries = [];
     let nativePdfReferenceCount = 0;
+    let rasterPdfReferenceCount = 0;
     for (const referencePath of referencePaths) {
       try {
         if (/\.pdf$/i.test(String(referencePath || ''))) {
@@ -8489,6 +8500,35 @@ async function getReferenceAmountAnchor(bank) {
               status: amount?.status || 'unavailable',
               reason: amount?.reason || 'typed-amount-label-not-found',
             }));
+            // A PDF can be a scanned/raster template and therefore have no
+            // native text-layer label. Reuse the template profile's existing
+            // PDF raster OCR path instead of abandoning the reference here.
+            // The profile only exposes explicitly typed primary-amount ROIs;
+            // Akbank's structured ŞCH row is promoted there only when unique.
+            const rasterProfile = await extractReferenceTemplateProfile(referencePath, normalizedBank);
+            const rasterAmount = rasterProfile?.fields?.amount?.find(field =>
+              field?.templateRole === 'primaryAmount' && field?.xNorm != null && field?.yNorm != null
+            );
+            if (rasterAmount) {
+              entries.push({
+                xNorm: Number(rasterAmount.xNorm),
+                yNorm: Number(rasterAmount.yNorm),
+                widthNorm: Math.max(0.001, Number(rasterAmount.widthNorm) || 0),
+                heightNorm: Math.max(0.001, Number(rasterAmount.heightNorm) || 0),
+                referenceFile: path.basename(referencePath),
+                pageNumber: Number(rasterAmount.pageNumber) || 1,
+              });
+              rasterPdfReferenceCount++;
+              console.log('PDF RASTER REFERENCE AMOUNT BOX:', JSON.stringify({
+                referenceFile: path.basename(referencePath),
+                pageNumber: Number(rasterAmount.pageNumber) || 1,
+                resolver: rasterAmount.style?.source || 'reference-template-profile-ocr',
+                valueBoxNorm: {
+                  x: Number(rasterAmount.xNorm), y: Number(rasterAmount.yNorm),
+                  width: Number(rasterAmount.widthNorm), height: Number(rasterAmount.heightNorm),
+                },
+              }));
+            }
           }
           continue;
         }
@@ -8897,6 +8937,8 @@ async function getReferenceAmountAnchor(bank) {
         ? 'trusted-pdf-native-target-nearest-reference-v1'
         : nativePdfReferenceCount
         ? 'trusted-pdf-native-typed-amount-label-coordinate-ensemble-v1'
+        : rasterPdfReferenceCount
+        ? 'trusted-pdf-raster-ocr-primary-amount-ensemble-v1'
         : 'trusted-telegram-raster-ensemble-v16.1-explicit-amount-label-fallback',
     };
     referenceAmountAnchorCache.set(cacheKey, anchor);
@@ -13018,6 +13060,100 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
           if (rule.key === 'amount' && !/(?:\d|TL|TRY|₺|EUR|USD|GBP)/i.test(String(value.text || ''))) continue;
           addRasterField(rule.key, lr, value.region, label.text);
         }
+
+        // Akbank's EFT dekont uses a two-value "TUTAR BİLGİLERİ" table:
+        // MEVDUAT is the total debit, while the non-zero value in the ŞCH row
+        // is the principal transfer amount. A generic nearest-number rule
+        // binds the heading to MEVDUAT (including fees); replace that guess
+        // only when this exact structured table yields one unique principal.
+        if (normalizedBank === 'akbank') {
+          const normalizeOcr = value => normalizeFieldTextForMatch(value)
+            .replace(/[.]/g, ' ').replace(/\s+/g, ' ').trim();
+          const lines = [];
+          for (const item of [...regions].sort((a, b) =>
+            ((a.region.y1 + a.region.y2) / 2) - ((b.region.y1 + b.region.y2) / 2) ||
+            a.region.x1 - b.region.x1
+          )) {
+            const centerY = (item.region.y1 + item.region.y2) / 2;
+            const itemHeight = Math.max(8, item.region.y2 - item.region.y1);
+            let line = lines.find(candidate =>
+              Math.abs(candidate.centerY - centerY) <= Math.max(8, Math.min(itemHeight, candidate.height) * 0.65)
+            );
+            if (!line) {
+              line = { centerY, height: itemHeight, items: [] };
+              lines.push(line);
+            }
+            line.items.push(item);
+            line.centerY = line.items.reduce((sum, region) => sum + (region.region.y1 + region.region.y2) / 2, 0) / line.items.length;
+            line.height = Math.max(line.height, itemHeight);
+          }
+          for (const line of lines) line.items.sort((a, b) => a.region.x1 - b.region.x1);
+          const heading = lines.find(line =>
+            /\bTUTAR\s+BILGILERI\b/.test(normalizeOcr(line.items.map(item => item.text).join(' ')))
+          );
+          if (heading) {
+            const schLines = lines.filter(line =>
+              line.centerY > heading.centerY &&
+              line.centerY - heading.centerY <= Math.max(150, heading.height * 14) &&
+              line.items.some(item => /^(?:S?CH|SÇH)$/i.test(normalizeOcr(item.text)))
+            );
+            if (schLines.length === 1) {
+              const schLine = schLines[0];
+              const labelItems = schLine.items.filter(item => /^(?:S?CH|SÇH)$/i.test(normalizeOcr(item.text)));
+              const valueCandidates = [];
+              const amountRe = /[-+]?\d{1,3}(?:[. ]\d{3})*(?:,\d{2}|\.\d{2})/g;
+              for (const item of schLine.items) {
+                const sourceText = String(item.text || '');
+                for (const match of sourceText.matchAll(amountRe)) {
+                  const raw = match[0];
+                  const numeric = Number(raw.replace(/\s/g, '').replace(/\.(?=\d{3}(?:,|$))/g, '').replace(',', '.'));
+                  if (!Number.isFinite(numeric) || numeric === 0) continue;
+                  const r = item.region;
+                  const startRatio = (match.index || 0) / Math.max(1, sourceText.length);
+                  const widthRatio = raw.length / Math.max(1, sourceText.length);
+                  valueCandidates.push({
+                    amountKey: numeric.toFixed(2),
+                    region: {
+                      x1: r.x1 + (r.x2 - r.x1) * startRatio,
+                      y1: r.y1,
+                      x2: Math.min(r.x2, r.x1 + (r.x2 - r.x1) * (startRatio + widthRatio)),
+                      y2: r.y2,
+                    },
+                  });
+                }
+              }
+              const uniqueValues = new Map(valueCandidates.map(candidate => [candidate.amountKey, candidate]));
+              if (uniqueValues.size === 1 && labelItems.length) {
+                const amount = uniqueValues.values().next().value;
+                const labelRegion = {
+                  x1: Math.min(...labelItems.map(item => item.region.x1)),
+                  y1: Math.min(...labelItems.map(item => item.region.y1)),
+                  x2: Math.max(...labelItems.map(item => item.region.x2)),
+                  y2: Math.max(...labelItems.map(item => item.region.y2)),
+                };
+                fields.amount = [{
+                  xNorm: amount.region.x1 / width,
+                  yNorm: amount.region.y1 / height,
+                  widthNorm: Math.max(0.001, (amount.region.x2 - amount.region.x1) / width),
+                  heightNorm: Math.max(0.001, (amount.region.y2 - amount.region.y1) / height),
+                  pageNumber: 1,
+                  labelKey: 'amount',
+                  label: 'ŞCH',
+                  labelPresent: true,
+                  templateRole: 'primaryAmount',
+                  style: { source: 'reference-raster-ocr-akbank-sch-row', fontNames: [], avgFontHeight: amount.region.y2 - amount.region.y1, avgCharWidth: 0, itemCount: 1 },
+                  referenceFile: path.basename(referencePath),
+                }];
+                console.log('AKBANK REFERENCE PRINCIPAL AMOUNT OCR BOX:', JSON.stringify({
+                  referenceFile: path.basename(referencePath),
+                  label: 'ŞCH',
+                  amountBoxNorm: fields.amount[0],
+                  excludedRows: ['MEVDUAT', 'KOMİSYON', 'BSMV', 'TOPLAM'],
+                }));
+              }
+            }
+          }
+        }
       }
     } catch (error) {
       console.warn('REFERENCE RASTER OCR FALLBACK HATASI:', path.basename(referencePath), error?.message || error);
@@ -13025,7 +13161,7 @@ async function extractReferenceTemplateProfile(referencePath, normalizedBank) {
   }
 
   const hasRasterFields = Object.values(fields).some(list =>
-    Array.isArray(list) && list.some(item => item?.style?.source === 'reference-raster-ocr')
+    Array.isArray(list) && list.some(item => String(item?.style?.source || '').startsWith('reference-raster-ocr'))
   );
 
   return {
@@ -19931,14 +20067,28 @@ fileName
 const statementIdentityProbe = await analyzeStatement(base64, mime, fileName, null);
 const statementProbeBank = normalizeBank(statementIdentityProbe?.documentData?.bank) ||
   detectStatementBankFromText(String(statementIdentityProbe?.summary || "").slice(0, 700), "");
-const statementBank = statementProbeBank || null;
+const observedStatementBanks = [...new Set([
+  statementProbeBank,
+  detectedStatementBank,
+  statementBankCandidate,
+].filter(Boolean))];
+const statementDetectionConflict = observedStatementBanks.length > 1;
+// The text detector is restricted to the statement header/issuer evidence,
+// while the model may fail when OCR is unavailable or its queue is full. Use
+// either independent document signal, and only fall back to an explicit user
+// bank choice when neither document signal was available. Contradictory
+// identities must not silently load any bank's reference.
+const statementBank = statementDetectionConflict
+  ? null
+  : (detectedStatementBank || statementProbeBank || statementBankCandidate || null);
 const statementTextBankConflict = Boolean(
-  statementBank && detectedStatementBank && statementBank !== detectedStatementBank
+  statementProbeBank && detectedStatementBank && statementProbeBank !== detectedStatementBank
 );
 const statementRequestBankConflict = Boolean(
-  statementBank && statementBankCandidate && statementBank !== statementBankCandidate
+  statementBankCandidate && [statementProbeBank, detectedStatementBank].some(candidate =>
+    candidate && candidate !== statementBankCandidate
+  )
 );
-const statementDetectionConflict = statementTextBankConflict || statementRequestBankConflict;
 
 console.log("HESAP ÖZETİ BANKA ÖN TARAMA:", JSON.stringify({
   requestBank: statementBankCandidate || null,
@@ -19948,7 +20098,15 @@ console.log("HESAP ÖZETİ BANKA ÖN TARAMA:", JSON.stringify({
   textVisualConflict: statementTextBankConflict,
   textBankConflict: statementTextBankConflict,
   requestBankConflict: statementRequestBankConflict,
-  referenceAuthorizedBy: statementBank ? "visual-document-identity-pass" : null,
+  identityConflict: statementDetectionConflict,
+  observedStatementBanks,
+  referenceAuthorizedBy: statementBank
+    ? statementProbeBank
+      ? "visual-document-identity-pass"
+      : detectedStatementBank
+        ? "header-scoped-pdf-text-identity"
+        : "explicit-request-bank-fallback"
+    : null,
 }));
 
 let statementReference = statementBank
@@ -20032,7 +20190,11 @@ if (statementResult.pdfProvenanceReview.triggered) {
   statementResult.statementAuditFindings = [...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []), statementResult.pdfProvenanceReview.message];
   statementResult.evidence = [...new Set([...(statementResult.evidence || []), statementResult.pdfProvenanceReview.message])];
 }
-const statementTemplateCompatibility = statementBank === 'ziraat'
+// Validate the selected issuer template for every bank. A correct bank label
+// alone does not prove that the uploaded statement uses that bank's layout.
+// If the comparison is unavailable or materially different, surface that
+// uncertainty instead of silently presenting the reference as a match.
+const statementTemplateCompatibility = statementBank && statementReference
   ? await compareStatementReferenceTemplate(buffer, statementReference, statementBank)
   : null;
 if (statementTemplateCompatibility) {
@@ -20041,7 +20203,8 @@ if (statementTemplateCompatibility) {
   if (statementTemplateCompatibility.status !== 'compatible') {
     statementResult.manualReviewRequired = true;
     statementResult.statementReferenceTemplateValidated = false;
-    const templateFinding = statementTemplateCompatibility.message || 'Ziraat hesap özeti şablon uyumu doğrulanamadı.';
+    const templateFinding = statementTemplateCompatibility.message ||
+      `${statementBank} hesap özeti şablon uyumu doğrulanamadı; kayıtlı referansla güvenilir karşılaştırma yapılamadı.`;
     statementResult.statementAuditFindings = [...(Array.isArray(statementResult.statementAuditFindings) ? statementResult.statementAuditFindings : []), templateFinding];
     statementResult.evidence = [...new Set([...(statementResult.evidence || []), templateFinding])];
     statementResult.summary = [String(statementResult.summary || '').trim(), `• ${templateFinding}`].filter(Boolean).join('\n');
@@ -20065,8 +20228,9 @@ if (isPdfUpload && statementBank && statementBank !== 'ziraat' && statementRefer
 }
 if (statementBankIdentityConflict) {
   const bankConflictReasons = [];
-  if (statementTextBankConflict) bankConflictReasons.push(`üst bilgi metin tespiti ${detectedStatementBank}, görsel ön tarama ${statementBank} dedi`);
-  if (statementRequestBankConflict) bankConflictReasons.push(`istek bankası ${statementBankCandidate}, belge görseli ${statementBank} olarak tanındı`);
+  if (statementTextBankConflict) bankConflictReasons.push(`üst bilgi metin tespiti ${detectedStatementBank}, görsel ön tarama ${statementProbeBank} dedi`);
+  if (statementRequestBankConflict) bankConflictReasons.push(`istek bankası ${statementBankCandidate}, belge tespiti ${statementProbeBank || detectedStatementBank} dedi`);
+  if (statementDetectionConflict && !bankConflictReasons.length) bankConflictReasons.push(`banka kaynakları çelişti (${observedStatementBanks.join(', ')})`);
   if (statementReferencePassDiscarded) bankConflictReasons.push('referanslı analiz banka kimliğinde ön taramayla çelişti ve sonuç kullanılmadı');
   if (statementFinalBankConflict) bankConflictReasons.push(`son analiz ${statementModelBank}, görsel ön tarama ${statementBank} dedi`);
   if (statementReference && !statementModelBank) bankConflictReasons.push('referanslı analiz banka kimliğini doğrulayamadı');
