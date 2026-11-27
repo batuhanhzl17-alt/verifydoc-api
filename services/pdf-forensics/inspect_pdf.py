@@ -85,7 +85,7 @@ def overlay_candidates(page):
     )
     if not covers or len(covers) > 200:
         return []
-    words = [fitz.Rect(word[:4]) for word in page.get_text("words") if AMOUNT.fullmatch(word[4])]
+    words = [(fitz.Rect(word[:4]), str(word[4])) for word in page.get_text("words") if AMOUNT.fullmatch(word[4])]
     candidates = []
     for index, (kind, box) in enumerate(operations):
         if kind != "fill-text":
@@ -94,12 +94,14 @@ def overlay_candidates(page):
         for cover_index, cover_kind, cover in covers:
             if cover_index <= index or not cover.intersects(ink):
                 continue
-            for word in words:
-                if not word.intersects(ink):
+            for word_box, word_text in words:
+                if not word_box.intersects(ink):
                     continue
-                overlap = (word & cover).get_area() / word.get_area()
+                overlap = (word_box & cover).get_area() / word_box.get_area()
                 if overlap >= 0.5:
-                    candidates.append({"box": list(word), "coverType": cover_kind})
+                    candidates.append({"text": word_text, "box": list(word_box),
+                                       "coverBox": list(cover), "coverType": cover_kind,
+                                       "overlapRatio": round(overlap, 4)})
                     if len(candidates) == 20:
                         return candidates
     return candidates
