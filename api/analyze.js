@@ -1494,6 +1494,7 @@ const paddleOCRInFlight = new Map();
 // calls do not hammer the same remote queue during one analysis request.
 const paddleOCRFailureCache = new Map();
 const PADDLE_FAILURE_CACHE_MS = 12000;
+const azureDocumentLayoutCache = new Map();
 
 
 // =====================================================
@@ -1622,7 +1623,7 @@ function normalizeAzureLayoutResult(payload) {
   };
 }
 
-async function runAzureDocumentLayout(filePath) {
+async function runAzureDocumentLayout(filePath, options = {}) {
   const cfg = getAzureDocumentIntelligenceConfig();
   if (!cfg) {
     console.log("AZURE DOCUMENT INTELLIGENCE: ENV YOK, ATLANDI");
@@ -1632,6 +1633,12 @@ async function runAzureDocumentLayout(filePath) {
   try {
     const buffer = await fs.readFile(filePath);
     if (!buffer?.length) return null;
+    const cacheKey = `azure-layout:${createHash('sha256').update(buffer).digest('hex')}`;
+    const cachedLayout = azureDocumentLayoutCache.get(cacheKey);
+    if (cachedLayout) {
+      console.log("AZURE DOCUMENT INTELLIGENCE LAYOUT CACHE HIT:", path.basename(filePath));
+      return cachedLayout;
+    }
 
     const endpoint = `${cfg.endpoint}/documentintelligence/documentModels/prebuilt-layout:analyze?_overload=analyzeDocument&api-version=${AZURE_DI_API_VERSION}&locale=tr-TR&stringIndexType=textElements`;
     const post = await fetch(endpoint, {
@@ -1651,7 +1658,8 @@ async function runAzureDocumentLayout(filePath) {
     const operationLocation = post.headers.get("operation-location") || post.headers.get("Operation-Location");
     if (!operationLocation) throw new Error("Azure Operation-Location header bulunamadı.");
 
-    for (let attempt = 0; attempt < 45; attempt++) {
+    const maxPollAttempts = Math.max(1, Math.ceil((Number(options.maxWaitMs) || 45000) / 1000));
+    for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
       const poll = await fetch(operationLocation, {
         method: "GET",
@@ -1665,6 +1673,8 @@ async function runAzureDocumentLayout(filePath) {
       const status = String(payload?.status || "").toLowerCase();
       if (status === "succeeded") {
         const normalized = normalizeAzureLayoutResult(payload);
+        if (azureDocumentLayoutCache.size >= 24) azureDocumentLayoutCache.clear();
+        azureDocumentLayoutCache.set(cacheKey, normalized);
         console.log("AZURE DOCUMENT INTELLIGENCE LAYOUT:", JSON.stringify({
           pageCount: normalized.pageCount,
           lineCount: normalized.lines.length,
@@ -2019,7 +2029,7 @@ try {
   }
   const cached = paddleOCRCache.get(paddleCacheKey);
   if (cached?.success) {
-    console.log("PADDLEOCR CONTENT CACHE HIT:", filePath);
+    console.log("OCR CONTENT CACHE HIT:", JSON.stringify({ file: path.basename(filePath), provider: cached.provider || 'paddleocr' }));
     return JSON.parse(JSON.stringify(cached));
   }
   const inFlight = paddleOCRInFlight.get(paddleCacheKey);
@@ -2069,11 +2079,10 @@ for (let attempt = 1; attempt <= maxAttempts; attempt++) {
   } catch (ocrError) {
     const msg = String(ocrError?.message || ocrError || "");
     const queueFull = /queue|队列|task.*full|too many|busy|rate.?limit|429|kuyruk/i.test(msg);
-    if (!queueFull || attempt === maxAttempts) throw ocrError;
-    const base = [1200, 2500, 4500][attempt - 1] || 6000;
-    const waitMs = base + Math.floor(Math.random() * 750);
-    console.warn(`PADDLEOCR KUYRUK DOLU — ${waitMs}ms bekleniyor (deneme ${attempt}/${maxAttempts})`);
-    await new Promise(resolve => setTimeout(resolve, waitMs));
+    // Queue-full is provider backpressure, so don't resubmit into the same
+    // saturated queue. The outer handler immediately tries Azure then Tesseract.
+    if (queueFull) throw ocrError;
+    if (attempt === maxAttempts) throw ocrError;
   }
 }
 
@@ -2304,6 +2313,7 @@ pages.length,
 regions:
 allRegions,
 pageGeometry,
+provider: 'paddleocr',
 };
 
 if (paddleCacheKey) {
@@ -2334,6 +2344,18 @@ error
 console.error(
 "================================================"
 );
+
+const errorMessage = String(error?.message || error || '');
+const queueFull = /queue|队列|task.*full|too many|busy|rate.?limit|429|kuyruk/i.test(errorMessage);
+if (queueFull) {
+  console.warn('PADDLEOCR KUYRUK HATASI — AZURE/TESSERACT YEDEĞİ BAŞLATILIYOR');
+  const backupOCR = await runOCRBackupAfterPaddleQueueFull(filePath);
+  if (backupOCR?.success) {
+    if (paddleCacheKey) paddleOCRCache.set(paddleCacheKey, backupOCR);
+    return backupOCR;
+  }
+}
+
 if (paddleCacheKey) paddleOCRFailureCache.set(paddleCacheKey, Date.now());
 
 return {
@@ -2386,7 +2408,107 @@ const { data } = await worker.recognize(imagePath);
 return {
 text: data.text || "",
 confidence: Number(data.confidence) || 0,
+regions: (Array.isArray(data.words) ? data.words : []).map(word => {
+  const box = word?.bbox || {};
+  const x1 = Number(box.x0 ?? box.x1), y1 = Number(box.y0 ?? box.y1);
+  const x2 = Number(box.x1 ?? box.x2), y2 = Number(box.y1 ?? box.y2);
+  const score = Number(word?.confidence);
+  if (![x1, y1, x2, y2].every(Number.isFinite) || x2 <= x1 || y2 <= y1 || !String(word?.text || '').trim()) return null;
+  return { pageIndex: 0, text: String(word.text).trim(), score: Number.isFinite(score) ? Math.max(0, Math.min(1, score / 100)) : 0.6,
+    region: { x1, y1, x2, y2 } };
+}).filter(Boolean),
 };
+}
+
+async function runOCRBackupAfterPaddleQueueFull(filePath) {
+  // Azure Layout is preferred because it supplies text geometry and table rows.
+  // Keep its queue fallback bounded; if unavailable or slow, use local Tesseract.
+  try {
+    const layout = await runAzureDocumentLayout(filePath, { maxWaitMs: 12000 });
+    if (layout?.available && layout.lines?.length) {
+      let rasterPages = [];
+      const extension = path.extname(String(filePath || '')).toLowerCase();
+      if (extension === '.pdf') {
+        const pdfBuffer = await fs.readFile(filePath);
+        const pdf = await getPdfDocument({ data: new Uint8Array(pdfBuffer) }).promise;
+        try {
+          for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+            const page = await pdf.getPage(pageNumber);
+            const viewport = page.getViewport({ scale: 1.6 });
+            rasterPages.push({ width: viewport.width, height: viewport.height });
+          }
+        } finally { try { await pdf.destroy?.(); } catch {} }
+      } else {
+        const meta = await sharp(filePath).metadata();
+        rasterPages = [{ width: Number(meta.width) || 0, height: Number(meta.height) || 0 }];
+      }
+      const regions = [];
+      for (const word of (layout.words || [])) {
+        const pageIndex = Math.max(0, (Number(word.pageNumber) || 1) - 1);
+        const sourcePage = layout.pages?.[pageIndex];
+        const raster = rasterPages[pageIndex];
+        if (!sourcePage?.width || !sourcePage?.height || !raster?.width || !raster?.height) continue;
+        const scaleX = raster.width / sourcePage.width, scaleY = raster.height / sourcePage.height;
+        const score = word.confidence == null ? NaN : Number(word.confidence);
+        regions.push({ pageIndex, text: word.text, score: Number.isFinite(score) ? score : 0.75,
+          region: { x1: word.box.x1 * scaleX, y1: word.box.y1 * scaleY,
+            x2: word.box.x2 * scaleX, y2: word.box.y2 * scaleY } });
+      }
+      if (regions.length) {
+        const output = { text: layout.content || layout.lines.map(line => line.text).join('\n'),
+          confidence: Math.round(regions.reduce((sum, item) => sum + item.score, 0) / regions.length * 100),
+          success: true, pages: layout.pageCount, regions,
+          pageGeometry: rasterPages.map((page, index) => ({ ...page, source: 'azure-layout-raster-map', pageIndex: index })),
+          provider: 'azure-document-intelligence-layout', fallbackReason: 'paddle-queue-full' };
+        console.warn('OCR YEDEK GEÇİŞİ:', JSON.stringify({ provider: output.provider, reason: output.fallbackReason, regions: regions.length }));
+        return output;
+      }
+    }
+  } catch (error) {
+    console.warn('AZURE OCR YEDEK HATASI:', error?.message || error);
+  }
+
+  const tempFiles = [];
+  try {
+    const extension = path.extname(String(filePath || '')).toLowerCase();
+    let imagePaths = [filePath];
+    if (extension === '.pdf') {
+      const pdfBuffer = await fs.readFile(filePath);
+      const pdf = await getPdfDocument({ data: new Uint8Array(pdfBuffer) }).promise;
+      imagePaths = [];
+      try {
+        for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+          const rendered = await renderPdfPagePng(pdf, pageNumber, 1.6);
+          if (!rendered?.buffer) continue;
+          const tempPath = `/tmp/verifydoc-tesseract-fallback-${Date.now()}-${pageNumber}.png`;
+          await fs.writeFile(tempPath, rendered.buffer);
+          tempFiles.push(tempPath);
+          imagePaths.push(tempPath);
+        }
+      } finally { try { await pdf.destroy?.(); } catch {} }
+    }
+    const pages = [];
+    for (const [pageIndex, imagePath] of imagePaths.entries()) {
+      const pageResult = await runOCR(imagePath);
+      const meta = await sharp(imagePath).metadata();
+      pages.push({ ...pageResult, pageIndex, width: Number(meta.width) || 0, height: Number(meta.height) || 0 });
+    }
+    const regions = pages.flatMap(page => (page.regions || []).map(region => ({ ...region, pageIndex: page.pageIndex })));
+    const text = pages.map(page => page.text).filter(Boolean).join('\n');
+    if (text.trim()) {
+      const output = { text, confidence: Math.round(pages.reduce((sum, page) => sum + (Number(page.confidence) || 0), 0) / Math.max(1, pages.length)),
+        success: true, pages: pages.length, regions,
+        pageGeometry: pages.map(({ width, height, pageIndex }) => ({ width, height, source: 'tesseract-raster', pageIndex })),
+        provider: 'tesseract.js', fallbackReason: 'paddle-queue-full' };
+      console.warn('OCR YEDEK GEÇİŞİ:', JSON.stringify({ provider: output.provider, reason: output.fallbackReason, regions: regions.length }));
+      return output;
+    }
+  } catch (error) {
+    console.warn('TESSERACT OCR YEDEK HATASI:', error?.message || error);
+  } finally {
+    for (const tempPath of tempFiles) try { await fs.unlink(tempPath); } catch {}
+  }
+  return null;
 }
 
 
@@ -18766,9 +18888,7 @@ paddleImageOCR.success
 // reference-anchor resolver before amount forensics requests an anchor.
 activeReferenceVariant = activeReferenceVariant || detectReferenceVariantFromText(paddleImageOCR.text || '');
 
-console.log(
-"PADDLEOCR IMAGE OCR BAŞARILI"
-);
+console.log("IMAGE OCR BAŞARILI:", paddleImageOCR.provider || 'paddleocr');
 
 console.log(
 "PADDLEOCR IMAGE CONFIDENCE:",
