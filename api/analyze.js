@@ -1495,6 +1495,7 @@ const paddleOCRInFlight = new Map();
 const paddleOCRFailureCache = new Map();
 const PADDLE_FAILURE_CACHE_MS = 12000;
 const azureDocumentLayoutCache = new Map();
+const PADDLE_OCR_CALL_TIMEOUT_MS = 25000;
 
 
 // =====================================================
@@ -2066,22 +2067,35 @@ console.log(
 );
 
 let result = null;
-// V62 SPEED: Paddle queue yoğunluğunda gereksiz uzun beklemeyi azalt.
-// 4 deneme yeterli; son deneme yine hata verirse mevcut hata yönetimi çalışır.
+// Queue-full or a stalled SDK request should quickly hand off to the configured
+// backup OCR instead of consuming the full Vercel function duration.
 const maxAttempts = 4;
 for (let attempt = 1; attempt <= maxAttempts; attempt++) {
   try {
-    result = await client.ocr({
-      filePath: filePath,
-      model: Model.PPOCRv6,
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        const error = new Error(`PADDLEOCR_REQUEST_TIMEOUT after ${PADDLE_OCR_CALL_TIMEOUT_MS}ms`);
+        error.code = 'PADDLEOCR_REQUEST_TIMEOUT';
+        reject(error);
+      }, PADDLE_OCR_CALL_TIMEOUT_MS);
     });
+    try {
+      result = await Promise.race([
+        client.ocr({ filePath, model: Model.PPOCRv6 }),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
     break;
   } catch (ocrError) {
     const msg = String(ocrError?.message || ocrError || "");
     const queueFull = /queue|队列|task.*full|too many|busy|rate.?limit|429|kuyruk/i.test(msg);
+    const requestTimedOut = /PADDLEOCR_REQUEST_TIMEOUT|timed out|timeout|zaman aşımı/i.test(msg);
     // Queue-full is provider backpressure, so don't resubmit into the same
-    // saturated queue. The outer handler immediately tries Azure then Tesseract.
-    if (queueFull) throw ocrError;
+    // saturated queue. A stalled request is handled the same way.
+    if (queueFull || requestTimedOut) throw ocrError;
     if (attempt === maxAttempts) throw ocrError;
   }
 }
@@ -2347,9 +2361,11 @@ console.error(
 
 const errorMessage = String(error?.message || error || '');
 const queueFull = /queue|队列|task.*full|too many|busy|rate.?limit|429|kuyruk/i.test(errorMessage);
-if (queueFull) {
-  console.warn('PADDLEOCR KUYRUK HATASI — AZURE/TESSERACT YEDEĞİ BAŞLATILIYOR');
-  const backupOCR = await runOCRBackupAfterPaddleQueueFull(filePath);
+const requestTimedOut = /PADDLEOCR_REQUEST_TIMEOUT|timed out|timeout|zaman aşımı/i.test(errorMessage);
+if (queueFull || requestTimedOut) {
+  const fallbackReason = queueFull ? 'paddle-queue-full' : 'paddle-request-timeout';
+  console.warn('PADDLEOCR ERİŞİM SORUNU — AZURE/TESSERACT YEDEĞİ BAŞLATILIYOR:', fallbackReason);
+  const backupOCR = await runOCRBackupAfterPaddleQueueFull(filePath, fallbackReason);
   if (backupOCR?.success) {
     if (paddleCacheKey) paddleOCRCache.set(paddleCacheKey, backupOCR);
     return backupOCR;
@@ -2420,7 +2436,7 @@ regions: (Array.isArray(data.words) ? data.words : []).map(word => {
 };
 }
 
-async function runOCRBackupAfterPaddleQueueFull(filePath) {
+async function runOCRBackupAfterPaddleQueueFull(filePath, fallbackReason = 'paddle-queue-full') {
   // Azure Layout is preferred because it supplies text geometry and table rows.
   // Keep its queue fallback bounded; if unavailable or slow, use local Tesseract.
   try {
@@ -2459,7 +2475,7 @@ async function runOCRBackupAfterPaddleQueueFull(filePath) {
           confidence: Math.round(regions.reduce((sum, item) => sum + item.score, 0) / regions.length * 100),
           success: true, pages: layout.pageCount, regions,
           pageGeometry: rasterPages.map((page, index) => ({ ...page, source: 'azure-layout-raster-map', pageIndex: index })),
-          provider: 'azure-document-intelligence-layout', fallbackReason: 'paddle-queue-full' };
+          provider: 'azure-document-intelligence-layout', fallbackReason };
         console.warn('OCR YEDEK GEÇİŞİ:', JSON.stringify({ provider: output.provider, reason: output.fallbackReason, regions: regions.length }));
         return output;
       }
@@ -2499,7 +2515,7 @@ async function runOCRBackupAfterPaddleQueueFull(filePath) {
       const output = { text, confidence: Math.round(pages.reduce((sum, page) => sum + (Number(page.confidence) || 0), 0) / Math.max(1, pages.length)),
         success: true, pages: pages.length, regions,
         pageGeometry: pages.map(({ width, height, pageIndex }) => ({ width, height, source: 'tesseract-raster', pageIndex })),
-        provider: 'tesseract.js', fallbackReason: 'paddle-queue-full' };
+        provider: 'tesseract.js', fallbackReason };
       console.warn('OCR YEDEK GEÇİŞİ:', JSON.stringify({ provider: output.provider, reason: output.fallbackReason, regions: regions.length }));
       return output;
     }
@@ -20956,8 +20972,8 @@ throw new Error(
 // PADDLEOCR CONTEXT
 // -------------------------------------------------
 
-// PaddleOCR sonucu, OpenAI'nin belge görüntüsü/PDF'si ile birlikte
-// yalnızca yardımcı OCR metni olarak verilir.
+// OCR sonucu, OpenAI'nin belge görüntüsü/PDF'si ile birlikte yalnızca
+// yardımcı metindir. Aynı belgenin mevcut OCR sonucu varsa tekrar API çağrısı yapma.
 // Gerçek görsel/PDF her zaman ana kaynaktır.
 if (
 (type === "image" || type === "pdf") &&
@@ -20965,10 +20981,17 @@ process.env.PADDLEOCR_ACCESS_TOKEN &&
 !paddleOcrAttempted
 ) {
 
-const paddleResult =
-await runPaddleOCR(filePath);
+const reusableOCR = paddleDocumentOCR?.success
+  ? paddleDocumentOCR
+  : paddleImageOCR?.success
+    ? paddleImageOCR
+    : null;
+const paddleResult = reusableOCR || await runPaddleOCR(filePath);
 paddleDocumentOCR = paddleResult;
 paddleOcrAttempted = true;
+if (reusableOCR) {
+  console.log('OCR CONTEXT MEVCUT SONUÇTAN KULLANILDI:', reusableOCR.provider || 'paddleocr');
+}
 
 if (!amountForensics) {
 amountForensics =
@@ -20992,10 +21015,10 @@ type:
 "input_text",
 text: `
 =====================================================
-PADDLEOCR YARDIMCI OCR SONUCU
+OCR YARDIMCI METNİ (${paddleResult.provider || 'paddleocr'})
 =====================================================
 
-Bu metin PaddleOCR tarafından gerçek yüklenen dosyadan
+Bu metin OCR tarafından gerçek yüklenen dosyadan
 çıkarılmış yardımcı OCR sonucudur.
 OCR güven skoru: ${paddleOcrConfidence}/100
 ÇOK ÖNEMLİ:
@@ -21003,7 +21026,7 @@ OCR güven skoru: ${paddleOcrConfidence}/100
 Bu metni tek başına gerçek belge kabul etme.
 Ana kaynak her zaman aşağıdaki gerçek JPG/PDF dosyasıdır.
 
-PaddleOCR'da okunamayan veya belirsiz görünen bilgileri
+OCR'da okunamayan veya belirsiz görünen bilgileri
 ana belge görüntüsünden doğrula.
 
 Referans PDF'den hiçbir bilgi aktarma.
@@ -21017,9 +21040,7 @@ ${paddleOcrText}
 `,
 });
 
-console.log(
-"PADDLEOCR CONTEXT OPENAI'YE EKLENDİ"
-);
+console.log("OCR CONTEXT OPENAI'YE EKLENDİ:", paddleResult.provider || 'paddleocr');
 
 }
 }
