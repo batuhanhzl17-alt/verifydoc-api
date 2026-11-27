@@ -2268,9 +2268,31 @@ function formatPdfRevisionReview(review) {
   entry.comparedPages < Math.min(entry.pageCount, review.pageCount))) {
   lines.push('• Sürüm veya sayfa karşılaştırması kısmi.');
  }
- const overlayPages = (review.pages || []).filter(page => page.possibleAmountOverlays?.length).map(page => page.page);
- if (overlayPages.length) {
-  lines.push(`• Olası tutar örtüşmesi: Sayfa ${overlayPages.slice(0, 10).join(', ')}${overlayPages.length > 10 ? '…' : ''}.`);
+ const overlayDetails = (review.pages || []).flatMap(page =>
+  (Array.isArray(page?.possibleAmountOverlays) ? page.possibleAmountOverlays : []).map(candidate => ({
+   page: Number(page.page) || null,
+   text: String(candidate?.text || '').trim(),
+   box: Array.isArray(candidate?.box) ? candidate.box.map(Number) : [],
+   coverBox: Array.isArray(candidate?.coverBox) ? candidate.coverBox.map(Number) : [],
+   coverType: candidate?.coverType || null,
+   overlapRatio: Number(candidate?.overlapRatio),
+  }))
+ );
+ if (overlayDetails.length) {
+  const coverLabels = { 'white-fill': 'beyaz vektör şekli', 'fill-image': 'görsel nesne' };
+  lines.push('• Olası tutar örtüşmesi adayları (tek başına düzenleme kanıtı değildir):');
+  for (const item of overlayDetails.slice(0, 5)) {
+   const box = item.box.length >= 4 && item.box.every(Number.isFinite) ? item.box : null;
+   const coverBox = item.coverBox.length >= 4 && item.coverBox.every(Number.isFinite) ? item.coverBox : null;
+   const boxText = values => `x=${values[0].toFixed(1)}, y=${values[1].toFixed(1)}, genişlik=${(values[2] - values[0]).toFixed(1)}, yükseklik=${(values[3] - values[1]).toFixed(1)} pt`;
+   const location = box ? `tutar kutusu (${boxText(box)})` : 'tutar alanı';
+   const coverLocation = coverBox ? `; üst öğe kutusu (${boxText(coverBox)})` : '';
+   const amountText = item.text ? ` “${item.text}”` : '';
+   const coverText = coverLabels[item.coverType] || item.coverType || 'üst çizim öğesi';
+   const ratio = Number.isFinite(item.overlapRatio) ? `; örtüşme %${Math.round(item.overlapRatio * 100)}` : '';
+   lines.push(`  – s.${item.page || '?'}${amountText}: ${location}; olası örtücü ${coverText}${coverLocation}${ratio}. Koordinatlar sayfanın sol üstünden ölçülür.`);
+  }
+  if (overlayDetails.length > 5) lines.push(`  – Ayrıca ${overlayDetails.length - 5} örtüşme adayı daha var.`);
  }
  return lines.join('\n');
 }
